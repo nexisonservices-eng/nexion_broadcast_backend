@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: whatsapp-business-backend
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        description: MongoDB connection string (get this from MongoDB Atlas)
+      - key: JWT_SECRET
+        generateValue: true
+    plan: free
+    autoDeploy: true
