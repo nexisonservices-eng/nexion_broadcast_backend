@@ -34,10 +34,10 @@ const wss = new WebSocket.Server({ server });
 // Middleware
 const allowedOrigins = [
   process.env.FRONTEND_URL,
+  "https://technovo-automation-afplwwbfj-technovas-projects-37226de2.vercel.app",
   "http://localhost:5173",
   "http://127.0.0.1:5173",
   "http://127.0.0.1:53918",
-  "http://127.0.0.1:60932",
   "http://localhost:53918",
   "http://localhost:60932",
   "http://localhost:5174",
@@ -54,6 +54,9 @@ app.use(cors({
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
+    
+    // Log blocked origins for debugging
+    console.log(`CORS blocked: ${origin}`);
     return callback(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
