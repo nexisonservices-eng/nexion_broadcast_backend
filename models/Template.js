@@ -49,7 +49,6 @@ TemplateSchema.pre('save', function(next) {
   next();
 });
 
-TemplateSchema.index({ name: 1 });
 TemplateSchema.index({ status: 1, isActive: 1 });
 
 module.exports = mongoose.model('Template', TemplateSchema);
