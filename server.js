@@ -35,6 +35,8 @@ const wss = new WebSocket.Server({ server });
 const allowedOrigins = [
   process.env.FRONTEND_URL,
   "https://technovo-automation-afplwwbfj-technovas-projects-37226de2.vercel.app",
+  "https://technovo-automation-m9n8fz6sl-technovas-projects-37226de2.vercel.app",
+  "https://technovo-automation.vercel.app",
   "http://localhost:5173",
   "http://127.0.0.1:5173",
   "http://127.0.0.1:53918",
@@ -55,13 +57,21 @@ app.use(cors({
       return callback(null, true);
     }
     
+    // Allow any vercel.app subdomain for development
+    if (origin.includes('.vercel.app')) {
+      console.log(`CORS allowed for Vercel deployment: ${origin}`);
+      return callback(null, true);
+    }
+    
     // Log blocked origins for debugging
     console.log(`CORS blocked: ${origin}`);
     return callback(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  preflightContinue: false,
+  optionsSuccessStatus: 204
 }));
 
 app.options("*", cors());
