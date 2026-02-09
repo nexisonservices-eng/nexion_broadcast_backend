@@ -161,8 +161,8 @@ class TemplateController {
               type: 'official',
               category: wt.category || 'utility',
               language: wt.language,
-              status: wt.status, // Keep original case from Meta API
-              isActive: wt.status === 'APPROVED',
+              status: wt.status.toLowerCase(), // Convert to lowercase for database
+              isActive: wt.status.toLowerCase() === 'approved',
               content: {
                 header: headerComponent ? {
                   type: (headerComponent.format || 'text').toLowerCase(),
@@ -201,8 +201,8 @@ class TemplateController {
                   name: wt.name,
                   category: wt.category || 'utility',
                   language: wt.language,
-                  status: wt.status, // Keep original case from Meta API
-                  isActive: wt.status === 'APPROVED',
+                  status: wt.status.toLowerCase(), // Convert to lowercase for database
+                  isActive: wt.status.toLowerCase() === 'approved',
                   content: {
                     header: headerComponent ? {
                       type: (headerComponent.format || 'text').toLowerCase(),

@@ -58,6 +58,24 @@ BroadcastSchema.virtual('repliedPercentageOfTotal').get(function() {
   return ((this.stats.replied / this.recipientCount) * 100).toFixed(1);
 });
 
+// Virtual field for read percentage based on sent count
+BroadcastSchema.virtual('readPercentage').get(function() {
+  if (!this.stats || this.stats.sent === 0) return 0;
+  return ((this.stats.read / this.stats.sent) * 100).toFixed(1);
+});
+
+// Virtual field for read percentage based on total recipients
+BroadcastSchema.virtual('readPercentageOfTotal').get(function() {
+  if (!this.recipientCount || this.recipientCount === 0) return 0;
+  return ((this.stats.read / this.recipientCount) * 100).toFixed(1);
+});
+
+// Virtual field for delivery rate based on sent count
+BroadcastSchema.virtual('deliveryRate').get(function() {
+  if (!this.stats || this.stats.sent === 0) return 0;
+  return ((this.stats.delivered / this.stats.sent) * 100).toFixed(1);
+});
+
 // Ensure virtual fields are included in JSON output
 BroadcastSchema.set('toJSON', { virtuals: true });
 BroadcastSchema.set('toObject', { virtuals: true });

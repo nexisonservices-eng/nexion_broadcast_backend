@@ -262,8 +262,9 @@ class BroadcastService {
       broadcast.completedAt = new Date();
       await broadcast.save();
 
-      // Sync stats from actual messages after completion
-      await this.syncBroadcastStats(broadcastId);
+      // Note: Don't sync stats immediately after completion
+      // Stats will be updated in real-time via message status updates
+      // This prevents premature 100% read rates for first broadcasts
 
       return {
         success: true,
@@ -419,18 +420,32 @@ class BroadcastService {
 
       console.log(`?? Found ${messages.length} messages for broadcast "${broadcast.name}"`);
 
-      // Count statuses
+      // Count statuses with proper validation
       const stats = {
         sent: messages.length,
-        delivered: messages.filter(msg => msg.status === 'delivered' || msg.status === 'read').length,
+        delivered: messages.filter(msg => msg.status === 'delivered').length,
         read: messages.filter(msg => msg.status === 'read').length,
         failed: messages.filter(msg => msg.status === 'failed').length,
         replied: 0 // Will be calculated below
       };
 
-      // Normalize stats to avoid inconsistencies (read implies delivered; delivered implies sent)
-      stats.delivered = Math.max(stats.delivered, stats.read);
-      stats.sent = Math.max(stats.sent, stats.delivered);
+      // Debug: Log message statuses to identify issues
+      console.log('🔍 DEBUG: Message statuses found:', {
+        totalMessages: messages.length,
+        statusBreakdown: {
+          sent: messages.filter(msg => msg.status === 'sent').length,
+          delivered: messages.filter(msg => msg.status === 'delivered').length,
+          read: messages.filter(msg => msg.status === 'read').length,
+          failed: messages.filter(msg => msg.status === 'failed').length,
+          other: messages.filter(msg => !['sent', 'delivered', 'read', 'failed'].includes(msg.status)).length
+        },
+        messageDetails: messages.map(m => ({
+          id: m._id,
+          whatsappId: m.whatsappMessageId,
+          status: m.status,
+          timestamp: m.timestamp
+        }))
+      });
 
 
       // Count unique contacts who replied to this broadcast
@@ -475,8 +490,12 @@ class BroadcastService {
         const updatedBroadcast = await Broadcast.findById(broadcastId);
         const repliedPercentage = updatedBroadcast.repliedPercentage;
         const repliedPercentageOfTotal = updatedBroadcast.repliedPercentageOfTotal;
+        const readPercentage = updatedBroadcast.readPercentage;
+        const readPercentageOfTotal = updatedBroadcast.readPercentageOfTotal;
+        const deliveryRate = updatedBroadcast.deliveryRate;
         
         console.log(`📊 Updated stats for broadcast ${broadcast.name}:`, stats);
+        console.log(`📊 Delivery rate: ${deliveryRate}%, Read rate: ${readPercentage}% of sent, ${readPercentageOfTotal}% of total recipients`);
         console.log(`📊 Replied percentage: ${repliedPercentage}% of sent, ${repliedPercentageOfTotal}% of total recipients`);
       } else {
         console.log(`📊 No stat changes for broadcast ${broadcast.name}`);

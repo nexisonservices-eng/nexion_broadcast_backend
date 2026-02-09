@@ -13,6 +13,7 @@ connectDB();
 
 // Services
 const broadcastService = require('./services/broadcastService');
+const templateController = require('./controllers/templateController');
 
 // Models
 const Contact = require('./models/Contact');
@@ -820,13 +821,37 @@ app.get('/health', (req, res) => {
 
 // Start server
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 WebSocket server ready`);
   console.log(`🌐 Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:5173'}`);
   
   // Start the scheduler for checking scheduled broadcasts
   startScheduler();
+  
+  // Initial template sync on server startup
+  console.log('🔄 Performing initial template sync on server startup...');
+  try {
+    const mockReq = {};
+    const mockRes = {
+      status: (code) => ({
+        json: (data) => {
+          if (code === 200) {
+            console.log('✅ Initial template sync completed:', data.message);
+          } else {
+            console.error('❌ Initial template sync failed:', data.error);
+          }
+        }
+      }),
+      json: (data) => {
+        console.log('✅ Initial template sync completed:', data.message);
+      }
+    };
+    
+    await templateController.syncWhatsAppTemplates(mockReq, mockRes);
+  } catch (error) {
+    console.error('❌ Initial template sync error:', error.message);
+  }
 });
 
 // Scheduler to check for scheduled broadcasts every minute
@@ -856,7 +881,43 @@ function startScheduler() {
     }
   });
 
+  // Sync templates from Meta every 6 hours
+  cron.schedule('0 */6 * * *', async () => {
+    try {
+      console.log('🔄 Starting automatic template sync from Meta...');
+      
+      // Check database connection before proceeding
+      if (mongoose.connection.readyState !== 1) {
+        console.log('⚠️ Database not connected, skipping template sync');
+        return;
+      }
+      
+      // Create a mock request/response for the template sync
+      const mockReq = {};
+      const mockRes = {
+        status: (code) => ({
+          json: (data) => {
+            if (code === 200) {
+              console.log('✅ Automatic template sync completed:', data.message);
+            } else {
+              console.error('❌ Automatic template sync failed:', data.error);
+            }
+          }
+        }),
+        json: (data) => {
+          console.log('✅ Automatic template sync completed:', data.message);
+        }
+      };
+      
+      await templateController.syncWhatsAppTemplates(mockReq, mockRes);
+      
+    } catch (error) {
+      console.error('❌ Automatic template sync error:', error.message);
+    }
+  });
+
   console.log('✅ Broadcast scheduler started - checking every minute');
+  console.log('✅ Template auto-sync scheduled - every 6 hours');
 }
 
 // Check for recent message status updates and sync broadcast stats
@@ -888,7 +949,7 @@ async function checkAndUpdateBroadcastStats() {
         // Calculate current stats from messages
         const currentStats = {
           sent: messages.length,
-          delivered: messages.filter(msg => msg.status === 'delivered' || msg.status === 'read').length,
+          delivered: messages.filter(msg => msg.status === 'delivered').length,
           read: messages.filter(msg => msg.status === 'read').length,
           failed: messages.filter(msg => msg.status === 'failed').length,
           replied: 0 // Will be calculated below
@@ -928,7 +989,7 @@ async function checkAndUpdateBroadcastStats() {
           // Update broadcast stats
           await broadcastService.syncBroadcastStats(broadcast._id);
           
-          // Get updated broadcast and emit WebSocket event
+          // Get updated broadcast with virtual fields
           const updatedBroadcast = await Broadcast.findById(broadcast._id);
           if (updatedBroadcast) {
             const stringId = broadcast._id.toString();
@@ -938,7 +999,10 @@ async function checkAndUpdateBroadcastStats() {
               stats: {
                 ...updatedBroadcast.stats,
                 repliedPercentage: updatedBroadcast.repliedPercentage,
-                repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal
+                repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal,
+                readPercentage: updatedBroadcast.readPercentage,
+                readPercentageOfTotal: updatedBroadcast.readPercentageOfTotal,
+                deliveryRate: updatedBroadcast.deliveryRate
               }
             });
             app.locals.broadcast({
@@ -947,7 +1011,10 @@ async function checkAndUpdateBroadcastStats() {
               stats: {
                 ...updatedBroadcast.stats,
                 repliedPercentage: updatedBroadcast.repliedPercentage,
-                repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal
+                repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal,
+                readPercentage: updatedBroadcast.readPercentage,
+                readPercentageOfTotal: updatedBroadcast.readPercentageOfTotal,
+                deliveryRate: updatedBroadcast.deliveryRate
               }
             });
           }
