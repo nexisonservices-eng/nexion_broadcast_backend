@@ -8,6 +8,7 @@ const cron = require('node-cron');
 
 // Database connection
 const connectDB = require('./config/database');
+const mongoose = require('mongoose');
 connectDB();
 
 // Services
@@ -17,6 +18,7 @@ const broadcastService = require('./services/broadcastService');
 const Contact = require('./models/Contact');
 const Conversation = require('./models/Conversation');
 const Message = require('./models/Message');
+const Broadcast = require('./models/Broadcast');
 const whatsappService = require('./services/whatsappService');
 const whatsappConfig = require('./config/whatsapp');
 
@@ -26,6 +28,7 @@ const templateRoutes = require('./routes/templates');
 const broadcastRoutes = require('./routes/broadcasts');
 const conversationRoutes = require('./routes/conversations');
 const messageRoutes = require('./routes/messages');
+const contactRoutes = require('./routes/contacts');
 
 const app = express();
 const server = http.createServer(app);
@@ -83,23 +86,28 @@ app.use('/api/templates', templateRoutes);
 app.use('/api/broadcasts', broadcastRoutes);
 app.use('/api/conversations', conversationRoutes);
 app.use('/api/messages', messageRoutes);
+app.use('/api/contacts', contactRoutes);
 
 // ============ WEBSOCKET MANAGEMENT ============
 
 const clients = new Map(); // Store connected clients
 
 wss.on('connection', (ws, req) => {
+  console.log('🔌 New WebSocket connection established');
   const userId = req.headers['user-id'] || 'anonymous';
+  console.log('👤 User ID:', userId);
   clients.set(userId, ws);
   
-  console.log(`Client connected: ${userId}`);
+  console.log('📊 Total connected clients:', clients.size);
   
-  // Broadcast user list update
-  broadcastUserList();
-
+  // Send current user list to all clients
+  const userList = Array.from(clients.keys());
+  broadcast({ type: 'user_list', users: userList });
+  
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
+      console.log('📨 WebSocket message received:', data);
       handleWebSocketMessage(data, userId, ws);
     } catch (error) {
       console.error('WebSocket message parse error:', error);
@@ -258,6 +266,49 @@ async function handleIncomingMessage(messageData, value) {
       timestamp: new Date() // Explicitly set timestamp
     });
 
+    // Check if this is a reply to a broadcast message
+    const broadcast = await Broadcast.findOne({
+      'recipients.phone': from,
+      status: { $in: ['sending', 'completed'] }, // Only check active/completed broadcasts
+      startedAt: { $exists: true }
+    }).sort({ startedAt: -1 }); // Get the most recent broadcast
+
+    if (broadcast) {
+      // Check if this is the first reply from this contact in this broadcast
+      const previousReplies = await Message.countDocuments({
+        conversationId: conversation._id,
+        sender: 'contact',
+        timestamp: { 
+          $gte: broadcast.startedAt,
+          $lte: new Date()
+        }
+      });
+
+      if (previousReplies === 1) { // This is the first reply
+        // Increment the replied count
+        await Broadcast.updateOne(
+          { _id: broadcast._id },
+          { $inc: { 'stats.replied': 1 } }
+        );
+
+        // Get updated broadcast to emit
+        const updatedBroadcast = await Broadcast.findById(broadcast._id);
+        
+        // Emit update to connected clients with calculated percentage
+        broadcast({
+          type: 'broadcast_stats_updated',
+          broadcastId: broadcast._id.toString(),
+          stats: {
+            ...updatedBroadcast.stats,
+            repliedPercentage: updatedBroadcast.repliedPercentage,
+            repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal
+          }
+        });
+        
+        console.log(`📊 Updated replied count for broadcast "${broadcast.name}": ${updatedBroadcast.stats.replied} (${updatedBroadcast.repliedPercentage}% of sent)`);
+      }
+    }
+
     // Broadcast to all connected clients
     broadcast({
       type: 'new_message',
@@ -276,29 +327,146 @@ async function handleMessageStatus(statusData) {
   try {
     const messageId = statusData.id;
     const status = statusData.status; // sent, delivered, read, failed
+    const recipient = statusData.recipient_id;
 
-    const message = await Message.findOneAndUpdate(
-      { whatsappMessageId: messageId },
-      { status: status },
-      { new: true }
-    );
+    console.log('📊 DEBUG: Received status update:', {
+      messageId,
+      status,
+      recipient,
+      timestamp: statusData.timestamp,
+      conversationStatus: statusData.conversation?.id
+    });
+
+    // First try to find by whatsappMessageId
+    let message = await Message.findOne({ whatsappMessageId: messageId });
+    
+    if (!message) {
+      console.log('🔍 DEBUG: Message not found by whatsappMessageId, trying alternative lookup...');
+      // Try alternative lookup methods
+      message = await Message.findOne({ 
+        $or: [
+          { whatsappMessageId: messageId },
+          { 'whatsappMessageId': messageId }
+        ]
+      });
+    }
 
     if (message) {
+      console.log('📊 DEBUG: Found message to update:', {
+        messageId: message._id,
+        currentStatus: message.status,
+        newStatus: status,
+        whatsappMessageId: message.whatsappMessageId
+      });
+
+      const updatedMessage = await Message.findOneAndUpdate(
+        { whatsappMessageId: messageId },
+        { status: status, updatedAt: new Date() },
+        { new: true }
+      );
+
+      console.log('📊 DEBUG: Message updated successfully:', {
+        messageId: updatedMessage._id,
+        oldStatus: message.status,
+        newStatus: updatedMessage.status
+      });
+
+      // Trigger broadcast update
       broadcast({
         type: 'message_status',
         messageId: messageId,
         status: status,
         conversationId: message.conversationId
       });
+
+      // Also update broadcast stats if this is a broadcast message
+      if (updatedMessage.conversationId) {
+        const conversation = await Conversation.findById(updatedMessage.conversationId);
+        if (conversation) {
+          console.log('📊 DEBUG: Looking for broadcasts with contact phone:', conversation.contactPhone);
+          const broadcasts = await Broadcast.find({
+            'recipients.phone': conversation.contactPhone,
+            status: { $in: ['sending', 'completed'] } // Only check active/completed broadcasts
+          });
+          
+          for (const broadcast of broadcasts) {
+            try {
+              console.log('📊 DEBUG: Updating stats for broadcast:', broadcast.name);
+              
+              // Calculate the proper increment based on status progression
+              const oldStatus = message.status;
+              const newStatus = updatedMessage.status;
+              let update = {};
+              
+              // Handle status progression to avoid double-counting
+              if (oldStatus !== newStatus) {
+                if (newStatus === 'delivered' && oldStatus === 'sent') {
+                  // Message went from sent to delivered
+                  update['stats.delivered'] = 1;
+                } else if (newStatus === 'read' && oldStatus !== 'read') {
+                  // Message was read (regardless of previous status)
+                  update['stats.read'] = 1;
+                  // If it wasn't already counted as delivered, count it now
+                  if (oldStatus !== 'delivered') {
+                    update['stats.delivered'] = 1;
+                  }
+                } else if (newStatus === 'failed' && oldStatus !== 'failed') {
+                  // Message failed, increment failed count
+                  update['stats.failed'] = 1;
+                  // If it was previously counted as sent, decrement sent
+                  if (oldStatus === 'sent') {
+                    update['stats.sent'] = -1;
+                  }
+                }
+                
+                // Update the broadcast immediately if there are changes
+                if (Object.keys(update).length > 0) {
+                  await Broadcast.updateOne(
+                    { _id: broadcast._id },
+                    { $inc: update }
+                  );
+                  
+                  // Get the updated broadcast for logging
+                  const updatedBroadcast = await Broadcast.findById(broadcast._id);
+                  
+                  if (updatedBroadcast) {
+                    console.log('⚡ Immediate update for broadcast:', {
+                      broadcastId: broadcast._id.toString(),
+                      messageStatus: updatedMessage.status,
+                      statusChange: `${oldStatus} → ${newStatus}`,
+                      updateApplied: update,
+                      newStats: updatedBroadcast.stats
+                    });
+                    
+                    // Broadcast the update to all connected clients
+                    broadcast({
+                      type: 'broadcast_stats_updated',
+                      broadcastId: broadcast._id.toString(),
+                      stats: updatedBroadcast.stats,
+                      statusChange: `${oldStatus} → ${newStatus}`
+                    });
+                  }
+                } else {
+                  console.log('📊 DEBUG: No status change needed for broadcast:', broadcast.name);
+                }
+              } else {
+                console.log('📊 DEBUG: Message status unchanged, skipping broadcast update');
+              }
+            } catch (broadcastError) {
+              console.error('❌ Error updating broadcast stats:', broadcastError);
+            }
+          }
+        }
+      }
+    } else {
+      console.log('❌ DEBUG: No message found for whatsappMessageId:', messageId);
     }
   } catch (error) {
-    console.error('Error handling message status:', error);
+    console.error('❌ Error handling message status:', error);
   }
 }
 
 // ============ API ROUTES ============
-
-// Send message
 app.post('/api/messages/send', async (req, res) => {
   try {
     const { to, text, conversationId, mediaUrl, mediaType } = req.body;
@@ -561,6 +729,17 @@ app.put('/api/contacts/:id', async (req, res) => {
   }
 });
 
+// Debug endpoint to investigate broadcast data
+app.get('/api/debug-broadcasts', async (req, res) => {
+  try {
+    const debugInServer = require('./debugInServer');
+    await debugInServer();
+    res.json({ success: true, message: 'Debug completed - check server logs' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Get analytics
 app.get('/api/analytics', async (req, res) => {
   try {
@@ -570,29 +749,19 @@ app.get('/api/analytics', async (req, res) => {
     const last7Days = new Date();
     last7Days.setDate(last7Days.getDate() - 7);
     
-    // Message metrics
-    const messagesSent = await Message.countDocuments({
+    // Message metrics - count all agent messages first, then break down by status
+    const allAgentMessages = await Message.find({
       sender: 'agent',
       timestamp: { $gte: last7Days }
     });
     
-    const messagesDelivered = await Message.countDocuments({
-      sender: 'agent',
-      status: 'delivered',
-      timestamp: { $gte: last7Days }
-    });
+    const messagesSent = allAgentMessages.length;
+    const messagesDelivered = allAgentMessages.filter(msg => msg.status === 'delivered').length;
+    const messagesRead = allAgentMessages.filter(msg => msg.status === 'read').length;
+    const messagesFailed = allAgentMessages.filter(msg => msg.status === 'failed').length;
     
-    const messagesRead = await Message.countDocuments({
-      sender: 'agent',
-      status: 'read',
-      timestamp: { $gte: last7Days }
-    });
-    
-    const messagesFailed = await Message.countDocuments({
-      sender: 'agent',
-      status: 'failed',
-      timestamp: { $gte: last7Days }
-    });
+    // Note: Read messages should also be counted as delivered for accurate metrics
+    const totalDeliveredOrRead = allAgentMessages.filter(msg => msg.status === 'delivered' || msg.status === 'read').length;
     
     const messagesReceived = await Message.countDocuments({
       sender: 'contact',
@@ -603,7 +772,7 @@ app.get('/api/analytics', async (req, res) => {
       totalConversations,
       activeConversations,
       messagesSent,
-      messagesDelivered,
+      messagesDelivered: totalDeliveredOrRead, // Use total delivered+read for accurate delivery metrics
       messagesRead,
       messagesFailed,
       messagesReceived,
@@ -620,6 +789,27 @@ app.get('/api/analytics', async (req, res) => {
     res.json(analytics);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Manual sync endpoint for debugging broadcast stats
+app.post('/api/broadcasts/:id/sync', async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log('🔄 Manual sync requested for broadcast:', id);
+    
+    const result = await broadcastService.syncBroadcastStats(id);
+    
+    if (result.success) {
+      console.log('✅ Manual sync completed:', result.data);
+      res.json(result);
+    } else {
+      console.log('❌ Manual sync failed:', result.error);
+      res.status(400).json(result);
+    }
+  } catch (error) {
+    console.error('❌ Error in manual sync:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -647,12 +837,124 @@ function startScheduler() {
   cron.schedule('* * * * *', async () => {
     try {
       console.log('🔍 Checking for scheduled broadcasts...');
-      await broadcastService.checkScheduledBroadcasts(broadcast);
+      
+      // Check database connection before proceeding
+      if (mongoose.connection.readyState !== 1) {
+        console.log('⚠️ Database not connected, skipping scheduler run');
+        return;
+      }
+      
+      await broadcastService.checkScheduledBroadcasts();
+      
+      // Also check for recent message status updates and sync broadcast stats
+      console.log('🔄 Checking for message status updates...');
+      await checkAndUpdateBroadcastStats();
+      
     } catch (error) {
-      console.error('❌ Error in scheduler:', error);
+      console.error('❌ Scheduler error:', error.message);
+      // Don't exit the process, just log the error and continue
     }
   });
-  
+
   console.log('✅ Broadcast scheduler started - checking every minute');
 }
 
+// Check for recent message status updates and sync broadcast stats
+async function checkAndUpdateBroadcastStats() {
+  try {
+    // Find broadcasts that might need syncing (completed in last hour)
+    const recentBroadcasts = await Broadcast.find({
+      status: 'completed',
+      completedAt: { $gte: new Date(Date.now() - 60 * 60 * 1000) } // Last hour
+    });
+
+    console.log(`� Checking ${recentBroadcasts.length} recent broadcasts for stats updates`);
+
+    for (const broadcast of recentBroadcasts) {
+      // Check if broadcast stats are out of sync
+      const startTime = new Date(broadcast.startedAt || broadcast.createdAt);
+      const endTime = new Date(broadcast.completedAt || Date.now());
+      
+      // Find messages for this broadcast (expand time range to catch messages sent before broadcast started)
+      const messages = await Message.find({
+        sender: 'agent',
+        timestamp: { 
+          $gte: new Date(startTime.getTime() - 5 * 60 * 1000), // 5 minutes before start
+          $lte: new Date(endTime.getTime() + 5 * 60 * 1000)    // 5 minutes after completion
+        }
+      });
+
+      if (messages.length > 0) {
+        // Calculate current stats from messages
+        const currentStats = {
+          sent: messages.length,
+          delivered: messages.filter(msg => msg.status === 'delivered' || msg.status === 'read').length,
+          read: messages.filter(msg => msg.status === 'read').length,
+          failed: messages.filter(msg => msg.status === 'failed').length,
+          replied: 0 // Will be calculated below
+        };
+
+        // Count unique contacts who replied to this broadcast
+        const recipientPhones = broadcast.recipients.map(r => r.phone);
+        const conversations = await Conversation.find({ 
+          contactPhone: { $in: recipientPhones } 
+        });
+        
+        const conversationIds = conversations.map(c => c._id);
+        const replyMessages = await Message.find({
+          conversationId: { $in: conversationIds },
+          sender: 'contact',
+          timestamp: { $gte: startTime }
+        });
+        
+        // Count unique conversations that have at least one reply
+        const uniqueRepliedConversations = new Set(replyMessages.map(msg => msg.conversationId.toString()));
+        currentStats.replied = uniqueRepliedConversations.size;
+
+        // Check if stats are different
+        const statsChanged = 
+          broadcast.stats?.sent !== currentStats.sent ||
+          broadcast.stats?.delivered !== currentStats.delivered ||
+          broadcast.stats?.read !== currentStats.read ||
+          broadcast.stats?.failed !== currentStats.failed ||
+          broadcast.stats?.replied !== currentStats.replied;
+
+        if (statsChanged) {
+          console.log(`📊 Stats changed for broadcast "${broadcast.name}":`, {
+            old: broadcast.stats,
+            new: currentStats
+          });
+
+          // Update broadcast stats
+          await broadcastService.syncBroadcastStats(broadcast._id);
+          
+          // Get updated broadcast and emit WebSocket event
+          const updatedBroadcast = await Broadcast.findById(broadcast._id);
+          if (updatedBroadcast) {
+            const stringId = broadcast._id.toString();
+            console.log('📡 Emitting auto-sync broadcast_stats_updated event:', {
+              broadcastId: stringId,
+              broadcastName: broadcast.name,
+              stats: {
+                ...updatedBroadcast.stats,
+                repliedPercentage: updatedBroadcast.repliedPercentage,
+                repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal
+              }
+            });
+            app.locals.broadcast({
+              type: 'broadcast_stats_updated',
+              broadcastId: stringId,
+              stats: {
+                ...updatedBroadcast.stats,
+                repliedPercentage: updatedBroadcast.repliedPercentage,
+                repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal
+              }
+            });
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error('❌ Error checking broadcast stats:', error);
+  }
+}

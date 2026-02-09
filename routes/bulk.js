@@ -284,23 +284,43 @@ router.post('/send', async (req, res) => {
       
       console.log(`📊 Processing recipient ${phone}:`, { rowData, variables });
       
-      try {
-        let result;
-        let messageTextForInbox = '';
+      let result;
+      let messageTextForInbox = '';
 
+      try {
         console.log(`📤 About to send message to ${phone} with type: ${msgType}`);
 
         if (msgType === 'template' && finalTemplateName) {
           console.log(`🔍 DEBUG: Processing template ${finalTemplateName} for phone ${phone}`);
           
           // Fetch template from database to get actual content
-          const template = await Template.findOne({ name: finalTemplateName, isActive: true });
+          console.log(`🔍 Looking for template: ${finalTemplateName} (removing isActive filter for debugging)`);
+          const template = await Template.findOne({ name: finalTemplateName });
+          console.log(`🔍 Found template:`, template ? {
+            name: template.name,
+            category: template.category,
+            status: template.status,
+            isActive: template.isActive
+          } : 'NOT FOUND');
+          
           if (!template) {
-            console.log(`❌ Template ${finalTemplateName} not found`);
+            console.log(`❌ Template ${finalTemplateName} not found in database`);
             results.push({
               phone,
               success: false,
-              error: `Template '${finalTemplateName}' not found or inactive`
+              error: `Template '${finalTemplateName}' not found`
+            });
+            failed++;
+            continue;
+          }
+          
+          // Check if template is active
+          if (!template.isActive) {
+            console.log(`❌ Template ${finalTemplateName} is not active (status: ${template.status})`);
+            results.push({
+              phone,
+              success: false,
+              error: `Template '${finalTemplateName}' is not active. Status: ${template.status}`
             });
             failed++;
             continue;
@@ -343,6 +363,8 @@ router.post('/send', async (req, res) => {
             language || 'en_US',
             templateVariables
           );
+          
+          console.log(`📤 WhatsApp API result for ${phone}:`, result);
         } else if (customMsg) {
           // Replace variables in custom message using enhanced processing with named variables
           messageTextForInbox = processTemplateVariables(customMsg, variables, rowData);

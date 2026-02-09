@@ -91,6 +91,48 @@ class BroadcastController {
       res.status(500).json({ success: false, error: error.message });
     }
   }
+
+  async pauseBroadcast(req, res) {
+    try {
+      const { id } = req.params;
+      const result = await broadcastService.pauseBroadcast(id);
+      if (result.success) {
+        res.json(result);
+      } else {
+        res.status(400).json(result);
+      }
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async resumeBroadcast(req, res) {
+    try {
+      const { id } = req.params;
+      const result = await broadcastService.resumeBroadcast(id);
+      if (result.success) {
+        res.json(result);
+      } else {
+        res.status(400).json(result);
+      }
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async cancelScheduledBroadcast(req, res) {
+    try {
+      const { id } = req.params;
+      const result = await broadcastService.cancelScheduledBroadcast(id);
+      if (result.success) {
+        res.json(result);
+      } else {
+        res.status(400).json(result);
+      }
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
 }
 
 module.exports = new BroadcastController();

@@ -7,6 +7,7 @@ class WhatsAppService {
     this.wabaId = whatsappConfig.WHATSAPP_BUSINESS_ACCOUNT_ID;
     this.phoneNumberId = whatsappConfig.WHATSAPP_PHONE_NUMBER_ID;
     this.accessToken = whatsappConfig.WHATSAPP_ACCESS_TOKEN;
+    this.mockMode = process.env.WHATSAPP_MOCK_MODE === 'true';
   }
 
   getHeaders() {
@@ -17,6 +18,17 @@ class WhatsAppService {
   }
 
   async sendTextMessage(to, text) {
+    if (this.mockMode) {
+      console.log(`🧪 MOCK MODE: Simulating text message to ${to}: "${text}"`);
+      return { 
+        success: true, 
+        data: { 
+          messageId: 'mock_' + Date.now(),
+          status: 'sent'
+        } 
+      };
+    }
+
     try {
       // WhatsApp API requires phone numbers in E.164 format with + prefix and no spaces/special chars
       let normalizedPhone = to;
@@ -52,7 +64,28 @@ class WhatsAppService {
   }
 
   async sendTemplateMessage(to, templateName, language = 'en_US', variables = []) {
+    if (this.mockMode) {
+      console.log(`🧪 MOCK MODE: Simulating template message to ${to}`);
+      console.log(`   Template: ${templateName}`);
+      console.log(`   Language: ${language}`);
+      console.log(`   Variables:`, variables);
+      return { 
+        success: true, 
+        data: { 
+          messageId: 'mock_template_' + Date.now(),
+          status: 'sent',
+          template: templateName
+        } 
+      };
+    }
+
     try {
+      console.log(`🔍 DEBUG: sendTemplateMessage called with:`);
+      console.log(`   to: ${to}`);
+      console.log(`   templateName: "${templateName}"`);
+      console.log(`   language: ${language}`);
+      console.log(`   variables:`, variables);
+      
       // WhatsApp API requires phone numbers in E.164 format with + prefix and no spaces/special chars
       let normalizedPhone = to;
       
@@ -65,6 +98,7 @@ class WhatsAppService {
       }
       
       console.log(`📞 Normalized phone number: ${to} -> ${normalizedPhone}`);
+      console.log(`🔍 Template details: name=${templateName}, language=${language}, variables=${variables.length}`);
       
       const components = [];
       
@@ -92,15 +126,42 @@ class WhatsAppService {
         }
       };
 
+      console.log(`📤 Sending template payload:`, JSON.stringify(payload, null, 2));
+
       const response = await axios.post(
         `${this.apiUrl}/${this.phoneNumberId}/messages`,
         payload,
         { headers: this.getHeaders() }
       );
       
+      console.log(`✅ Template sent successfully to ${normalizedPhone}:`, response.data);
       return { success: true, data: response.data };
     } catch (error) {
-      console.error('Error sending template message:', error.response?.data || error.message);
+      const phoneNumberForLog = to || 'unknown';
+      console.error(`❌ Error sending template "${templateName}" to ${phoneNumberForLog}:`, {
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+        message: error.message
+      });
+      
+      // Log specific WhatsApp Business API errors
+      if (error.response?.data) {
+        const whatsappError = error.response.data;
+        if (whatsappError.error) {
+          console.error(`🔍 WhatsApp API Error Code: ${whatsappError.error.code}`);
+          console.error(`🔍 WhatsApp API Error Message: ${whatsappError.error.message}`);
+          console.error(`🔍 WhatsApp API Error Title: ${whatsappError.error.title}`);
+          
+          // Check for common template restrictions
+          if (whatsappError.error.code === 131051) {
+            console.error(`🚫 Template restriction: Template not approved for this number`);
+          } else if (whatsappError.error.code === 131047) {
+            console.error(`🚫 Template restriction: Number not in approved conversation window`);
+          }
+        }
+      }
+      
       return { 
         success: false, 
         error: error.response?.data || error.message 

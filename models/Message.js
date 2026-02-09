@@ -23,6 +23,7 @@ const MessageSchema = new mongoose.Schema({
   whatsappMessageId: { type: String, unique: true, sparse: true },
   whatsappTimestamp: Date,
   errorMessage: String,
+  broadcastId: { type: mongoose.Schema.Types.ObjectId, ref: 'Broadcast', index: true },
   timestamp: { type: Date, default: Date.now, index: true },
   isForwarded: { type: Boolean, default: false },
   forwardedFrom: String,

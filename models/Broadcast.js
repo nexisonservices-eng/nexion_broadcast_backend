@@ -2,8 +2,10 @@ const mongoose = require('mongoose');
 
 const BroadcastSchema = new mongoose.Schema({
   name: { type: String, required: true },
+  messageType: { type: String, enum: ['template', 'text'], default: 'text' },
   message: String,
   templateName: String,
+  language: String,
   templateId: { type: mongoose.Schema.Types.ObjectId, ref: 'Template' },
   mediaUrl: String,
   mediaType: String,
@@ -43,6 +45,22 @@ BroadcastSchema.pre('save', function(next) {
   }
   next();
 });
+
+// Virtual field for replied percentage based on sent count
+BroadcastSchema.virtual('repliedPercentage').get(function() {
+  if (!this.stats || this.stats.sent === 0) return 0;
+  return ((this.stats.replied / this.stats.sent) * 100).toFixed(1);
+});
+
+// Virtual field for replied percentage based on total recipients (for reference)
+BroadcastSchema.virtual('repliedPercentageOfTotal').get(function() {
+  if (!this.recipientCount || this.recipientCount === 0) return 0;
+  return ((this.stats.replied / this.recipientCount) * 100).toFixed(1);
+});
+
+// Ensure virtual fields are included in JSON output
+BroadcastSchema.set('toJSON', { virtuals: true });
+BroadcastSchema.set('toObject', { virtuals: true });
 
 BroadcastSchema.index({ status: 1, createdAt: -1 });
 BroadcastSchema.index({ createdBy: 1 });

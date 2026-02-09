@@ -120,38 +120,39 @@ class TemplateController {
             whatsappTemplateId: wt.id 
           });
 
-          if (!existingTemplate) {
-            // Extract template components
-            const components = [];
-            
-            if (wt.components) {
-              for (const component of wt.components) {
-                switch (component.type) {
-                  case 'HEADER':
-                    components.push({
-                      type: 'header',
-                      format: component.format,
-                      text: component.text
-                    });
-                    break;
-                  case 'BODY':
-                    components.push({
-                      type: 'body',
-                      text: component.text
-                    });
-                    break;
-                  case 'FOOTER':
-                    components.push({
-                      type: 'footer',
-                      text: component.text
-                    });
-                    break;
-                  case 'BUTTONS':
-                    // Handle buttons separately, not as content
-                    break;
-                }
+          // Extract template components (move outside the if block)
+          const components = [];
+          
+          if (wt.components) {
+            for (const component of wt.components) {
+              switch (component.type) {
+                case 'HEADER':
+                  components.push({
+                    type: 'header',
+                    format: component.format,
+                    text: component.text
+                  });
+                  break;
+                case 'BODY':
+                  components.push({
+                    type: 'body',
+                    text: component.text
+                  });
+                  break;
+                case 'FOOTER':
+                  components.push({
+                    type: 'footer',
+                    text: component.text
+                  });
+                  break;
+                case 'BUTTONS':
+                  // Handle buttons separately, not as content
+                  break;
               }
             }
+          }
+
+          if (!existingTemplate) {
 
             // Create template object for our database
             const headerComponent = components.find(c => c.type === 'header');
@@ -160,7 +161,7 @@ class TemplateController {
               type: 'official',
               category: wt.category || 'utility',
               language: wt.language,
-              status: wt.status === 'APPROVED' ? 'approved' : 'pending',
+              status: wt.status, // Keep original case from Meta API
               isActive: wt.status === 'APPROVED',
               content: {
                 header: headerComponent ? {
@@ -200,7 +201,7 @@ class TemplateController {
                   name: wt.name,
                   category: wt.category || 'utility',
                   language: wt.language,
-                  status: wt.status === 'APPROVED' ? 'approved' : 'pending',
+                  status: wt.status, // Keep original case from Meta API
                   isActive: wt.status === 'APPROVED',
                   content: {
                     header: headerComponent ? {
@@ -270,6 +271,57 @@ class TemplateController {
       res.json({ success: true, data: template });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  // Get templates directly from Meta WhatsApp Business API
+  async getMetaTemplates(req, res) {
+    try {
+      console.log('🔄 Fetching templates directly from Meta WhatsApp Business API...');
+      
+      const result = await whatsappService.getTemplateList();
+      
+      if (!result.success) {
+        return res.status(500).json({ 
+          success: false, 
+          error: result.error 
+        });
+      }
+
+      const metaTemplates = result.data.data || [];
+      console.log(`📋 Retrieved ${metaTemplates.length} templates from Meta`);
+
+      res.json({
+        success: true,
+        data: metaTemplates,
+        count: metaTemplates.length
+      });
+
+    } catch (error) {
+      console.error('❌ Failed to fetch Meta templates:', error);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message,
+        message: 'Failed to fetch templates from Meta WhatsApp Business API'
+      });
+    }
+  }
+
+  // Sync templates from Meta WhatsApp Business API
+  async syncMetaTemplates(req, res) {
+    try {
+      console.log('🔄 Starting template sync from Meta WhatsApp Business API...');
+      
+      // Call the existing sync method
+      await this.syncWhatsAppTemplates(req, res);
+      
+    } catch (error) {
+      console.error('❌ Meta template sync failed:', error);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message,
+        message: 'Failed to sync templates from Meta WhatsApp Business API'
+      });
     }
   }
 }
