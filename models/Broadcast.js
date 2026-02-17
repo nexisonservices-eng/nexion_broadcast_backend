@@ -5,6 +5,7 @@ const BroadcastSchema = new mongoose.Schema({
   messageType: { type: String, enum: ['template', 'text'], default: 'text' },
   message: String,
   templateName: String,
+  templateContent: String,
   language: String,
   templateId: { type: mongoose.Schema.Types.ObjectId, ref: 'Template' },
   mediaUrl: String,

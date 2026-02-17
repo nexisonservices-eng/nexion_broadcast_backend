@@ -1,14 +1,107 @@
 const express = require('express');
+const axios = require('axios');
 const csv = require('csv-parser');
 const { Readable } = require('stream');
 const whatsappService = require('../services/whatsappService');
-const Template = require('../models/Template');
+const auth = require('../middleware/auth');
+const requireWhatsAppCredentials = require('../middleware/requireWhatsAppCredentials');
 const Broadcast = require('../models/Broadcast');
 const Contact = require('../models/Contact');
 const Conversation = require('../models/Conversation');
 const Message = require('../models/Message');
 
 const router = express.Router();
+router.use(auth);
+console.log('[BULK_ROUTE_VERSION] bulk_direct_meta_v2 loaded');
+
+const WHATSAPP_API_URL = 'https://graph.facebook.com/v20.0';
+
+async function sendTemplateDirectViaMeta({ phone, templateName, language, variables, credentials }) {
+  const sanitizedCredentials = {
+    accessToken: String(credentials?.accessToken || '').trim(),
+    phoneNumberId: String(credentials?.phoneNumberId || '').trim()
+  };
+  if (!sanitizedCredentials.accessToken || !sanitizedCredentials.phoneNumberId) {
+    return { success: false, error: 'Invalid WhatsApp credentials for template send' };
+  }
+
+  const normalizedPhone = String(phone || '').replace(/[^\d+]/g, '').startsWith('+')
+    ? String(phone || '').replace(/[^\d+]/g, '')
+    : `+${String(phone || '').replace(/[^\d+]/g, '')}`;
+
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: normalizedPhone,
+    type: 'template',
+    template: {
+      name: String(templateName || '').trim(),
+      language: { code: language || 'en_US' }
+    }
+  };
+
+  if (Array.isArray(variables) && variables.length > 0) {
+    payload.template.components = [
+      {
+        type: 'BODY',
+        parameters: variables.map((value) => ({ type: 'text', text: String(value) }))
+      }
+    ];
+  }
+
+  try {
+    const response = await axios.post(
+      `${WHATSAPP_API_URL}/${sanitizedCredentials.phoneNumberId}/messages`,
+      payload,
+      {
+        headers: {
+          Authorization: `Bearer ${sanitizedCredentials.accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    return { success: true, data: response.data };
+  } catch (error) {
+    return {
+      success: false,
+      error:
+        error.response?.data?.error?.message ||
+        error.response?.data?.error?.error_user_msg ||
+        error.response?.data ||
+        error.message
+    };
+  }
+}
+
+async function resolveTemplatePreviewTextFromMeta({ templateName, language, credentials }) {
+  try {
+    const listResult = await whatsappService.getTemplateList(credentials || null);
+    if (!listResult?.success) return null;
+
+    const templates = listResult?.data?.data || [];
+    const requested = String(templateName || '').trim().toLowerCase();
+    const requestedLanguage = String(language || '').trim().toLowerCase();
+
+    const matchedTemplate =
+      templates.find((t) => String(t.name || '').trim().toLowerCase() === requested && String(t.language || '').trim().toLowerCase() === requestedLanguage) ||
+      templates.find((t) => String(t.name || '').trim().toLowerCase() === requested);
+
+    if (!matchedTemplate || !Array.isArray(matchedTemplate.components)) {
+      return null;
+    }
+
+    const bodyComponent = matchedTemplate.components.find((component) => String(component.type || '').toUpperCase() === 'BODY');
+    const bodyText =
+      bodyComponent?.text ||
+      bodyComponent?.body_text ||
+      (Array.isArray(bodyComponent?.example?.body_text) ? bodyComponent.example.body_text[0] : '');
+    if (!bodyText) return null;
+
+    return String(bodyText);
+  } catch (error) {
+    console.error('Failed to resolve template preview text from Meta:', error.message);
+    return null;
+  }
+}
 
 // Process template variables - supports unlimited named variables - matching Python reference
 function processTemplateVariables(templateContent, variables, rowData = {}) {
@@ -194,14 +287,17 @@ router.post('/upload', async (req, res) => {
 });
 
 // Bulk send endpoint with rate limiting and enhanced processing
-router.post('/send', async (req, res) => {
+router.post('/send', requireWhatsAppCredentials, async (req, res) => {
   try {
     console.log('📥 Received bulk send request:', req.body);
-    const { message_type, template_name, language, custom_message, broadcast_name, recipients, messageType, customMessage, templateName } = req.body;
+    const { message_type, template_name, language, custom_message, broadcast_name, recipients, messageType, customMessage, templateName, templateContent } = req.body;
     
     // Support both camelCase and snake_case parameter names
     const msgType = message_type || messageType || (templateName ? 'template' : 'text');
-    const finalTemplateName = template_name || templateName;
+    const rawTemplateName = template_name || templateName;
+    const finalTemplateName = rawTemplateName
+      ? String(rawTemplateName).trim().toLowerCase()
+      : rawTemplateName;
     const customMsg = custom_message || customMessage;
     
     console.log('📋 Message type:', msgType);
@@ -243,22 +339,36 @@ router.post('/send', async (req, res) => {
       });
     }
 
-    // Create broadcast record
+    const results = [];
+    let successful = 0;
+    let failed = 0;
+    let templatePreviewText = String(templateContent || '').trim() || null;
+
+    if (msgType === 'template' && finalTemplateName) {
+      if (!templatePreviewText) {
+        templatePreviewText = await resolveTemplatePreviewTextFromMeta({
+          templateName: finalTemplateName,
+          language: language || 'en_US',
+          credentials: req.whatsappCredentials
+        });
+      }
+    }
+
+    // Create broadcast record (persist resolved template body for history/inbox context)
     const broadcast = await Broadcast.create({
       name: broadcast_name || `Bulk Send - ${new Date().toISOString()}`,
       message: customMsg || '',
       templateName: finalTemplateName || null,
+      templateContent: templatePreviewText || '',
       language: language || 'en_US',
       recipients: parsedRecipients.map(r => ({ phone: r.phone, variables: r.variables || [] })),
       status: 'sending',
       startedAt: new Date(),
-      createdBy: req.body.createdBy || 'system',
+      createdBy: req.user.username || req.user.email || req.user.id,
+      createdByEmail: req.user.email,
+      createdById: req.user.id,
       messageType: msgType // Add message type to broadcast record
     });
-
-    const results = [];
-    let successful = 0;
-    let failed = 0;
 
     console.log(`🚀 Starting bulk send to ${parsedRecipients.length} recipients`);
     console.log(`📋 First recipient data sample:`, parsedRecipients[0]);
@@ -291,85 +401,23 @@ router.post('/send', async (req, res) => {
         console.log(`📤 About to send message to ${phone} with type: ${msgType}`);
 
         if (msgType === 'template' && finalTemplateName) {
-          console.log(`🔍 DEBUG: Processing template ${finalTemplateName} for phone ${phone}`);
-          
-          // Fetch template from database to get actual content
-          console.log(`🔍 Looking for template: ${finalTemplateName} (removing isActive filter for debugging)`);
-          const template = await Template.findOne({ name: finalTemplateName });
-          console.log(`🔍 Found template:`, template ? {
-            name: template.name,
-            category: template.category,
-            status: template.status,
-            isActive: template.isActive
-          } : 'NOT FOUND');
-          
-          if (!template) {
-            console.log(`❌ Template ${finalTemplateName} not found in database`);
-            results.push({
-              phone,
-              success: false,
-              error: `Template '${finalTemplateName}' not found`
-            });
-            failed++;
-            continue;
-          }
-          
-          // Check if template is active
-          if (!template.isActive) {
-            console.log(`❌ Template ${finalTemplateName} is not active (status: ${template.status})`);
-            results.push({
-              phone,
-              success: false,
-              error: `Template '${finalTemplateName}' is not active. Status: ${template.status}`
-            });
-            failed++;
-            continue;
-          }
-
-          console.log(`✅ Template found: ${template.name}`);
-
-          // Process template content for inbox display with named variables
-          let templateContent = template.content.body || '';
-          if (template.content.header && template.content.header.text) {
-            templateContent = template.content.header.text + '\n' + templateContent;
-          }
-          if (template.content.footer) {
-            templateContent = templateContent + '\n' + template.content.footer;
-          }
-          
-          // Process the template content with named variables for both WhatsApp and inbox
-          const processedTemplateContent = processTemplateVariables(templateContent, variables, rowData);
-          messageTextForInbox = processedTemplateContent;
-          
-          console.log(`🔍 DEBUG: Template processing results:`);
-          console.log(`   Raw template content: "${templateContent}"`);
-          console.log(`   Variables:`, variables);
-          console.log(`   RowData:`, rowData);
-          console.log(`   Processed content: "${messageTextForInbox}"`);
-          console.log(`   Processed content type: ${typeof messageTextForInbox}`);
-          console.log(`   Processed content length: ${messageTextForInbox.length}`);
-          
-          // For template messages, we still need to send via WhatsApp template API
-          // but we'll use the processed content for the inbox display
-          // Check if template content has placeholders to determine if we need to send variables
-          const hasPlaceholders = /\{\{\d+\}\}/.test(templateContent) || /\{var\d+\}/.test(templateContent);
-          const templateVariables = hasPlaceholders ? variables : [];
-          
-          console.log(`🔍 Template "${finalTemplateName}" has placeholders: ${hasPlaceholders}, sending ${templateVariables.length} variables:`, templateVariables);
-          
-          result = await whatsappService.sendTemplateMessage(
+          console.log(`Sending template directly via Meta API: ${finalTemplateName} -> ${phone}`);
+          messageTextForInbox = templatePreviewText
+            ? processTemplateVariables(templatePreviewText, variables, rowData)
+            : `Template: ${finalTemplateName}`;
+          result = await sendTemplateDirectViaMeta({
             phone,
-            finalTemplateName,
-            language || 'en_US',
-            templateVariables
-          );
-          
-          console.log(`📤 WhatsApp API result for ${phone}:`, result);
+            templateName: finalTemplateName,
+            language: language || 'en_US',
+            variables,
+            credentials: req.whatsappCredentials
+          });
+          console.log(`Template send result for ${phone}:`, result);
         } else if (customMsg) {
           // Replace variables in custom message using enhanced processing with named variables
           messageTextForInbox = processTemplateVariables(customMsg, variables, rowData);
           console.log(`📤 Sending processed custom message: "${messageTextForInbox}"`);
-          result = await whatsappService.sendTextMessage(phone, messageTextForInbox);
+          result = await whatsappService.sendTextMessage(phone, messageTextForInbox, req.whatsappCredentials);
           console.log(`📤 WhatsApp service result:`, result);
         } else {
           console.log(`❌ Missing template_name or custom_message. Template: ${finalTemplateName}, Custom: ${customMsg}`);
@@ -387,14 +435,19 @@ router.post('/send', async (req, res) => {
           broadcast.stats.sent++;
 
           // Create/Update contact + conversation + message so Team Inbox shows it
-          let contact = await Contact.findOne({ phone });
+          let contact = await Contact.findOne({ userId: req.user.id, phone });
           if (!contact) {
-            contact = await Contact.create({ phone, name: '', lastContact: new Date() });
+            contact = await Contact.create({ userId: req.user.id, phone, name: '', lastContact: new Date() });
           }
 
-          let conversation = await Conversation.findOne({ contactPhone: phone, status: { $in: ['active', 'pending'] } });
+          let conversation = await Conversation.findOne({
+            userId: req.user.id,
+            contactPhone: phone,
+            status: { $in: ['active', 'pending'] }
+          });
           if (!conversation) {
             conversation = await Conversation.create({
+              userId: req.user.id,
               contactId: contact._id,
               contactPhone: phone,
               contactName: contact.name,
@@ -416,19 +469,21 @@ router.post('/send', async (req, res) => {
           console.log(`🔍 DEBUG: messageTextForInbox length: ${messageTextForInbox.length}`);
           
           const savedMessage = await Message.create({
+            userId: req.user.id,
             conversationId: conversation._id,
             sender: 'agent',
             text: messageTextForInbox,
             status: 'sent',
-            whatsappMessageId
+            whatsappMessageId,
+            broadcastId: broadcast._id
           });
           
           console.log(`🔍 DEBUG: Created message with ID: ${savedMessage._id} and text: "${savedMessage.text}"`);
 
           // Realtime push to all team members
-          const broadcaster = req.app?.locals?.broadcast;
-          if (typeof broadcaster === 'function') {
-            broadcaster({
+          const sendToUser = req.app?.locals?.sendToUser;
+          if (typeof sendToUser === 'function') {
+            sendToUser(String(req.user.id), {
               type: 'message_sent',
               conversation: conversation.toObject(),
               message: savedMessage.toObject()
@@ -473,6 +528,7 @@ router.post('/send', async (req, res) => {
 
     res.json({
       success: true,
+      engine: 'bulk_direct_meta_v2',
       broadcastId: broadcast._id,
       total_sent: parsedRecipients.length,
       successful,
@@ -489,3 +545,4 @@ router.post('/send', async (req, res) => {
 });
 
 module.exports = router;
+

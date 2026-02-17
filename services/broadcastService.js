@@ -2,10 +2,40 @@ const Broadcast = require('../models/Broadcast');
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
-const Template = require('../models/Template');
 const whatsappService = require('./whatsappService');
 
 class BroadcastService {
+  async resolveTemplatePreviewTextFromMeta(templateName, language, credentials) {
+    try {
+      const listResult = await whatsappService.getTemplateList(credentials || null);
+      if (!listResult?.success) return null;
+
+      const templates = listResult?.data?.data || [];
+      const requested = String(templateName || '').trim().toLowerCase();
+      const requestedLanguage = String(language || '').trim().toLowerCase();
+
+      const matchedTemplate =
+        templates.find((t) => String(t.name || '').trim().toLowerCase() === requested && String(t.language || '').trim().toLowerCase() === requestedLanguage) ||
+        templates.find((t) => String(t.name || '').trim().toLowerCase() === requested);
+
+      if (!matchedTemplate || !Array.isArray(matchedTemplate.components)) {
+        return null;
+      }
+
+      const bodyComponent = matchedTemplate.components.find((component) => String(component.type || '').toUpperCase() === 'BODY');
+      const bodyText =
+        bodyComponent?.text ||
+        bodyComponent?.body_text ||
+        (Array.isArray(bodyComponent?.example?.body_text) ? bodyComponent.example.body_text[0] : '');
+      if (!bodyText) return null;
+
+      return String(bodyText);
+    } catch (error) {
+      console.error('Failed to resolve template preview text from Meta:', error.message);
+      return null;
+    }
+  }
+
   // Process template variables - matching Python reference format
   processTemplateVariables(templateContent, variables) {
     let processedContent = templateContent;
@@ -57,11 +87,17 @@ class BroadcastService {
     }
   }
 
-  async sendBroadcast(broadcastId, broadcaster) {
+  async sendBroadcast(broadcastId, broadcaster, credentials = null) {
     try {
       const broadcast = await Broadcast.findById(broadcastId);
       if (!broadcast) {
         return { success: false, error: 'Broadcast not found' };
+      }
+
+      const resolvedCredentials = credentials;
+
+      if (!resolvedCredentials) {
+        return { success: false, error: 'WhatsApp credentials are not configured for this user' };
       }
 
       console.log('🔍 Broadcast data being processed:', {
@@ -81,6 +117,16 @@ class BroadcastService {
       const results = [];
       let successful = 0;
       let failed = 0;
+      let templatePreviewText = broadcast.templateContent || null;
+
+      // If templateContent is not stored, try to resolve from Meta
+      if (!templatePreviewText && broadcast.templateName) {
+        templatePreviewText = await this.resolveTemplatePreviewTextFromMeta(
+          broadcast.templateName,
+          broadcast.language || 'en_US',
+          resolvedCredentials
+        );
+      }
 
       for (const recipient of broadcast.recipients) {
         try {
@@ -89,59 +135,12 @@ class BroadcastService {
           
           let messageTextForInbox = broadcast.message;
           if (broadcast.templateName) {
-            // Fetch template from database - use simple query first
-            console.log(`🔍 Looking for template: "${broadcast.templateName}"`);
-            
-            let template = await Template.findOne({ name: broadcast.templateName });
-            
-            // If not found, try case-insensitive search
-            if (!template) {
-              console.log(`🔍 Template not found with exact match, trying case-insensitive search`);
-              template = await Template.findOne({ 
-                name: { $regex: new RegExp(`^${broadcast.templateName}$`, 'i') }
-              });
-            }
-            
-            // If still not found, list all available templates for debugging
-            if (!template) {
-              const allTemplates = await Template.find({});
-              console.log(`🔍 Available templates in database:`);
-              allTemplates.forEach(t => {
-                console.log(`   - name: "${t.name}", status: "${t.status}", isActive: ${t.isActive}`);
-              });
-            }
-            
-            console.log(`🔍 Found template:`, template ? {
-              _id: template._id,
-              name: template.name,
-              templateName: template.templateName,
-              category: template.category,
-              status: template.status,
-              isActive: template.isActive
-            } : 'NOT FOUND');
-            
-            if (!template) {
-              console.log(`❌ Template ${broadcast.templateName} not found in database`);
+            const normalizedTemplateName = String(broadcast.templateName || '').trim();
+            if (!normalizedTemplateName) {
               results.push({
                 phone: phoneNumber,
                 success: false,
-                error: `Template '${broadcast.templateName}' not found`
-              });
-              failed++;
-              broadcast.stats.failed++;
-              continue;
-            }
-            
-            // Check if template is active - more flexible validation
-            const activeStatuses = ['APPROVED', 'approved', 'ACTIVE', 'active', true];
-            const isActive = activeStatuses.includes(template.status) || template.isActive || activeStatuses.includes(template.isActive);
-            
-            if (!isActive) {
-              console.log(`❌ Template ${broadcast.templateName} is not active (status: ${template.status}, isActive: ${template.isActive})`);
-              results.push({
-                phone: phoneNumber,
-                success: false,
-                error: `Template '${broadcast.templateName}' is not active. Status: ${template.status}`
+                error: 'Template name is required'
               });
               failed++;
               broadcast.stats.failed++;
@@ -150,63 +149,27 @@ class BroadcastService {
 
             result = await whatsappService.sendTemplateMessage(
               phoneNumber,
-              broadcast.templateName,
+              normalizedTemplateName,
               broadcast.language || 'en_US',
-              recipient.variables || broadcast.variables || []
+              recipient.variables || broadcast.variables || [],
+              resolvedCredentials
             );
             
             console.log(`📤 Template send result for ${phoneNumber}:`, {
               success: result.success,
-              templateName: broadcast.templateName,
+              templateName: normalizedTemplateName,
               language: broadcast.language || 'en_US',
               variables: recipient.variables || broadcast.variables || [],
               error: result.error
             });
             
-            // Process template content for inbox display - more flexible content extraction
-            let templateContent = '';
-            
-            // Handle different template content structures
-            if (template.content && template.content.body) {
-              templateContent = template.content.body;
-              if (template.content.header && template.content.header.text) {
-                templateContent = template.content.header.text + '\n' + templateContent;
-              }
-              if (template.content.footer) {
-                templateContent = templateContent + '\n' + template.content.footer;
-              }
-            } else if (template.components) {
-              // Extract text from components structure
-              const bodyComponent = template.components.find(comp => comp.type === 'BODY');
-              if (bodyComponent && bodyComponent.text) {
-                templateContent = bodyComponent.text;
-              }
-              
-              const headerComponent = template.components.find(comp => comp.type === 'HEADER');
-              if (headerComponent && headerComponent.text) {
-                templateContent = headerComponent.text + '\n' + templateContent;
-              }
-              
-              const footerComponent = template.components.find(comp => comp.type === 'FOOTER');
-              if (footerComponent && footerComponent.text) {
-                templateContent = templateContent + '\n' + footerComponent.text;
-              }
-            } else if (template.text) {
-              // Fallback to simple text field
-              templateContent = template.text;
-            } else if (template.message) {
-              // Another fallback
-              templateContent = template.message;
-            } else {
-              // Last resort - use template name
-              templateContent = `Template: ${template.name || broadcast.templateName}`;
-            }
-            
-            messageTextForInbox = this.processTemplateVariables(templateContent, recipient.variables || broadcast.variables || []);
+            messageTextForInbox = templatePreviewText
+              ? this.processTemplateVariables(templatePreviewText, recipient.variables || broadcast.variables || [])
+              : `Template: ${normalizedTemplateName}`;
           } else if (broadcast.message) {
             // Process custom message with variable replacement
             const processedMessage = this.processTemplateVariables(broadcast.message, recipient.variables || broadcast.variables || []);
-            result = await whatsappService.sendTextMessage(phoneNumber, processedMessage);
+            result = await whatsappService.sendTextMessage(phoneNumber, processedMessage, resolvedCredentials);
             messageTextForInbox = processedMessage;
           } else {
             results.push({
@@ -224,7 +187,13 @@ class BroadcastService {
             broadcast.stats.sent++;
             
             // Create or update conversation + create message so Team Inbox shows it
-            const { conversation, message } = await this.updateConversation(phoneNumber, messageTextForInbox, result.data, broadcast._id);
+            const { conversation, message } = await this.updateConversation(
+              phoneNumber,
+              messageTextForInbox,
+              result.data,
+              broadcast._id,
+              broadcast.createdById
+            );
 
             if (typeof broadcaster === 'function' && conversation && message) {
               broadcaster({
@@ -269,6 +238,7 @@ class BroadcastService {
       return {
         success: true,
         data: {
+          engine: 'broadcast_direct_meta_v2',
           broadcast,
           results,
           stats: {
@@ -283,16 +253,17 @@ class BroadcastService {
     }
   }
 
-  async updateConversation(phone, message, whatsappResponse, broadcastId) {
+  async updateConversation(phone, message, whatsappResponse, broadcastId, userId) {
     try {
-      let contact = await Contact.findOne({ phone });
+      let contact = await Contact.findOne({ userId, phone });
       if (!contact) {
-        contact = await Contact.create({ phone, name: '' });
+        contact = await Contact.create({ userId, phone, name: '' });
       }
 
-      let conversation = await Conversation.findOne({ contactPhone: phone, status: { $in: ['active', 'pending'] } });
+      let conversation = await Conversation.findOne({ userId, contactPhone: phone, status: { $in: ['active', 'pending'] } });
       if (!conversation) {
         conversation = await Conversation.create({
+          userId,
           contactId: contact._id,
           contactPhone: phone,
           contactName: contact.name,
@@ -309,6 +280,7 @@ class BroadcastService {
 
       const whatsappMessageId = whatsappResponse?.messages?.[0]?.id;
       const savedMessage = await Message.create({
+        userId,
         conversationId: conversation._id,
         sender: 'agent',
         text: message,
@@ -359,6 +331,7 @@ class BroadcastService {
       const endTime = new Date(broadcast.completedAt || Date.now());
 
       const broadcastIdQuery = {
+        userId: broadcast.createdById,
         sender: 'agent',
         broadcastId: broadcast._id,
         timestamp: { $gte: startTime, $lte: endTime }
@@ -373,13 +346,14 @@ class BroadcastService {
           .filter(Boolean);
 
         const conversations = recipientPhones.length
-          ? await Conversation.find({ contactPhone: { $in: recipientPhones } })
+          ? await Conversation.find({ userId: broadcast.createdById, contactPhone: { $in: recipientPhones } })
           : [];
 
         const conversationIds = conversations.map(c => c._id);
 
         if (conversationIds.length > 0) {
           let convoQuery = {
+            userId: broadcast.createdById,
             sender: 'agent',
             conversationId: { $in: conversationIds },
             timestamp: { $gte: startTime, $lte: endTime }
@@ -395,27 +369,8 @@ class BroadcastService {
           }
         }
 
-        // Last-resort fallback for legacy data
-        if (messages.length === 0) {
-          let messageQuery = {
-            sender: 'agent',
-            timestamp: { $gte: startTime, $lte: endTime }
-          };
-
-          if (broadcast.message) {
-            messageQuery.$or = [
-              { text: broadcast.message },
-              { text: { $regex: broadcast.message.substring(0, 20), $options: 'i' } }
-            ];
-          } else if (broadcast.templateName) {
-            messageQuery.$or = [
-              { text: { $regex: broadcast.templateName, $options: 'i' } }
-            ];
-          }
-
-          console.log('?? Message query for broadcast sync (legacy fallback):', messageQuery);
-          messages = await Message.find(messageQuery);
-        }
+        // Intentionally avoid broad text-based legacy fallback queries:
+        // they can cross-match unrelated broadcasts and cause stat drops/fluctuations.
       }
 
       console.log(`?? Found ${messages.length} messages for broadcast "${broadcast.name}"`);
@@ -423,7 +378,8 @@ class BroadcastService {
       // Count statuses with proper validation
       const stats = {
         sent: messages.length,
-        delivered: messages.filter(msg => msg.status === 'delivered').length,
+        // In WhatsApp, "read" implies message was delivered.
+        delivered: messages.filter(msg => msg.status === 'delivered' || msg.status === 'read').length,
         read: messages.filter(msg => msg.status === 'read').length,
         failed: messages.filter(msg => msg.status === 'failed').length,
         replied: 0 // Will be calculated below
@@ -434,7 +390,7 @@ class BroadcastService {
         totalMessages: messages.length,
         statusBreakdown: {
           sent: messages.filter(msg => msg.status === 'sent').length,
-          delivered: messages.filter(msg => msg.status === 'delivered').length,
+          delivered: messages.filter(msg => msg.status === 'delivered' || msg.status === 'read').length,
           read: messages.filter(msg => msg.status === 'read').length,
           failed: messages.filter(msg => msg.status === 'failed').length,
           other: messages.filter(msg => !['sent', 'delivered', 'read', 'failed'].includes(msg.status)).length
@@ -455,6 +411,7 @@ class BroadcastService {
         : startTime;
 
       const replyMessages = await Message.find({
+        userId: broadcast.createdById,
         conversationId: { $in: conversationIds },
         sender: 'contact',
         timestamp: { $gte: replyStartTime }

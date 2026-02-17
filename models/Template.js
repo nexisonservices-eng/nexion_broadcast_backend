@@ -1,7 +1,8 @@
 const mongoose = require('mongoose');
 
 const TemplateSchema = new mongoose.Schema({
-  name: { type: String, required: true, unique: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  name: { type: String, required: true },
   type: { 
     type: String, 
     enum: ['official', 'custom'], 
@@ -49,6 +50,7 @@ TemplateSchema.pre('save', function(next) {
   next();
 });
 
-TemplateSchema.index({ status: 1, isActive: 1 });
+TemplateSchema.index({ userId: 1, status: 1, isActive: 1 });
+TemplateSchema.index({ userId: 1, name: 1 }, { unique: true });
 
 module.exports = mongoose.model('Template', TemplateSchema);

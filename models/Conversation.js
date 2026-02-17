@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 
 const ConversationSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   contactId: { type: mongoose.Schema.Types.ObjectId, ref: 'Contact', required: true },
   contactPhone: { type: String, required: true, index: true },
   contactName: String,
@@ -32,7 +33,8 @@ ConversationSchema.pre('save', function(next) {
   next();
 });
 
-ConversationSchema.index({ contactPhone: 1, status: 1 });
-ConversationSchema.index({ assignedTo: 1, status: 1 });
+ConversationSchema.index({ userId: 1, contactPhone: 1, status: 1 });
+ConversationSchema.index({ userId: 1, assignedTo: 1, status: 1 });
+ConversationSchema.index({ userId: 1, lastMessageTime: -1 });
 
 module.exports = mongoose.model('Conversation', ConversationSchema);

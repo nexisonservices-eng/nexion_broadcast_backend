@@ -1,11 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const broadcastController = require('../controllers/broadcastController');
+const auth = require('../middleware/auth');
+const requireWhatsAppCredentials = require('../middleware/requireWhatsAppCredentials');
+
+router.use(auth);
 
 router.get('/', (req, res) => broadcastController.getBroadcasts(req, res));
 router.get('/:id', (req, res) => broadcastController.getBroadcastById(req, res));
 router.post('/', (req, res) => broadcastController.createBroadcast(req, res));
-router.post('/:id/send', (req, res) => broadcastController.sendBroadcast(req, res));
+router.post('/:id/send', requireWhatsAppCredentials, (req, res) => broadcastController.sendBroadcast(req, res));
 router.post('/:id/pause', (req, res) => broadcastController.pauseBroadcast(req, res));
 router.post('/:id/resume', (req, res) => broadcastController.resumeBroadcast(req, res));
 router.post('/:id/cancel', (req, res) => broadcastController.cancelScheduledBroadcast(req, res));

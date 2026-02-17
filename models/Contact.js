@@ -1,8 +1,9 @@
 const mongoose = require('mongoose');
 
 const ContactSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   name: { type: String, default: '' },
-  phone: { type: String, unique: true, required: true, index: true },
+  phone: { type: String, required: true, index: true },
   email: String,
   tags: [{ type: String }],
   customFields: mongoose.Schema.Types.Mixed,
@@ -17,5 +18,8 @@ ContactSchema.pre('save', function(next) {
   this.updatedAt = Date.now();
   next();
 });
+
+ContactSchema.index({ userId: 1, phone: 1 }, { unique: true });
+ContactSchema.index({ userId: 1, lastContact: -1 });
 
 module.exports = mongoose.model('Contact', ContactSchema);

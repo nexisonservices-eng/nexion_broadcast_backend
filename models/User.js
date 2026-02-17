@@ -6,9 +6,18 @@ const UserSchema = new mongoose.Schema({
   password: { type: String, required: true },
   role: { 
     type: String, 
-    enum: ['admin', 'agent', 'manager'], 
+    enum: ['super_admin', 'admin', 'agent', 'manager'], 
     default: 'agent' 
   },
+  // WhatsApp credentials for admin users
+  whatsappCredentials: {
+    phoneNumberId: String,
+    accessToken: String,
+    businessAccountId: String,
+    webhookVerifyToken: { type: String, default: () => 'verify_token_' + Math.random().toString(36).substring(2, 15) }
+  },
+  // Parent admin for non-super admin users
+  parentAdminId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   avatar: String,
   isActive: { type: Boolean, default: true },
   lastSeen: Date,

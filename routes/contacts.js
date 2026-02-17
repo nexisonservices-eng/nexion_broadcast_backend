@@ -1,13 +1,15 @@
 const express = require('express');
 const Contact = require('../models/Contact');
+const auth = require('../middleware/auth');
 
 const router = express.Router();
+router.use(auth);
 
 // Get all contacts
 router.get('/', async (req, res) => {
   try {
     const { search, tags } = req.query;
-    const filters = {};
+    const filters = { userId: req.user.id };
     
     if (search) {
       filters.$or = [
@@ -31,7 +33,10 @@ router.get('/', async (req, res) => {
 // Create new contact
 router.post('/', async (req, res) => {
   try {
-    const contact = await Contact.create(req.body);
+    const contact = await Contact.create({
+      ...req.body,
+      userId: req.user.id
+    });
     res.status(201).json(contact);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -74,7 +79,7 @@ router.post('/import', async (req, res) => {
           }
 
           // Check for duplicate phone numbers
-          const existingContact = await Contact.findOne({ phone: contactData.phone });
+          const existingContact = await Contact.findOne({ phone: contactData.phone, userId: req.user.id });
           if (existingContact) {
             results.failed++;
             results.errors.push({
@@ -87,6 +92,7 @@ router.post('/import', async (req, res) => {
 
           // Create contact
           const contact = new Contact({
+            userId: req.user.id,
             name: contactData.name || '',
             phone: contactData.phone,
             email: contactData.email || '',
@@ -139,8 +145,8 @@ router.post('/import', async (req, res) => {
 // Update contact
 router.put('/:id', async (req, res) => {
   try {
-    const contact = await Contact.findByIdAndUpdate(
-      req.params.id,
+    const contact = await Contact.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user.id },
       req.body,
       { new: true, runValidators: true }
     );
@@ -158,7 +164,7 @@ router.put('/:id', async (req, res) => {
 // Delete contact
 router.delete('/:id', async (req, res) => {
   try {
-    const contact = await Contact.findByIdAndDelete(req.params.id);
+    const contact = await Contact.findOneAndDelete({ _id: req.params.id, userId: req.user.id });
     
     if (!contact) {
       return res.status(404).json({ error: 'Contact not found' });

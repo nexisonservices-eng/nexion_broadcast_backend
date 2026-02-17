@@ -22,6 +22,12 @@ const Message = require('./models/Message');
 const Broadcast = require('./models/Broadcast');
 const whatsappService = require('./services/whatsappService');
 const whatsappConfig = require('./config/whatsapp');
+const auth = require('./middleware/auth');
+const requireWhatsAppCredentials = require('./middleware/requireWhatsAppCredentials');
+const {
+  resolveUserIdByPhoneNumberId,
+  getWhatsAppCredentialsForUser
+} = require('./services/userWhatsAppCredentialsService');
 
 // Routes
 const bulkRoutes = require('./routes/bulk');
@@ -162,6 +168,14 @@ function sendToUser(userId, data) {
   }
 }
 
+function emitRealtimeEvent(userId, data) {
+  if (userId) {
+    sendToUser(String(userId), data);
+    return;
+  }
+  broadcast(data);
+}
+
 // ============ WHATSAPP WEBHOOK ============
 
 app.get('/webhook', (req, res) => {
@@ -221,11 +235,19 @@ async function handleIncomingMessage(messageData, value) {
     const from = messageData.from;
     const text = messageData.text?.body || '';
     const messageId = messageData.id;
+    const phoneNumberId = value?.metadata?.phone_number_id;
+    const userId = await resolveUserIdByPhoneNumberId(phoneNumberId);
+
+    if (!userId) {
+      console.warn(`Skipping incoming message: no user mapping found for phone_number_id=${phoneNumberId || 'unknown'}`);
+      return;
+    }
 
     // Find or create contact
-    let contact = await Contact.findOne({ phone: from });
+    let contact = await Contact.findOne({ userId, phone: from });
     if (!contact) {
       contact = await Contact.create({
+        userId,
         phone: from,
         name: value.contacts?.[0]?.profile?.name || from,
         lastContact: new Date()
@@ -236,9 +258,10 @@ async function handleIncomingMessage(messageData, value) {
     }
 
     // Find or create conversation
-    let conversation = await Conversation.findOne({ contactPhone: from, status: { $in: ['active', 'pending'] } });
+    let conversation = await Conversation.findOne({ userId, contactPhone: from, status: { $in: ['active', 'pending'] } });
     if (!conversation) {
       conversation = await Conversation.create({
+        userId,
         contactId: contact._id,
         contactPhone: from,
         contactName: contact.name,
@@ -257,6 +280,7 @@ async function handleIncomingMessage(messageData, value) {
 
     // Save message
     const message = await Message.create({
+      userId,
       conversationId: conversation._id,
       sender: 'contact',
       senderName: contact.name,
@@ -269,6 +293,7 @@ async function handleIncomingMessage(messageData, value) {
 
     // Check if this is a reply to a broadcast message
     const broadcast = await Broadcast.findOne({
+      createdById: userId,
       'recipients.phone': from,
       status: { $in: ['sending', 'completed'] }, // Only check active/completed broadcasts
       startedAt: { $exists: true }
@@ -296,7 +321,7 @@ async function handleIncomingMessage(messageData, value) {
         const updatedBroadcast = await Broadcast.findById(broadcast._id);
         
         // Emit update to connected clients with calculated percentage
-        broadcast({
+        emitRealtimeEvent(userId, {
           type: 'broadcast_stats_updated',
           broadcastId: broadcast._id.toString(),
           stats: {
@@ -311,7 +336,7 @@ async function handleIncomingMessage(messageData, value) {
     }
 
     // Broadcast to all connected clients
-    broadcast({
+    emitRealtimeEvent(userId, {
       type: 'new_message',
       conversation: conversation.toObject(),
       message: message.toObject()
@@ -330,7 +355,7 @@ async function handleMessageStatus(statusData) {
     const status = statusData.status; // sent, delivered, read, failed
     const recipient = statusData.recipient_id;
 
-    console.log('📊 DEBUG: Received status update:', {
+    console.log('DEBUG: Received status update:', {
       messageId,
       status,
       recipient,
@@ -338,137 +363,97 @@ async function handleMessageStatus(statusData) {
       conversationStatus: statusData.conversation?.id
     });
 
-    // First try to find by whatsappMessageId
-    let message = await Message.findOne({ whatsappMessageId: messageId });
-    
+    // Find message by WhatsApp message id
+    const message = await Message.findOne({ whatsappMessageId: messageId });
     if (!message) {
-      console.log('🔍 DEBUG: Message not found by whatsappMessageId, trying alternative lookup...');
-      // Try alternative lookup methods
-      message = await Message.findOne({ 
-        $or: [
-          { whatsappMessageId: messageId },
-          { 'whatsappMessageId': messageId }
-        ]
-      });
+      console.log('DEBUG: No message found for whatsappMessageId:', messageId);
+      return;
     }
 
-    if (message) {
-      console.log('📊 DEBUG: Found message to update:', {
-        messageId: message._id,
-        currentStatus: message.status,
-        newStatus: status,
-        whatsappMessageId: message.whatsappMessageId
-      });
+    const oldStatus = message.status;
+    const updatedMessage = await Message.findOneAndUpdate(
+      { _id: message._id },
+      { status: status, updatedAt: new Date() },
+      { new: true }
+    );
 
-      const updatedMessage = await Message.findOneAndUpdate(
-        { whatsappMessageId: messageId },
-        { status: status, updatedAt: new Date() },
-        { new: true }
-      );
+    if (!updatedMessage) {
+      return;
+    }
 
-      console.log('📊 DEBUG: Message updated successfully:', {
-        messageId: updatedMessage._id,
-        oldStatus: message.status,
-        newStatus: updatedMessage.status
-      });
+    // Realtime update for Team Inbox message status
+    emitRealtimeEvent(message.userId, {
+      type: 'message_status',
+      messageId: messageId,
+      status: status,
+      conversationId: message.conversationId
+    });
 
-      // Trigger broadcast update
-      broadcast({
-        type: 'message_status',
-        messageId: messageId,
-        status: status,
-        conversationId: message.conversationId
-      });
+    // Broadcast stats update must apply ONLY to the exact originating broadcast
+    if (updatedMessage.broadcastId && oldStatus !== updatedMessage.status) {
+      try {
+        const broadcast = await Broadcast.findOne({
+          _id: updatedMessage.broadcastId,
+          createdById: message.userId,
+          status: { $in: ['sending', 'completed'] }
+        });
 
-      // Also update broadcast stats if this is a broadcast message
-      if (updatedMessage.conversationId) {
-        const conversation = await Conversation.findById(updatedMessage.conversationId);
-        if (conversation) {
-          console.log('📊 DEBUG: Looking for broadcasts with contact phone:', conversation.contactPhone);
-          const broadcasts = await Broadcast.find({
-            'recipients.phone': conversation.contactPhone,
-            status: { $in: ['sending', 'completed'] } // Only check active/completed broadcasts
-          });
-          
-          for (const broadcast of broadcasts) {
-            try {
-              console.log('📊 DEBUG: Updating stats for broadcast:', broadcast.name);
-              
-              // Calculate the proper increment based on status progression
-              const oldStatus = message.status;
-              const newStatus = updatedMessage.status;
-              let update = {};
-              
-              // Handle status progression to avoid double-counting
-              if (oldStatus !== newStatus) {
-                if (newStatus === 'delivered' && oldStatus === 'sent') {
-                  // Message went from sent to delivered
-                  update['stats.delivered'] = 1;
-                } else if (newStatus === 'read' && oldStatus !== 'read') {
-                  // Message was read (regardless of previous status)
-                  update['stats.read'] = 1;
-                  // If it wasn't already counted as delivered, count it now
-                  if (oldStatus !== 'delivered') {
-                    update['stats.delivered'] = 1;
-                  }
-                } else if (newStatus === 'failed' && oldStatus !== 'failed') {
-                  // Message failed, increment failed count
-                  update['stats.failed'] = 1;
-                  // If it was previously counted as sent, decrement sent
-                  if (oldStatus === 'sent') {
-                    update['stats.sent'] = -1;
-                  }
-                }
-                
-                // Update the broadcast immediately if there are changes
-                if (Object.keys(update).length > 0) {
-                  await Broadcast.updateOne(
-                    { _id: broadcast._id },
-                    { $inc: update }
-                  );
-                  
-                  // Get the updated broadcast for logging
-                  const updatedBroadcast = await Broadcast.findById(broadcast._id);
-                  
-                  if (updatedBroadcast) {
-                    console.log('⚡ Immediate update for broadcast:', {
-                      broadcastId: broadcast._id.toString(),
-                      messageStatus: updatedMessage.status,
-                      statusChange: `${oldStatus} → ${newStatus}`,
-                      updateApplied: update,
-                      newStats: updatedBroadcast.stats
-                    });
-                    
-                    // Broadcast the update to all connected clients
-                    broadcast({
-                      type: 'broadcast_stats_updated',
-                      broadcastId: broadcast._id.toString(),
-                      stats: updatedBroadcast.stats,
-                      statusChange: `${oldStatus} → ${newStatus}`
-                    });
-                  }
-                } else {
-                  console.log('📊 DEBUG: No status change needed for broadcast:', broadcast.name);
-                }
-              } else {
-                console.log('📊 DEBUG: Message status unchanged, skipping broadcast update');
-              }
-            } catch (broadcastError) {
-              console.error('❌ Error updating broadcast stats:', broadcastError);
-            }
+        if (!broadcast) {
+          return;
+        }
+
+        const newStatus = updatedMessage.status;
+        let update = {};
+
+        if (newStatus === 'delivered' && oldStatus === 'sent') {
+          update['stats.delivered'] = 1;
+        } else if (newStatus === 'read' && oldStatus !== 'read') {
+          update['stats.read'] = 1;
+          if (oldStatus !== 'delivered') {
+            update['stats.delivered'] = 1;
+          }
+        } else if (newStatus === 'failed' && oldStatus !== 'failed') {
+          update['stats.failed'] = 1;
+          if (oldStatus === 'sent') {
+            update['stats.sent'] = -1;
           }
         }
+
+        if (Object.keys(update).length > 0) {
+          await Broadcast.updateOne({ _id: broadcast._id }, { $inc: update });
+          const updatedBroadcast = await Broadcast.findById(broadcast._id);
+
+          if (updatedBroadcast) {
+            // Safety clamp: never allow negative counters
+            let clamped = false;
+            ['sent', 'delivered', 'read', 'failed', 'replied'].forEach((k) => {
+              if ((updatedBroadcast.stats?.[k] || 0) < 0) {
+                updatedBroadcast.stats[k] = 0;
+                clamped = true;
+              }
+            });
+            if (clamped) {
+              await updatedBroadcast.save();
+            }
+
+            emitRealtimeEvent(message.userId, {
+              type: 'broadcast_stats_updated',
+              broadcastId: broadcast._id.toString(),
+              stats: updatedBroadcast.stats,
+              statusChange: `${oldStatus} -> ${newStatus}`
+            });
+          }
+        }
+      } catch (broadcastError) {
+        console.error('Error updating broadcast stats:', broadcastError);
       }
-    } else {
-      console.log('❌ DEBUG: No message found for whatsappMessageId:', messageId);
     }
   } catch (error) {
-    console.error('❌ Error handling message status:', error);
+    console.error('Error handling message status:', error);
   }
 }
-
 // ============ API ROUTES ============
-app.post('/api/messages/send', async (req, res) => {
+app.post('/api/messages/send', auth, requireWhatsAppCredentials, async (req, res) => {
   try {
     const { to, text, conversationId, mediaUrl, mediaType } = req.body;
     
@@ -481,9 +466,9 @@ app.post('/api/messages/send', async (req, res) => {
 
     let result;
     if (mediaUrl && mediaType) {
-      result = await whatsappService.sendMediaMessage(to, mediaType, mediaUrl, text);
+      result = await whatsappService.sendMediaMessage(to, mediaType, mediaUrl, text, req.whatsappCredentials);
     } else {
-      result = await whatsappService.sendTextMessage(to, text);
+      result = await whatsappService.sendTextMessage(to, text, req.whatsappCredentials);
     }
 
     if (!result.success) {
@@ -493,7 +478,13 @@ app.post('/api/messages/send', async (req, res) => {
     const whatsappMessageId = result.data.messages[0].id;
 
     // Save to database
+    const conversation = await Conversation.findOne({ _id: conversationId, userId: req.user.id });
+    if (!conversation) {
+      return res.status(404).json({ success: false, error: 'Conversation not found' });
+    }
+
     const message = await Message.create({
+      userId: req.user.id,
       conversationId: conversationId,
       sender: 'agent',
       text: text,
@@ -505,14 +496,14 @@ app.post('/api/messages/send', async (req, res) => {
     });
 
     // Update conversation
-    await Conversation.findByIdAndUpdate(conversationId, {
+    await Conversation.findOneAndUpdate({ _id: conversationId, userId: req.user.id }, {
       lastMessageTime: new Date(),
       lastMessage: text,
       lastMessageFrom: 'agent'
     });
 
     // Broadcast to clients
-    broadcast({
+    emitRealtimeEvent(req.user.id, {
       type: 'message_sent',
       message: message.toObject()
     });
@@ -525,10 +516,10 @@ app.post('/api/messages/send', async (req, res) => {
 });
 
 // Get conversations
-app.get('/api/conversations', async (req, res) => {
+app.get('/api/conversations', auth, async (req, res) => {
   try {
     const { status, assignedTo, search } = req.query;
-    const filters = {};
+    const filters = { userId: req.user.id };
     
     if (status) filters.status = status;
     if (assignedTo) filters.assignedTo = assignedTo;
@@ -550,12 +541,13 @@ app.get('/api/conversations', async (req, res) => {
 });
 
 // Create conversation
-app.post('/api/conversations', async (req, res) => {
+app.post('/api/conversations', auth, async (req, res) => {
   try {
     const { contactId, contactPhone, contactName, status } = req.body;
     
     // Check if conversation already exists
     const existingConversation = await Conversation.findOne({ 
+      userId: req.user.id,
       contactPhone: contactPhone,
       status: { $in: ['active', 'pending'] }
     });
@@ -566,6 +558,7 @@ app.post('/api/conversations', async (req, res) => {
     
     // Create new conversation
     const conversation = await Conversation.create({
+      userId: req.user.id,
       contactId: contactId,
       contactPhone: contactPhone,
       contactName: contactName,
@@ -581,9 +574,9 @@ app.post('/api/conversations', async (req, res) => {
 });
 
 // Get single conversation
-app.get('/api/conversations/:id', async (req, res) => {
+app.get('/api/conversations/:id', auth, async (req, res) => {
   try {
-    const conversation = await Conversation.findById(req.params.id)
+    const conversation = await Conversation.findOne({ _id: req.params.id, userId: req.user.id })
       .populate('contactId', 'name phone email tags');
     if (!conversation) {
       return res.status(404).json({ error: 'Conversation not found' });
@@ -595,10 +588,10 @@ app.get('/api/conversations/:id', async (req, res) => {
 });
 
 // Update conversation
-app.put('/api/conversations/:id', async (req, res) => {
+app.put('/api/conversations/:id', auth, async (req, res) => {
   try {
-    const conversation = await Conversation.findByIdAndUpdate(
-      req.params.id,
+    const conversation = await Conversation.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user.id },
       req.body,
       { new: true }
     );
@@ -612,10 +605,20 @@ app.put('/api/conversations/:id', async (req, res) => {
 });
 
 // Mark conversation as read
-app.put('/api/conversations/:id/read', async (req, res) => {
+app.put('/api/conversations/:id/read', auth, async (req, res) => {
   try {
-    const conversation = await Conversation.findByIdAndUpdate(
-      req.params.id,
+    await Message.updateMany(
+      {
+        conversationId: req.params.id,
+        userId: req.user.id,
+        sender: 'contact',
+        status: 'received'
+      },
+      { status: 'read' }
+    );
+
+    const conversation = await Conversation.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user.id },
       { unreadCount: 0 },
       { new: true }
     );
@@ -624,7 +627,7 @@ app.put('/api/conversations/:id/read', async (req, res) => {
     }
     
     // Broadcast the read status to all clients
-    broadcast({
+    emitRealtimeEvent(req.user.id, {
       type: 'conversation_read',
       conversationId: req.params.id,
       unreadCount: 0
@@ -637,9 +640,9 @@ app.put('/api/conversations/:id/read', async (req, res) => {
 });
 
 // Get messages for conversation
-app.get('/api/conversations/:id/messages', async (req, res) => {
+app.get('/api/conversations/:id/messages', auth, async (req, res) => {
   try {
-    const messages = await Message.find({ conversationId: req.params.id })
+    const messages = await Message.find({ conversationId: req.params.id, userId: req.user.id })
       .sort({ timestamp: 1 });
     res.json(messages);
   } catch (error) {
@@ -648,10 +651,10 @@ app.get('/api/conversations/:id/messages', async (req, res) => {
 });
 
 // Get contacts
-app.get('/api/contacts', async (req, res) => {
+app.get('/api/contacts', auth, async (req, res) => {
   try {
     const { search, tags } = req.query;
-    const filters = {};
+    const filters = { userId: req.user.id };
     
     if (search) {
       filters.$or = [
@@ -672,9 +675,9 @@ app.get('/api/contacts', async (req, res) => {
 });
 
 // Create contact
-app.post('/api/contacts', async (req, res) => {
+app.post('/api/contacts', auth, async (req, res) => {
   try {
-    const contact = await Contact.create(req.body);
+    const contact = await Contact.create({ ...req.body, userId: req.user.id });
     res.json(contact);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -682,20 +685,20 @@ app.post('/api/contacts', async (req, res) => {
 });
 
 // Update contact
-app.put('/api/contacts/:id', async (req, res) => {
+app.put('/api/contacts/:id', auth, async (req, res) => {
   try {
     const { id } = req.params;
     const { name, phone, email, tags, notes, isBlocked } = req.body;
     
     // Find current contact
-    const currentContact = await Contact.findById(id);
+    const currentContact = await Contact.findOne({ _id: id, userId: req.user.id });
     if (!currentContact) {
       return res.status(404).json({ error: 'Contact not found' });
     }
     
     // Check if phone number is being changed and if it conflicts with existing contact
     if (phone && phone !== currentContact.phone) {
-      const existingContact = await Contact.findOne({ phone, _id: { $ne: id } });
+      const existingContact = await Contact.findOne({ phone, _id: { $ne: id }, userId: req.user.id });
       if (existingContact) {
         return res.status(400).json({ error: 'Another contact with this phone number already exists' });
       }
@@ -710,8 +713,8 @@ app.put('/api/contacts/:id', async (req, res) => {
     if (notes !== undefined) updateData.notes = notes;
     if (isBlocked !== undefined) updateData.isBlocked = isBlocked;
     
-    const contact = await Contact.findByIdAndUpdate(
-      id,
+    const contact = await Contact.findOneAndUpdate(
+      { _id: id, userId: req.user.id },
       updateData,
       { new: true, runValidators: true }
     );
@@ -719,7 +722,7 @@ app.put('/api/contacts/:id', async (req, res) => {
     // If name was updated, also update all conversations for this contact
     if (name !== undefined && name !== currentContact.name) {
       await Conversation.updateMany(
-        { contactId: id },
+        { contactId: id, userId: req.user.id },
         { contactName: name }
       );
     }
@@ -731,7 +734,7 @@ app.put('/api/contacts/:id', async (req, res) => {
 });
 
 // Debug endpoint to investigate broadcast data
-app.get('/api/debug-broadcasts', async (req, res) => {
+app.get('/api/debug-broadcasts', auth, async (req, res) => {
   try {
     const debugInServer = require('./debugInServer');
     await debugInServer();
@@ -742,16 +745,17 @@ app.get('/api/debug-broadcasts', async (req, res) => {
 });
 
 // Get analytics
-app.get('/api/analytics', async (req, res) => {
+app.get('/api/analytics', auth, async (req, res) => {
   try {
-    const totalConversations = await Conversation.countDocuments();
-    const activeConversations = await Conversation.countDocuments({ status: 'active' });
+    const totalConversations = await Conversation.countDocuments({ userId: req.user.id });
+    const activeConversations = await Conversation.countDocuments({ userId: req.user.id, status: 'active' });
     
     const last7Days = new Date();
     last7Days.setDate(last7Days.getDate() - 7);
     
     // Message metrics - count all agent messages first, then break down by status
     const allAgentMessages = await Message.find({
+      userId: req.user.id,
       sender: 'agent',
       timestamp: { $gte: last7Days }
     });
@@ -765,6 +769,7 @@ app.get('/api/analytics', async (req, res) => {
     const totalDeliveredOrRead = allAgentMessages.filter(msg => msg.status === 'delivered' || msg.status === 'read').length;
     
     const messagesReceived = await Message.countDocuments({
+      userId: req.user.id,
       sender: 'contact',
       timestamp: { $gte: last7Days }
     });
@@ -794,11 +799,16 @@ app.get('/api/analytics', async (req, res) => {
 });
 
 // Manual sync endpoint for debugging broadcast stats
-app.post('/api/broadcasts/:id/sync', async (req, res) => {
+app.post('/api/broadcasts/:id/sync', auth, async (req, res) => {
   try {
     const { id } = req.params;
     console.log('🔄 Manual sync requested for broadcast:', id);
     
+    const ownsBroadcast = await Broadcast.findOne({ _id: id, createdById: req.user.id }).select('_id').lean();
+    if (!ownsBroadcast) {
+      return res.status(404).json({ success: false, error: 'Broadcast not found' });
+    }
+
     const result = await broadcastService.syncBroadcastStats(id);
     
     if (result.success) {
@@ -819,6 +829,45 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+app.get('/api/version', (req, res) => {
+  res.json({
+    service: 'whatsapp-backend',
+    version: 'bulk_direct_meta_v2',
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/api/debug/auth-credentials', auth, async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const credentials = await getWhatsAppCredentialsForUser({
+      authHeader,
+      userId: req.user?.id || null
+    });
+
+    res.json({
+      success: true,
+      user: req.user,
+      hasAuthHeader: Boolean(authHeader),
+      credentialsFound: Boolean(credentials),
+      credentials: credentials
+        ? {
+            twilioId: credentials.twilioId,
+            whatsappId: credentials.whatsappId,
+            whatsappBusiness: credentials.whatsappBusiness,
+            accessTokenPreview: `${String(credentials.accessToken).slice(0, 10)}...`
+          }
+        : null
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      user: req.user
+    });
+  }
+});
+
 // Start server
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, async () => {
@@ -827,31 +876,16 @@ server.listen(PORT, async () => {
   console.log(`🌐 Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:5173'}`);
   
   // Start the scheduler for checking scheduled broadcasts
+  try {
+    await Promise.all([Contact.syncIndexes(), Template.syncIndexes()]);
+    console.log('MongoDB indexes synced for user-scoped data models.');
+  } catch (indexError) {
+    console.error('Failed to sync MongoDB indexes:', indexError.message);
+  }
+
   startScheduler();
   
-  // Initial template sync on server startup
-  console.log('🔄 Performing initial template sync on server startup...');
-  try {
-    const mockReq = {};
-    const mockRes = {
-      status: (code) => ({
-        json: (data) => {
-          if (code === 200) {
-            console.log('✅ Initial template sync completed:', data.message);
-          } else {
-            console.error('❌ Initial template sync failed:', data.error);
-          }
-        }
-      }),
-      json: (data) => {
-        console.log('✅ Initial template sync completed:', data.message);
-      }
-    };
-    
-    await templateController.syncWhatsAppTemplates(mockReq, mockRes);
-  } catch (error) {
-    console.error('❌ Initial template sync error:', error.message);
-  }
+  console.log('Skipping global template sync on startup: credentials are user-scoped and fetched per request.');
 });
 
 // Scheduler to check for scheduled broadcasts every minute
@@ -872,8 +906,7 @@ function startScheduler() {
       await broadcastService.checkScheduledBroadcasts();
       
       // Also check for recent message status updates and sync broadcast stats
-      console.log('🔄 Checking for message status updates...');
-      await checkAndUpdateBroadcastStats();
+      // removed automatic stat backfill to avoid metric fluctuations
       
     } catch (error) {
       console.error('❌ Scheduler error:', error.message);
@@ -917,111 +950,15 @@ function startScheduler() {
   });
 
   console.log('✅ Broadcast scheduler started - checking every minute');
-  console.log('✅ Template auto-sync scheduled - every 6 hours');
+  console.log('Template auto-sync disabled: run per user via authenticated API.');
 }
 
 // Check for recent message status updates and sync broadcast stats
 async function checkAndUpdateBroadcastStats() {
-  try {
-    // Find broadcasts that might need syncing (completed in last hour)
-    const recentBroadcasts = await Broadcast.find({
-      status: 'completed',
-      completedAt: { $gte: new Date(Date.now() - 60 * 60 * 1000) } // Last hour
-    });
-
-    console.log(`� Checking ${recentBroadcasts.length} recent broadcasts for stats updates`);
-
-    for (const broadcast of recentBroadcasts) {
-      // Check if broadcast stats are out of sync
-      const startTime = new Date(broadcast.startedAt || broadcast.createdAt);
-      const endTime = new Date(broadcast.completedAt || Date.now());
-      
-      // Find messages for this broadcast (expand time range to catch messages sent before broadcast started)
-      const messages = await Message.find({
-        sender: 'agent',
-        timestamp: { 
-          $gte: new Date(startTime.getTime() - 5 * 60 * 1000), // 5 minutes before start
-          $lte: new Date(endTime.getTime() + 5 * 60 * 1000)    // 5 minutes after completion
-        }
-      });
-
-      if (messages.length > 0) {
-        // Calculate current stats from messages
-        const currentStats = {
-          sent: messages.length,
-          delivered: messages.filter(msg => msg.status === 'delivered').length,
-          read: messages.filter(msg => msg.status === 'read').length,
-          failed: messages.filter(msg => msg.status === 'failed').length,
-          replied: 0 // Will be calculated below
-        };
-
-        // Count unique contacts who replied to this broadcast
-        const recipientPhones = broadcast.recipients.map(r => r.phone);
-        const conversations = await Conversation.find({ 
-          contactPhone: { $in: recipientPhones } 
-        });
-        
-        const conversationIds = conversations.map(c => c._id);
-        const replyMessages = await Message.find({
-          conversationId: { $in: conversationIds },
-          sender: 'contact',
-          timestamp: { $gte: startTime }
-        });
-        
-        // Count unique conversations that have at least one reply
-        const uniqueRepliedConversations = new Set(replyMessages.map(msg => msg.conversationId.toString()));
-        currentStats.replied = uniqueRepliedConversations.size;
-
-        // Check if stats are different
-        const statsChanged = 
-          broadcast.stats?.sent !== currentStats.sent ||
-          broadcast.stats?.delivered !== currentStats.delivered ||
-          broadcast.stats?.read !== currentStats.read ||
-          broadcast.stats?.failed !== currentStats.failed ||
-          broadcast.stats?.replied !== currentStats.replied;
-
-        if (statsChanged) {
-          console.log(`📊 Stats changed for broadcast "${broadcast.name}":`, {
-            old: broadcast.stats,
-            new: currentStats
-          });
-
-          // Update broadcast stats
-          await broadcastService.syncBroadcastStats(broadcast._id);
-          
-          // Get updated broadcast with virtual fields
-          const updatedBroadcast = await Broadcast.findById(broadcast._id);
-          if (updatedBroadcast) {
-            const stringId = broadcast._id.toString();
-            console.log('📡 Emitting auto-sync broadcast_stats_updated event:', {
-              broadcastId: stringId,
-              broadcastName: broadcast.name,
-              stats: {
-                ...updatedBroadcast.stats,
-                repliedPercentage: updatedBroadcast.repliedPercentage,
-                repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal,
-                readPercentage: updatedBroadcast.readPercentage,
-                readPercentageOfTotal: updatedBroadcast.readPercentageOfTotal,
-                deliveryRate: updatedBroadcast.deliveryRate
-              }
-            });
-            app.locals.broadcast({
-              type: 'broadcast_stats_updated',
-              broadcastId: stringId,
-              stats: {
-                ...updatedBroadcast.stats,
-                repliedPercentage: updatedBroadcast.repliedPercentage,
-                repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal,
-                readPercentage: updatedBroadcast.readPercentage,
-                readPercentageOfTotal: updatedBroadcast.readPercentageOfTotal,
-                deliveryRate: updatedBroadcast.deliveryRate
-              }
-            });
-          }
-        }
-      }
-    }
-  } catch (error) {
-    console.error('❌ Error checking broadcast stats:', error);
-  }
+  // intentionally disabled to prevent periodic stat rollback/fluctuation
+  return;
 }
+
+
+
+

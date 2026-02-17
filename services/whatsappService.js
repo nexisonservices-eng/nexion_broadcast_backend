@@ -1,23 +1,33 @@
 const axios = require('axios');
-const whatsappConfig = require('../config/whatsapp');
 
 class WhatsAppService {
   constructor() {
-    this.apiUrl = whatsappConfig.WHATSAPP_API_URL;
-    this.wabaId = whatsappConfig.WHATSAPP_BUSINESS_ACCOUNT_ID;
-    this.phoneNumberId = whatsappConfig.WHATSAPP_PHONE_NUMBER_ID;
-    this.accessToken = whatsappConfig.WHATSAPP_ACCESS_TOKEN;
+    this.apiUrl = 'https://graph.facebook.com/v20.0';
     this.mockMode = process.env.WHATSAPP_MOCK_MODE === 'true';
   }
 
+  // Initialize service with user-specific credentials
+  initialize(credentials) {
+    this.wabaId = credentials.businessAccountId;
+    this.phoneNumberId = credentials.phoneNumberId;
+    this.accessToken = credentials.accessToken;
+    this.webhookVerifyToken = credentials.webhookVerifyToken;
+  }
+
   getHeaders() {
+    if (!this.accessToken) {
+      throw new Error('WhatsApp service not initialized with credentials');
+    }
     return {
       'Authorization': `Bearer ${this.accessToken}`,
       'Content-Type': 'application/json'
     };
   }
 
-  async sendTextMessage(to, text) {
+  async sendTextMessage(to, text, credentials = null) {
+    if (credentials) {
+      this.initialize(credentials);
+    }
     if (this.mockMode) {
       console.log(`🧪 MOCK MODE: Simulating text message to ${to}: "${text}"`);
       return { 
@@ -63,7 +73,10 @@ class WhatsAppService {
     }
   }
 
-  async sendTemplateMessage(to, templateName, language = 'en_US', variables = []) {
+  async sendTemplateMessage(to, templateName, language = 'en_US', variables = [], credentials = null, retryOnNotFound = true) {
+    if (credentials) {
+      this.initialize(credentials);
+    }
     if (this.mockMode) {
       console.log(`🧪 MOCK MODE: Simulating template message to ${to}`);
       console.log(`   Template: ${templateName}`);
@@ -80,9 +93,14 @@ class WhatsAppService {
     }
 
     try {
+      const normalizedTemplateName = String(templateName || '').trim();
+      if (!normalizedTemplateName) {
+        return { success: false, error: 'Template name is required' };
+      }
+
       console.log(`🔍 DEBUG: sendTemplateMessage called with:`);
       console.log(`   to: ${to}`);
-      console.log(`   templateName: "${templateName}"`);
+      console.log(`   templateName: "${normalizedTemplateName}"`);
       console.log(`   language: ${language}`);
       console.log(`   variables:`, variables);
       
@@ -98,7 +116,7 @@ class WhatsAppService {
       }
       
       console.log(`📞 Normalized phone number: ${to} -> ${normalizedPhone}`);
-      console.log(`🔍 Template details: name=${templateName}, language=${language}, variables=${variables.length}`);
+      console.log(`🔍 Template details: name=${normalizedTemplateName}, language=${language}, variables=${variables.length}`);
       
       const components = [];
       
@@ -120,11 +138,14 @@ class WhatsAppService {
         to: normalizedPhone,
         type: 'template',
         template: {
-          name: templateName,
-          language: { code: language },
-          components: components
+          name: normalizedTemplateName,
+          language: { code: language }
         }
       };
+
+      if (components.length > 0) {
+        payload.template.components = components;
+      }
 
       console.log(`📤 Sending template payload:`, JSON.stringify(payload, null, 2));
 
@@ -162,14 +183,51 @@ class WhatsAppService {
         }
       }
       
-      return { 
-        success: false, 
-        error: error.response?.data || error.message 
+      const metaMessage =
+        error.response?.data?.error?.message ||
+        error.response?.data?.error?.error_user_msg ||
+        '';
+
+      if (retryOnNotFound && /template .* not found/i.test(metaMessage)) {
+        try {
+          const listResult = await this.getTemplateList(credentials || null);
+          if (listResult.success) {
+            const templates = listResult.data?.data || [];
+            const normalizedRequested = normalizedTemplateName.toLowerCase();
+            const exactMatch = templates.find(
+              (t) => String(t.name || '').trim().toLowerCase() === normalizedRequested
+            );
+            if (exactMatch && exactMatch.name && exactMatch.name !== normalizedTemplateName) {
+              console.log(`🔁 Retrying template send with Meta-canonical name: ${exactMatch.name}`);
+              return this.sendTemplateMessage(
+                to,
+                exactMatch.name,
+                language,
+                variables,
+                credentials,
+                false
+              );
+            }
+          }
+        } catch (retryError) {
+          console.error('Template retry resolution failed:', retryError.message);
+        }
+      }
+
+      return {
+        success: false,
+        error:
+          metaMessage ||
+          error.response?.data ||
+          error.message
       };
     }
   }
 
-  async sendMediaMessage(to, mediaType, mediaUrl, caption = '') {
+  async sendMediaMessage(to, mediaType, mediaUrl, caption = '', credentials = null) {
+    if (credentials) {
+      this.initialize(credentials);
+    }
     try {
       const payload = {
         messaging_product: 'whatsapp',
@@ -197,7 +255,10 @@ class WhatsAppService {
     }
   }
 
-  async markMessageAsRead(messageId) {
+  async markMessageAsRead(messageId, credentials = null) {
+    if (credentials) {
+      this.initialize(credentials);
+    }
     try {
       const response = await axios.post(
         `${this.apiUrl}/${this.phoneNumberId}/messages`,
@@ -218,7 +279,57 @@ class WhatsAppService {
     }
   }
 
-  async getTemplateList() {
+  async createTemplate(templateData, credentials = null) {
+    if (credentials) {
+      this.initialize(credentials);
+    }
+    if (this.mockMode) {
+      console.log(`🧪 MOCK MODE: Simulating template creation:`, templateData);
+      return { 
+        success: true, 
+        data: { 
+          id: 'mock_template_' + Date.now(),
+          name: templateData.name,
+          status: 'PENDING'
+        } 
+      };
+    }
+
+    try {
+      console.log(`📝 Creating template: ${templateData.name}`);
+      
+      // Meta API format for template creation
+      const metaTemplateData = {
+        name: templateData.name,
+        category: templateData.category,
+        language: templateData.language,
+        components: templateData.components || []
+      };
+
+      const response = await axios.post(
+        `${this.apiUrl}/${this.wabaId}/message_templates`,
+        metaTemplateData,
+        { headers: this.getHeaders() }
+      );
+      
+      console.log('✅ Template created successfully:', response.data);
+      return { 
+        success: true, 
+        data: response.data 
+      };
+    } catch (error) {
+      console.error('❌ Failed to create template:', error.response?.data || error.message);
+      return { 
+        success: false, 
+        error: error.response?.data?.error?.message || error.message 
+      };
+    }
+  }
+
+  async getTemplateList(credentials = null) {
+    if (credentials) {
+      this.initialize(credentials);
+    }
     try {
       if (!this.wabaId) {
         return {
@@ -229,7 +340,13 @@ class WhatsAppService {
       console.log(`Fetching templates from: ${this.apiUrl}/${this.wabaId}/message_templates`);
       const response = await axios.get(
         `${this.apiUrl}/${this.wabaId}/message_templates`,
-        { headers: this.getHeaders() }
+        {
+          headers: this.getHeaders(),
+          params: {
+            fields: 'id,name,language,status,category,components',
+            limit: 200
+          }
+        }
       );
       console.log('Raw Meta API Response:', JSON.stringify(response.data, null, 2));
       console.log('Templates found:', response.data.data?.length || 0);
@@ -242,6 +359,35 @@ class WhatsAppService {
       };
     }
   }
+
+  async deleteTemplateByName(templateName, credentials = null) {
+    if (credentials) {
+      this.initialize(credentials);
+    }
+
+    try {
+      const normalizedName = String(templateName || '').trim();
+      if (!normalizedName) {
+        return { success: false, error: 'Template name is required' };
+      }
+
+      const response = await axios.delete(
+        `${this.apiUrl}/${this.wabaId}/message_templates`,
+        {
+          headers: this.getHeaders(),
+          params: { name: normalizedName }
+        }
+      );
+
+      return { success: true, data: response.data };
+    } catch (error) {
+      return {
+        success: false,
+        error: error.response?.data?.error?.message || error.message
+      };
+    }
+  }
+
 }
 
 module.exports = new WhatsAppService();

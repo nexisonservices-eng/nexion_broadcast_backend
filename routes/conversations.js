@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const conversationController = require('../controllers/conversationController');
+const auth = require('../middleware/auth');
+
+router.use(auth);
 
 // Get all conversations with optional filters
 router.get('/', (req, res) => conversationController.getConversations(req, res));

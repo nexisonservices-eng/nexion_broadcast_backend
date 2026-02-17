@@ -1,12 +1,14 @@
 const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
 const Message = require('../models/Message');
+const mongoose = require('mongoose');
 
 class ConversationController {
   async getConversations(req, res) {
     try {
       const { status, assignedTo, search } = req.query;
-      const filters = {};
+      const filters = { userId: req.user.id };
+      const userObjectId = new mongoose.Types.ObjectId(req.user.id);
       
       if (status) filters.status = status;
       if (assignedTo) filters.assignedTo = assignedTo;
@@ -14,6 +16,32 @@ class ConversationController {
       let conversations = await Conversation.find(filters)
         .populate('contactId')
         .sort({ lastMessageTime: -1 });
+
+      const unreadCounts = await Message.aggregate([
+        {
+          $match: {
+            userId: userObjectId,
+            sender: 'contact',
+            status: 'received'
+          }
+        },
+        {
+          $group: {
+            _id: '$conversationId',
+            count: { $sum: 1 }
+          }
+        }
+      ]);
+
+      const unreadMap = new Map(
+        unreadCounts.map((item) => [String(item._id), item.count || 0])
+      );
+
+      conversations = conversations.map((conv) => {
+        const unread = unreadMap.get(String(conv._id)) || 0;
+        conv.unreadCount = unread;
+        return conv;
+      });
       
       // Apply search filter if provided
       if (search) {
@@ -34,7 +62,7 @@ class ConversationController {
   async getContacts(req, res) {
     try {
       const { search, tags } = req.query;
-      const filters = {};
+      const filters = { userId: req.user.id };
       
       if (search) {
         filters.$or = [
@@ -62,7 +90,7 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const contact = await Contact.findById(id);
+      const contact = await Contact.findOne({ _id: id, userId: req.user.id });
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -79,7 +107,10 @@ class ConversationController {
   async getConversationContacts(req, res) {
     try {
       // Get all unique contacts from conversations
-      const conversations = await Conversation.find({ status: { $in: ['active', 'pending'] } })
+      const conversations = await Conversation.find({
+        userId: req.user.id,
+        status: { $in: ['active', 'pending'] }
+      })
         .select('contactPhone contactName')
         .sort({ lastMessageTime: -1 });
       
@@ -111,7 +142,7 @@ class ConversationController {
       const { name, phone, email, tags, notes } = req.body;
       
       // Check if contact already exists
-      const existingContact = await Contact.findOne({ phone });
+      const existingContact = await Contact.findOne({ phone, userId: req.user.id });
       if (existingContact) {
         return res.status(400).json({ 
           success: false, 
@@ -120,6 +151,7 @@ class ConversationController {
       }
       
       const contact = await Contact.create({
+        userId: req.user.id,
         name,
         phone,
         email,
@@ -139,7 +171,7 @@ class ConversationController {
       const { name, phone, email, tags, notes, isBlocked } = req.body;
       
       // Find contact by ID
-      const contact = await Contact.findById(id);
+      const contact = await Contact.findOne({ _id: id, userId: req.user.id });
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -149,7 +181,7 @@ class ConversationController {
       
       // Check if phone number is being changed and if it conflicts with existing contact
       if (phone && phone !== contact.phone) {
-        const existingContact = await Contact.findOne({ phone, _id: { $ne: id } });
+        const existingContact = await Contact.findOne({ phone, _id: { $ne: id }, userId: req.user.id });
         if (existingContact) {
           return res.status(400).json({ 
             success: false, 
@@ -167,8 +199,8 @@ class ConversationController {
       if (notes !== undefined) updateData.notes = notes;
       if (isBlocked !== undefined) updateData.isBlocked = isBlocked;
       
-      const updatedContact = await Contact.findByIdAndUpdate(
-        id, 
+      const updatedContact = await Contact.findOneAndUpdate(
+        { _id: id, userId: req.user.id },
         updateData, 
         { new: true, runValidators: true }
       );
@@ -176,7 +208,7 @@ class ConversationController {
       // If name was updated, also update all conversations for this contact
       if (name !== undefined && name !== contact.name) {
         await Conversation.updateMany(
-          { contactId: id },
+          { contactId: id, userId: req.user.id },
           { contactName: name }
         );
       }
@@ -191,7 +223,7 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const contact = await Contact.findById(id);
+      const contact = await Contact.findOne({ _id: id, userId: req.user.id });
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -199,7 +231,7 @@ class ConversationController {
         });
       }
       
-      await Contact.findByIdAndDelete(id);
+      await Contact.deleteOne({ _id: id, userId: req.user.id });
       
       res.json({ success: true, message: 'Contact deleted successfully' });
     } catch (error) {
@@ -211,7 +243,7 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const conversation = await Conversation.findById(id);
+      const conversation = await Conversation.findOne({ _id: id, userId: req.user.id });
       if (!conversation) {
         return res.status(404).json({ 
           success: false, 
@@ -219,8 +251,8 @@ class ConversationController {
         });
       }
       
-      await Conversation.findByIdAndDelete(id);
-      await Message.deleteMany({ conversationId: id });
+      await Conversation.deleteOne({ _id: id, userId: req.user.id });
+      await Message.deleteMany({ conversationId: id, userId: req.user.id });
       
       res.json({ success: true, message: 'Conversation deleted successfully' });
     } catch (error) {
@@ -230,8 +262,8 @@ class ConversationController {
 
   async deleteAllConversations(req, res) {
     try {
-      await Conversation.deleteMany({});
-      await Message.deleteMany({});
+      await Conversation.deleteMany({ userId: req.user.id });
+      await Message.deleteMany({ userId: req.user.id });
       res.json({ success: true, message: 'All conversations deleted successfully' });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
@@ -249,8 +281,8 @@ class ConversationController {
         });
       }
       
-      await Conversation.deleteMany({ _id: { $in: conversationIds } });
-      await Message.deleteMany({ conversationId: { $in: conversationIds } });
+      await Conversation.deleteMany({ _id: { $in: conversationIds }, userId: req.user.id });
+      await Message.deleteMany({ conversationId: { $in: conversationIds }, userId: req.user.id });
       
       res.json({ 
         success: true, 

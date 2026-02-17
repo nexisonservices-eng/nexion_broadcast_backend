@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const Message = require('../models/Message');
+const auth = require('../middleware/auth');
+
+router.use(auth);
 
 // Delete selected messages
 router.delete('/delete-selected', async (req, res) => {
@@ -15,7 +18,7 @@ router.delete('/delete-selected', async (req, res) => {
     }
     
     // Delete messages from database
-    const deleteResult = await Message.deleteMany({ _id: { $in: messageIds } });
+    const deleteResult = await Message.deleteMany({ _id: { $in: messageIds }, userId: req.user.id });
     
     res.json({ 
       success: true, 
