@@ -12,11 +12,24 @@ class BroadcastController {
 
   async createBroadcast(req, res) {
     try {
+      const creds = req.whatsappCredentials || null;
       const payload = {
         ...req.body,
         createdById: req.user.id,
         createdBy: req.user.username || req.user.email || req.user.id,
-        createdByEmail: req.user.email
+        createdByEmail: req.user.email,
+        authHeaderSnapshot: req.headers.authorization || null,
+        credentialsSnapshot: creds
+          ? {
+              accessToken: creds.accessToken || creds.whatsappToken || null,
+              businessAccountId: creds.businessAccountId || creds.whatsappBusiness || null,
+              phoneNumberId: creds.phoneNumberId || creds.whatsappId || null,
+              whatsappToken: creds.whatsappToken || creds.accessToken || null,
+              whatsappBusiness: creds.whatsappBusiness || creds.businessAccountId || null,
+              whatsappId: creds.whatsappId || creds.phoneNumberId || null,
+              twilioId: creds.twilioId || null
+            }
+          : undefined
       };
 
       const result = await broadcastService.createBroadcast(payload);

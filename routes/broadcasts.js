@@ -8,7 +8,7 @@ router.use(auth);
 
 router.get('/', (req, res) => broadcastController.getBroadcasts(req, res));
 router.get('/:id', (req, res) => broadcastController.getBroadcastById(req, res));
-router.post('/', (req, res) => broadcastController.createBroadcast(req, res));
+router.post('/', requireWhatsAppCredentials, (req, res) => broadcastController.createBroadcast(req, res));
 router.post('/:id/send', requireWhatsAppCredentials, (req, res) => broadcastController.sendBroadcast(req, res));
 router.post('/:id/pause', (req, res) => broadcastController.pauseBroadcast(req, res));
 router.post('/:id/resume', (req, res) => broadcastController.resumeBroadcast(req, res));

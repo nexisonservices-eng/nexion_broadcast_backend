@@ -437,7 +437,19 @@ router.post('/send', requireWhatsAppCredentials, async (req, res) => {
           // Create/Update contact + conversation + message so Team Inbox shows it
           let contact = await Contact.findOne({ userId: req.user.id, phone });
           if (!contact) {
-            contact = await Contact.create({ userId: req.user.id, phone, name: '', lastContact: new Date() });
+            contact = await Contact.create({
+              userId: req.user.id,
+              phone,
+              name: '',
+              lastContact: new Date(),
+              sourceType: 'incoming_message'
+            });
+          } else {
+            if (contact.sourceType !== 'incoming_message') {
+              contact.sourceType = 'incoming_message';
+            }
+            contact.lastContact = new Date();
+            await contact.save();
           }
 
           let conversation = await Conversation.findOne({

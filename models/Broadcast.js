@@ -36,7 +36,17 @@ const BroadcastSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
   createdBy: String,
-  createdById: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
+  createdById: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  credentialsSnapshot: {
+    accessToken: String,
+    businessAccountId: String,
+    phoneNumberId: String,
+    whatsappToken: String,
+    whatsappBusiness: String,
+    whatsappId: String,
+    twilioId: String
+  },
+  authHeaderSnapshot: String
 });
 
 BroadcastSchema.pre('save', function(next) {

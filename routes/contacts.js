@@ -35,7 +35,8 @@ router.post('/', async (req, res) => {
   try {
     const contact = await Contact.create({
       ...req.body,
-      userId: req.user.id
+      userId: req.user.id,
+      sourceType: 'manual'
     });
     res.status(201).json(contact);
   } catch (error) {
@@ -98,6 +99,7 @@ router.post('/import', async (req, res) => {
             email: contactData.email || '',
             tags: Array.isArray(contactData.tags) ? contactData.tags : [],
             isBlocked: contactData.status === 'Opted-out',
+            sourceType: 'imported',
             lastContact: new Date(),
             createdAt: new Date(),
             updatedAt: new Date()

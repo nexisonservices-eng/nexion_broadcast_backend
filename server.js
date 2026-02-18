@@ -250,6 +250,7 @@ async function handleIncomingMessage(messageData, value) {
         userId,
         phone: from,
         name: value.contacts?.[0]?.profile?.name || from,
+        sourceType: 'incoming_message',
         lastContact: new Date()
       });
     } else {
@@ -677,7 +678,7 @@ app.get('/api/contacts', auth, async (req, res) => {
 // Create contact
 app.post('/api/contacts', auth, async (req, res) => {
   try {
-    const contact = await Contact.create({ ...req.body, userId: req.user.id });
+    const contact = await Contact.create({ ...req.body, userId: req.user.id, sourceType: 'manual' });
     res.json(contact);
   } catch (error) {
     res.status(500).json({ error: error.message });

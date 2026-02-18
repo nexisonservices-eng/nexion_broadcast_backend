@@ -3,8 +3,63 @@ const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
 const whatsappService = require('./whatsappService');
+const { getWhatsAppCredentialsForUser } = require('./userWhatsAppCredentialsService');
 
 class BroadcastService {
+  async resolveCredentialsForBroadcast(broadcast, credentials = null) {
+    if (credentials) return credentials;
+
+    const authHeader = String(broadcast?.authHeaderSnapshot || '').trim();
+    if (authHeader.startsWith('Bearer ')) {
+      try {
+        const fetched = await getWhatsAppCredentialsForUser({
+          authHeader,
+          userId: String(broadcast?.createdById || '')
+        });
+        if (fetched) {
+          return fetched;
+        }
+      } catch (error) {
+        console.error(`Failed to fetch admin credentials for scheduled broadcast ${broadcast?._id}:`, error.message);
+      }
+    }
+
+    const snapshot = broadcast?.credentialsSnapshot || null;
+    const accessToken = String(snapshot?.accessToken || snapshot?.whatsappToken || '').trim();
+    const businessAccountId = String(snapshot?.businessAccountId || snapshot?.whatsappBusiness || '').trim();
+    const phoneNumberId = String(snapshot?.phoneNumberId || snapshot?.whatsappId || '').trim();
+
+    if (accessToken && businessAccountId && phoneNumberId) {
+      return {
+        accessToken,
+        businessAccountId,
+        phoneNumberId,
+        whatsappToken: accessToken,
+        whatsappBusiness: businessAccountId,
+        whatsappId: phoneNumberId,
+        twilioId: snapshot?.twilioId || null
+      };
+    }
+
+    const envAccessToken = String(process.env.WHATSAPP_ACCESS_TOKEN || '').trim();
+    const envBusinessAccountId = String(process.env.WHATSAPP_BUSINESS_ACCOUNT_ID || '').trim();
+    const envPhoneNumberId = String(process.env.WHATSAPP_PHONE_NUMBER_ID || '').trim();
+
+    if (envAccessToken && envBusinessAccountId && envPhoneNumberId) {
+      return {
+        accessToken: envAccessToken,
+        businessAccountId: envBusinessAccountId,
+        phoneNumberId: envPhoneNumberId,
+        whatsappToken: envAccessToken,
+        whatsappBusiness: envBusinessAccountId,
+        whatsappId: envPhoneNumberId,
+        twilioId: null
+      };
+    }
+
+    return null;
+  }
+
   async resolveTemplatePreviewTextFromMeta(templateName, language, credentials) {
     try {
       const listResult = await whatsappService.getTemplateList(credentials || null);
@@ -94,7 +149,7 @@ class BroadcastService {
         return { success: false, error: 'Broadcast not found' };
       }
 
-      const resolvedCredentials = credentials;
+      const resolvedCredentials = await this.resolveCredentialsForBroadcast(broadcast, credentials);
 
       if (!resolvedCredentials) {
         return { success: false, error: 'WhatsApp credentials are not configured for this user' };
@@ -257,7 +312,16 @@ class BroadcastService {
     try {
       let contact = await Contact.findOne({ userId, phone });
       if (!contact) {
-        contact = await Contact.create({ userId, phone, name: '' });
+        contact = await Contact.create({
+          userId,
+          phone,
+          name: '',
+          sourceType: 'incoming_message'
+        });
+      } else if (broadcastId && contact.sourceType !== 'incoming_message') {
+        // If this contact is being used in broadcast message flow, mark source as message-origin.
+        contact.sourceType = 'incoming_message';
+        await contact.save();
       }
 
       let conversation = await Conversation.findOne({ userId, contactPhone: phone, status: { $in: ['active', 'pending'] } });
@@ -505,8 +569,12 @@ class BroadcastService {
         console.log(`📅 Current time: ${now}`);
         
         try {
-          await this.sendBroadcast(broadcast._id);
-          console.log(`✅ Successfully sent scheduled broadcast: ${broadcast.name}`);
+          const result = await this.sendBroadcast(broadcast._id);
+          if (result?.success) {
+            console.log(`✅ Successfully sent scheduled broadcast: ${broadcast.name}`);
+          } else {
+            console.error(`❌ Scheduled broadcast failed: ${broadcast.name}: ${result?.error || 'Unknown error'}`);
+          }
         } catch (error) {
           console.error(`❌ Failed to send scheduled broadcast ${broadcast.name}:`, error);
         }

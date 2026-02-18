@@ -8,6 +8,11 @@ const ContactSchema = new mongoose.Schema({
   tags: [{ type: String }],
   customFields: mongoose.Schema.Types.Mixed,
   notes: String,
+  sourceType: {
+    type: String,
+    enum: ['manual', 'imported', 'incoming_message'],
+    default: 'manual'
+  },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
   lastContact: Date,

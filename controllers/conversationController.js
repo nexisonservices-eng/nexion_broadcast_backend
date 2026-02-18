@@ -156,7 +156,8 @@ class ConversationController {
         phone,
         email,
         tags: tags || [],
-        notes
+        notes,
+        sourceType: 'manual'
       });
       
       res.status(201).json({ success: true, data: contact });
