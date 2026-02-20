@@ -188,6 +188,10 @@ class WhatsAppService {
         error.response?.data?.error?.error_user_msg ||
         '';
 
+      const shouldRetryOnLanguage =
+        /language/i.test(metaMessage) &&
+        (/translation/i.test(metaMessage) || /does not exist/i.test(metaMessage));
+
       if (retryOnNotFound && /template .* not found/i.test(metaMessage)) {
         try {
           const listResult = await this.getTemplateList(credentials || null);
@@ -214,12 +218,57 @@ class WhatsAppService {
         }
       }
 
+      if (retryOnNotFound && shouldRetryOnLanguage) {
+        try {
+          const listResult = await this.getTemplateList(credentials || null);
+          if (listResult.success) {
+            const templates = listResult.data?.data || [];
+            const sameName = templates.filter(
+              (t) =>
+                String(t.name || '').trim().toLowerCase() ===
+                String(normalizedTemplateName || '').trim().toLowerCase()
+            );
+            const candidate = sameName.find(
+              (t) =>
+                String(t.language || '').trim().toLowerCase() !==
+                String(language || '').trim().toLowerCase()
+            );
+            if (candidate?.language) {
+              console.log(
+                `🔁 Retrying template send with Meta-available language: ${candidate.language}`
+              );
+              return this.sendTemplateMessage(
+                to,
+                normalizedTemplateName,
+                candidate.language,
+                variables,
+                credentials,
+                false
+              );
+            }
+          }
+        } catch (retryError) {
+          console.error('Template language retry resolution failed:', retryError.message);
+        }
+      }
+
+      let normalizedError = metaMessage;
+      if (!normalizedError) {
+        const rawError = error.response?.data || error.message;
+        if (typeof rawError === 'string') {
+          normalizedError = rawError;
+        } else {
+          try {
+            normalizedError = JSON.stringify(rawError);
+          } catch (stringifyError) {
+            normalizedError = 'Unknown WhatsApp API error';
+          }
+        }
+      }
+
       return {
         success: false,
-        error:
-          metaMessage ||
-          error.response?.data ||
-          error.message
+        error: normalizedError
       };
     }
   }

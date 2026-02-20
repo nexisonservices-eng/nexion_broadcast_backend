@@ -13,10 +13,12 @@ connectDB();
 
 // Services
 const broadcastService = require('./services/broadcastService');
+const missedCallAutomationService = require('./services/missedCallAutomationService');
 const templateController = require('./controllers/templateController');
 
 // Models
 const Contact = require('./models/Contact');
+const Template = require('./models/Template');
 const Conversation = require('./models/Conversation');
 const Message = require('./models/Message');
 const Broadcast = require('./models/Broadcast');
@@ -36,6 +38,7 @@ const broadcastRoutes = require('./routes/broadcasts');
 const conversationRoutes = require('./routes/conversations');
 const messageRoutes = require('./routes/messages');
 const contactRoutes = require('./routes/contacts');
+const missedCallRoutes = require('./routes/missedCalls');
 
 const app = express();
 const server = http.createServer(app);
@@ -87,6 +90,7 @@ app.use(cors({
 app.options("*", cors());
 
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 // API Routes - Moved up before WebSocket and other route handlers
 app.use('/api/bulk', bulkRoutes);
 app.use('/api/templates', templateRoutes);
@@ -94,6 +98,7 @@ app.use('/api/broadcasts', broadcastRoutes);
 app.use('/api/conversations', conversationRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/contacts', contactRoutes);
+app.use('/api/missedcalls', missedCallRoutes);
 
 // ============ WEBSOCKET MANAGEMENT ============
 
@@ -905,6 +910,7 @@ function startScheduler() {
       }
       
       await broadcastService.checkScheduledBroadcasts();
+      await missedCallAutomationService.processPendingMissedCalls({ app });
       
       // Also check for recent message status updates and sync broadcast stats
       // removed automatic stat backfill to avoid metric fluctuations

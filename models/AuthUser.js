@@ -7,7 +7,9 @@ const AuthUserSchema = new mongoose.Schema(
     whatsapptoken: String,
     whatsappbussiness: String,
     whatsappid: String,
-    twilioid: String
+    twilioid: String,
+    phonenumber: String,
+    missedcallwebhook: String
   },
   {
     strict: false,

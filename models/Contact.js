@@ -10,7 +10,7 @@ const ContactSchema = new mongoose.Schema({
   notes: String,
   sourceType: {
     type: String,
-    enum: ['manual', 'imported', 'incoming_message'],
+    enum: ['manual', 'imported', 'incoming_message', 'incoming_call'],
     default: 'manual'
   },
   createdAt: { type: Date, default: Date.now },
