@@ -307,6 +307,7 @@ router.get('/settings', async (req, res) => {
     return res.json({
       success: true,
       data: {
+        missedCallWebhook: String(creds?.missedCallWebhook || '').trim(),
         missedCallAutomationEnabled: creds?.missedCallAutomationEnabled !== false,
         missedCallDelayMinutes:
           Number.isFinite(Number(creds?.missedCallDelayMinutes))
@@ -391,6 +392,7 @@ router.put('/settings', async (req, res) => {
     return res.json({
       success: true,
       data: {
+        missedCallWebhook: String(updated?.missedCallWebhook || '').trim(),
         missedCallAutomationEnabled: updated.missedCallAutomationEnabled !== false,
         missedCallDelayMinutes:
           Number.isFinite(Number(updated.missedCallDelayMinutes))
