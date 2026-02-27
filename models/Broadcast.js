@@ -93,5 +93,7 @@ BroadcastSchema.set('toObject', { virtuals: true });
 
 BroadcastSchema.index({ status: 1, createdAt: -1 });
 BroadcastSchema.index({ createdBy: 1 });
+BroadcastSchema.index({ createdById: 1, createdAt: -1 });
+BroadcastSchema.index({ createdById: 1, status: 1, createdAt: -1 });
 
 module.exports = mongoose.model('Broadcast', BroadcastSchema);

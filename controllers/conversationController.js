@@ -8,7 +8,6 @@ class ConversationController {
     try {
       const { status, assignedTo, search } = req.query;
       const filters = { userId: req.user.id };
-      const userObjectId = new mongoose.Types.ObjectId(req.user.id);
       
       if (status) filters.status = status;
       if (assignedTo) filters.assignedTo = assignedTo;
@@ -17,10 +16,16 @@ class ConversationController {
         .populate('contactId')
         .sort({ lastMessageTime: -1 });
 
-      const unreadCounts = await Message.aggregate([
+      const conversationIds = conversations.map((conv) => conv._id);
+      const userMatchId = mongoose.Types.ObjectId.isValid(req.user.id)
+        ? new mongoose.Types.ObjectId(req.user.id)
+        : req.user.id;
+
+      const unreadRows = await Message.aggregate([
         {
           $match: {
-            userId: userObjectId,
+            userId: userMatchId,
+            conversationId: { $in: conversationIds },
             sender: 'contact',
             status: 'received'
           }
@@ -28,18 +33,23 @@ class ConversationController {
         {
           $group: {
             _id: '$conversationId',
-            count: { $sum: 1 }
+            unreadCount: { $sum: 1 }
           }
         }
       ]);
 
       const unreadMap = new Map(
-        unreadCounts.map((item) => [String(item._id), item.count || 0])
+        unreadRows.map((row) => [String(row._id), Number(row.unreadCount) || 0])
       );
 
       conversations = conversations.map((conv) => {
-        const unread = unreadMap.get(String(conv._id)) || 0;
-        conv.unreadCount = unread;
+        const fromMessages = unreadMap.get(String(conv._id));
+        const fromConversation = Number(conv.unreadCount || 0);
+        conv.unreadCount = Number.isFinite(fromMessages)
+          ? Math.max(0, fromMessages)
+          : Number.isFinite(fromConversation)
+            ? Math.max(0, fromConversation)
+            : 0;
         return conv;
       });
       

@@ -6,6 +6,262 @@ const whatsappService = require('./whatsappService');
 const { getWhatsAppCredentialsForUser } = require('./userWhatsAppCredentialsService');
 
 class BroadcastService {
+  normalizePhoneNumber(phone) {
+    return String(phone || '').replace(/\D/g, '');
+  }
+
+  getStatusScore(status) {
+    const normalized = String(status || '').toLowerCase();
+    if (normalized === 'read') return 4;
+    if (normalized === 'delivered') return 3;
+    if (normalized === 'sent') return 2;
+    if (normalized === 'failed') return 1;
+    return 0;
+  }
+
+  async buildRecipientStatusDetails(broadcast) {
+    const recipients = Array.isArray(broadcast?.recipients) ? broadcast.recipients : [];
+    const detailsByPhone = new Map();
+    recipients.forEach((recipient) => {
+      const rawPhone = recipient?.phone || recipient;
+      const normalizedPhone = this.normalizePhoneNumber(rawPhone);
+      if (!normalizedPhone) return;
+      detailsByPhone.set(normalizedPhone, {
+        phone: rawPhone,
+        name: recipient?.name || '',
+        sent: false,
+        delivered: false,
+        read: false,
+        failed: false,
+        replied: false,
+        replyCount: 0,
+        status: 'pending',
+        lastSentAt: null,
+        lastStatusAt: null,
+        lastReplyAt: null,
+        lastReplyText: ''
+      });
+    });
+
+    const startTime = new Date(broadcast.startedAt || broadcast.createdAt || Date.now());
+    const completedAt = new Date(broadcast.completedAt || startTime);
+    const endTime = new Date(completedAt);
+    endTime.setDate(endTime.getDate() + 1);
+
+    let outboundMessages = await Message.find({
+      userId: broadcast.createdById,
+      sender: 'agent',
+      broadcastId: broadcast._id
+    })
+      .select('conversationId status timestamp text')
+      .sort({ timestamp: 1 })
+      .lean();
+
+    // Legacy fallback: old records may not have broadcastId tagged.
+    // In that case, find agent messages in recipient conversations during campaign window.
+    if (outboundMessages.length === 0 && detailsByPhone.size > 0) {
+      const recipientPhoneVariants = Array.from(detailsByPhone.keys());
+      const recipientPhoneRegex = recipientPhoneVariants.map((phone) => new RegExp(`${phone}$`));
+      const legacyConversations = await Conversation.find({
+        userId: broadcast.createdById,
+        $or: [
+          { contactPhone: { $in: recipientPhoneVariants } },
+          ...recipientPhoneRegex.map((phoneRegex) => ({ contactPhone: phoneRegex }))
+        ]
+      })
+        .select('_id contactPhone contactName')
+        .lean();
+
+      const legacyConversationIds = legacyConversations.map((item) => item._id);
+      if (legacyConversationIds.length > 0) {
+        outboundMessages = await Message.find({
+          userId: broadcast.createdById,
+          sender: 'agent',
+          conversationId: { $in: legacyConversationIds },
+          timestamp: { $gte: startTime, $lte: endTime }
+        })
+          .select('conversationId status timestamp text')
+          .sort({ timestamp: 1 })
+          .lean();
+      }
+    }
+
+    const conversationIds = Array.from(
+      new Set(outboundMessages.map((message) => String(message.conversationId || '')).filter(Boolean))
+    );
+
+    const conversations = conversationIds.length
+      ? await Conversation.find({ _id: { $in: conversationIds } })
+          .select('_id contactPhone contactName')
+          .lean()
+      : [];
+
+    const conversationPhoneMap = new Map();
+    conversations.forEach((conversation) => {
+      conversationPhoneMap.set(String(conversation._id), {
+        normalizedPhone: this.normalizePhoneNumber(conversation.contactPhone),
+        rawPhone: conversation.contactPhone,
+        contactName: conversation.contactName || ''
+      });
+    });
+
+    outboundMessages.forEach((message) => {
+      const conversationEntry = conversationPhoneMap.get(String(message.conversationId || ''));
+      const normalizedPhone = conversationEntry?.normalizedPhone;
+      if (!normalizedPhone) return;
+
+      if (!detailsByPhone.has(normalizedPhone)) {
+        detailsByPhone.set(normalizedPhone, {
+          phone: conversationEntry?.rawPhone || normalizedPhone,
+          name: conversationEntry?.contactName || '',
+          sent: false,
+          delivered: false,
+          read: false,
+          failed: false,
+          replied: false,
+          replyCount: 0,
+          status: 'pending',
+          lastSentAt: null,
+          lastStatusAt: null,
+          lastReplyAt: null,
+          lastReplyText: ''
+        });
+      }
+
+      const detail = detailsByPhone.get(normalizedPhone);
+      const status = String(message.status || 'sent').toLowerCase();
+      const messageTime = message.timestamp ? new Date(message.timestamp) : null;
+
+      detail.sent = true;
+      if (!detail.lastSentAt || (messageTime && messageTime > new Date(detail.lastSentAt))) {
+        detail.lastSentAt = messageTime;
+      }
+
+      if (!detail.name && conversationEntry?.contactName) {
+        detail.name = conversationEntry.contactName;
+      }
+      if (!detail.phone && conversationEntry?.rawPhone) {
+        detail.phone = conversationEntry.rawPhone;
+      }
+
+      if (status === 'delivered' || status === 'read') detail.delivered = true;
+      if (status === 'read') detail.read = true;
+      if (status === 'failed') detail.failed = true;
+
+      const currentScore = this.getStatusScore(detail.status);
+      const nextScore = this.getStatusScore(status);
+      if (nextScore >= currentScore) {
+        detail.status = status;
+      }
+
+      if (!detail.lastStatusAt || (messageTime && messageTime > new Date(detail.lastStatusAt))) {
+        detail.lastStatusAt = messageTime;
+      }
+    });
+
+    const firstSentTimeByConversation = new Map();
+    outboundMessages.forEach((message) => {
+      const key = String(message.conversationId || '');
+      if (!key || !message.timestamp) return;
+      const current = firstSentTimeByConversation.get(key);
+      const candidate = new Date(message.timestamp);
+      if (!current || candidate < current) {
+        firstSentTimeByConversation.set(key, candidate);
+      }
+    });
+
+    const incomingMessages = conversationIds.length
+      ? await Message.find({
+          userId: broadcast.createdById,
+          sender: 'contact',
+          conversationId: { $in: conversationIds },
+          timestamp: { $gte: startTime }
+        })
+          .select('conversationId text timestamp')
+          .sort({ timestamp: 1 })
+          .lean()
+      : [];
+
+    incomingMessages.forEach((message) => {
+      const conversationId = String(message.conversationId || '');
+      const conversationEntry = conversationPhoneMap.get(conversationId);
+      const normalizedPhone = conversationEntry?.normalizedPhone;
+      if (!normalizedPhone) return;
+
+      if (!detailsByPhone.has(normalizedPhone)) {
+        detailsByPhone.set(normalizedPhone, {
+          phone: conversationEntry?.rawPhone || normalizedPhone,
+          name: conversationEntry?.contactName || '',
+          sent: false,
+          delivered: false,
+          read: false,
+          failed: false,
+          replied: false,
+          replyCount: 0,
+          status: 'pending',
+          lastSentAt: null,
+          lastStatusAt: null,
+          lastReplyAt: null,
+          lastReplyText: ''
+        });
+      }
+
+      const firstSentTime = firstSentTimeByConversation.get(conversationId);
+      const replyTime = message.timestamp ? new Date(message.timestamp) : null;
+      if (firstSentTime && replyTime && replyTime < firstSentTime) return;
+
+      const detail = detailsByPhone.get(normalizedPhone);
+      detail.replied = true;
+      detail.replyCount += 1;
+      detail.lastReplyAt = replyTime || detail.lastReplyAt;
+      detail.lastReplyText = String(message.text || '').trim();
+    });
+
+    // Final fallback: populate missing names from contacts table.
+    const missingNamePhones = Array.from(detailsByPhone.entries())
+      .filter(([, detail]) => !String(detail?.name || '').trim())
+      .map(([normalizedPhone]) => normalizedPhone)
+      .filter(Boolean);
+
+    if (missingNamePhones.length > 0) {
+      const contactPhoneRegex = missingNamePhones.map((phone) => new RegExp(`${phone}$`));
+      const contacts = await Contact.find({
+        userId: broadcast.createdById,
+        $or: [
+          { phone: { $in: missingNamePhones } },
+          ...contactPhoneRegex.map((phoneRegex) => ({ phone: phoneRegex }))
+        ]
+      })
+        .select('phone name')
+        .lean();
+
+      const contactNameByPhone = new Map();
+      contacts.forEach((contact) => {
+        const normalized = this.normalizePhoneNumber(contact?.phone);
+        const name = String(contact?.name || '').trim();
+        if (normalized && name && !contactNameByPhone.has(normalized)) {
+          contactNameByPhone.set(normalized, name);
+        }
+      });
+
+      missingNamePhones.forEach((normalizedPhone) => {
+        const detail = detailsByPhone.get(normalizedPhone);
+        if (!detail) return;
+        const fallbackName = contactNameByPhone.get(normalizedPhone);
+        if (fallbackName) {
+          detail.name = fallbackName;
+        }
+      });
+    }
+
+    return Array.from(detailsByPhone.values()).map((detail) => ({
+      ...detail,
+      lastSentAt: detail.lastSentAt || null,
+      lastStatusAt: detail.lastStatusAt || null,
+      lastReplyAt: detail.lastReplyAt || null
+    }));
+  }
+
   async resolveCredentialsForBroadcast(broadcast, credentials = null) {
     if (credentials) return credentials;
 
@@ -362,8 +618,11 @@ class BroadcastService {
 
   async getBroadcasts(filters = {}) {
     try {
+      // Keep list endpoint lightweight for fast overview updates.
       const broadcasts = await Broadcast.find(filters)
-        .sort({ createdAt: -1 });
+        .select('name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language')
+        .sort({ createdAt: -1 })
+        .lean();
       return { success: true, data: broadcasts };
     } catch (error) {
       return { success: false, error: error.message };
@@ -376,7 +635,10 @@ class BroadcastService {
       if (!broadcast) {
         return { success: false, error: 'Broadcast not found' };
       }
-      return { success: true, data: broadcast };
+      const recipientDetails = await this.buildRecipientStatusDetails(broadcast);
+      const data = broadcast.toObject ? broadcast.toObject() : broadcast;
+      data.recipientDetails = recipientDetails;
+      return { success: true, data };
     } catch (error) {
       return { success: false, error: error.message };
     }

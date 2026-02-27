@@ -234,9 +234,19 @@ class TemplateController {
   async syncWhatsAppTemplates(req, res) {
     try {
       console.log(' Starting template sync from Meta WhatsApp Business API...');
+
+      const userId = req?.user?.id || req?.user?._id || req?.syncUserId || null;
+      if (!userId) {
+        return res.status(400).json({
+          success: false,
+          error: 'Template sync requires a user context (req.user.id or syncUserId)'
+        });
+      }
+
+      const credentials = req?.whatsappCredentials || null;
       
       // 1. Authenticate with Meta API and fetch templates
-      const result = await whatsappService.getTemplateList(req.whatsappCredentials);
+      const result = await whatsappService.getTemplateList(credentials);
       
       if (!result.success) {
         return res.status(500).json({ 
@@ -255,7 +265,7 @@ class TemplateController {
         try {
           // Check if template already exists
           const existingTemplate = await Template.findOne({
-            userId: req.user.id,
+            userId,
             whatsappTemplateId: wt.id
           });
 
@@ -296,7 +306,7 @@ class TemplateController {
             // Create template object for our database
             const headerComponent = components.find(c => c.type === 'header');
             const templateData = {
-              userId: req.user.id,
+              userId,
               name: wt.name,
               type: 'official',
               category: wt.category || 'utility',
@@ -321,7 +331,7 @@ class TemplateController {
               createdAt: new Date(),
               updatedAt: new Date(),
               syncedAt: new Date(),
-              createdById: req.user.id
+              createdById: userId
             };
 
             const newTemplate = await Template.create(templateData);
@@ -468,7 +478,6 @@ class TemplateController {
 }
 
 module.exports = new TemplateController();
-
 
 
 
