@@ -6,6 +6,14 @@ const cors = require('cors');
 const WebSocket = require('ws');
 const cron = require('node-cron');
 
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+});
+
 // Database connection
 const connectDB = require('./config/database');
 const mongoose = require('mongoose');
@@ -22,9 +30,12 @@ const Template = require('./models/Template');
 const Conversation = require('./models/Conversation');
 const Message = require('./models/Message');
 const Broadcast = require('./models/Broadcast');
+const MetaAdsTransaction = require('./models/MetaAdsTransaction');
+const MetaAdsWallet = require('./models/MetaAdsWallet');
 const whatsappService = require('./services/whatsappService');
 const whatsappConfig = require('./config/whatsapp');
 const auth = require('./middleware/auth');
+const metaAdsService = require('./services/metaAdsService');
 const requireWhatsAppCredentials = require('./middleware/requireWhatsAppCredentials');
 const {
   resolveUserIdByPhoneNumberId,
@@ -39,6 +50,7 @@ const conversationRoutes = require('./routes/conversations');
 const messageRoutes = require('./routes/messages');
 const contactRoutes = require('./routes/contacts');
 const missedCallRoutes = require('./routes/missedCalls');
+const metaAdsRoutes = require('./routes/metaAds');
 
 const app = express();
 const server = http.createServer(app);
@@ -101,6 +113,7 @@ app.use('/api/conversations', conversationRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/contacts', contactRoutes);
 app.use('/api/missedcalls', missedCallRoutes);
+app.use('/api/meta-ads', metaAdsRoutes);
 
 // ============ WEBSOCKET MANAGEMENT ============
 
@@ -1064,7 +1077,7 @@ server.listen(PORT, async () => {
   
   // Start the scheduler for checking scheduled broadcasts
   try {
-    await Promise.all([Contact.syncIndexes(), Template.syncIndexes()]);
+    await Promise.all([Contact.syncIndexes(), Template.syncIndexes(), MetaAdsWallet.syncIndexes(), MetaAdsTransaction.syncIndexes()]);
     console.log('MongoDB indexes synced for user-scoped data models.');
   } catch (indexError) {
     console.error('Failed to sync MongoDB indexes:', indexError.message);
@@ -1156,6 +1169,22 @@ function startScheduler() {
   });
 
   console.log('✅ Broadcast scheduler started - checking every minute');
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      if (mongoose.connection.readyState !== 1) {
+        console.log('Skipping Meta Ads sync: database not connected');
+        return;
+      }
+
+      const result = await metaAdsService.syncAllCampaignAnalytics();
+      if (result.synced || result.warnings.length) {
+        console.log(`Meta Ads sync completed. Synced: ${result.synced}, warnings: ${result.warnings.length}`);
+      }
+    } catch (error) {
+      console.error('Meta Ads sync error:', error.message);
+    }
+  });
+
   console.log('Template auto-sync disabled: run per user via authenticated API.');
 }
 
