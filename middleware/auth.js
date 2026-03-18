@@ -4,7 +4,10 @@ const jwt = require('jsonwebtoken');
 // In production, this should be properly configured via environment variables
 const JWT_SECRET = process.env.JWT_SECRET || 'technova_jwt_secret_key_2024';
 
-module.exports = (req, res, next) => {
+/**
+ * Authentication guard: verifies Bearer token and attaches user info.
+ */
+const protect = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization || '';
     if (!authHeader.startsWith('Bearer ')) {
@@ -30,3 +33,20 @@ module.exports = (req, res, next) => {
     return res.status(401).json({ success: false, error: 'Unauthorized: invalid token' });
   }
 };
+
+/**
+ * Role-based authorization guard.
+ * Usage: router.use(authorize('admin', 'superadmin'));
+ */
+const authorize = (...roles) => (req, res, next) => {
+  if (!req.user || !roles.includes(req.user.role)) {
+    return res.status(403).json({ success: false, error: 'Forbidden: insufficient permissions' });
+  }
+  next();
+};
+
+// Export both default middleware for backward compatibility (router.use(auth))
+// and named helpers for explicit imports.
+module.exports = protect;
+module.exports.protect = protect;
+module.exports.authorize = authorize;

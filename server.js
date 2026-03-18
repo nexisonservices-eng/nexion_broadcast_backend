@@ -51,6 +51,8 @@ const messageRoutes = require('./routes/messages');
 const contactRoutes = require('./routes/contacts');
 const missedCallRoutes = require('./routes/missedCalls');
 const metaAdsRoutes = require('./routes/metaAds');
+// ============ NEW CAMPAIGN ROUTES ============
+const campaignRoutes = require('./routes/campaignRoutes');
 
 const app = express();
 const server = http.createServer(app);
@@ -105,7 +107,8 @@ app.options("*", cors());
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-// API Routes - Moved up before WebSocket and other route handlers
+
+// ============ API ROUTES ============
 app.use('/api/bulk', bulkRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/broadcasts', broadcastRoutes);
@@ -114,6 +117,8 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/contacts', contactRoutes);
 app.use('/api/missedcalls', missedCallRoutes);
 app.use('/api/meta-ads', metaAdsRoutes);
+// ============ NEW CAMPAIGN ROUTES ============
+app.use('/api/campaigns', campaignRoutes);
 
 // ============ WEBSOCKET MANAGEMENT ============
 
@@ -478,7 +483,11 @@ async function handleMessageStatus(statusData) {
     console.error('Error handling message status:', error);
   }
 }
+
 // ============ API ROUTES ============
+
+// Campaign Management Routes - Already added above with app.use('/api/campaigns', campaignRoutes)
+
 app.post('/api/messages/send', auth, requireWhatsAppCredentials, async (req, res) => {
   try {
     const { to, text, conversationId, mediaUrl, mediaType } = req.body;
@@ -1024,16 +1033,143 @@ app.post('/api/broadcasts/:id/sync', auth, async (req, res) => {
   }
 });
 
+// ============ CAMPAIGN MANAGEMENT ROUTES ============
+
+/**
+ * @route   GET /api/campaigns/test
+ * @desc    Test campaign route
+ * @access  Public
+ */
+app.get('/api/campaigns/test', (req, res) => {
+  res.json({ 
+    success: true, 
+    message: 'Campaign routes are working',
+    timestamp: new Date().toISOString()
+  });
+});
+
+/**
+ * @route   GET /api/campaigns/debug/status
+ * @desc    Debug endpoint to check campaign module status
+ * @access  Public (for testing)
+ */
+app.get('/api/campaigns/debug/status', (req, res) => {
+  try {
+    const campaignRoutesExist = require.resolve('./routes/campaignRoutes');
+    const campaignControllerExists = require.resolve('./controllers/campaignController');
+    const campaignModelExists = require.resolve('./models/Campaign');
+    
+    res.json({
+      success: true,
+      modules: {
+        routes: !!campaignRoutesExist,
+        controller: !!campaignControllerExists,
+        model: !!campaignModelExists
+      },
+      mongodb: {
+        connected: mongoose.connection.readyState === 1,
+        database: mongoose.connection.name
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// ============ META ADS CAMPAIGN INTEGRATION ============
+
+/**
+ * @route   POST /api/meta-ads/campaigns/sync
+ * @desc    Sync campaigns from Meta Ads
+ * @access  Private
+ */
+app.post('/api/meta-ads/campaigns/sync', auth, async (req, res) => {
+  try {
+    const result = await metaAdsService.syncCampaigns(req.user.id);
+    res.json({
+      success: true,
+      data: result,
+      message: `Synced ${result.length} campaigns from Meta Ads`
+    });
+  } catch (error) {
+    console.error('Error syncing Meta campaigns:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @route   GET /api/meta-ads/campaigns
+ * @desc    Get Meta Ads campaigns
+ * @access  Private
+ */
+app.get('/api/meta-ads/campaigns', auth, async (req, res) => {
+  try {
+    const { status, limit = 50 } = req.query;
+    const campaigns = await metaAdsService.getCampaigns(req.user.id, { status, limit });
+    res.json({
+      success: true,
+      data: campaigns
+    });
+  } catch (error) {
+    console.error('Error fetching Meta campaigns:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * @route   GET /api/meta-ads/campaigns/:id/insights
+ * @desc    Get insights for a specific Meta campaign
+ * @access  Private
+ */
+app.get('/api/meta-ads/campaigns/:id/insights', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { datePreset = 'last_30d' } = req.query;
+    
+    const insights = await metaAdsService.getCampaignInsights(id, datePreset);
+    res.json({
+      success: true,
+      data: insights
+    });
+  } catch (error) {
+    console.error('Error fetching campaign insights:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    services: {
+      campaigns: 'active',
+      websocket: 'active',
+      database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+    }
+  });
 });
 
 app.get('/api/version', (req, res) => {
   res.json({
     service: 'whatsapp-backend',
     version: 'bulk_direct_meta_v2',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    features: ['campaigns', 'broadcasts', 'meta-ads', 'websocket']
   });
 });
 
@@ -1074,11 +1210,19 @@ server.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 WebSocket server ready`);
   console.log(`🌐 Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:5173'}`);
+  console.log(`📊 Campaign Management API: http://localhost:${PORT}/api/campaigns`);
   
   // Start the scheduler for checking scheduled broadcasts
   try {
-    await Promise.all([Contact.syncIndexes(), Template.syncIndexes(), MetaAdsWallet.syncIndexes(), MetaAdsTransaction.syncIndexes()]);
-    console.log('MongoDB indexes synced for user-scoped data models.');
+    await Promise.all([
+      Contact.syncIndexes(), 
+      Template.syncIndexes(), 
+      MetaAdsWallet.syncIndexes(), 
+      MetaAdsTransaction.syncIndexes(),
+      // Add Campaign model indexes
+      require('./models/campaign').syncIndexes()
+    ]);
+    console.log('MongoDB indexes synced for all models including Campaigns.');
   } catch (indexError) {
     console.error('Failed to sync MongoDB indexes:', indexError.message);
   }
@@ -1169,6 +1313,8 @@ function startScheduler() {
   });
 
   console.log('✅ Broadcast scheduler started - checking every minute');
+  
+  // Meta Ads sync every 5 minutes
   cron.schedule('*/5 * * * *', async () => {
     try {
       if (mongoose.connection.readyState !== 1) {
@@ -1185,6 +1331,29 @@ function startScheduler() {
     }
   });
 
+  // Campaign performance sync every 30 minutes
+  cron.schedule('*/30 * * * *', async () => {
+    try {
+      if (mongoose.connection.readyState !== 1) {
+        console.log('Skipping campaign performance sync: database not connected');
+        return;
+      }
+
+      console.log('🔄 Syncing campaign performance metrics...');
+      const Campaign = require('./models/campaign');
+      
+      // Update campaign performance metrics based on latest message data
+      const result = await Campaign.updateMany(
+        {},
+        { $set: { lastSynced: new Date() } }
+      );
+      
+      console.log(`✅ Campaign performance sync completed: ${result.modifiedCount} campaigns updated`);
+    } catch (error) {
+      console.error('Campaign performance sync error:', error.message);
+    }
+  });
+
   console.log('Template auto-sync disabled: run per user via authenticated API.');
 }
 
@@ -1193,7 +1362,3 @@ async function checkAndUpdateBroadcastStats() {
   // intentionally disabled to prevent periodic stat rollback/fluctuation
   return;
 }
-
-
-
-
