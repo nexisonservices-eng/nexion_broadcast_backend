@@ -54,7 +54,7 @@ const missedCallRoutes = require('./routes/missedCalls');
 const metaAdsRoutes = require('./routes/metaAds');
 const insightsRoutes = require('./routes/insights');
 // ============ NEW CAMPAIGN ROUTES ============
-const campaignRoutes = require('./routes/campaignRoutes');
+const campaignRoutes = require('./routes/campaignroutes');
 
 const app = express();
 const server = http.createServer(app);
@@ -1071,9 +1071,9 @@ app.get('/api/campaigns/test', (req, res) => {
  */
 app.get('/api/campaigns/debug/status', (req, res) => {
   try {
-    const campaignRoutesExist = require.resolve('./routes/campaignRoutes');
-    const campaignControllerExists = require.resolve('./controllers/campaignController');
-    const campaignModelExists = require.resolve('./models/Campaign');
+    const campaignRoutesExist = require.resolve('./routes/campaignroutes');
+    const campaignControllerExists = require.resolve('./controllers/campaigncontroller');
+    const campaignModelExists = require.resolve('./models/campaign');
     
     res.json({
       success: true,
