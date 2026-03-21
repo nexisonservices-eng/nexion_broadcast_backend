@@ -118,6 +118,12 @@ app.options("*", cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Backward-compatible redirect for older Meta OAuth callback URLs.
+app.get('/auth/meta/callback', (req, res) => {
+  const query = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+  res.redirect(`/api/meta-ads/oauth/callback${query}`);
+});
+
 const metaEnvValidation = validateMetaAdsEnv();
 if (metaEnvValidation.warnings.length) {
   console.warn('Meta Ads configuration warnings:', metaEnvValidation.warnings.join(' '));
