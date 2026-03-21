@@ -1,10 +1,12 @@
 // routes/campaignRoutes.js
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
 const { body, param, query, validationResult } = require('express-validator');
 const { protect, authorize } = require('../middleware/auth');
 const Campaign = require('../models/campaign');
 const campaignController = require('../controllers/campaigncontroller');
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Validation middleware
 const validate = (req, res, next) => {
@@ -16,6 +18,11 @@ const validate = (req, res, next) => {
         });
     }
     next();
+};
+
+const isLocalOrMetaCampaignId = (value) => {
+    const normalized = String(value || '').trim();
+    return /^[a-f\d]{24}$/i.test(normalized) || /^meta_[A-Za-z0-9_]+$/i.test(normalized);
 };
 
 // Campaign validation rules
@@ -202,6 +209,7 @@ router.get(
  */
 router.post(
     '/',
+    upload.single('creativeImage'),
     campaignValidation,
     validate,
     campaignController.createCampaign
@@ -230,6 +238,7 @@ router.get(
  */
 router.put(
     '/:id',
+    upload.single('creativeImage'),
     [
         param('id').isMongoId().withMessage('Invalid campaign ID'),
         ...campaignValidation
@@ -245,20 +254,26 @@ router.put(
  */
 router.delete(
     '/:id',
-    [
-        param('id').isMongoId().withMessage('Invalid campaign ID')
-    ],
-    validate,
     campaignController.deleteCampaign
 );
 
 // ==================== CAMPAIGN ACTION ROUTES ====================
 
 /**
- * @route   PUT /api/campaigns/:id/pause
+ * @route   POST /api/campaigns/:id/pause
  * @desc    Pause a campaign
  * @access  Private
  */
+router.post(
+    '/:id/pause',
+    [
+        param('id').isMongoId().withMessage('Invalid campaign ID')
+    ],
+    validate,
+    campaignController.pauseCampaign
+);
+
+// Backward-compatible alias
 router.put(
     '/:id/pause',
     [
@@ -269,10 +284,20 @@ router.put(
 );
 
 /**
- * @route   PUT /api/campaigns/:id/resume
+ * @route   POST /api/campaigns/:id/resume
  * @desc    Resume a paused campaign
  * @access  Private
  */
+router.post(
+    '/:id/resume',
+    [
+        param('id').isMongoId().withMessage('Invalid campaign ID')
+    ],
+    validate,
+    campaignController.resumeCampaign
+);
+
+// Backward-compatible alias
 router.put(
     '/:id/resume',
     [
@@ -295,6 +320,54 @@ router.post(
     ],
     validate,
     campaignController.duplicateCampaign
+);
+
+router.post(
+    '/:id/verify-payment',
+    [
+        param('id').isMongoId().withMessage('Invalid campaign ID')
+    ],
+    validate,
+    campaignController.verifyCampaignPayment
+);
+
+router.post(
+    '/:id/submit-review',
+    [
+        param('id').isMongoId().withMessage('Invalid campaign ID'),
+        body('reviewNotes').optional().isString().trim()
+    ],
+    validate,
+    campaignController.submitCampaignForReview
+);
+
+router.post(
+    '/:id/approve',
+    [
+        param('id').isMongoId().withMessage('Invalid campaign ID'),
+        body('reviewNotes').optional().isString().trim()
+    ],
+    validate,
+    campaignController.approveCampaignReview
+);
+
+router.post(
+    '/:id/reject',
+    [
+        param('id').isMongoId().withMessage('Invalid campaign ID'),
+        body('reviewNotes').optional().isString().trim()
+    ],
+    validate,
+    campaignController.rejectCampaignReview
+);
+
+router.post(
+    '/:id/publish',
+    [
+        param('id').isMongoId().withMessage('Invalid campaign ID')
+    ],
+    validate,
+    campaignController.publishCampaign
 );
 
 /**
@@ -363,33 +436,6 @@ router.put(
     ],
     validate,
     campaignController.bulkUpdateStatus
-);
-
-// ==================== META INTEGRATION ROUTES ====================
-
-/**
- * @route   POST /api/campaigns/meta/sync/:id
- * @desc    Sync campaign with Meta Ads
- * @access  Private
- */
-router.post(
-    '/meta/sync/:id',
-    [
-        param('id').isMongoId().withMessage('Invalid campaign ID')
-    ],
-    validate,
-    campaignController.syncWithMeta
-);
-
-/**
- * @route   POST /api/campaigns/meta/sync-all
- * @desc    Sync all campaigns with Meta Ads
- * @access  Private (Admin only)
- */
-router.post(
-    '/meta/sync-all',
-    authorize('admin', 'superadmin'),
-    campaignController.syncAllWithMeta
 );
 
 // ==================== TEMPLATE ROUTES ====================

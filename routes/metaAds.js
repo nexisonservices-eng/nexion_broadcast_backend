@@ -1,80 +1,90 @@
 const express = require('express');
-const multer = require('multer');
-const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const auth = require('../middleware/auth');
-const MetaAdCampaign = require('../models/MetaAdCampaign');
+const Campaign = require('../models/campaign');
 const MetaAdsTransaction = require('../models/MetaAdsTransaction');
 const MetaAdsWallet = require('../models/MetaAdsWallet');
 const metaAdsService = require('../services/metaAdsService');
+const { getMetaConfigForUser, getMetaConfigByUserId } = require('../services/userMetaCredentialsService');
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage() });
 const STATE_SECRET = process.env.JWT_SECRET || 'technova_jwt_secret_key_2024';
 
-const getBackendOrigin = (req) => `${req.protocol}://${req.get('host')}`;
+const normalizeOrigin = (value) => String(value || '').trim().replace(/\/+$/, '');
+const getBackendOrigin = (req) =>
+  normalizeOrigin(process.env.PUBLIC_BACKEND_URL) || `${req.protocol}://${req.get('host')}`;
 const getCallbackUrl = (req) => `${getBackendOrigin(req)}/api/meta-ads/oauth/callback`;
-const buildFacebookAuthUrl = (req) => {
-  const state = jwt.sign(
-    {
-      userId: req.user.id,
-      origin: req.body?.origin || process.env.FRONTEND_URL || '',
-      issuedAt: Date.now()
-    },
-    STATE_SECRET,
-    { expiresIn: '10m' }
-  );
+const getResolvedRedirectUri = (req, metaConfig = null) =>
+  normalizeOrigin(metaConfig?.redirectUri) || getCallbackUrl(req);
 
-  return metaAdsService.getLoginDialogUrl({
-    redirectUri: getCallbackUrl(req),
-    state
+const encodeStatePayload = (payload) => Buffer.from(JSON.stringify(payload)).toString('base64url');
+const signStatePayload = (payload, secret) =>
+  crypto.createHmac('sha256', String(secret || '')).update(payload).digest('hex');
+
+const buildSignedState = ({ userId, origin }) => {
+  const payload = encodeStatePayload({
+    userId,
+    origin,
+    issuedAt: Date.now(),
+    expiresAt: Date.now() + 10 * 60 * 1000
   });
+  const signature = signStatePayload(payload, STATE_SECRET);
+  return `${payload}.${signature}`;
 };
 
-const buildSetupState = async (userId) => {
-  const setupBundle = await metaAdsService.getSetupBundle({ userId });
-  const latestCampaign = await MetaAdCampaign.findOne({ userId }).sort({ updatedAt: -1 }).lean();
-  const availablePageIds = new Set(
-    (setupBundle.pages || []).map((page) => String(page?.id || '')).filter(Boolean)
-  );
-  const latestCampaignPageId = String(latestCampaign?.setupSnapshot?.selectedPageId || '').trim();
-  const safeSelectedPageId =
-    (latestCampaignPageId && availablePageIds.has(latestCampaignPageId) ? latestCampaignPageId : '') ||
-    setupBundle.pageId ||
-    '';
+const parseSignedState = (state) => {
+  const [payload = '', signature = ''] = String(state || '').split('.');
+  if (!payload || !signature) {
+    throw new Error('Meta OAuth state is invalid.');
+  }
+
+  let decoded;
+  try {
+    decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+  } catch {
+    throw new Error('Meta OAuth state payload is invalid.');
+  }
 
   return {
-    connected: Boolean(setupBundle.connected),
-    selectedAdAccountId: setupBundle.adAccountId || '',
-    selectedPageId: safeSelectedPageId,
-    linkedWhatsappNumber:
-      latestCampaign?.setupSnapshot?.linkedWhatsappNumber ||
-      setupBundle?.selectedWhatsappNumber ||
-      setupBundle?.whatsappNumbers?.[0]?.display_phone_number ||
-      '',
-    availablePages: setupBundle.pages || [],
-    availableBusinesses: setupBundle.businesses || [],
-    availableAdAccounts: setupBundle.adAccounts || [],
-    availableWhatsappNumbers: setupBundle.whatsappNumbers || [],
-    adAccountId: setupBundle.adAccountId || '',
-    mode: setupBundle.mode || 'mock',
-    setupError: setupBundle.setupError || '',
-    hasPageAccess: Boolean((setupBundle.pages || []).length && (setupBundle.pageId || (setupBundle.pages || [])[0]?.id)),
-    authSource: setupBundle.authSource || 'env',
-    profileName: setupBundle.profileName || ''
+    payload,
+    signature,
+    decoded
   };
 };
 
-const buildSummary = (campaigns = []) => {
-  return campaigns.reduce(
+const buildFacebookAuthUrl = async (req) => {
+  const authHeader = req.headers.authorization || '';
+  const metaConfig = await getMetaConfigForUser({ authHeader });
+  if (!metaConfig?.appId || !metaConfig?.appSecret) {
+    const error = new Error('Meta App ID and Meta App Secret must be configured by super admin for this admin.');
+    error.status = 400;
+    throw error;
+  }
+
+  const state = buildSignedState({
+    userId: req.user.id,
+    origin: req.body?.origin || process.env.FRONTEND_URL || ''
+  });
+
+  return metaAdsService.getLoginDialogUrl({
+    redirectUri: getResolvedRedirectUri(req, metaConfig),
+    state,
+    appId: metaConfig.appId,
+    apiVersion: metaConfig.apiVersion
+  });
+};
+
+const buildSummary = (campaigns = []) =>
+  campaigns.reduce(
     (acc, campaign) => {
-      const spend = Number(campaign?.analytics?.spend || 0);
-      const clicks = Number(campaign?.analytics?.clicks || 0);
+      const spend = Number(campaign?.spent || campaign?.analytics?.spend || 0);
+      const clicks = Number(campaign?.clicks || campaign?.analytics?.clicks || 0);
       const leads = Number(campaign?.analytics?.leads || 0);
-      const impressions = Number(campaign?.analytics?.impressions || 0);
+      const impressions = Number(campaign?.impressions || campaign?.analytics?.impressions || 0);
 
       acc.totalCampaigns += 1;
-      acc.activeCampaigns += String(campaign.status).toUpperCase() === 'ACTIVE' ? 1 : 0;
+      acc.activeCampaigns += String(campaign.status || '').toUpperCase() === 'ACTIVE' ? 1 : 0;
       acc.totalSpend += spend;
       acc.totalClicks += clicks;
       acc.totalLeads += leads;
@@ -90,7 +100,6 @@ const buildSummary = (campaigns = []) => {
       totalImpressions: 0
     }
   );
-};
 
 const getOrCreateWallet = async (userId) => {
   let wallet = await MetaAdsWallet.findOne({ userId });
@@ -114,23 +123,15 @@ const buildWalletState = async (userId) => {
   };
 };
 
-const getDraftCampaignForUser = async (userId, draftId) => {
-  if (!draftId) return null;
-  return MetaAdCampaign.findOne({ _id: draftId, userId });
-};
-
-const mergeCompletedSteps = (existing = [], nextStep) => {
-  return Array.from(new Set([...(existing || []), nextStep])).sort((a, b) => a - b);
-};
-
 router.get('/overview', auth, async (req, res) => {
   try {
-    const campaigns = await MetaAdCampaign.find({ userId: req.user.id }).sort({ createdAt: -1 }).lean();
+    const campaigns = await Campaign.find({ createdBy: req.user.id }).sort({ createdAt: -1 }).lean();
     const summary = buildSummary(campaigns);
+    const setup = await metaAdsService.getSetupBundle({ userId: req.user.id });
 
     res.json({
       success: true,
-      setup: await buildSetupState(req.user.id),
+      setup,
       summary: {
         ...summary,
         averageCtr:
@@ -151,10 +152,7 @@ router.get('/overview', auth, async (req, res) => {
 router.get('/diagnostics', auth, async (req, res) => {
   try {
     const diagnostics = await metaAdsService.getConnectionDiagnostics({ userId: req.user.id });
-    res.json({
-      success: true,
-      diagnostics
-    });
+    res.json({ success: true, diagnostics });
   } catch (error) {
     res.status(500).json({
       success: false,
@@ -168,13 +166,10 @@ router.post('/connect/auth-url', auth, async (req, res) => {
   try {
     res.json({
       success: true,
-      authUrl: buildFacebookAuthUrl(req)
+      authUrl: await buildFacebookAuthUrl(req)
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -182,36 +177,86 @@ router.post('/auth/facebook', auth, async (req, res) => {
   try {
     res.json({
       success: true,
-      authUrl: buildFacebookAuthUrl(req),
+      authUrl: await buildFacebookAuthUrl(req),
       message: 'Facebook OAuth URL generated successfully.'
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+    res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 
 router.get('/oauth/callback', async (req, res) => {
   const { code, state, error: authError, error_message: authErrorMessage } = req.query;
 
+  const renderCallbackPage = ({ message, payload, targetOrigin = '*' }) => `
+      <!doctype html>
+      <html lang="en">
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>Meta Connect</title>
+          <style>
+            body { font-family: Arial, sans-serif; background:#f5f7fb; color:#102042; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; }
+            .card { background:#fff; padding:24px 28px; border-radius:16px; box-shadow:0 18px 48px rgba(16,32,66,.14); max-width:480px; width:calc(100% - 32px); }
+            h1 { margin:0 0 12px; font-size:22px; }
+            p { margin:0 0 16px; line-height:1.5; }
+            button { border:0; border-radius:10px; background:#2563eb; color:#fff; padding:10px 16px; font-weight:600; cursor:pointer; }
+          </style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>${message}</h1>
+            <p>You can close this window and return to the app if it does not close automatically.</p>
+            <button onclick="window.close()">Close Window</button>
+          </div>
+          <script>
+            (function () {
+              try {
+                if (window.opener && !window.opener.closed) {
+                  window.opener.postMessage(${JSON.stringify(payload)}, ${JSON.stringify(targetOrigin === '*' ? '*' : targetOrigin)});
+                  setTimeout(function () { window.close(); }, 250);
+                }
+              } catch (error) {
+                console.error('Meta OAuth callback handoff failed:', error);
+              }
+            }());
+          </script>
+        </body>
+      </html>
+    `;
+
   if (authError) {
-    return res.status(200).send(`
-      <script>
-        if (window.opener) {
-          window.opener.postMessage({ type: 'meta_oauth_error', error: ${JSON.stringify(authErrorMessage || authError)} }, '*');
-        }
-        window.close();
-      </script>
-    `);
+    return res
+      .status(200)
+      .send(
+        renderCallbackPage({
+          message: 'Meta connection failed',
+          payload: { type: 'meta_oauth_error', error: String(authErrorMessage || authError || 'Meta OAuth failed.') }
+        })
+      );
   }
 
   try {
-    const decoded = jwt.verify(String(state || ''), STATE_SECRET);
+    const { payload, signature, decoded } = parseSignedState(state);
+    const metaConfig = await getMetaConfigByUserId(decoded.userId);
+    if (!metaConfig?.appId || !metaConfig?.appSecret) {
+      throw new Error('Meta app credentials are not configured for this admin.');
+    }
+
+    const expectedSignature = signStatePayload(payload, STATE_SECRET);
+    if (signature !== expectedSignature) {
+      throw new Error('Meta OAuth state signature mismatch.');
+    }
+    if (!decoded?.expiresAt || Number(decoded.expiresAt) < Date.now()) {
+      throw new Error('Meta OAuth state expired.');
+    }
+
     const tokenData = await metaAdsService.exchangeCodeForAccessToken({
       code,
-      redirectUri: getCallbackUrl(req)
+      redirectUri: getResolvedRedirectUri(req, metaConfig),
+      appId: metaConfig.appId,
+      appSecret: metaConfig.appSecret,
+      apiVersion: metaConfig.apiVersion
     });
 
     await metaAdsService.saveUserConnection({
@@ -220,29 +265,27 @@ router.get('/oauth/callback', async (req, res) => {
       scopes: Array.isArray(tokenData.granted_scopes) ? tokenData.granted_scopes : []
     });
 
-    const setup = await buildSetupState(decoded.userId);
+    const setup = await metaAdsService.getSetupBundle({ userId: decoded.userId });
     const targetOrigin = decoded.origin || process.env.FRONTEND_URL || '*';
 
-    return res.status(200).send(`
-      <script>
-        if (window.opener) {
-          window.opener.postMessage(
-            { type: 'meta_oauth_success', setup: ${JSON.stringify(setup)} },
-            ${JSON.stringify(targetOrigin === '*' ? '*' : targetOrigin)}
-          );
-        }
-        window.close();
-      </script>
-    `);
+    return res
+      .status(200)
+      .send(
+        renderCallbackPage({
+          message: 'Meta account connected',
+          payload: { type: 'meta_oauth_success', setup },
+          targetOrigin
+        })
+      );
   } catch (error) {
-    return res.status(200).send(`
-      <script>
-        if (window.opener) {
-          window.opener.postMessage({ type: 'meta_oauth_error', error: ${JSON.stringify(error.message)} }, '*');
-        }
-        window.close();
-      </script>
-    `);
+    return res
+      .status(200)
+      .send(
+        renderCallbackPage({
+          message: 'Meta connection failed',
+          payload: { type: 'meta_oauth_error', error: String(error.message || 'Meta OAuth failed.') }
+        })
+      );
   }
 });
 
@@ -250,7 +293,7 @@ router.post('/connect', auth, async (req, res) => {
   try {
     res.json({
       success: true,
-      setup: await buildSetupState(req.user.id),
+      setup: await metaAdsService.getSetupBundle({ userId: req.user.id }),
       message: 'Meta account access is ready for campaign setup.'
     });
   } catch (error) {
@@ -261,16 +304,14 @@ router.post('/connect', auth, async (req, res) => {
 router.get('/adaccounts', auth, async (req, res) => {
   try {
     const adAccounts = await metaAdsService.getUserAdAccounts({ userId: req.user.id });
+    const setup = await metaAdsService.getSetupBundle({ userId: req.user.id });
     res.json({
       success: true,
       adAccounts,
-      selectedAdAccountId: (await buildSetupState(req.user.id)).selectedAdAccountId || ''
+      selectedAdAccountId: setup.adAccountId || ''
     });
   } catch (error) {
-    res.status(error.status || 500).json({
-      success: false,
-      error: error.message
-    });
+    res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -324,14 +365,11 @@ router.post('/settings/selection', auth, async (req, res) => {
 
     res.json({
       success: true,
-      setup: await buildSetupState(req.user.id),
+      setup: await metaAdsService.getSetupBundle({ userId: req.user.id }),
       message: 'Meta setup selections saved.'
     });
   } catch (error) {
-    res.status(error.status || 500).json({
-      success: false,
-      error: error.message
-    });
+    res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -344,495 +382,11 @@ router.post('/save-adaccount', auth, async (req, res) => {
 
     res.json({
       success: true,
-      setup: await buildSetupState(req.user.id),
+      setup: await metaAdsService.getSetupBundle({ userId: req.user.id }),
       message: 'Selected Meta ad account saved successfully.'
     });
   } catch (error) {
-    res.status(error.status || 500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-router.post('/campaigns', auth, upload.single('creativeFile'), async (req, res) => {
-  try {
-    const payload = req.body?.payload ? JSON.parse(req.body.payload) : req.body;
-    const setup = await buildSetupState(req.user.id);
-    const selectedAdAccountId = payload?.adAccountId || setup.selectedAdAccountId || setup.adAccountId || metaAdsService.getEnvConfig().adAccountId;
-    const selectedPageId = payload?.configuredPageId || setup.selectedPageId || metaAdsService.getEnvConfig().pageId;
-    const selectedWhatsappNumber = payload?.whatsappNumber || setup.linkedWhatsappNumber || '';
-
-    const creativeUpload = await metaAdsService.uploadCreativeAsset({
-      fileBuffer: req.file?.buffer,
-      fileName: req.file?.originalname,
-      mediaUrl: payload?.creative?.mediaUrl,
-      userId: req.user.id,
-      adAccountId: selectedAdAccountId
-    });
-
-    const stack = await metaAdsService.createMetaAdStack({
-      campaign: {
-        ...payload,
-        adAccountId: selectedAdAccountId,
-        configuredPageId: selectedPageId,
-        whatsappNumber: selectedWhatsappNumber
-      },
-      creativeUpload,
-      userId: req.user.id
-    });
-
-    const createdCampaign = await MetaAdCampaign.create({
-      userId: req.user.id,
-      campaignName: payload.campaignName,
-      objective: payload.objective,
-      status: payload.status || 'PAUSED',
-      configuredPageId: selectedPageId,
-      configuredInstagramActorId: payload.configuredInstagramActorId,
-      whatsappNumber: selectedWhatsappNumber,
-      budget: payload.budget,
-      targeting: payload.targeting,
-      creative: {
-        ...payload.creative,
-        mediaHash: creativeUpload.mediaHash || payload?.creative?.mediaHash || ''
-      },
-      placement: payload.placement,
-      schedule: payload.schedule,
-      meta: {
-        adAccountId: stack.adAccountId || selectedAdAccountId,
-        campaignId: stack.campaignId,
-        adSetId: stack.adSetId,
-        creativeId: stack.creativeId,
-        adId: stack.adId
-      },
-      accounting: {
-        reservedBudget: 0,
-        totalDebited: 0,
-        reconciledSpend: 0,
-        lastReconciledAt: null
-      },
-      setupSnapshot: {
-        connected: true,
-        selectedAdAccountId,
-        selectedPageId: selectedPageId,
-        linkedWhatsappNumber: selectedWhatsappNumber
-      },
-      apiMode: stack.apiMode
-    });
-
-    const latestAnalytics = await metaAdsService.fetchCampaignInsights(createdCampaign);
-    if (latestAnalytics) {
-      createdCampaign.analytics = latestAnalytics;
-      await createdCampaign.save();
-    }
-
-    res.status(201).json({
-      success: true,
-      message: 'Meta ad campaign created successfully.',
-      campaign: createdCampaign
-    });
-  } catch (error) {
-    res.status(error.status || 400).json({
-      success: false,
-      error: error.message,
-      stage: error.stage || 'Campaign request',
-      details: error.details || error.response?.data || null
-    });
-  }
-});
-
-router.post('/campaigns/step/campaign', auth, async (req, res) => {
-  try {
-    const draftId = req.body?.draftId;
-    const campaignName = String(req.body?.campaignName || '').trim();
-    const objective = String(req.body?.objective || 'OUTCOME_LEADS').trim();
-    const adAccountId = String(req.body?.adAccountId || '').trim();
-
-    if (!campaignName) {
-      return res.status(400).json({ success: false, error: 'Campaign name is required.' });
-    }
-
-    let draft = await getDraftCampaignForUser(req.user.id, draftId);
-    if (!draft) {
-      draft = new MetaAdCampaign({
-        userId: req.user.id,
-        campaignName,
-        objective,
-        status: 'DRAFT',
-        meta: { adAccountId },
-        wizard: {
-          currentStep: 2,
-          completedSteps: [1],
-          lastSavedAt: new Date()
-        }
-      });
-    } else {
-      draft.campaignName = campaignName;
-      draft.objective = objective;
-      if (adAccountId) {
-        draft.meta = { ...(draft.meta?.toObject?.() || draft.meta || {}), adAccountId };
-      }
-      draft.status = draft.status || 'DRAFT';
-      draft.wizard = {
-        currentStep: 2,
-        completedSteps: mergeCompletedSteps(draft.wizard?.completedSteps, 1),
-        lastSavedAt: new Date()
-      };
-    }
-
-    await draft.save();
-
-    res.json({
-      success: true,
-      message: 'Campaign step saved.',
-      draftId: String(draft._id),
-      campaign: draft
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-router.post('/campaigns/step/adset', auth, async (req, res) => {
-  try {
-    const draft = await getDraftCampaignForUser(req.user.id, req.body?.draftId);
-    if (!draft) {
-      return res.status(404).json({ success: false, error: 'Campaign draft not found.' });
-    }
-
-    draft.targeting = {
-      ...(draft.targeting?.toObject?.() || draft.targeting || {}),
-      countries: Array.isArray(req.body?.countries) ? req.body.countries : draft.targeting?.countries || ['IN'],
-      ageMin: Number(req.body?.ageMin || draft.targeting?.ageMin || 21),
-      ageMax: Number(req.body?.ageMax || draft.targeting?.ageMax || 45)
-    };
-    draft.budget = {
-      ...(draft.budget?.toObject?.() || draft.budget || {}),
-      dailyBudget: Number(req.body?.dailyBudget || draft.budget?.dailyBudget || 500),
-      currency: String(req.body?.currency || draft.budget?.currency || 'INR')
-    };
-    draft.wizard = {
-      currentStep: 3,
-      completedSteps: mergeCompletedSteps(draft.wizard?.completedSteps, 2),
-      lastSavedAt: new Date()
-    };
-
-    await draft.save();
-
-    res.json({
-      success: true,
-      message: 'Ad set step saved.',
-      draftId: String(draft._id),
-      campaign: draft
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-router.post('/campaigns/step/ad', auth, upload.single('creativeFile'), async (req, res) => {
-  try {
-    const payload = req.body?.payload ? JSON.parse(req.body.payload) : req.body;
-    const draft = await getDraftCampaignForUser(req.user.id, payload?.draftId);
-    if (!draft) {
-      return res.status(404).json({ success: false, error: 'Campaign draft not found.' });
-    }
-
-    const setup = await buildSetupState(req.user.id);
-    const selectedAdAccountId =
-      draft.meta?.adAccountId ||
-      draft.setupSnapshot?.selectedAdAccountId ||
-      setup.selectedAdAccountId ||
-      setup.adAccountId;
-
-    const creativeUpload = await metaAdsService.uploadCreativeAsset({
-      fileBuffer: req.file?.buffer,
-      fileName: req.file?.originalname,
-      mediaUrl: payload?.mediaUrl,
-      userId: req.user.id,
-      adAccountId: selectedAdAccountId
-    });
-
-    draft.creative = {
-      ...(draft.creative?.toObject?.() || draft.creative || {}),
-      primaryText: String(payload?.primaryText || draft.creative?.primaryText || ''),
-      headline: String(payload?.headline || draft.creative?.headline || draft.campaignName || ''),
-      description: String(payload?.description || draft.creative?.description || ''),
-      callToAction: String(payload?.callToAction || draft.creative?.callToAction || 'WHATSAPP_MESSAGE'),
-      mediaUrl: creativeUpload.mediaUrl || payload?.mediaUrl || draft.creative?.mediaUrl || '',
-      mediaHash: creativeUpload.mediaHash || draft.creative?.mediaHash || ''
-    };
-    draft.wizard = {
-      currentStep: 4,
-      completedSteps: mergeCompletedSteps(draft.wizard?.completedSteps, 3),
-      lastSavedAt: new Date()
-    };
-
-    await draft.save();
-
-    res.json({
-      success: true,
-      message: 'Ad creative step saved.',
-      draftId: String(draft._id),
-      campaign: draft
-    });
-  } catch (error) {
-    res.status(error.status || 400).json({
-      success: false,
-      error: error.message,
-      details: error.details || null
-    });
-  }
-});
-
-router.post('/campaigns/:id/publish', auth, async (req, res) => {
-  try {
-    const draft = await MetaAdCampaign.findOne({ _id: req.params.id, userId: req.user.id });
-    if (!draft) {
-      return res.status(404).json({ success: false, error: 'Campaign draft not found.' });
-    }
-
-    const setup = await buildSetupState(req.user.id);
-    const selectedAdAccountId =
-      draft.meta?.adAccountId ||
-      draft.setupSnapshot?.selectedAdAccountId ||
-      setup.selectedAdAccountId ||
-      setup.adAccountId ||
-      metaAdsService.getEnvConfig().adAccountId;
-    const selectedPageId =
-      draft.configuredPageId ||
-      draft.setupSnapshot?.selectedPageId ||
-      setup.selectedPageId ||
-      setup.availablePages?.[0]?.id ||
-      '';
-    const selectedWhatsappNumber =
-      draft.whatsappNumber ||
-      draft.setupSnapshot?.linkedWhatsappNumber ||
-      setup.linkedWhatsappNumber ||
-      '';
-
-    if (!setup.availablePages?.length || !selectedPageId) {
-      return res.status(400).json({
-        success: false,
-        error: 'Creative creation cannot continue because no accessible Facebook Page is available for the current Meta login.',
-        stage: 'Creative creation',
-        details: {
-          requestedPageId:
-            draft.configuredPageId ||
-            draft.setupSnapshot?.selectedPageId ||
-            metaAdsService.getEnvConfig().pageId ||
-            '',
-          accessiblePages: setup.availablePages || [],
-          setupError: setup.setupError || '',
-          action:
-            'Reconnect Facebook and grant page access. Then choose a Facebook Page in Settings before publishing.'
-        }
-      });
-    }
-
-    const stack = await metaAdsService.createMetaAdStack({
-      campaign: {
-        campaignName: draft.campaignName,
-        objective: draft.objective,
-        status: 'PAUSED',
-        adAccountId: selectedAdAccountId,
-        configuredPageId: selectedPageId,
-        configuredInstagramActorId: draft.configuredInstagramActorId,
-        whatsappNumber: selectedWhatsappNumber,
-        budget: draft.budget,
-        targeting: draft.targeting,
-        creative: draft.creative,
-        placement: draft.placement,
-        schedule: draft.schedule
-      },
-      creativeUpload: {
-        mediaHash: draft.creative?.mediaHash || '',
-        mediaUrl: draft.creative?.mediaUrl || ''
-      },
-      userId: req.user.id
-    });
-
-    draft.status = 'PAUSED';
-    draft.configuredPageId = selectedPageId;
-    draft.whatsappNumber = selectedWhatsappNumber;
-    draft.meta = {
-      ...(draft.meta?.toObject?.() || draft.meta || {}),
-      adAccountId: stack.adAccountId || selectedAdAccountId,
-      campaignId: stack.campaignId,
-      adSetId: stack.adSetId,
-      creativeId: stack.creativeId,
-      adId: stack.adId
-    };
-    draft.setupSnapshot = {
-      connected: true,
-      selectedAdAccountId,
-      selectedPageId,
-      linkedWhatsappNumber: selectedWhatsappNumber
-    };
-    draft.apiMode = stack.apiMode;
-    draft.wizard = {
-      currentStep: 4,
-      completedSteps: mergeCompletedSteps(draft.wizard?.completedSteps, 4),
-      lastSavedAt: new Date()
-    };
-
-    const latestAnalytics = await metaAdsService.fetchCampaignInsights(draft);
-    if (latestAnalytics) {
-      draft.analytics = latestAnalytics;
-    }
-
-    await draft.save();
-
-    res.json({
-      success: true,
-      message: 'Campaign published successfully.',
-      campaign: draft
-    });
-  } catch (error) {
-    res.status(error.status || 400).json({
-      success: false,
-      error: error.message,
-      stage: error.stage || 'Campaign publish',
-      details: error.details || null
-    });
-  }
-});
-
-router.get('/campaigns', auth, async (req, res) => {
-  try {
-    const campaigns = await MetaAdCampaign.find({ userId: req.user.id }).sort({ createdAt: -1 });
-    res.json({ success: true, campaigns });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-router.post('/campaigns/:id/status', auth, async (req, res) => {
-  try {
-    const campaign = await MetaAdCampaign.findOne({ _id: req.params.id, userId: req.user.id });
-    if (!campaign) {
-      return res.status(404).json({ success: false, error: 'Campaign not found' });
-    }
-
-    const status = String(req.body?.status || '').toUpperCase();
-    if (status === 'ACTIVE') {
-      const wallet = await getOrCreateWallet(req.user.id);
-      const requiredBalance = Math.max(0, Number(campaign?.budget?.dailyBudget || 0));
-      if (Number(wallet.balance || 0) < requiredBalance) {
-        return res.status(400).json({
-          success: false,
-          error: `Insufficient wallet balance. Add at least ₹${requiredBalance} before activating this campaign.`,
-          stage: 'Wallet balance check'
-        });
-      }
-
-      if (String(campaign.status).toUpperCase() !== 'ACTIVE' && requiredBalance > 0) {
-        wallet.balance = Number(wallet.balance || 0) - requiredBalance;
-        await wallet.save();
-
-        await MetaAdsTransaction.create({
-          userId: req.user.id,
-          campaignId: campaign._id,
-          amount: requiredBalance,
-          type: 'debit',
-          note: `Activation reserve for ${campaign.campaignName}`
-        });
-
-        campaign.accounting = {
-          reservedBudget: Number(campaign?.accounting?.reservedBudget || 0) + requiredBalance,
-          totalDebited: Number(campaign?.accounting?.totalDebited || 0) + requiredBalance,
-          reconciledSpend: Number(campaign?.accounting?.reconciledSpend || 0),
-          lastReconciledAt: campaign?.accounting?.lastReconciledAt || null
-        };
-      }
-    }
-
-    const result = await metaAdsService.updateCampaignDeliveryStatus({
-      campaign,
-      userId: req.user.id,
-      status
-    });
-
-    campaign.status = result.status;
-    campaign.lastError = '';
-    await campaign.save();
-
-    res.json({
-      success: true,
-      message: `Campaign ${result.status === 'ACTIVE' ? 'activated' : 'paused'} successfully.`,
-      campaign,
-      wallet: await buildWalletState(req.user.id)
-    });
-  } catch (error) {
-    res.status(error.status || 400).json({
-      success: false,
-      error: error.message,
-      stage: error.stage || 'Campaign status update',
-      details: error.details || error.response?.data || null
-    });
-  }
-});
-
-router.post('/campaigns/:id/sync', auth, async (req, res) => {
-  try {
-    const campaign = await MetaAdCampaign.findOne({ _id: req.params.id, userId: req.user.id });
-    if (!campaign) {
-      return res.status(404).json({ success: false, error: 'Campaign not found' });
-    }
-
-    await metaAdsService.syncCampaignAnalyticsRecord(campaign);
-
-    res.json({ success: true, campaign });
-  } catch (error) {
-    const campaign = await MetaAdCampaign.findOne({ _id: req.params.id, userId: req.user.id });
-    if (campaign) {
-      campaign.lastError = error.message || 'Insights sync failed';
-      await campaign.save();
-      return res.status(200).json({
-        success: true,
-        warning: error.message,
-        stage: error.stage || 'Insights sync',
-        campaign
-      });
-    }
-
-    res.status(error.status || 400).json({
-      success: false,
-      error: error.message,
-      stage: error.stage || 'Insights sync',
-      details: error.details || error.response?.data || null
-    });
-  }
-});
-
-router.post('/campaigns/sync-all', auth, async (req, res) => {
-  try {
-    const campaigns = await MetaAdCampaign.find({ userId: req.user.id, status: { $in: ['ACTIVE', 'PAUSED'] } });
-    let synced = 0;
-    const warnings = [];
-
-    for (const campaign of campaigns) {
-      try {
-        await metaAdsService.syncCampaignAnalyticsRecord(campaign);
-        synced += 1;
-      } catch (error) {
-        campaign.lastError = error.message || 'Analytics sync failed';
-        await campaign.save();
-        warnings.push({
-          campaignId: String(campaign._id),
-          campaignName: campaign.campaignName,
-          error: error.message
-        });
-      }
-    }
-
-    res.json({
-      success: true,
-      synced,
-      warnings
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error.status || 500).json({ success: false, error: error.message });
   }
 });
 

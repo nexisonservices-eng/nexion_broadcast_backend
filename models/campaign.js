@@ -34,6 +34,60 @@ const campaignSchema = new mongoose.Schema({
         },
         default: 'draft'
     },
+    lifecycleStatus: {
+        type: String,
+        enum: [
+            'draft',
+            'pending_payment',
+            'payment_verified',
+            'pending_review',
+            'approved',
+            'rejected',
+            'publishing',
+            'running',
+            'paused',
+            'completed',
+            'archived'
+        ],
+        default: 'draft'
+    },
+    paymentStatus: {
+        type: String,
+        enum: ['pending', 'verified', 'failed'],
+        default: 'pending'
+    },
+    reviewStatus: {
+        type: String,
+        enum: ['not_submitted', 'pending_review', 'approved', 'rejected'],
+        default: 'not_submitted'
+    },
+    deliveryStatus: {
+        type: String,
+        enum: ['not_published', 'publishing', 'active', 'paused', 'rejected', 'completed'],
+        default: 'not_published'
+    },
+    reviewNotes: {
+        type: String,
+        trim: true,
+        maxlength: [2000, 'Review notes cannot exceed 2000 characters'],
+        default: ''
+    },
+    paymentVerifiedAt: {
+        type: Date,
+        default: null
+    },
+    submittedForReviewAt: {
+        type: Date,
+        default: null
+    },
+    reviewedAt: {
+        type: Date,
+        default: null
+    },
+    publishedAt: {
+        type: Date,
+        default: null
+    },
     dailyBudget: {
         type: Number,
         min: [1, 'Daily budget must be at least $1'],
@@ -57,8 +111,20 @@ const campaignSchema = new mongoose.Schema({
         type: Date,
         validate: {
             validator: function(value) {
-                // End date should be after start date if provided
-                return !value || value > this.startDate;
+                if (!value) return true;
+
+                // Support both document validation and query update validation.
+                let startDate = this.startDate;
+                if (this instanceof mongoose.Query) {
+                    const update = this.getUpdate() || {};
+                    startDate =
+                        update.startDate ||
+                        (update.$set && update.$set.startDate) ||
+                        this.get('startDate') ||
+                        startDate;
+                }
+
+                return !startDate || new Date(value) > new Date(startDate);
             },
             message: 'End date must be after start date'
         }
@@ -106,6 +172,87 @@ const campaignSchema = new mongoose.Schema({
         sparse: true,
         unique: true
     },
+    metaAdSetId: {
+        type: String,
+        sparse: true
+    },
+    metaAdId: {
+        type: String,
+        sparse: true
+    },
+    metaCreativeId: {
+        type: String,
+        sparse: true
+    },
+    metaImageHash: {
+        type: String,
+        trim: true
+    },
+    ageMin: {
+        type: Number,
+        min: 13,
+        max: 65,
+        default: 18
+    },
+    ageMax: {
+        type: Number,
+        min: 13,
+        max: 65,
+        default: 65
+    },
+    gender: {
+        type: String,
+        enum: ['all', 'male', 'female'],
+        default: 'all'
+    },
+    interests: {
+        type: String,
+        trim: true,
+        maxlength: [500, 'Interests cannot exceed 500 characters']
+    },
+    behaviors: {
+        type: String,
+        trim: true,
+        maxlength: [500, 'Behaviors cannot exceed 500 characters']
+    },
+    primaryText: {
+        type: String,
+        trim: true,
+        maxlength: [5000, 'Primary text cannot exceed 5000 characters']
+    },
+    headline: {
+        type: String,
+        trim: true,
+        maxlength: [255, 'Headline cannot exceed 255 characters']
+    },
+    description: {
+        type: String,
+        trim: true,
+        maxlength: [500, 'Description cannot exceed 500 characters']
+    },
+    destinationUrl: {
+        type: String,
+        trim: true
+    },
+    imageUrl: {
+        type: String,
+        trim: true
+    },
+    callToAction: {
+        type: String,
+        trim: true,
+        default: 'LEARN_MORE'
+    },
+    optimizationGoal: {
+        type: String,
+        trim: true,
+        default: 'LINK_CLICKS'
+    },
+    bidStrategy: {
+        type: String,
+        trim: true,
+        default: 'LOWEST_COST_WITHOUT_CAP'
+    },
     metaResponse: {
         type: mongoose.Schema.Types.Mixed
     },
@@ -127,6 +274,7 @@ const campaignSchema = new mongoose.Schema({
 
 // Indexes for better query performance
 campaignSchema.index({ status: 1, platform: 1 });
+campaignSchema.index({ lifecycleStatus: 1, paymentStatus: 1, reviewStatus: 1, deliveryStatus: 1 });
 campaignSchema.index({ createdBy: 1 });
 campaignSchema.index({ startDate: 1, endDate: 1 });
 campaignSchema.index({ name: 'text', objective: 'text' });

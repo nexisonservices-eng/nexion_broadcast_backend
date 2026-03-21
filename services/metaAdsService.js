@@ -1,12 +1,13 @@
 const axios = require('axios');
-const FormData = require('form-data');
 const MetaAdCampaign = require('../models/MetaAdCampaign');
 const MetaAdsConnection = require('../models/MetaAdsConnection');
 const MetaAdsTransaction = require('../models/MetaAdsTransaction');
 const MetaAdsWallet = require('../models/MetaAdsWallet');
-const { decryptMetaToken, encryptMetaToken } = require('../utils/metaTokenCrypto');
+const { getMetaAdsConfig } = require('../config/metaAdsConfig');
+const metaAuthService = require('./metaAuthService');
+const metaCreativeService = require('./metaCreativeService');
 
-const GRAPH_BASE_URL = 'https://graph.facebook.com';
+const { GRAPH_BASE_URL, decryptMetaToken, encryptMetaToken } = metaAuthService;
 
 const normalizeArray = (value) => (Array.isArray(value) ? value.filter(Boolean) : []);
 const normalizeAdAccountId = (value) => String(value || '').replace(/^act_/i, '');
@@ -20,39 +21,12 @@ const toCanonicalAdAccountId = (value) => {
   return normalizedId ? `act_${normalizedId}` : '';
 };
 
-const getEnvConfig = () => {
-  const accessToken = process.env.META_ACCESS_TOKEN || '';
-  const apiVersion = process.env.META_API_VERSION || 'v22.0';
-  const adAccountId = process.env.META_AD_ACCOUNT_ID || '';
-  const pageId = process.env.META_PAGE_ID || '';
-  const pixelId = process.env.META_PIXEL_ID || '';
-  const appId = process.env.META_APP_ID || '';
-  const appSecret = process.env.META_APP_SECRET || '';
-  const forceMock = String(process.env.META_ADS_FORCE_MOCK || 'false').toLowerCase() === 'true';
-  const advantageAudience = String(process.env.META_ADVANTAGE_AUDIENCE || '0') === '1' ? 1 : 0;
-  const bidStrategy = String(process.env.META_DEFAULT_BID_STRATEGY || 'LOWEST_COST_WITH_BID_CAP').trim();
-  const bidAmount = Number(process.env.META_BID_AMOUNT || 5000);
-
-  return {
-    accessToken,
-    apiVersion,
-    adAccountId,
-    pageId,
-    pixelId,
-    appId,
-    appSecret,
-    forceMock,
-    advantageAudience,
-    bidStrategy,
-    bidAmount,
-    hasCredentials: Boolean(accessToken && adAccountId)
-  };
-};
+const getEnvConfig = () => getMetaAdsConfig();
 
 const graphRequest = async ({ method = 'GET', path, params, data, headers, accessToken: overrideToken, apiVersion: overrideApiVersion }) => {
   const { apiVersion, accessToken } = getEnvConfig();
   const url = `${GRAPH_BASE_URL}/${apiVersion}/${path.replace(/^\/+/, '')}`;
-  const response = await axios({
+  const requestConfig = {
     url,
     method,
     params: {
@@ -61,8 +35,34 @@ const graphRequest = async ({ method = 'GET', path, params, data, headers, acces
     },
     data,
     headers
-  });
-  return response.data;
+  };
+
+  console.log(
+    '[Meta API]',
+    JSON.stringify({
+      method: requestConfig.method,
+      path,
+      hasToken: Boolean(requestConfig.params.access_token),
+      params: Object.keys(params || {})
+    })
+  );
+
+  try {
+    const response = await axios(requestConfig);
+    return response.data;
+  } catch (error) {
+    console.error(
+      '[Meta API Error]',
+      JSON.stringify({
+        method: requestConfig.method,
+        path,
+        message: error?.response?.data?.error?.message || error.message,
+        status: error?.response?.status || null,
+        details: error?.response?.data || null
+      })
+    );
+    throw error;
+  }
 };
 
 const extractApiErrorMessage = (error) => {
@@ -72,6 +72,47 @@ const extractApiErrorMessage = (error) => {
     error?.message ||
     'Meta API request failed'
   );
+};
+
+const mapCrudObjectiveToMetaObjective = (objective) => {
+  const normalizedObjective = String(objective || '').trim().toLowerCase();
+
+  switch (normalizedObjective) {
+    case 'traffic':
+      return 'OUTCOME_TRAFFIC';
+    case 'engagement':
+      return 'OUTCOME_ENGAGEMENT';
+    case 'leads':
+      return 'OUTCOME_LEADS';
+    case 'sales':
+    case 'catalog':
+      return 'OUTCOME_SALES';
+    case 'awareness':
+    default:
+      return 'OUTCOME_AWARENESS';
+  }
+};
+
+const getAllowedOptimizationGoalsForCrudObjective = (objective) => {
+  const normalizedObjective = String(objective || '').trim().toLowerCase();
+
+  switch (normalizedObjective) {
+    case 'traffic':
+      return ['LINK_CLICKS', 'LANDING_PAGE_VIEWS', 'REACH', 'IMPRESSIONS'];
+    case 'engagement':
+      return ['POST_ENGAGEMENT', 'REACH', 'IMPRESSIONS'];
+    case 'leads':
+      return ['LEADS', 'QUALITY_LEAD', 'CONVERSATIONS'];
+    case 'sales':
+      return ['OFFSITE_CONVERSIONS', 'VALUE', 'LINK_CLICKS'];
+    case 'awareness':
+    default:
+      return ['REACH', 'IMPRESSIONS'];
+  }
+};
+
+const getDefaultOptimizationGoalForCrudObjective = (objective) => {
+  return getAllowedOptimizationGoalsForCrudObjective(objective)[0];
 };
 
 const buildStageError = (stage, error) => {
@@ -93,34 +134,28 @@ const buildStageErrorWithDetails = (stage, message, details, status = 400) => {
 
 const shouldUseMockMode = () => {
   const config = getEnvConfig();
-  return config.forceMock || !config.hasCredentials;
+  return config.forceMock;
 };
 
-const getAccessContextForUser = async (userId) => {
-  const env = getEnvConfig();
-  if (!userId) {
-    return {
-      accessToken: env.accessToken,
-      apiVersion: env.apiVersion,
-      source: 'env'
-    };
+const getAccessContextForUser = async (userId) => metaAuthService.getAccessContextForUser(userId);
+
+const ensureConnectedMetaUser = async (userId, stage = 'Meta access') => {
+  const accessContext = await getAccessContextForUser(userId);
+
+  if (shouldUseMockMode()) {
+    return accessContext;
   }
 
-  const connection = await MetaAdsConnection.findOne({ userId }).lean();
-  if (connection?.accessToken) {
-    return {
-      accessToken: decryptMetaToken(connection.accessToken),
-      apiVersion: env.apiVersion,
-      source: 'user',
-      connection
-    };
+  if (!userId || !accessContext?.accessToken || !['user', 'admin'].includes(accessContext.source)) {
+    throw buildStageErrorWithDetails(
+      stage,
+      'Meta access is not configured for this admin.',
+      { userId: userId || '', authSource: accessContext?.source || 'none' },
+      400
+    );
   }
 
-  return {
-    accessToken: env.accessToken,
-    apiVersion: env.apiVersion,
-    source: 'env'
-  };
+  return accessContext;
 };
 
 const buildTargeting = (targeting = {}) => {
@@ -174,132 +209,33 @@ const buildPlacement = (placement = {}) => {
   };
 };
 
-const sanitizeWhatsappNumber = (value) =>
-  String(value || '')
-    .replace(/[^\d]/g, '')
-    .trim();
-
-const buildCreativeDestination = ({ whatsappNumber, pageId }) => {
-  const sanitizedWhatsapp = sanitizeWhatsappNumber(whatsappNumber);
-  if (sanitizedWhatsapp) {
-    return {
-      whatsappNumber: sanitizedWhatsapp,
-      destinationUrl: `https://wa.me/${sanitizedWhatsapp}`
-    };
-  }
-
-  if (pageId) {
-    return {
-      whatsappNumber: '',
-      destinationUrl: `https://www.facebook.com/${pageId}`
-    };
-  }
-
-  return {
-    whatsappNumber: '',
-    destinationUrl: 'https://www.facebook.com/'
-  };
-};
-
-const getAccessiblePages = async ({ accessToken }) => {
-  const response = await graphRequest({
-    path: 'me/accounts',
-    params: { fields: 'id,name' },
-    accessToken
+const sanitizeWhatsappNumber = metaCreativeService.sanitizeWhatsappNumber;
+const buildCreativeDestination = metaCreativeService.buildCreativeDestination;
+const getAccessiblePages = async ({ accessToken }) =>
+  metaCreativeService.getAccessiblePages({ accessToken, graphRequest });
+const resolveCreativePageContext = async ({ requestedPageId, accessToken }) =>
+  metaCreativeService.resolveCreativePageContext({
+    requestedPageId,
+    accessToken,
+    graphRequest,
+    env: getEnvConfig(),
+    buildStageErrorWithDetails
   });
-
-  return Array.isArray(response?.data) ? response.data : [];
-};
-
-const resolveCreativePageContext = async ({ requestedPageId, accessToken }) => {
-  const normalizedRequestedPageId = String(requestedPageId || '').trim();
-  const accessiblePages = await getAccessiblePages({ accessToken });
-
-  if (!accessiblePages.length) {
-    throw buildStageErrorWithDetails(
-      'Creative creation',
-      'No accessible Facebook pages were found for this Meta token.',
-      {
-        requestedPageId: normalizedRequestedPageId,
-        accessiblePages: []
-      },
-      400
-    );
-  }
-
-  const matchedPage =
-    accessiblePages.find((page) => String(page?.id || '') === normalizedRequestedPageId) ||
-    accessiblePages[0];
-
-  if (!matchedPage?.id) {
-    throw buildStageErrorWithDetails(
-      'Creative creation',
-      'The selected Facebook page is not available for this Meta token.',
-      {
-        requestedPageId: normalizedRequestedPageId,
-        accessiblePages
-      },
-      400
-    );
-  }
-
-  return {
-    pageId: String(matchedPage.id),
-    pageName: String(matchedPage.name || ''),
-    requestedPageId: normalizedRequestedPageId,
-    accessiblePages
-  };
-};
-
-const uploadCreativeAsset = async ({ fileBuffer, fileName, mediaUrl, userId, adAccountId }) => {
-  if (!fileBuffer && !mediaUrl) {
-    return { mediaHash: '', mediaUrl: '' };
-  }
-
-  if (shouldUseMockMode()) {
-    return {
-      mediaHash: `mock_${Date.now()}`,
-      mediaUrl: mediaUrl || `mock://${fileName || 'upload'}`
-    };
-  }
-
-  const accessContext = await getAccessContextForUser(userId);
-  const effectiveAdAccountId =
-    adAccountId ||
-    accessContext.connection?.selectedAdAccountId ||
-    getEnvConfig().adAccountId;
-
-  if (mediaUrl) {
-    const response = await graphRequest({
-      method: 'POST',
-      path: buildAdAccountPath(effectiveAdAccountId, 'adimages'),
-      data: { url: mediaUrl },
-      accessToken: accessContext.accessToken
-    });
-    const image = response?.images ? Object.values(response.images)[0] : null;
-    return {
-      mediaHash: image?.hash || '',
-      mediaUrl
-    };
-  }
-
-  const form = new FormData();
-  form.append('filename', fileBuffer, { filename: fileName || `creative-${Date.now()}.jpg` });
-
-  const response = await graphRequest({
-    method: 'POST',
-    path: buildAdAccountPath(effectiveAdAccountId, 'adimages'),
-    data: form,
-    headers: form.getHeaders(),
-    accessToken: accessContext.accessToken
+const uploadCreativeAsset = async ({ fileBuffer, fileName, mediaUrl, userId, adAccountId }) =>
+  metaCreativeService.uploadCreativeAsset({
+    fileBuffer,
+    fileName,
+    mediaUrl,
+    userId,
+    adAccountId,
+    shouldUseMockMode,
+    getAccessContextForUser,
+    getEnvConfig,
+    graphRequest,
+    buildAdAccountPath,
+    buildStageErrorWithDetails,
+    extractApiErrorMessage
   });
-  const image = response?.images ? Object.values(response.images)[0] : null;
-
-  return {
-    mediaHash: image?.hash || '',
-    mediaUrl: ''
-  };
-};
 
 const getSetupBundle = async ({ userId } = {}) => {
   if (shouldUseMockMode()) {
@@ -327,9 +263,24 @@ const getSetupBundle = async ({ userId } = {}) => {
     };
   }
 
-  const env = getEnvConfig();
-  const envAdAccountId = toCanonicalAdAccountId(env.adAccountId);
   const accessContext = await getAccessContextForUser(userId);
+  if (!userId || !accessContext?.accessToken || !['user', 'admin'].includes(accessContext.source)) {
+    return {
+      mode: 'disconnected',
+      connected: false,
+      adAccountId: '',
+      pageId: '',
+      selectedWhatsappNumber: '',
+      pages: [],
+      businesses: [],
+      adAccounts: [],
+      whatsappNumbers: [],
+      setupError: 'Meta access is not configured for this admin.',
+      authSource: accessContext?.source || 'none',
+      profileName: ''
+    };
+  }
+
   const warnings = [];
   const savedSelection = accessContext.connection || {};
 
@@ -349,9 +300,9 @@ const getSetupBundle = async ({ userId } = {}) => {
       params: { fields: 'id,name,account_status,currency,timezone_name' },
       accessToken: accessContext.accessToken
     }),
-    (savedSelection.selectedPageId || env.pageId)
+    savedSelection.selectedPageId
       ? graphRequest({
-          path: savedSelection.selectedPageId || env.pageId,
+          path: savedSelection.selectedPageId,
           params: { fields: 'id,name,whatsapp_business_account{id,name,phone_numbers{display_phone_number,id}}' },
           accessToken: accessContext.accessToken
         })
@@ -382,15 +333,20 @@ const getSetupBundle = async ({ userId } = {}) => {
     warnings.push(`Ad accounts: ${extractApiErrorMessage(adAccountsResult.reason)}`);
   }
 
-  const requestedPageId = String(savedSelection.selectedPageId || env.pageId || '').trim();
+  const fallbackAccessiblePageId = String(pages[0]?.id || '').trim();
+  const requestedPageId = String(savedSelection.selectedPageId || fallbackAccessiblePageId || '').trim();
   const accessiblePageIds = new Set(
     pages.map((page) => String(page?.id || '').trim()).filter(Boolean)
   );
   let selectedPageId =
     (requestedPageId && accessiblePageIds.has(requestedPageId) ? requestedPageId : '') ||
-    String(pages[0]?.id || '').trim() ||
+    fallbackAccessiblePageId ||
     '';
-  const selectedAdAccountId = savedSelection.selectedAdAccountId || adAccounts[0]?.id || envAdAccountId || '';
+  const selectedAdAccountId =
+    savedSelection.selectedAdAccountId ||
+    accessContext?.adminMetaConfig?.adAccountId ||
+    adAccounts[0]?.id ||
+    '';
   let whatsappNumbers = [];
 
   if (pageDetailsResult.status === 'fulfilled' && pageDetailsResult.value) {
@@ -401,6 +357,35 @@ const getSetupBundle = async ({ userId } = {}) => {
     selectedPageId = String(pageDetailsResult.value?.id || selectedPageId || '').trim();
   } else if (pageDetailsResult.status === 'rejected') {
     warnings.push(`Page details: ${extractApiErrorMessage(pageDetailsResult.reason)}`);
+  }
+
+  if (selectedPageId && !whatsappNumbers.length && (!pageDetailsResult.value || String(pageDetailsResult.value?.id || '').trim() !== selectedPageId)) {
+    try {
+      const selectedPageDetails = await graphRequest({
+        path: selectedPageId,
+        params: { fields: 'id,name,whatsapp_business_account{id,name,phone_numbers{display_phone_number,id}}' },
+        accessToken: accessContext.accessToken
+      });
+
+      whatsappNumbers =
+        selectedPageDetails?.whatsapp_business_account?.phone_numbers?.data ||
+        selectedPageDetails?.whatsapp_business_account?.phone_numbers ||
+        [];
+    } catch (error) {
+      warnings.push(`Selected page details: ${extractApiErrorMessage(error)}`);
+    }
+  }
+
+  if (userId && selectedPageId && selectedPageId !== String(savedSelection.selectedPageId || '').trim()) {
+    await MetaAdsConnection.updateOne(
+      { userId },
+      {
+        $set: {
+          selectedPageId,
+          lastValidatedAt: new Date()
+        }
+      }
+    );
   }
 
   if (!selectedPageId && requestedPageId) {
@@ -426,18 +411,18 @@ const getSetupBundle = async ({ userId } = {}) => {
   }
 
   const fallback = {
-    mode: 'mock',
+    mode: 'disconnected',
     connected: false,
-    adAccountId: savedSelection.selectedAdAccountId || envAdAccountId || 'mock-ad-account',
-    pageId: savedSelection.selectedPageId || env.pageId || 'mock-page',
+    adAccountId: savedSelection.selectedAdAccountId || '',
+    pageId: savedSelection.selectedPageId || '',
     selectedWhatsappNumber: savedSelection.selectedWhatsappNumber || '',
-    pages: pages.length ? pages : [],
-    businesses: [{ id: 'mock-business-1', name: 'Technovo Demo Business' }],
-    adAccounts: [{ id: savedSelection.selectedAdAccountId || envAdAccountId || 'act_mock_account', name: 'Technovo Demo Ad Account' }],
-    whatsappNumbers: [{ id: 'mock-waba-1', display_phone_number: savedSelection.selectedWhatsappNumber || '+91 98765 43210' }],
-    setupError: warnings.join(' | ') || 'Meta setup could not be loaded with the current credentials.',
-    authSource: accessContext.source,
-    profileName: accessContext.connection?.name || ''
+    pages,
+    businesses,
+    adAccounts,
+    whatsappNumbers,
+      setupError: warnings.join(' | ') || 'Meta setup could not be loaded for this admin.',
+      authSource: accessContext.source,
+      profileName: accessContext.connection?.name || ''
   };
 
   console.warn('Meta Ads setup fallback enabled:', fallback.setupError);
@@ -462,6 +447,42 @@ const toCheckResult = (result, mapSuccess) => {
 const getConnectionDiagnostics = async ({ userId } = {}) => {
   const env = getEnvConfig();
   const accessContext = await getAccessContextForUser(userId);
+  const selectedPageId = String(accessContext?.connection?.selectedPageId || '').trim();
+  const selectedAdAccountId = toCanonicalAdAccountId(accessContext?.connection?.selectedAdAccountId || '');
+
+  if (!userId || !accessContext?.accessToken || !['user', 'admin'].includes(accessContext.source)) {
+    return {
+      env: {
+        apiVersion: env.apiVersion,
+        hasAccessToken: false,
+        hasAdAccountId: false,
+        hasPageId: false,
+        forceMock: env.forceMock,
+        authSource: accessContext?.source || 'none',
+        connectedProfileName: ''
+      },
+      checks: {
+        profile: { ok: false, error: 'Meta access is not configured for this admin.' },
+        businesses: { ok: false, error: 'Meta access is not configured for this admin.' },
+        pages: { ok: false, error: 'Meta access is not configured for this admin.' },
+        pageDetails: { ok: false, error: 'No page selected for this admin.' },
+        adAccount: { ok: false, error: 'No ad account selected for this admin.' }
+      },
+      warnings: ['Meta access is not configured for this admin.'],
+      summary: {
+        healthy: false,
+        mode: 'disconnected',
+        accessiblePages: 0,
+        accessibleBusinesses: 0
+      },
+      targets: {
+        pageId: '',
+        adAccountId: '',
+        apiVersion: env.apiVersion,
+        graphBaseUrl: GRAPH_BASE_URL
+      }
+    };
+  }
 
   const checks = await Promise.allSettled([
     graphRequest({
@@ -479,20 +500,20 @@ const getConnectionDiagnostics = async ({ userId } = {}) => {
       params: { fields: 'id,name,instagram_business_account{id,username}' },
       accessToken: accessContext.accessToken
     }),
-    env.pageId
+    selectedPageId
       ? graphRequest({
-          path: env.pageId,
+          path: selectedPageId,
           params: { fields: 'id,name,whatsapp_business_account{id,name,phone_numbers{display_phone_number,id}}' },
           accessToken: accessContext.accessToken
         })
-      : Promise.reject(new Error('META_PAGE_ID is not configured')),
-    env.adAccountId
+      : Promise.reject(new Error('No Meta page selected for this user')),
+    selectedAdAccountId
       ? graphRequest({
-          path: buildAdAccountPath(env.adAccountId),
+          path: buildAdAccountPath(selectedAdAccountId),
           params: { fields: 'id,name,account_status,currency,timezone_name' },
           accessToken: accessContext.accessToken
         })
-      : Promise.reject(new Error('META_AD_ACCOUNT_ID is not configured'))
+      : Promise.reject(new Error('No Meta ad account selected for this user'))
   ]);
 
   const [meResult, businessesResult, pagesResult, pageDetailsResult, adAccountResult] = checks;
@@ -501,8 +522,8 @@ const getConnectionDiagnostics = async ({ userId } = {}) => {
     env: {
       apiVersion: env.apiVersion,
       hasAccessToken: Boolean(accessContext.accessToken),
-      hasAdAccountId: Boolean(env.adAccountId),
-      hasPageId: Boolean(env.pageId),
+      hasAdAccountId: Boolean(selectedAdAccountId),
+      hasPageId: Boolean(selectedPageId),
       forceMock: env.forceMock,
       authSource: accessContext.source,
       connectedProfileName: accessContext.connection?.name || ''
@@ -544,8 +565,8 @@ const getConnectionDiagnostics = async ({ userId } = {}) => {
   };
 
   diagnostics.targets = {
-    pageId: env.pageId || '',
-    adAccountId: env.adAccountId || '',
+    pageId: selectedPageId,
+    adAccountId: selectedAdAccountId,
     apiVersion: env.apiVersion,
     graphBaseUrl: GRAPH_BASE_URL
   };
@@ -553,18 +574,8 @@ const getConnectionDiagnostics = async ({ userId } = {}) => {
   return diagnostics;
 };
 
-const exchangeCodeForAccessToken = async ({ code, redirectUri }) => {
-  const env = getEnvConfig();
-  const response = await axios.get(`${GRAPH_BASE_URL}/${env.apiVersion}/oauth/access_token`, {
-    params: {
-      client_id: env.appId || process.env.META_APP_ID,
-      client_secret: env.appSecret || process.env.META_APP_SECRET,
-      redirect_uri: redirectUri,
-      code
-    }
-  });
-  return response.data;
-};
+const exchangeCodeForAccessToken = async ({ code, redirectUri, appId, appSecret, apiVersion }) =>
+  metaAuthService.exchangeCodeForAccessToken({ code, redirectUri, appId, appSecret, apiVersion });
 
 const getUserAdAccounts = async ({ userId } = {}) => {
   if (shouldUseMockMode()) {
@@ -572,7 +583,7 @@ const getUserAdAccounts = async ({ userId } = {}) => {
     return setup.adAccounts || [];
   }
 
-  const accessContext = await getAccessContextForUser(userId);
+  const accessContext = await ensureConnectedMetaUser(userId, 'Meta account selection');
   const response = await graphRequest({
     path: 'me/adaccounts',
     params: { fields: 'id,name,account_status,currency,timezone_name' },
@@ -582,90 +593,204 @@ const getUserAdAccounts = async ({ userId } = {}) => {
   return Array.isArray(response?.data) ? response.data : [];
 };
 
-const getLoginDialogUrl = ({ redirectUri, state }) => {
-  const env = getEnvConfig();
-  const scopes = [
-    'public_profile',
-    'email',
-    'business_management',
-    'ads_management',
-    'ads_read',
-    'pages_show_list',
-    'pages_read_engagement',
-    'pages_manage_metadata'
-  ].join(',');
+const mapMetaObjectiveToCrudObjective = (objective) => {
+  const normalizedObjective = String(objective || '').trim().toUpperCase();
 
-  const params = new URLSearchParams({
-    client_id: process.env.META_APP_ID,
-    redirect_uri: redirectUri,
-    scope: scopes,
-    response_type: 'code',
-    state
-  });
-
-  return `https://www.facebook.com/${env.apiVersion}/dialog/oauth?${params.toString()}`;
-};
-
-const saveUserConnection = async ({ userId, accessToken, scopes = [] }) => {
-  const profile = await graphRequest({
-    path: 'me',
-    params: { fields: 'id,name' },
-    accessToken
-  });
-
-  const connection = await MetaAdsConnection.findOneAndUpdate(
-    { userId },
-    {
-      userId,
-      platformUserId: String(profile?.id || ''),
-      name: String(profile?.name || ''),
-      accessToken: encryptMetaToken(accessToken),
-      scopes,
-      connectedAt: new Date(),
-      lastValidatedAt: new Date()
-    },
-    {
-      new: true,
-      upsert: true,
-      setDefaultsOnInsert: true
-    }
-  );
-
-  return connection;
-};
-
-const ensureUserConnectionRecord = async ({ userId } = {}) => {
-  if (!userId) return null;
-
-  const existingConnection = await MetaAdsConnection.findOne({ userId });
-  if (existingConnection) return existingConnection;
-
-  const accessContext = await getAccessContextForUser(userId);
-  if (!accessContext?.accessToken) return null;
-
-  try {
-    return await saveUserConnection({
-      userId,
-      accessToken: accessContext.accessToken,
-      scopes: accessContext.connection?.scopes || []
-    });
-  } catch {
-    return MetaAdsConnection.findOneAndUpdate(
-      { userId },
-      {
-        userId,
-        accessToken: encryptMetaToken(accessContext.accessToken),
-        connectedAt: new Date(),
-        lastValidatedAt: new Date()
-      },
-      {
-        new: true,
-        upsert: true,
-        setDefaultsOnInsert: true
-      }
-    );
+  switch (normalizedObjective) {
+    case 'OUTCOME_TRAFFIC':
+      return 'traffic';
+    case 'OUTCOME_ENGAGEMENT':
+      return 'engagement';
+    case 'OUTCOME_LEADS':
+      return 'leads';
+    case 'OUTCOME_SALES':
+      return 'sales';
+    case 'OUTCOME_AWARENESS':
+    default:
+      return 'awareness';
   }
 };
+
+const mapMetaStatusToCrudStatus = (status, effectiveStatus) => {
+  const normalized = String(effectiveStatus || status || '').trim().toUpperCase();
+
+  if (['ACTIVE', 'IN_PROCESS'].includes(normalized)) {
+    return 'active';
+  }
+  if (
+    [
+      'PAUSED',
+      'CAMPAIGN_PAUSED',
+      'ADSET_PAUSED',
+      'AD_PAUSED'
+    ].includes(normalized)
+  ) {
+    return 'paused';
+  }
+  if (['ARCHIVED', 'DELETED'].includes(normalized)) {
+    return 'archived';
+  }
+  if (['COMPLETED', 'WITH_ISSUES'].includes(normalized)) {
+    return 'ended';
+  }
+
+  return 'draft';
+};
+
+const toMoneyAmount = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed / 100 : 0;
+};
+
+const normalizeMetaDateValue = (value) => {
+  const normalized = String(value || '').trim();
+  if (!normalized) return '';
+  if (/^1970-01-01T/i.test(normalized)) return '';
+  return normalized;
+};
+
+const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
+  if (shouldUseMockMode()) {
+    return [];
+  }
+
+  const accessContext = await getAccessContextForUser(userId);
+  const tokenCandidates = [...new Set([accessContext.accessToken].filter(Boolean))];
+
+  if (!userId || !tokenCandidates.length || !['user', 'admin'].includes(accessContext.source)) {
+    return [];
+  }
+
+  const adAccountCandidates = new Map();
+  const configuredAccountIds = [accessContext.connection?.selectedAdAccountId]
+    .map((value) => toCanonicalAdAccountId(value))
+    .filter(Boolean);
+
+  configuredAccountIds.forEach((id) => adAccountCandidates.set(id, { id }));
+
+  for (const accessToken of tokenCandidates) {
+    try {
+      const response = await graphRequest({
+        path: 'me/adaccounts',
+        params: { fields: 'id,name,account_status,currency,timezone_name', limit: 50 },
+        accessToken
+      });
+
+      for (const account of Array.isArray(response?.data) ? response.data : []) {
+        const canonicalId = toCanonicalAdAccountId(account?.id);
+        if (!canonicalId) continue;
+        adAccountCandidates.set(canonicalId, { ...(adAccountCandidates.get(canonicalId) || {}), ...account });
+      }
+    } catch (error) {
+      console.warn(
+        '[Meta Ads] Unable to load ad accounts while fetching remote campaigns',
+        JSON.stringify({
+          source: accessContext.source,
+          message: extractApiErrorMessage(error)
+        })
+      );
+    }
+  }
+
+  const remoteCampaignMap = new Map();
+  const accountIds = [...adAccountCandidates.keys()];
+
+  for (const adAccountId of accountIds) {
+    let response = null;
+
+    for (const accessToken of tokenCandidates) {
+      try {
+        response = await graphRequest({
+          path: buildAdAccountPath(adAccountId, 'campaigns'),
+          params: {
+            fields:
+              'id,name,status,effective_status,objective,daily_budget,lifetime_budget,start_time,stop_time,created_time,updated_time,insights.limit(1){impressions,clicks,spend,ctr,cpc}',
+            limit: 100
+          },
+          accessToken
+        });
+        break;
+      } catch (error) {
+        console.warn(
+          '[Meta Ads] Unable to load campaigns for ad account',
+          JSON.stringify({
+            adAccountId,
+            source: accessContext.source,
+            message: extractApiErrorMessage(error)
+          })
+        );
+      }
+    }
+
+    const campaigns = Array.isArray(response?.data) ? response.data : [];
+    for (const campaign of campaigns) {
+      const remoteId = String(campaign?.id || '').trim();
+      if (!remoteId || remoteCampaignMap.has(remoteId)) continue;
+
+      const insight = Array.isArray(campaign?.insights?.data) ? campaign.insights.data[0] || {} : {};
+      remoteCampaignMap.set(remoteId, {
+        _id: `meta_${remoteId}`,
+        id: `meta_${remoteId}`,
+        source: 'meta',
+        readOnly: true,
+        syncedFromMeta: true,
+        metaCampaignId: remoteId,
+        metaAdAccountId: adAccountId,
+        name: String(campaign?.name || `Meta Campaign ${remoteId}`),
+        platform: 'both',
+        objective: mapMetaObjectiveToCrudObjective(campaign?.objective),
+        status: mapMetaStatusToCrudStatus(campaign?.status, campaign?.effective_status),
+        dailyBudget: toMoneyAmount(campaign?.daily_budget),
+        lifetimeBudget: toMoneyAmount(campaign?.lifetime_budget),
+        startDate: normalizeMetaDateValue(campaign?.start_time || campaign?.created_time || ''),
+        endDate: normalizeMetaDateValue(campaign?.stop_time || ''),
+        targeting: 'Imported from Meta Ads',
+        spent: Number(insight?.spend || 0),
+        impressions: Number(insight?.impressions || 0),
+        clicks: Number(insight?.clicks || 0),
+        ctr: Number(insight?.ctr || 0),
+        cpc: Number(insight?.cpc || 0),
+        revenue: 0,
+        createdAt: campaign?.created_time || null,
+        updatedAt: campaign?.updated_time || null,
+        metaResponse: campaign
+      });
+    }
+  }
+
+  const normalizedSearch = String(filters.search || '').trim().toLowerCase();
+  const normalizedStatus = String(filters.status || 'all').trim().toLowerCase();
+  const normalizedObjective = String(filters.objective || '').trim().toLowerCase();
+  const normalizedPlatform = String(filters.platform || 'all').trim().toLowerCase();
+
+  return [...remoteCampaignMap.values()].filter((campaign) => {
+    if (!['', 'all'].includes(normalizedStatus) && campaign.status !== normalizedStatus) {
+      return false;
+    }
+    if (normalizedObjective && campaign.objective !== normalizedObjective) {
+      return false;
+    }
+    if (!['', 'all', 'both'].includes(normalizedPlatform) && campaign.platform !== normalizedPlatform) {
+      return false;
+    }
+    if (
+      normalizedSearch &&
+      !`${campaign.name} ${campaign.objective} ${campaign.metaCampaignId}`.toLowerCase().includes(normalizedSearch)
+    ) {
+      return false;
+    }
+    return true;
+  });
+};
+
+const getLoginDialogUrl = ({ redirectUri, state, appId, apiVersion }) =>
+  metaAuthService.getLoginDialogUrl({ redirectUri, state, appId, apiVersion });
+
+const saveUserConnection = async ({ userId, accessToken, scopes = [] }) =>
+  metaAuthService.saveUserConnection({ userId, accessToken, scopes, graphRequest });
+
+const ensureUserConnectionRecord = async ({ userId } = {}) =>
+  metaAuthService.ensureUserConnectionRecord({ userId, graphRequest });
 
 const saveUserSelections = async ({ userId, adAccountId, pageId, whatsappNumber }) => {
   const existingConnection = await ensureUserConnectionRecord({ userId });
@@ -727,13 +852,117 @@ const saveUserAdAccountSelection = async ({ userId, adAccountId }) => {
   return saveUserSelections({ userId, adAccountId: selectedAdAccountId });
 };
 
-const createMetaAdStack = async ({ campaign, creativeUpload, userId }) => {
+const mapObjectiveToPixelEvent = (objective) => {
+  const normalized = String(objective || '').trim().toUpperCase();
+  switch (normalized) {
+    case 'OUTCOME_SALES':
+      return 'PURCHASE';
+    case 'OUTCOME_LEADS':
+      return 'LEAD';
+    case 'OUTCOME_TRAFFIC':
+      return 'VIEW_CONTENT';
+    default:
+      return 'LEAD';
+  }
+};
+
+const buildPromotedObject = ({ objective, destinationUrl, pageId }) => {
   const env = getEnvConfig();
-  const accessContext = await getAccessContextForUser(userId);
+  if (!env.pixelId) return null;
+  if (!/^https?:\/\//i.test(String(destinationUrl || ''))) return null;
+
+  return {
+    pixel_id: env.pixelId,
+    custom_event_type: mapObjectiveToPixelEvent(objective),
+    page_id: pageId || undefined
+  };
+};
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const resolveAdIdFromCreation = async ({
+  createdAd,
+  createdAdSetId,
+  createdCreativeId,
+  effectiveAdAccountId,
+  resolvedAccessToken,
+  campaignName
+}) => {
+  const directId =
+    String(
+      createdAd?.id ||
+      createdAd?.ad_id ||
+      createdAd?.data?.id ||
+      createdAd?.result?.id ||
+      ''
+    ).trim();
+
+  if (directId) {
+    return directId;
+  }
+
+  const adName = `${campaignName} - Ad`;
+  for (const waitMs of [0, 800, 1500, 2500, 4000]) {
+    if (waitMs > 0) {
+      await delay(waitMs);
+    }
+
+    const lookupCandidates = [];
+
+    try {
+      const adSetAdsResponse = await graphRequest({
+        path: `${String(createdAdSetId).trim()}/ads`,
+        params: {
+          fields: 'id,name,creative{id},adset{id}',
+          limit: 50
+        },
+        accessToken: resolvedAccessToken
+      });
+
+      lookupCandidates.push(...(Array.isArray(adSetAdsResponse?.data) ? adSetAdsResponse.data : []));
+    } catch (error) {
+      console.warn('[Meta Ads] Unable to resolve ad id from ad set lookup:', extractApiErrorMessage(error));
+    }
+
+    if (!lookupCandidates.length) {
+      try {
+        const accountAdsResponse = await graphRequest({
+          path: buildAdAccountPath(effectiveAdAccountId, 'ads'),
+          params: {
+            fields: 'id,name,adset{id},creative{id}',
+            limit: 100
+          },
+          accessToken: resolvedAccessToken
+        });
+
+        lookupCandidates.push(...(Array.isArray(accountAdsResponse?.data) ? accountAdsResponse.data : []));
+      } catch (error) {
+        console.warn('[Meta Ads] Unable to resolve ad id from ad account lookup:', extractApiErrorMessage(error));
+      }
+    }
+
+    const matchedAd =
+      lookupCandidates.find((item) => String(item?.creative?.id || '') === String(createdCreativeId || '')) ||
+      lookupCandidates.find((item) => String(item?.name || '').trim() === adName) ||
+      lookupCandidates.find((item) => String(item?.adset?.id || item?.adset_id || '') === String(createdAdSetId || ''));
+
+    const resolvedId = String(matchedAd?.id || '').trim();
+    if (resolvedId) {
+      return resolvedId;
+    }
+  }
+
+  return '';
+};
+
+const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
+  const accessContext = await ensureConnectedMetaUser(userId, 'Campaign creation');
+  let resolvedAccessToken = accessContext.accessToken;
+  const initialDeliveryStatus =
+    String(campaign?.status || '').trim().toUpperCase() === 'ACTIVE' ? 'ACTIVE' : 'PAUSED';
   const effectiveAdAccountId =
     campaign?.adAccountId ||
-    accessContext.connection?.selectedAdAccountId ||
-    env.adAccountId;
+    accessContext.connection?.selectedAdAccountId;
 
   if (shouldUseMockMode()) {
     const now = Date.now();
@@ -748,12 +977,29 @@ const createMetaAdStack = async ({ campaign, creativeUpload, userId }) => {
     };
   }
 
+  if (!effectiveAdAccountId) {
+    throw buildStageErrorWithDetails(
+      'Campaign creation',
+      'Select a Meta ad account for this user before publishing campaigns.',
+      { userId: userId || '' },
+      400
+    );
+  }
+
   const objective = campaign.objective || 'OUTCOME_LEADS';
   const deliveryObjective = objective === 'OUTCOME_LEADS' ? 'OUTCOME_TRAFFIC' : objective;
-  const requestedPageId = campaign.configuredPageId || accessContext.connection?.selectedPageId || env.pageId;
+  const requestedPageId = campaign.configuredPageId || accessContext.connection?.selectedPageId;
+  if (!requestedPageId) {
+    throw buildStageErrorWithDetails(
+      'Campaign creation',
+      'Select a Facebook Page for this user before publishing campaigns.',
+      { userId: userId || '' },
+      400
+    );
+  }
   const creativePageContext = await resolveCreativePageContext({
     requestedPageId,
-    accessToken: accessContext.accessToken
+    accessToken: resolvedAccessToken
   });
   const configuredPageId = creativePageContext.pageId;
   const instagramActorId = campaign.configuredInstagramActorId || undefined;
@@ -761,8 +1007,14 @@ const createMetaAdStack = async ({ campaign, creativeUpload, userId }) => {
     whatsappNumber: campaign.whatsappNumber,
     pageId: configuredPageId
   });
+  const resolvedDestinationUrl = String(campaign?.metaOverrides?.destinationUrl || destinationUrl).trim();
   const targeting = buildTargeting(campaign.targeting);
   const placement = buildPlacement(campaign.placement);
+  const promotedObject = buildPromotedObject({
+    objective,
+    destinationUrl: resolvedDestinationUrl,
+    pageId: configuredPageId
+  });
   const dailyBudget = Math.max(100, Number(campaign.budget?.dailyBudget || 500));
   const startTime = campaign.schedule?.startTime ? new Date(campaign.schedule.startTime).toISOString() : new Date().toISOString();
   const endTime = campaign.schedule?.endTime ? new Date(campaign.schedule.endTime).toISOString() : undefined;
@@ -775,10 +1027,10 @@ const createMetaAdStack = async ({ campaign, creativeUpload, userId }) => {
       data: {
         name: campaign.campaignName,
         objective: deliveryObjective,
-        status: 'PAUSED',
+        status: initialDeliveryStatus,
         special_ad_categories: []
       },
-      accessToken: accessContext.accessToken
+      accessToken: resolvedAccessToken
     });
   } catch (error) {
     throw buildStageError('Campaign creation', error);
@@ -790,15 +1042,16 @@ const createMetaAdStack = async ({ campaign, creativeUpload, userId }) => {
     daily_budget: Math.round(dailyBudget * 100),
     billing_event: 'IMPRESSIONS',
     optimization_goal:
-      objective === 'OUTCOME_TRAFFIC'
+      campaign?.metaOverrides?.optimizationGoal ||
+      (objective === 'OUTCOME_TRAFFIC'
         ? 'LINK_CLICKS'
         : objective === 'OUTCOME_ENGAGEMENT'
           ? 'REACH'
-          : 'LINK_CLICKS',
-    bid_strategy: env.bidStrategy || 'LOWEST_COST_WITH_BID_CAP',
+          : 'LINK_CLICKS'),
+    bid_strategy: campaign?.metaOverrides?.bidStrategy || env.bidStrategy || 'LOWEST_COST_WITH_BID_CAP',
     bid_amount: Number.isFinite(env.bidAmount) && env.bidAmount > 0 ? env.bidAmount : 5000,
     targeting,
-    status: 'PAUSED',
+    status: initialDeliveryStatus,
     start_time: startTime,
     end_time: endTime,
     ...placement
@@ -812,18 +1065,21 @@ const createMetaAdStack = async ({ campaign, creativeUpload, userId }) => {
       {
         ...adSetPayload,
         bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
-        bid_amount: undefined
+        bid_amount: undefined,
+        promoted_object: promotedObject || undefined
       },
       {
         ...adSetPayload,
         bid_strategy: 'LOWEST_COST_WITH_BID_CAP',
-        bid_amount: Number.isFinite(env.bidAmount) && env.bidAmount > 0 ? env.bidAmount : 5000
+        bid_amount: Number.isFinite(env.bidAmount) && env.bidAmount > 0 ? env.bidAmount : 5000,
+        promoted_object: promotedObject || undefined
       },
       {
         ...adSetPayload,
         optimization_goal: 'REACH',
         bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
-        bid_amount: undefined
+        bid_amount: undefined,
+        promoted_object: undefined
       },
       {
         name: `${campaign.campaignName} - Ad Set`,
@@ -834,9 +1090,10 @@ const createMetaAdStack = async ({ campaign, creativeUpload, userId }) => {
         bid_strategy: 'LOWEST_COST_WITH_BID_CAP',
         bid_amount: Number.isFinite(env.bidAmount) && env.bidAmount > 0 ? env.bidAmount : 5000,
         targeting,
-        status: 'PAUSED',
+        status: initialDeliveryStatus,
         start_time: startTime,
-        end_time: endTime
+        end_time: endTime,
+        promoted_object: promotedObject || undefined
       }
     ].map((payload) => {
       const cleaned = { ...payload };
@@ -857,7 +1114,7 @@ const createMetaAdStack = async ({ campaign, creativeUpload, userId }) => {
           method: 'POST',
           path: buildAdAccountPath(effectiveAdAccountId, 'adsets'),
           data: variant,
-          accessToken: accessContext.accessToken
+          accessToken: resolvedAccessToken
         });
         lastError = null;
         break;
@@ -901,68 +1158,29 @@ const createMetaAdStack = async ({ campaign, creativeUpload, userId }) => {
     throw buildStageError('Ad set creation', error);
   }
 
-  const requestedCtaType = String(campaign.creative?.callToAction || 'WHATSAPP_MESSAGE').trim();
-  const effectiveCtaType =
-    requestedCtaType === 'WHATSAPP_MESSAGE' && !sanitizedWhatsappNumber
-      ? 'LEARN_MORE'
-      : requestedCtaType;
-
-  const callToActionValue =
-    effectiveCtaType === 'WHATSAPP_MESSAGE'
-      ? {
-          app_destination: 'WHATSAPP',
-          link: destinationUrl,
-          page_welcome_message: campaign.creative?.primaryText || campaign.campaignName || 'Start a conversation on WhatsApp'
-        }
-      : {
-          link: destinationUrl
-        };
-
-  const objectStorySpec = {
-    page_id: configuredPageId,
-    link_data: {
-      link: destinationUrl,
-      message: campaign.creative?.primaryText || campaign.campaignName || 'Learn more',
-      name: campaign.creative?.headline || campaign.campaignName,
-      description: campaign.creative?.description || '',
-      call_to_action: {
-        type: effectiveCtaType,
-        value: callToActionValue
-      }
-    }
-  };
-
-  if (creativeUpload?.mediaHash) {
-    objectStorySpec.link_data.image_hash = creativeUpload.mediaHash;
-  }
-  if (instagramActorId) {
-    objectStorySpec.instagram_actor_id = instagramActorId;
-  }
-
   let createdCreative;
   try {
-    createdCreative = await graphRequest({
-      method: 'POST',
-      path: buildAdAccountPath(effectiveAdAccountId, 'adcreatives'),
-      data: {
-        name: `${campaign.campaignName} - Creative`,
-        object_story_spec: objectStorySpec
-      },
-      accessToken: accessContext.accessToken
+    createdCreative = await metaCreativeService.createCreative({
+      campaignName: campaign.campaignName,
+      creative: campaign.creative,
+      creativeUpload,
+      configuredPageId,
+      instagramActorId,
+      destinationUrl: resolvedDestinationUrl,
+      sanitizedWhatsappNumber,
+      adAccountId: effectiveAdAccountId,
+      accessToken: resolvedAccessToken,
+      graphRequest,
+      buildAdAccountPath,
+      buildStageErrorWithDetails,
+      extractApiErrorMessage,
+      creativePageContext
     });
   } catch (error) {
-    throw buildStageErrorWithDetails(
-      'Creative creation',
-      extractApiErrorMessage(error),
-      {
-        metaError: error?.response?.data || null,
-        requestedPageId: creativePageContext.requestedPageId,
-        resolvedPageId: creativePageContext.pageId,
-        resolvedPageName: creativePageContext.pageName,
-        accessiblePages: creativePageContext.accessiblePages
-      },
-      error?.response?.status || 400
-    );
+    if (error?.stage) {
+      throw error;
+    }
+    throw buildStageError('Creative creation', error);
   }
 
   let createdAd;
@@ -976,10 +1194,33 @@ const createMetaAdStack = async ({ campaign, creativeUpload, userId }) => {
         creative: { creative_id: createdCreative.id },
         status: campaign.status === 'ACTIVE' ? 'ACTIVE' : 'PAUSED'
       },
-      accessToken: accessContext.accessToken
+      accessToken: resolvedAccessToken
     });
   } catch (error) {
     throw buildStageError('Ad creation', error);
+  }
+
+  const resolvedAdId = await resolveAdIdFromCreation({
+    createdAd,
+    createdAdSetId: createdAdSet.id,
+    createdCreativeId: createdCreative.id,
+    effectiveAdAccountId,
+    resolvedAccessToken,
+    campaignName: campaign.campaignName
+  });
+
+  if (!resolvedAdId) {
+    throw buildStageErrorWithDetails(
+      'Ad creation',
+      'Meta ad was created but its id could not be resolved from the API response.',
+      {
+        createdAd,
+        adSetId: createdAdSet.id,
+        creativeId: createdCreative.id,
+        adAccountId: effectiveAdAccountId
+      },
+      400
+    );
   }
 
   return {
@@ -988,10 +1229,15 @@ const createMetaAdStack = async ({ campaign, creativeUpload, userId }) => {
     campaignId: createdCampaign.id,
     adSetId: createdAdSet.id,
     creativeId: createdCreative.id,
-    adId: createdAd.id,
-    mediaHash: creativeUpload?.mediaHash || ''
+    adId: resolvedAdId,
+    mediaHash: creativeUpload?.mediaHash || '',
+    destinationUrl: resolvedDestinationUrl,
+    pageId: configuredPageId
   };
 };
+
+const createMetaAdStack = async ({ campaign, creativeUpload, userId }) =>
+  createFullAdStack({ campaign, creativeUpload, userId });
 
 const fetchCampaignInsights = async (campaign) => {
   if (!campaign?.meta?.campaignId) {
@@ -1021,8 +1267,16 @@ const fetchCampaignInsights = async (campaign) => {
   }
 
   let response;
-  const accessContext = await getAccessContextForUser(campaign.userId);
-  const effectiveAdAccountId = campaign?.meta?.adAccountId || accessContext.connection?.selectedAdAccountId || getEnvConfig().adAccountId;
+  const accessContext = await ensureConnectedMetaUser(campaign.userId, 'Insights sync');
+  const effectiveAdAccountId = campaign?.meta?.adAccountId || accessContext.connection?.selectedAdAccountId;
+  if (!effectiveAdAccountId) {
+    throw buildStageErrorWithDetails(
+      'Insights sync',
+      'Select a Meta ad account for this user before syncing analytics.',
+      { campaignId: String(campaign?._id || '') },
+      400
+    );
+  }
   try {
     response = await graphRequest({
       path: buildAdAccountPath(effectiveAdAccountId, 'insights'),
@@ -1063,6 +1317,80 @@ const getOrCreateWalletRecord = async (userId) => {
     wallet = await MetaAdsWallet.create({ userId, balance: 0 });
   }
   return wallet;
+};
+
+const ensureWalletBalance = async ({ userId, requiredAmount, note, campaignId }) => {
+  const amount = Math.max(0, Number(requiredAmount || 0));
+  const wallet = await getOrCreateWalletRecord(userId);
+
+  if (Number(wallet.balance || 0) < amount) {
+    const error = new Error(`Insufficient wallet balance. Add at least ₹${amount} before activating this campaign.`);
+    error.status = 400;
+    error.stage = 'Wallet balance check';
+    error.details = {
+      balance: Number(wallet.balance || 0),
+      requiredAmount: amount
+    };
+    throw error;
+  }
+
+  if (amount > 0) {
+    wallet.balance = Number(wallet.balance || 0) - amount;
+    await wallet.save();
+
+    await MetaAdsTransaction.create({
+      userId,
+      campaignId: campaignId || null,
+      amount,
+      type: 'debit',
+      note: note || 'Campaign activation reserve'
+    });
+  }
+
+  return wallet;
+};
+
+const trackPixelEvent = async ({
+  eventName,
+  userData = {},
+  customData = {},
+  eventTime,
+  eventSourceUrl,
+  actionSource = 'website',
+  accessToken
+}) => {
+  const env = getEnvConfig();
+  if (!env.pixelId) {
+    return {
+      skipped: true,
+      reason: 'META_PIXEL_ID is not configured'
+    };
+  }
+
+  if (shouldUseMockMode()) {
+    return {
+      apiMode: 'mock',
+      eventName
+    };
+  }
+
+  return graphRequest({
+    method: 'POST',
+    path: `${env.pixelId}/events`,
+    data: {
+      data: [
+        {
+          event_name: eventName,
+          event_time: eventTime || Math.floor(Date.now() / 1000),
+          action_source: actionSource,
+          event_source_url: eventSourceUrl,
+          user_data: userData,
+          custom_data: customData
+        }
+      ]
+    },
+    accessToken
+  });
 };
 
 const reconcileCampaignSpend = async (campaign, latestAnalytics) => {
@@ -1118,6 +1446,336 @@ const syncCampaignAnalyticsRecord = async (campaign) => {
   return campaign;
 };
 
+const createMetaCampaignFromCrud = async ({ userId, name, objective, status }) => {
+  const accessContext = await ensureConnectedMetaUser(userId, 'Campaign creation');
+  const effectiveAdAccountId = accessContext.connection?.selectedAdAccountId;
+
+  if (!effectiveAdAccountId) {
+    throw buildStageErrorWithDetails(
+      'Campaign creation',
+      'Select a Meta ad account for this user before creating campaigns.',
+      { configuredAdAccountId: effectiveAdAccountId },
+      400
+    );
+  }
+
+  if (shouldUseMockMode()) {
+    return {
+      apiMode: 'mock',
+      id: `mock-campaign-${Date.now()}`,
+      effective_status: String(status || 'PAUSED').toUpperCase()
+    };
+  }
+
+  try {
+    const response = await graphRequest({
+      method: 'POST',
+      path: buildAdAccountPath(effectiveAdAccountId, 'campaigns'),
+      data: {
+        name: String(name || 'Campaign').trim(),
+        objective: mapCrudObjectiveToMetaObjective(objective),
+        status: String(status || 'PAUSED').toUpperCase() === 'ACTIVE' ? 'ACTIVE' : 'PAUSED',
+        special_ad_categories: []
+      },
+      accessToken: accessContext.accessToken
+    });
+
+    return {
+      apiMode: 'live',
+      ...response
+    };
+  } catch (error) {
+    throw buildStageError('Campaign creation', error);
+  }
+};
+
+const parseTargetingCountriesFromCrud = (targeting) => {
+  const tokens = String(targeting || '')
+    .split(',')
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean);
+
+  const countries = tokens.filter((token) => /^[A-Z]{2}$/.test(token));
+  return countries.length ? countries : ['IN'];
+};
+
+const createMetaAdStackFromCrud = async ({
+  userId,
+  campaignName,
+  objective,
+  dailyBudget,
+  startDate,
+  endDate,
+  targeting,
+  ageMin,
+  ageMax,
+  gender,
+  primaryText,
+  headline,
+  description,
+  destinationUrl,
+  callToAction,
+  optimizationGoal,
+  bidStrategy,
+  imageUrl,
+  imageFileBuffer,
+  imageFileName,
+  status
+}) => {
+  const accessContext = await ensureConnectedMetaUser(userId, 'Campaign creation');
+  const normalizedStatus = String(status || '').trim().toUpperCase() === 'ACTIVE' ? 'ACTIVE' : 'PAUSED';
+  const allowedOptimizationGoals = getAllowedOptimizationGoalsForCrudObjective(objective);
+  const normalizedOptimizationGoal = String(optimizationGoal || '').trim().toUpperCase();
+  const resolvedOptimizationGoal = allowedOptimizationGoals.includes(normalizedOptimizationGoal)
+    ? normalizedOptimizationGoal
+    : getDefaultOptimizationGoalForCrudObjective(objective);
+  const genders = [];
+
+  if (String(gender || '').toLowerCase() === 'male') genders.push(1);
+  if (String(gender || '').toLowerCase() === 'female') genders.push(2);
+
+  const configuredPageId = accessContext.connection?.selectedPageId;
+  const selectedAdAccountId = accessContext.connection?.selectedAdAccountId;
+  if (!configuredPageId) {
+    throw buildStageErrorWithDetails(
+      'Campaign creation',
+      'Select a Facebook Page for this user before publishing campaigns.',
+      { userId: userId || '' },
+      400
+    );
+  }
+  if (!selectedAdAccountId) {
+    throw buildStageErrorWithDetails(
+      'Campaign creation',
+      'Select a Meta ad account for this user before publishing campaigns.',
+      { userId: userId || '' },
+      400
+    );
+  }
+  const creativeUpload = await uploadCreativeAsset({
+    fileBuffer: imageFileBuffer,
+    fileName: imageFileName,
+    mediaUrl: imageUrl,
+    userId,
+    adAccountId: selectedAdAccountId
+  });
+
+  if (!creativeUpload?.mediaHash && !creativeUpload?.mediaUrl) {
+    throw buildStageErrorWithDetails(
+      'Creative upload',
+      'Ad image is required. Upload an image or provide a valid image URL.',
+      { imageUrl: imageUrl || '', fileName: imageFileName || '' },
+      400
+    );
+  }
+
+  const stack = await createFullAdStack({
+    userId,
+    creativeUpload,
+    campaign: {
+      campaignName,
+      objective: mapCrudObjectiveToMetaObjective(objective),
+      status: normalizedStatus,
+      configuredPageId,
+      budget: {
+        dailyBudget: Math.max(1, Number(dailyBudget || 50)),
+        currency: 'INR'
+      },
+      targeting: {
+        countries: parseTargetingCountriesFromCrud(targeting),
+        ageMin: Math.max(13, Number(ageMin || 18)),
+        ageMax: Math.min(65, Number(ageMax || 65)),
+        genders
+      },
+      creative: {
+        primaryText: String(primaryText || campaignName).trim(),
+        headline: String(headline || campaignName).trim(),
+        description: String(description || '').trim(),
+        callToAction: String(callToAction || 'LEARN_MORE').trim().toUpperCase(),
+        mediaUrl: creativeUpload.mediaUrl || imageUrl || '',
+        mediaHash: creativeUpload.mediaHash
+      },
+      schedule: {
+        startTime: startDate || undefined,
+        endTime: endDate || undefined
+      },
+      metaOverrides: {
+        optimizationGoal: resolvedOptimizationGoal,
+        bidStrategy: String(bidStrategy || env.bidStrategy || 'LOWEST_COST_WITHOUT_CAP')
+          .trim()
+          .toUpperCase(),
+        destinationUrl: String(destinationUrl || '').trim()
+      }
+    }
+  });
+
+  return {
+    ...stack,
+    imageHash: creativeUpload.mediaHash,
+    status: normalizedStatus,
+    destinationUrl:
+      String(destinationUrl || stack.destinationUrl || `https://www.facebook.com/${configuredPageId || ''}`).trim(),
+    pageId: configuredPageId || ''
+  };
+};
+
+const updateMetaCrudDeliveryStatus = async ({ userId, campaignId, adSetId, adId, status }) => {
+  const normalizedStatus = String(status || '').trim().toUpperCase();
+
+  if (!['ACTIVE', 'PAUSED'].includes(normalizedStatus)) {
+    return { skipped: true };
+  }
+
+  if (shouldUseMockMode()) {
+    return {
+      apiMode: 'mock',
+      status: normalizedStatus
+    };
+  }
+
+  const accessContext = await ensureConnectedMetaUser(userId, 'Campaign status update');
+  const updates = [
+    campaignId ? graphRequest({ method: 'POST', path: campaignId, data: { status: normalizedStatus }, accessToken: accessContext.accessToken }) : null,
+    adSetId ? graphRequest({ method: 'POST', path: adSetId, data: { status: normalizedStatus }, accessToken: accessContext.accessToken }) : null,
+    adId ? graphRequest({ method: 'POST', path: adId, data: { status: normalizedStatus }, accessToken: accessContext.accessToken }) : null
+  ].filter(Boolean);
+
+  try {
+    await Promise.all(updates);
+    return {
+      apiMode: 'live',
+      status: normalizedStatus
+    };
+  } catch (error) {
+    throw buildStageError('Campaign status update', error);
+  }
+};
+
+const archiveMetaCrudAssets = async ({ userId, campaignId, adSetId, adId }) => {
+  const assetIds = [
+    { id: adId, label: 'ad' },
+    { id: adSetId, label: 'ad set' },
+    { id: campaignId, label: 'campaign' }
+  ].filter((asset) => String(asset.id || '').trim());
+
+  if (!assetIds.length) {
+    return {
+      skipped: true,
+      reason: 'No Meta assets linked to this campaign.'
+    };
+  }
+
+  if (shouldUseMockMode()) {
+    return {
+      apiMode: 'mock',
+      archived: assetIds.map((asset) => ({
+        id: asset.id,
+        type: asset.label,
+        status: 'ARCHIVED'
+      }))
+    };
+  }
+
+  const accessContext = await ensureConnectedMetaUser(userId, 'Campaign deletion');
+  const archived = [];
+
+  for (const asset of assetIds) {
+    try {
+      await graphRequest({
+        method: 'POST',
+        path: String(asset.id).trim(),
+        data: { status: 'ARCHIVED' },
+        accessToken: accessContext.accessToken
+      });
+
+      archived.push({
+        id: asset.id,
+        type: asset.label,
+        status: 'ARCHIVED'
+      });
+    } catch (error) {
+      throw buildStageErrorWithDetails(
+        'Campaign deletion',
+        `Unable to archive the Meta ${asset.label} before deleting the local campaign.`,
+        {
+          assetType: asset.label,
+          assetId: asset.id,
+          archived,
+          metaError: error?.response?.data || { message: extractApiErrorMessage(error) }
+        },
+        error?.response?.status || 400
+      );
+    }
+  }
+
+  return {
+    apiMode: 'live',
+    archived
+  };
+};
+
+const updateMetaCampaignFromCrud = async ({ userId, campaignId, name, status }) => {
+  if (!campaignId) {
+    return { apiMode: shouldUseMockMode() ? 'mock' : 'skipped' };
+  }
+
+  if (shouldUseMockMode()) {
+    return {
+      apiMode: 'mock',
+      id: campaignId,
+      name,
+      status
+    };
+  }
+
+  const accessContext = await ensureConnectedMetaUser(userId, 'Campaign update');
+  const payload = {};
+
+  if (String(name || '').trim()) {
+    payload.name = String(name).trim();
+  }
+
+  const normalizedStatus = String(status || '').trim().toUpperCase();
+  if (['ACTIVE', 'PAUSED'].includes(normalizedStatus)) {
+    payload.status = normalizedStatus;
+  }
+
+  if (!Object.keys(payload).length) {
+    return {
+      apiMode: 'live',
+      id: campaignId,
+      skipped: true
+    };
+  }
+
+  try {
+    const response = await graphRequest({
+      method: 'POST',
+      path: campaignId,
+      data: payload,
+      accessToken: accessContext.accessToken
+    });
+
+    return {
+      apiMode: 'live',
+      ...response
+    };
+  } catch (error) {
+    throw buildStageError('Campaign update', error);
+  }
+};
+
+const updateCampaign = async ({ userId, campaignId, name, status }) =>
+  updateMetaCampaignFromCrud({ userId, campaignId, name, status });
+
+const pauseCampaign = async ({ userId, campaignId, adSetId, adId }) =>
+  updateMetaCrudDeliveryStatus({ userId, campaignId, adSetId, adId, status: 'PAUSED' });
+
+const resumeCampaign = async ({ userId, campaignId, adSetId, adId }) =>
+  updateMetaCrudDeliveryStatus({ userId, campaignId, adSetId, adId, status: 'ACTIVE' });
+
+const fetchInsights = async (campaign) => fetchCampaignInsights(campaign);
+
 const syncAllCampaignAnalytics = async () => {
   const campaigns = await MetaAdCampaign.find({
     status: { $in: ['ACTIVE', 'PAUSED'] }
@@ -1161,7 +1819,7 @@ const updateCampaignDeliveryStatus = async ({ campaign, userId, status }) => {
     };
   }
 
-  const accessContext = await getAccessContextForUser(userId || campaign?.userId);
+  const accessContext = await ensureConnectedMetaUser(userId || campaign?.userId, 'Campaign status update');
 
   try {
     if (campaign?.meta?.campaignId) {
@@ -1200,6 +1858,380 @@ const updateCampaignDeliveryStatus = async ({ campaign, userId, status }) => {
   };
 };
 
+const getInsightsDatePreset = (range) => {
+  const normalizedRange = String(range || '30d').trim().toLowerCase();
+  switch (normalizedRange) {
+    case '7d':
+      return 'last_7d';
+    case '90d':
+      return 'last_90d';
+    case '30d':
+    default:
+      return 'last_30d';
+  }
+};
+
+const dedupeById = (items = []) => {
+  const seen = new Set();
+  return items.filter((item) => {
+    const id = String(item?.id || '').trim();
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+};
+
+const resolveInsightsAccess = async ({ userId } = {}) => {
+  const accessContext = await getAccessContextForUser(userId);
+  if (!userId || !accessContext?.accessToken || !['user', 'admin'].includes(accessContext.source)) {
+    return {
+      accessContext,
+      tokenCandidates: [],
+      adAccounts: []
+    };
+  }
+  const tokenCandidates = [...new Set([accessContext.accessToken].filter(Boolean))];
+  const adAccounts = new Map();
+
+  [accessContext.connection?.selectedAdAccountId]
+    .map((value) => toCanonicalAdAccountId(value))
+    .filter(Boolean)
+    .forEach((id) => {
+      adAccounts.set(id, { id, source: 'configured' });
+    });
+
+  for (const accessToken of tokenCandidates) {
+    try {
+      const response = await graphRequest({
+        path: 'me/adaccounts',
+        params: { fields: 'id,name,account_status,currency,timezone_name', limit: 100 },
+        accessToken
+      });
+
+      for (const account of Array.isArray(response?.data) ? response.data : []) {
+        const id = toCanonicalAdAccountId(account?.id);
+        if (!id) continue;
+        adAccounts.set(id, {
+          ...(adAccounts.get(id) || {}),
+          ...account,
+          id
+        });
+      }
+    } catch (error) {
+      console.warn(
+        '[Meta Insights] Unable to load ad accounts',
+        JSON.stringify({
+          source: accessContext.source,
+          message: extractApiErrorMessage(error)
+        })
+      );
+    }
+  }
+
+  return {
+    accessContext,
+    tokenCandidates,
+    adAccounts: [...adAccounts.values()]
+  };
+};
+
+const requestMetaAcrossTokens = async ({ path, params, tokenCandidates }) => {
+  let lastError = null;
+
+  for (const accessToken of tokenCandidates) {
+    try {
+      return await graphRequest({
+        path,
+        params,
+        accessToken
+      });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+
+  return { data: [] };
+};
+
+const aggregateInsightRows = (rows = []) => {
+  const timeseriesMap = new Map();
+  const summary = {
+    reach: 0,
+    impressions: 0,
+    spend: 0,
+    clicks: 0
+  };
+
+  for (const row of rows) {
+    const date = String(row?.date_start || row?.date || '').trim();
+    const reach = Number(row?.reach || 0);
+    const impressions = Number(row?.impressions || 0);
+    const spend = Number(row?.spend || 0);
+    const clicks = Number(row?.clicks || 0);
+
+    summary.reach += reach;
+    summary.impressions += impressions;
+    summary.spend += spend;
+    summary.clicks += clicks;
+
+    if (date) {
+      const existing = timeseriesMap.get(date) || { date, reach: 0, spend: 0 };
+      existing.reach += reach;
+      existing.spend = Number((existing.spend + spend).toFixed(2));
+      timeseriesMap.set(date, existing);
+    }
+  }
+
+  const timeseries = [...timeseriesMap.values()].sort((left, right) => left.date.localeCompare(right.date));
+
+  return {
+    summary: {
+      reach: Math.round(summary.reach),
+      impressions: Math.round(summary.impressions),
+      spend: Number(summary.spend.toFixed(2)),
+      ctr: summary.impressions > 0 ? Number(((summary.clicks / summary.impressions) * 100).toFixed(2)) : 0
+    },
+    timeseries
+  };
+};
+
+const aggregateDemographicsRows = (rows = []) => {
+  const demographicsMap = new Map();
+
+  for (const row of rows) {
+    const age = String(row?.age || '').trim();
+    const gender = String(row?.gender || '').trim().toLowerCase();
+    const reach = Number(row?.reach || 0);
+    if (!age) continue;
+
+    const existing = demographicsMap.get(age) || { age, male: 0, female: 0 };
+    if (gender === 'male') {
+      existing.male += Math.round(reach);
+    } else if (gender === 'female') {
+      existing.female += Math.round(reach);
+    }
+    demographicsMap.set(age, existing);
+  }
+
+  const ageOrder = ['13-17', '18-24', '25-34', '35-44', '45-54', '55-64', '65+'];
+  return [...demographicsMap.values()].sort(
+    (left, right) => ageOrder.indexOf(left.age) - ageOrder.indexOf(right.age)
+  );
+};
+
+const fetchInsightsFilters = async ({ userId } = {}) => {
+  const { tokenCandidates, adAccounts } = await resolveInsightsAccess({ userId });
+  if (!tokenCandidates.length || !adAccounts.length) {
+    return {
+      campaigns: [{ id: 'all', name: 'All Campaigns', adSets: [{ id: 'all', name: 'All Ad Sets' }] }]
+    };
+  }
+
+  const campaignMap = new Map();
+  const adSetMap = new Map();
+
+  for (const account of adAccounts) {
+    try {
+      const campaignsResponse = await requestMetaAcrossTokens({
+        path: buildAdAccountPath(account.id, 'campaigns'),
+        params: {
+          fields: 'id,name,effective_status,objective',
+          limit: 100
+        },
+        tokenCandidates
+      });
+
+      for (const campaign of Array.isArray(campaignsResponse?.data) ? campaignsResponse.data : []) {
+        const campaignId = String(campaign?.id || '').trim();
+        if (!campaignId) continue;
+        campaignMap.set(campaignId, {
+          id: campaignId,
+          name: String(campaign?.name || campaignId),
+          objective: String(campaign?.objective || ''),
+          status: String(campaign?.effective_status || ''),
+          adSets: [{ id: 'all', name: 'All Ad Sets' }]
+        });
+      }
+    } catch (error) {
+      console.warn('[Meta Insights] Campaign filter load failed:', extractApiErrorMessage(error));
+    }
+
+    try {
+      const adSetsResponse = await requestMetaAcrossTokens({
+        path: buildAdAccountPath(account.id, 'adsets'),
+        params: {
+          fields: 'id,name,campaign_id',
+          limit: 200
+        },
+        tokenCandidates
+      });
+
+      for (const adSet of Array.isArray(adSetsResponse?.data) ? adSetsResponse.data : []) {
+        const adSetId = String(adSet?.id || '').trim();
+        const campaignId = String(adSet?.campaign_id || '').trim();
+        if (!adSetId || !campaignId) continue;
+
+        const normalizedAdSet = {
+          id: adSetId,
+          name: String(adSet?.name || adSetId)
+        };
+        adSetMap.set(adSetId, normalizedAdSet);
+
+        const existingCampaign = campaignMap.get(campaignId);
+        if (existingCampaign) {
+          existingCampaign.adSets = dedupeById([...(existingCampaign.adSets || []), normalizedAdSet]);
+          campaignMap.set(campaignId, existingCampaign);
+        }
+      }
+    } catch (error) {
+      console.warn('[Meta Insights] Ad set filter load failed:', extractApiErrorMessage(error));
+    }
+  }
+
+  return {
+    campaigns: [
+      { id: 'all', name: 'All Campaigns', adSets: [{ id: 'all', name: 'All Ad Sets' }] },
+      ...[...campaignMap.values()].sort((left, right) => left.name.localeCompare(right.name))
+    ]
+  };
+};
+
+const fetchInsightsDashboard = async ({ userId, range = '30d', campaignId, adSetId } = {}) => {
+  const datePreset = getInsightsDatePreset(range);
+
+  if (shouldUseMockMode()) {
+    const totalDays = range === '7d' ? 7 : range === '90d' ? 90 : 30;
+    const timeseries = Array.from({ length: totalDays }, (_, index) => {
+      const date = new Date();
+      date.setDate(date.getDate() - (totalDays - index - 1));
+      const reach = Math.round(4200 + index * 110 + Math.sin(index / 3) * 950);
+      const spend = Number((reach * 0.0042).toFixed(2));
+      return {
+        date: date.toISOString().slice(0, 10),
+        reach,
+        spend
+      };
+    });
+
+    const aggregated = aggregateInsightRows(
+      timeseries.map((entry) => ({
+        date_start: entry.date,
+        reach: entry.reach,
+        impressions: Math.round(entry.reach * 1.33),
+        spend: entry.spend,
+        clicks: Math.round(entry.reach * 0.022)
+      }))
+    );
+
+    return {
+      summary: aggregated.summary,
+      timeseries,
+      demographics: [
+        { age: '13-17', male: 4200, female: 3900 },
+        { age: '18-24', male: 15800, female: 12800 },
+        { age: '25-34', male: 22100, female: 18400 },
+        { age: '35-44', male: 12600, female: 10800 },
+        { age: '45-54', male: 7200, female: 6400 },
+        { age: '55-64', male: 3900, female: 3500 },
+        { age: '65+', male: 1700, female: 1600 }
+      ]
+    };
+  }
+
+  const { tokenCandidates, adAccounts } = await resolveInsightsAccess({ userId });
+  if (!tokenCandidates.length) {
+    throw buildStageErrorWithDetails(
+      'Insights',
+      'Meta access token is not configured for insights.',
+      { range, campaignId: campaignId || '', adSetId: adSetId || '' },
+      400
+    );
+  }
+
+  const insightRows = [];
+  const demographicRows = [];
+
+  const entityPath = adSetId
+    ? `${String(adSetId).trim()}/insights`
+    : campaignId
+      ? `${String(campaignId).trim()}/insights`
+      : null;
+
+  if (entityPath) {
+    const timeseriesResponse = await requestMetaAcrossTokens({
+      path: entityPath,
+      params: {
+        fields: 'date_start,reach,impressions,spend,clicks',
+        date_preset: datePreset,
+        time_increment: 1,
+        limit: 100
+      },
+      tokenCandidates
+    });
+    insightRows.push(...(Array.isArray(timeseriesResponse?.data) ? timeseriesResponse.data : []));
+
+    const demographicsResponse = await requestMetaAcrossTokens({
+      path: entityPath,
+      params: {
+        fields: 'reach',
+        date_preset: datePreset,
+        breakdowns: 'age,gender',
+        limit: 100
+      },
+      tokenCandidates
+    });
+    demographicRows.push(...(Array.isArray(demographicsResponse?.data) ? demographicsResponse.data : []));
+  } else {
+    for (const account of adAccounts) {
+      try {
+        const timeseriesResponse = await requestMetaAcrossTokens({
+          path: buildAdAccountPath(account.id, 'insights'),
+          params: {
+            fields: 'date_start,reach,impressions,spend,clicks',
+            date_preset: datePreset,
+            time_increment: 1,
+            level: 'campaign',
+            limit: 500
+          },
+          tokenCandidates
+        });
+        insightRows.push(...(Array.isArray(timeseriesResponse?.data) ? timeseriesResponse.data : []));
+      } catch (error) {
+        console.warn('[Meta Insights] Timeseries fetch failed:', extractApiErrorMessage(error));
+      }
+
+      try {
+        const demographicsResponse = await requestMetaAcrossTokens({
+          path: buildAdAccountPath(account.id, 'insights'),
+          params: {
+            fields: 'reach',
+            date_preset: datePreset,
+            breakdowns: 'age,gender',
+            level: 'campaign',
+            limit: 500
+          },
+          tokenCandidates
+        });
+        demographicRows.push(...(Array.isArray(demographicsResponse?.data) ? demographicsResponse.data : []));
+      } catch (error) {
+        console.warn('[Meta Insights] Demographics fetch failed:', extractApiErrorMessage(error));
+      }
+    }
+  }
+
+  const aggregated = aggregateInsightRows(insightRows);
+
+  return {
+    summary: aggregated.summary,
+    timeseries: aggregated.timeseries,
+    demographics: aggregateDemographicsRows(demographicRows)
+  };
+};
+
 module.exports = {
   extractApiErrorMessage,
   buildStageError,
@@ -1215,12 +2247,28 @@ module.exports = {
   ensureUserConnectionRecord,
   saveUserSelections,
   saveUserAdAccountSelection,
+  fetchInsightsFilters,
+  fetchInsightsDashboard,
+  fetchRemoteCampaigns,
   uploadCreativeAsset,
+  createFullAdStack,
   createMetaAdStack,
+  createMetaCampaignFromCrud,
+  createMetaAdStackFromCrud,
+  updateCampaign,
+  pauseCampaign,
+  resumeCampaign,
+  archiveMetaCrudAssets,
+  updateMetaCampaignFromCrud,
+  updateMetaCrudDeliveryStatus,
+  fetchInsights,
   fetchCampaignInsights,
   syncCampaignAnalyticsRecord,
   syncAllCampaignAnalytics,
   updateCampaignDeliveryStatus,
+  getOrCreateWalletRecord,
+  ensureWalletBalance,
+  trackPixelEvent,
   shouldUseMockMode,
   normalizeAdAccountId,
   toCanonicalAdAccountId

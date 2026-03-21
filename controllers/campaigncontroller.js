@@ -4,6 +4,171 @@ const Campaign = require('../models/campaign');
 require('../models/User');
 const APIFeatures = require('../utils/apifeature');
 const { validationResult } = require('express-validator');
+const metaAdsService = require('../services/metaAdsService');
+const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
+
+const buildMetaCreateErrorMessage = (metaError) => {
+    const details = metaError?.details?.error || {};
+    const title = String(details.error_user_title || '').trim();
+    const userMessage = String(details.error_user_msg || '').trim();
+    const stage = String(metaError?.stage || '').trim();
+    const errorCode = Number(details.code || 0);
+    const errorSubcode = Number(details.error_subcode || 0);
+    const rawMessage = String(details.message || metaError?.message || '').trim();
+
+    if (stage === 'Creative creation' && /invalid page id/i.test(title || metaError?.message || '')) {
+        const parts = [
+            'Image upload worked, but Meta rejected the ad creative because the selected Facebook Page is invalid or not accessible for this admin login.'
+        ];
+
+        if (userMessage) {
+            parts.push(userMessage);
+        }
+
+        parts.push('Reconnect Meta with the correct admin account, select a valid Facebook Page in Meta Connect, and then try publishing again.');
+        return parts.join(' ');
+    }
+
+    if (
+        stage === 'Creative creation' &&
+        (
+            /no permission to access this profile/i.test(title) ||
+            /required permission to access this profile/i.test(userMessage) ||
+            /application does not have permission for this action/i.test(rawMessage) ||
+            (errorCode === 10 && errorSubcode === 1341012)
+        )
+    ) {
+        const parts = [
+            'Meta rejected the ad creative because this admin login does not have permission to use the selected Facebook Page profile.'
+        ];
+
+        parts.push(
+            'Use a Facebook login that is an admin/editor of that Page, reconnect Meta, approve page permissions, and then try again.'
+        );
+
+        return parts.join(' ');
+    }
+
+    if (
+        stage === 'Ad creation' &&
+        (
+            /please authenticate your account/i.test(title) ||
+            /pending action/i.test(rawMessage) ||
+            (errorCode === 31 && errorSubcode === 3858385)
+        )
+    ) {
+        return 'Meta blocked new ad creation because this ad account has a pending security/authentication action. Open Ads Manager with the same account, complete the account authentication prompt, and then publish again.';
+    }
+
+    if (userMessage) {
+        return `${metaError.message || 'Meta campaign creation failed'}. ${userMessage}`;
+    }
+
+    return metaError?.message || 'Meta campaign creation failed';
+};
+
+const sendMetaError = (res, metaError, fallbackMessage) =>
+  res.status(metaError.status || 400).json({
+    success: false,
+    message: metaError.message || fallbackMessage,
+    details: metaError.details || null,
+    metaStage: metaError.stage || null
+  });
+
+const serializeCampaignRecord = (campaign) => {
+    const source =
+        typeof campaign?.toObject === 'function'
+            ? campaign.toObject({ virtuals: true })
+            : { ...(campaign || {}) };
+
+    const createdByValue =
+        source?.createdBy && typeof source.createdBy === 'object' && source.createdBy !== null
+            ? source.createdBy._id || source.createdBy.id || source.createdBy
+            : source?.createdBy;
+    const updatedByValue =
+        source?.updatedBy && typeof source.updatedBy === 'object' && source.updatedBy !== null
+            ? source.updatedBy._id || source.updatedBy.id || source.updatedBy
+            : source?.updatedBy;
+
+    return {
+        ...source,
+        createdById: createdByValue ? String(createdByValue) : '',
+        updatedById: updatedByValue ? String(updatedByValue) : '',
+        createdBy:
+            source?.createdBy && typeof source.createdBy === 'object' && source.createdBy !== null
+                ? source.createdBy
+                : (createdByValue ? String(createdByValue) : null),
+        updatedBy:
+            source?.updatedBy && typeof source.updatedBy === 'object' && source.updatedBy !== null
+                ? source.updatedBy
+                : (updatedByValue ? String(updatedByValue) : null)
+    };
+};
+
+const buildCampaignStats = (campaigns = []) =>
+    campaigns.reduce((acc, campaign) => {
+        acc.totalSpent += Number(campaign?.spent || 0);
+        acc.totalRevenue += Number(campaign?.revenue || 0);
+        acc.totalImpressions += Number(campaign?.impressions || 0);
+        acc.totalClicks += Number(campaign?.clicks || 0);
+        acc.avgCtrSource.push(Number(campaign?.ctr || 0));
+        acc.avgCpcSource.push(Number(campaign?.cpc || 0));
+        return acc;
+    }, {
+        totalSpent: 0,
+        totalRevenue: 0,
+        totalImpressions: 0,
+        totalClicks: 0,
+        avgCtrSource: [],
+        avgCpcSource: []
+    });
+
+const ensureCampaignOwnership = (campaign, req, res, actionMessage) => {
+    if (!campaign) {
+        res.status(404).json({
+            success: false,
+            message: 'Campaign not found'
+        });
+        return false;
+    }
+
+    if (req.user.role !== 'superadmin' && campaign.createdBy.toString() !== req.user.id) {
+        res.status(403).json({
+            success: false,
+            message: actionMessage
+        });
+        return false;
+    }
+
+    return true;
+};
+
+const normalizeLifecycleState = ({ requestedStatus, existingCampaign } = {}) => {
+    const wantsActiveLaunch = String(requestedStatus || '').toLowerCase() === 'active';
+    if (!wantsActiveLaunch) {
+        return {
+            status: 'draft',
+            lifecycleStatus:
+                existingCampaign?.lifecycleStatus === 'pending_payment' ||
+                existingCampaign?.lifecycleStatus === 'payment_verified' ||
+                existingCampaign?.lifecycleStatus === 'pending_review' ||
+                existingCampaign?.lifecycleStatus === 'approved'
+                    ? 'draft'
+                    : (existingCampaign?.lifecycleStatus || 'draft'),
+            paymentStatus: existingCampaign?.paymentStatus || 'verified',
+            reviewStatus: existingCampaign?.reviewStatus || 'approved',
+            deliveryStatus: existingCampaign?.deliveryStatus || 'not_published'
+        };
+    }
+
+    return {
+        status: 'draft',
+        lifecycleStatus: 'approved',
+        paymentStatus: 'verified',
+        reviewStatus: 'approved',
+        deliveryStatus: 'not_published'
+    };
+};
 
 // @desc    Get all campaigns
 // @route   GET /api/campaigns
@@ -12,10 +177,12 @@ exports.getCampaigns = async (req, res) => {
     try {
         // Build query
         const query = Campaign.find();
+        const ownershipFilter = {};
         
         // Add user filter (users can only see their own campaigns)
         if (req.user.role !== 'superadmin') {
             query.where('createdBy').equals(req.user.id);
+            ownershipFilter.createdBy = req.user.id;
         }
         
         // Apply filters, sorting, pagination
@@ -27,50 +194,60 @@ exports.getCampaigns = async (req, res) => {
             .search(['name', 'objective']);
 
         // Execute query
-        const campaigns = await features.query
-            .populate('createdBy', 'name email')
-            .populate('updatedBy', 'name email');
+        const campaigns = await features.query;
+
+        const localCampaigns = campaigns.map((campaign) => serializeCampaignRecord(campaign));
 
         // Get total count for pagination
-        const totalCount = await Campaign.countDocuments(features.filterConditions);
+        const combinedFilter = {
+            ...ownershipFilter,
+            ...(features.filterConditions || {})
+        };
+        const totalCount = await Campaign.countDocuments(combinedFilter);
+        let remoteCampaigns = [];
+        try {
+            remoteCampaigns = await metaAdsService.fetchRemoteCampaigns({
+                userId: req.user.id,
+                filters: req.query
+            });
+        } catch (remoteError) {
+            console.warn('Unable to fetch remote Meta campaigns:', remoteError.message || remoteError);
+        }
 
-        // Get statistics
-        const stats = await Campaign.aggregate([
-            {
-                $match: features.filterConditions
-            },
-            {
-                $group: {
-                    _id: null,
-                    totalSpent: { $sum: '$spent' },
-                    totalRevenue: { $sum: '$revenue' },
-                    totalImpressions: { $sum: '$impressions' },
-                    totalClicks: { $sum: '$clicks' },
-                    avgCTR: { $avg: '$ctr' },
-                    avgCPC: { $avg: '$cpc' }
-                }
-            }
-        ]);
+        const existingMetaCampaignIds = new Set(
+            localCampaigns.map((campaign) => String(campaign.metaCampaignId || '').trim()).filter(Boolean)
+        );
+        const remoteOnlyCampaigns = remoteCampaigns.filter(
+            (campaign) => !existingMetaCampaignIds.has(String(campaign.metaCampaignId || '').trim())
+        );
+        const mergedCampaigns = [...localCampaigns, ...remoteOnlyCampaigns];
+        const mergedStats = buildCampaignStats(mergedCampaigns);
+        const avgCtrSource = mergedStats.avgCtrSource.filter((value) => Number.isFinite(value));
+        const avgCpcSource = mergedStats.avgCpcSource.filter((value) => Number.isFinite(value));
 
         res.status(200).json({
             success: true,
-            count: campaigns.length,
-            total: totalCount,
+            count: mergedCampaigns.length,
+            total: totalCount + remoteOnlyCampaigns.length,
             pagination: {
                 page: parseInt(req.query.page) || 1,
                 limit: parseInt(req.query.limit) || 10,
-                total: totalCount,
-                pages: Math.ceil(totalCount / (parseInt(req.query.limit) || 10))
+                total: totalCount + remoteOnlyCampaigns.length,
+                pages: Math.ceil((totalCount + remoteOnlyCampaigns.length) / (parseInt(req.query.limit) || 10))
             },
-            stats: stats[0] || {
-                totalSpent: 0,
-                totalRevenue: 0,
-                totalImpressions: 0,
-                totalClicks: 0,
-                avgCTR: 0,
-                avgCPC: 0
+            stats: {
+                totalSpent: mergedStats.totalSpent,
+                totalRevenue: mergedStats.totalRevenue,
+                totalImpressions: mergedStats.totalImpressions,
+                totalClicks: mergedStats.totalClicks,
+                avgCTR: avgCtrSource.length
+                    ? avgCtrSource.reduce((sum, value) => sum + value, 0) / avgCtrSource.length
+                    : 0,
+                avgCPC: avgCpcSource.length
+                    ? avgCpcSource.reduce((sum, value) => sum + value, 0) / avgCpcSource.length
+                    : 0
             },
-            data: campaigns
+            data: mergedCampaigns
         });
     } catch (error) {
         console.error('Error fetching campaigns:', error);
@@ -87,9 +264,7 @@ exports.getCampaigns = async (req, res) => {
 // @access  Private
 exports.getCampaign = async (req, res) => {
     try {
-        const campaign = await Campaign.findById(req.params.id)
-            .populate('createdBy', 'name email')
-            .populate('updatedBy', 'name email');
+        const campaign = await Campaign.findById(req.params.id);
 
         if (!campaign) {
             return res.status(404).json({
@@ -99,7 +274,8 @@ exports.getCampaign = async (req, res) => {
         }
 
         // Check authorization
-        if (req.user.role !== 'superadmin' && campaign.createdBy._id.toString() !== req.user.id) {
+        const createdById = campaign.createdBy?._id ? campaign.createdBy._id.toString() : String(campaign.createdBy || '');
+        if (req.user.role !== 'superadmin' && createdById !== req.user.id) {
             return res.status(403).json({
                 success: false,
                 message: 'Not authorized to view this campaign'
@@ -108,7 +284,7 @@ exports.getCampaign = async (req, res) => {
 
         res.status(200).json({
             success: true,
-            data: campaign
+            data: serializeCampaignRecord(campaign)
         });
     } catch (error) {
         console.error('Error fetching campaign:', error);
@@ -154,13 +330,24 @@ exports.createCampaign = async (req, res) => {
             });
         }
 
+        if (req.file?.buffer) {
+            req.body.imageUrl = await uploadCampaignCreative(req.file, {
+                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads'
+            });
+        }
+
+        const wantsActiveLaunch = String(req.body.status || '').toLowerCase() === 'active';
+        Object.assign(req.body, normalizeLifecycleState({ requestedStatus: req.body.status }));
+
         // Create campaign
         const campaign = await Campaign.create(req.body);
 
         res.status(201).json({
             success: true,
-            message: 'Campaign created successfully',
-            data: campaign
+            message: wantsActiveLaunch
+                ? 'Campaign created and is ready to publish.'
+                : 'Campaign draft created successfully.',
+            data: serializeCampaignRecord(campaign)
         });
     } catch (error) {
         console.error('Error creating campaign:', error);
@@ -223,6 +410,36 @@ exports.updateCampaign = async (req, res) => {
             });
         }
 
+        if (req.file?.buffer) {
+            req.body.imageUrl = await uploadCampaignCreative(req.file, {
+                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads'
+            });
+        }
+
+        const nextName = req.body.name || campaign.name;
+        const nextStatus = req.body.status || campaign.status;
+        const isPublished = Boolean(campaign.metaCampaignId);
+
+        if (isPublished) {
+            try {
+                const metaUpdate = await metaAdsService.updateCampaign({
+                    userId: req.user.id,
+                    campaignId: campaign.metaCampaignId,
+                    name: nextName,
+                    status: ['active', 'paused'].includes(String(nextStatus || '').toLowerCase())
+                        ? String(nextStatus).toUpperCase()
+                        : undefined
+                });
+                req.body.metaResponse = metaUpdate;
+            } catch (metaError) {
+                return sendMetaError(res, metaError, 'Meta campaign update failed');
+            }
+        }
+
+        if (!isPublished) {
+            Object.assign(req.body, normalizeLifecycleState({ requestedStatus: nextStatus, existingCampaign: campaign }));
+        }
+
         // Update campaign
         campaign = await Campaign.findByIdAndUpdate(
             req.params.id,
@@ -231,13 +448,12 @@ exports.updateCampaign = async (req, res) => {
                 new: true,
                 runValidators: true
             }
-        ).populate('createdBy', 'name email')
-         .populate('updatedBy', 'name email');
+        );
 
         res.status(200).json({
             success: true,
             message: 'Campaign updated successfully',
-            data: campaign
+            data: serializeCampaignRecord(campaign)
         });
     } catch (error) {
         console.error('Error updating campaign:', error);
@@ -263,7 +479,35 @@ exports.updateCampaign = async (req, res) => {
 // @access  Private
 exports.deleteCampaign = async (req, res) => {
     try {
-        const campaign = await Campaign.findById(req.params.id);
+        const requestedId = String(req.params.id || '').trim();
+        let campaign = null;
+
+        if (!requestedId.startsWith('meta_')) {
+            campaign = await Campaign.findById(req.params.id);
+        }
+
+        if (!campaign && req.body?.metaCampaignId) {
+            try {
+                const metaDeletion = await metaAdsService.archiveMetaCrudAssets({
+                    userId: req.user.id,
+                    campaignId: req.body.metaCampaignId,
+                    adSetId: req.body.metaAdSetId,
+                    adId: req.body.metaAdId
+                });
+
+                return res.status(200).json({
+                    success: true,
+                    message: 'Meta campaign archived successfully',
+                    meta: metaDeletion || null
+                });
+            } catch (metaError) {
+                return sendMetaError(
+                    res,
+                    metaError,
+                    'Meta campaign deletion failed.'
+                );
+            }
+        }
 
         if (!campaign) {
             return res.status(404).json({
@@ -280,11 +524,32 @@ exports.deleteCampaign = async (req, res) => {
             });
         }
 
+        let metaDeletion = null;
+        if (campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId) {
+            try {
+                metaDeletion = await metaAdsService.archiveMetaCrudAssets({
+                    userId: req.user.id,
+                    campaignId: campaign.metaCampaignId,
+                    adSetId: campaign.metaAdSetId,
+                    adId: campaign.metaAdId
+                });
+            } catch (metaError) {
+                return sendMetaError(
+                    res,
+                    metaError,
+                    'Meta campaign deletion failed. The local campaign was not removed.'
+                );
+            }
+        }
+
         await campaign.deleteOne();
 
         res.status(200).json({
             success: true,
-            message: 'Campaign deleted successfully'
+            message: metaDeletion?.archived?.length
+                ? 'Campaign deleted locally and archived in Meta successfully'
+                : 'Campaign deleted successfully',
+            meta: metaDeletion || null
         });
     } catch (error) {
         console.error('Error deleting campaign:', error);
@@ -312,22 +577,25 @@ exports.pauseCampaign = async (req, res) => {
     try {
         const campaign = await Campaign.findById(req.params.id);
 
-        if (!campaign) {
-            return res.status(404).json({
-                success: false,
-                message: 'Campaign not found'
-            });
-        }
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to pause this campaign')) return;
 
-        // Check authorization
-        if (req.user.role !== 'superadmin' && campaign.createdBy.toString() !== req.user.id) {
-            return res.status(403).json({
-                success: false,
-                message: 'Not authorized to pause this campaign'
-            });
+        if (campaign.metaCampaignId) {
+            try {
+                const metaUpdate = await metaAdsService.pauseCampaign({
+                    userId: req.user.id,
+                    campaignId: campaign.metaCampaignId,
+                    adSetId: campaign.metaAdSetId,
+                    adId: campaign.metaAdId
+                });
+                campaign.metaResponse = metaUpdate;
+            } catch (metaError) {
+                return sendMetaError(res, metaError, 'Meta campaign pause failed');
+            }
         }
 
         campaign.status = 'paused';
+        campaign.lifecycleStatus = 'paused';
+        campaign.deliveryStatus = campaign.metaCampaignId ? 'paused' : campaign.deliveryStatus;
         await campaign.save();
 
         res.status(200).json({
@@ -352,22 +620,32 @@ exports.resumeCampaign = async (req, res) => {
     try {
         const campaign = await Campaign.findById(req.params.id);
 
-        if (!campaign) {
-            return res.status(404).json({
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to resume this campaign')) return;
+
+        if (!campaign.metaCampaignId) {
+            return res.status(400).json({
                 success: false,
-                message: 'Campaign not found'
+                message: 'Publish the campaign before running it.'
             });
         }
 
-        // Check authorization
-        if (req.user.role !== 'superadmin' && campaign.createdBy.toString() !== req.user.id) {
-            return res.status(403).json({
-                success: false,
-                message: 'Not authorized to resume this campaign'
-            });
+        if (campaign.metaCampaignId) {
+            try {
+                const metaUpdate = await metaAdsService.resumeCampaign({
+                    userId: req.user.id,
+                    campaignId: campaign.metaCampaignId,
+                    adSetId: campaign.metaAdSetId,
+                    adId: campaign.metaAdId
+                });
+                campaign.metaResponse = metaUpdate;
+            } catch (metaError) {
+                return sendMetaError(res, metaError, 'Meta campaign resume failed');
+            }
         }
 
         campaign.status = 'active';
+        campaign.lifecycleStatus = 'running';
+        campaign.deliveryStatus = 'active';
         await campaign.save();
 
         res.status(200).json({
@@ -431,18 +709,261 @@ exports.duplicateCampaign = async (req, res) => {
         duplicateData.cpc = 0;
         duplicateData.revenue = 0;
 
+        if (String(req.body?.name || '').trim()) {
+            duplicateData.name = String(req.body.name).trim();
+        }
+
+        duplicateData.lifecycleStatus = 'draft';
+        duplicateData.paymentStatus = 'verified';
+        duplicateData.reviewStatus = 'approved';
+        duplicateData.deliveryStatus = 'not_published';
+        duplicateData.reviewNotes = '';
+        duplicateData.paymentVerifiedAt = null;
+        duplicateData.submittedForReviewAt = null;
+        duplicateData.reviewedAt = null;
+        duplicateData.publishedAt = null;
+
         const newCampaign = await Campaign.create(duplicateData);
 
         res.status(201).json({
             success: true,
             message: 'Campaign duplicated successfully',
-            data: newCampaign
+            data: serializeCampaignRecord(newCampaign)
         });
     } catch (error) {
         console.error('Error duplicating campaign:', error);
         res.status(500).json({
             success: false,
             message: 'Error duplicating campaign',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+};
+
+exports.verifyCampaignPayment = async (req, res) => {
+    try {
+        const campaign = await Campaign.findById(req.params.id);
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to verify payment for this campaign')) return;
+
+        campaign.paymentStatus = 'verified';
+        campaign.paymentVerifiedAt = new Date();
+        if (campaign.lifecycleStatus === 'pending_payment' || campaign.lifecycleStatus === 'draft') {
+            campaign.lifecycleStatus = 'pending_review';
+        }
+        await campaign.save();
+
+        res.status(200).json({
+            success: true,
+            message: 'Campaign billing state marked as ready.',
+            data: campaign
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: 'Error verifying campaign payment',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+};
+
+exports.submitCampaignForReview = async (req, res) => {
+    try {
+        const campaign = await Campaign.findById(req.params.id);
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to submit this campaign for review')) return;
+
+        campaign.reviewStatus = 'pending_review';
+        campaign.lifecycleStatus = 'pending_review';
+        campaign.paymentStatus = 'verified';
+        campaign.submittedForReviewAt = new Date();
+        campaign.reviewNotes = String(req.body?.reviewNotes || campaign.reviewNotes || '').trim();
+        await campaign.save();
+
+        res.status(200).json({
+            success: true,
+            message: 'Campaign submitted for review.',
+            data: campaign
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: 'Error submitting campaign for review',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+};
+
+exports.approveCampaignReview = async (req, res) => {
+    try {
+        const campaign = await Campaign.findById(req.params.id);
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to approve this campaign')) return;
+
+        if (campaign.reviewStatus !== 'pending_review') {
+            return res.status(400).json({
+                success: false,
+                message: 'Only campaigns pending review can be approved.'
+            });
+        }
+
+        campaign.reviewStatus = 'approved';
+        campaign.lifecycleStatus = 'approved';
+        campaign.reviewedAt = new Date();
+        campaign.reviewNotes = String(req.body?.reviewNotes || campaign.reviewNotes || '').trim();
+        await campaign.save();
+
+        res.status(200).json({
+            success: true,
+            message: 'Campaign approved successfully.',
+            data: campaign
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: 'Error approving campaign review',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+};
+
+exports.rejectCampaignReview = async (req, res) => {
+    try {
+        const campaign = await Campaign.findById(req.params.id);
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to reject this campaign')) return;
+
+        campaign.reviewStatus = 'rejected';
+        campaign.lifecycleStatus = 'rejected';
+        campaign.deliveryStatus = 'rejected';
+        campaign.reviewedAt = new Date();
+        campaign.reviewNotes = String(req.body?.reviewNotes || campaign.reviewNotes || '').trim();
+        await campaign.save();
+
+        res.status(200).json({
+            success: true,
+            message: 'Campaign review rejected.',
+            data: campaign
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: 'Error rejecting campaign review',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+        });
+    }
+};
+
+exports.publishCampaign = async (req, res) => {
+    try {
+        const campaign = await Campaign.findById(req.params.id);
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to publish this campaign')) return;
+
+        const metaSetup = await metaAdsService.getSetupBundle({ userId: req.user.id });
+        if (!metaSetup?.pageId) {
+            campaign.lifecycleStatus = 'draft';
+            campaign.deliveryStatus = 'not_published';
+            await campaign.save();
+
+            return res.status(400).json({
+                success: false,
+                message: metaSetup?.setupError
+                    ? `Meta page setup incomplete. ${metaSetup.setupError}`
+                    : 'Meta page setup incomplete. Reconnect Meta and select a Facebook page before publishing.',
+                details: {
+                    setup: {
+                        pageId: metaSetup?.pageId || '',
+                        adAccountId: metaSetup?.adAccountId || '',
+                        authSource: metaSetup?.authSource || metaSetup?.mode || '',
+                        pagesAvailable: Array.isArray(metaSetup?.pages) ? metaSetup.pages.length : 0,
+                        setupError: metaSetup?.setupError || ''
+                    }
+                },
+                metaStage: 'Meta setup'
+            });
+        }
+
+        campaign.lifecycleStatus = 'publishing';
+        campaign.deliveryStatus = 'publishing';
+        await campaign.save();
+
+        if (!campaign.metaCampaignId) {
+            let metaCampaign = null;
+            try {
+                metaCampaign = await metaAdsService.createMetaAdStackFromCrud({
+                    userId: req.user.id,
+                    campaignName: campaign.name,
+                    objective: campaign.objective,
+                    dailyBudget: campaign.dailyBudget || campaign.lifetimeBudget,
+                    startDate: campaign.startDate,
+                    endDate: campaign.endDate,
+                    targeting: campaign.targeting,
+                    ageMin: campaign.ageMin,
+                    ageMax: campaign.ageMax,
+                    gender: campaign.gender,
+                    primaryText: campaign.primaryText,
+                    headline: campaign.headline,
+                    description: campaign.description,
+                    destinationUrl: campaign.destinationUrl,
+                    callToAction: campaign.callToAction,
+                    optimizationGoal: campaign.optimizationGoal,
+                    bidStrategy: campaign.bidStrategy,
+                    imageUrl: campaign.imageUrl,
+                    status: 'ACTIVE'
+                });
+            } catch (metaError) {
+                campaign.lifecycleStatus = 'draft';
+                campaign.deliveryStatus = 'not_published';
+                await campaign.save();
+                return res.status(metaError.status || 400).json({
+                    success: false,
+                    message: buildMetaCreateErrorMessage(metaError),
+                    details: metaError.details || metaError.response?.data || null,
+                    metaStage: metaError.stage || 'Meta publish',
+                    rawError: process.env.NODE_ENV === 'development'
+                        ? {
+                            message: metaError.message || '',
+                            stack: metaError.stack || ''
+                        }
+                        : undefined
+                });
+            }
+
+            if (metaCampaign?.campaignId) {
+                campaign.metaCampaignId = metaCampaign.campaignId;
+                campaign.metaAdSetId = metaCampaign.adSetId;
+                campaign.metaAdId = metaCampaign.adId;
+                campaign.metaCreativeId = metaCampaign.creativeId;
+                campaign.metaImageHash = metaCampaign.imageHash;
+                campaign.metaResponse = metaCampaign;
+            }
+        }
+
+        try {
+            campaign.metaResponse = await metaAdsService.resumeCampaign({
+                userId: req.user.id,
+                campaignId: campaign.metaCampaignId,
+                adSetId: campaign.metaAdSetId,
+                adId: campaign.metaAdId
+            });
+        } catch (metaError) {
+            campaign.lifecycleStatus = 'draft';
+            campaign.deliveryStatus = 'paused';
+            await campaign.save();
+            return sendMetaError(res, metaError, 'Meta campaign publish failed');
+        }
+
+        campaign.status = 'active';
+        campaign.lifecycleStatus = 'running';
+        campaign.deliveryStatus = 'active';
+        campaign.publishedAt = new Date();
+        await campaign.save();
+
+        res.status(200).json({
+            success: true,
+            message: 'Campaign published and running.',
+            data: campaign
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: 'Error publishing campaign',
             error: process.env.NODE_ENV === 'development' ? error.message : undefined
         });
     }
@@ -699,11 +1220,55 @@ exports.bulkDeleteCampaigns = async (req, res) => {
             return res.status(400).json({ success: false, message: 'campaignIds array required' });
         }
 
+        const campaigns = await Campaign.find({ _id: { $in: campaignIds } });
+
+        if (req.user.role !== 'superadmin') {
+            const unauthorized = campaigns.some(
+                (campaign) => campaign.createdBy.toString() !== req.user.id
+            );
+
+            if (unauthorized) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Not authorized to delete one or more campaigns'
+                });
+            }
+        }
+
+        const archivedMetaAssets = [];
+        for (const campaign of campaigns) {
+            if (!campaign.metaCampaignId && !campaign.metaAdSetId && !campaign.metaAdId) {
+                continue;
+            }
+
+            try {
+                const archiveResult = await metaAdsService.archiveMetaCrudAssets({
+                    userId: req.user.id,
+                    campaignId: campaign.metaCampaignId,
+                    adSetId: campaign.metaAdSetId,
+                    adId: campaign.metaAdId
+                });
+
+                archivedMetaAssets.push({
+                    campaignId: String(campaign._id),
+                    name: campaign.name,
+                    archived: archiveResult?.archived || []
+                });
+            } catch (metaError) {
+                return sendMetaError(
+                    res,
+                    metaError,
+                    'Meta campaign deletion failed. No local campaigns were removed.'
+                );
+            }
+        }
+
         const result = await Campaign.deleteMany({ _id: { $in: campaignIds } });
 
         res.status(200).json({
             success: true,
-            message: `Deleted ${result.deletedCount} campaigns`
+            message: `Deleted ${result.deletedCount} campaigns`,
+            meta: archivedMetaAssets
         });
     } catch (error) {
         console.error('Error bulk deleting campaigns:', error);

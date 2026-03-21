@@ -1,6 +1,5 @@
 node_modules/ 
 .env 
-.env.example
 *.log
 *.err.log
 *.out.log

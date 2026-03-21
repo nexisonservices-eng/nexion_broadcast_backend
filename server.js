@@ -36,6 +36,7 @@ const whatsappService = require('./services/whatsappService');
 const whatsappConfig = require('./config/whatsapp');
 const auth = require('./middleware/auth');
 const metaAdsService = require('./services/metaAdsService');
+const { validateMetaAdsEnv } = require('./config/metaAdsConfig');
 const requireWhatsAppCredentials = require('./middleware/requireWhatsAppCredentials');
 const {
   resolveUserIdByPhoneNumberId,
@@ -51,6 +52,7 @@ const messageRoutes = require('./routes/messages');
 const contactRoutes = require('./routes/contacts');
 const missedCallRoutes = require('./routes/missedCalls');
 const metaAdsRoutes = require('./routes/metaAds');
+const insightsRoutes = require('./routes/insights');
 // ============ NEW CAMPAIGN ROUTES ============
 const campaignRoutes = require('./routes/campaignRoutes');
 
@@ -66,6 +68,12 @@ const allowedOrigins = [
   "https://technovo-automation-afplwwbfj-technovas-projects-37226de2.vercel.app",
   "https://technovo-automation-m9n8fz6sl-technovas-projects-37226de2.vercel.app",
   "https://technovo-automation.vercel.app",
+  "https://localhost:5173",
+  "https://127.0.0.1:5173",
+  "https://localhost:5174",
+  "https://127.0.0.1:5174",
+  "https://localhost:5175",
+  "https://127.0.0.1:5175",
   "http://localhost:5173",
   "http://127.0.0.1:5173",
   "http://127.0.0.1:53918",
@@ -77,7 +85,7 @@ const allowedOrigins = [
   "http://127.0.0.1:5175",
 ].filter(Boolean);
 
-app.use(cors({
+const corsOptions = {
   origin: (origin, callback) => {
     // Postman / server-to-server requests
     if (!origin) return callback(null, true);
@@ -98,15 +106,22 @@ app.use(cors({
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "ngrok-skip-browser-warning"],
   preflightContinue: false,
   optionsSuccessStatus: 204
-}));
+};
 
-app.options("*", cors());
+app.use(cors(corsOptions));
+
+app.options("*", cors(corsOptions));
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+const metaEnvValidation = validateMetaAdsEnv();
+if (metaEnvValidation.warnings.length) {
+  console.warn('Meta Ads configuration warnings:', metaEnvValidation.warnings.join(' '));
+}
 
 // ============ API ROUTES ============
 app.use('/api/bulk', bulkRoutes);
@@ -117,6 +132,7 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/contacts', contactRoutes);
 app.use('/api/missedcalls', missedCallRoutes);
 app.use('/api/meta-ads', metaAdsRoutes);
+app.use('/api/insights', insightsRoutes);
 // ============ NEW CAMPAIGN ROUTES ============
 app.use('/api/campaigns', campaignRoutes);
 
@@ -1077,76 +1093,6 @@ app.get('/api/campaigns/debug/status', (req, res) => {
       success: false,
       error: error.message,
       timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// ============ META ADS CAMPAIGN INTEGRATION ============
-
-/**
- * @route   POST /api/meta-ads/campaigns/sync
- * @desc    Sync campaigns from Meta Ads
- * @access  Private
- */
-app.post('/api/meta-ads/campaigns/sync', auth, async (req, res) => {
-  try {
-    const result = await metaAdsService.syncCampaigns(req.user.id);
-    res.json({
-      success: true,
-      data: result,
-      message: `Synced ${result.length} campaigns from Meta Ads`
-    });
-  } catch (error) {
-    console.error('Error syncing Meta campaigns:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * @route   GET /api/meta-ads/campaigns
- * @desc    Get Meta Ads campaigns
- * @access  Private
- */
-app.get('/api/meta-ads/campaigns', auth, async (req, res) => {
-  try {
-    const { status, limit = 50 } = req.query;
-    const campaigns = await metaAdsService.getCampaigns(req.user.id, { status, limit });
-    res.json({
-      success: true,
-      data: campaigns
-    });
-  } catch (error) {
-    console.error('Error fetching Meta campaigns:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * @route   GET /api/meta-ads/campaigns/:id/insights
- * @desc    Get insights for a specific Meta campaign
- * @access  Private
- */
-app.get('/api/meta-ads/campaigns/:id/insights', auth, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { datePreset = 'last_30d' } = req.query;
-    
-    const insights = await metaAdsService.getCampaignInsights(id, datePreset);
-    res.json({
-      success: true,
-      data: insights
-    });
-  } catch (error) {
-    console.error('Error fetching campaign insights:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
     });
   }
 });
