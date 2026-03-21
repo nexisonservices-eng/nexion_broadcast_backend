@@ -5,6 +5,7 @@ const { Readable } = require('stream');
 const whatsappService = require('../services/whatsappService');
 const auth = require('../middleware/auth');
 const requireWhatsAppCredentials = require('../middleware/requireWhatsAppCredentials');
+const requirePlanFeature = require('../middleware/planGuard');
 const Broadcast = require('../models/Broadcast');
 const Contact = require('../models/Contact');
 const Conversation = require('../models/Conversation');
@@ -15,6 +16,34 @@ router.use(auth);
 console.log('[BULK_ROUTE_VERSION] bulk_direct_meta_v2 loaded');
 
 const WHATSAPP_API_URL = 'https://graph.facebook.com/v20.0';
+const ADMIN_USAGE_ENDPOINT =
+  process.env.ADMIN_USAGE_ENDPOINT || '/internal/usage/record';
+const ADMIN_API_BASE_URLS = [
+  process.env.ADMIN_API_BASE_URL,
+  process.env.ADMIN_BACKEND_URL,
+  'http://localhost:8000',
+  'http://localhost:5000'
+]
+  .map((url) => (url || '').trim())
+  .filter(Boolean)
+  .filter((url, index, arr) => arr.indexOf(url) === index);
+const ADMIN_INTERNAL_API_KEY = process.env.ADMIN_INTERNAL_API_KEY || '';
+
+const reportUsage = async (companyId, count) => {
+  if (!companyId || !ADMIN_INTERNAL_API_KEY) return;
+  for (const baseUrl of ADMIN_API_BASE_URLS) {
+    try {
+      await axios.post(
+        `${baseUrl}${ADMIN_USAGE_ENDPOINT}`,
+        { companyId, usageType: 'whatsapp_message', count },
+        { headers: { 'x-internal-api-key': ADMIN_INTERNAL_API_KEY }, timeout: 10000 }
+      );
+      return;
+    } catch (error) {
+      continue;
+    }
+  }
+};
 
 async function sendTemplateDirectViaMeta({ phone, templateName, language, variables, credentials }) {
   const sanitizedCredentials = {
@@ -287,7 +316,7 @@ router.post('/upload', async (req, res) => {
 });
 
 // Bulk send endpoint with rate limiting and enhanced processing
-router.post('/send', requireWhatsAppCredentials, async (req, res) => {
+router.post('/send', requirePlanFeature('broadcastMessaging'), requireWhatsAppCredentials, async (req, res) => {
   try {
     console.log('📥 Received bulk send request:', req.body);
     const { message_type, template_name, language, custom_message, broadcast_name, recipients, messageType, customMessage, templateName, templateContent } = req.body;
@@ -357,6 +386,7 @@ router.post('/send', requireWhatsAppCredentials, async (req, res) => {
     // Create broadcast record (persist resolved template body for history/inbox context)
     const broadcast = await Broadcast.create({
       name: broadcast_name || `Bulk Send - ${new Date().toISOString()}`,
+      companyId: req.companyId,
       message: customMsg || '',
       templateName: finalTemplateName || null,
       templateContent: templatePreviewText || '',
@@ -373,6 +403,8 @@ router.post('/send', requireWhatsAppCredentials, async (req, res) => {
     console.log(`🚀 Starting bulk send to ${parsedRecipients.length} recipients`);
     console.log(`📋 First recipient data sample:`, parsedRecipients[0]);
 
+    let usageBatchCount = 0;
+    const usageBatchSize = Number(process.env.BROADCAST_USAGE_BATCH || 50);
     for (let i = 0; i < parsedRecipients.length; i++) {
       const recipient = parsedRecipients[i];
       const phone = recipient.phone;
@@ -435,10 +467,11 @@ router.post('/send', requireWhatsAppCredentials, async (req, res) => {
           broadcast.stats.sent++;
 
           // Create/Update contact + conversation + message so Team Inbox shows it
-          let contact = await Contact.findOne({ userId: req.user.id, phone });
+          let contact = await Contact.findOne({ userId: req.user.id, companyId: req.companyId, phone });
           if (!contact) {
             contact = await Contact.create({
               userId: req.user.id,
+              companyId: req.companyId,
               phone,
               name: '',
               lastContact: new Date(),
@@ -454,12 +487,14 @@ router.post('/send', requireWhatsAppCredentials, async (req, res) => {
 
           let conversation = await Conversation.findOne({
             userId: req.user.id,
+            companyId: req.companyId,
             contactPhone: phone,
             status: { $in: ['active', 'pending'] }
           });
           if (!conversation) {
             conversation = await Conversation.create({
               userId: req.user.id,
+              companyId: req.companyId,
               contactId: contact._id,
               contactPhone: phone,
               contactName: contact.name,
@@ -482,6 +517,7 @@ router.post('/send', requireWhatsAppCredentials, async (req, res) => {
           
           const savedMessage = await Message.create({
             userId: req.user.id,
+            companyId: req.companyId,
             conversationId: conversation._id,
             sender: 'agent',
             text: messageTextForInbox,
@@ -500,6 +536,12 @@ router.post('/send', requireWhatsAppCredentials, async (req, res) => {
               conversation: conversation.toObject(),
               message: savedMessage.toObject()
             });
+          }
+
+          usageBatchCount += 1;
+          if (usageBatchCount >= usageBatchSize) {
+            await reportUsage(req.companyId, usageBatchCount);
+            usageBatchCount = 0;
           }
         } else {
           failed++;
@@ -535,6 +577,10 @@ router.post('/send', requireWhatsAppCredentials, async (req, res) => {
     broadcast.status = 'completed';
     broadcast.completedAt = new Date();
     await broadcast.save();
+
+    if (usageBatchCount > 0) {
+      await reportUsage(req.companyId, usageBatchCount);
+    }
 
     console.log(`✅ Bulk send completed: ${successful} successful, ${failed} failed`);
 

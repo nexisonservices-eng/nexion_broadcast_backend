@@ -3,7 +3,7 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const { body, param, query, validationResult } = require('express-validator');
-const { protect, authorize } = require('../middleware/auth');
+const protect = require('../middleware/auth');
 const Campaign = require('../models/campaign');
 const campaignController = require('../controllers/campaigncontroller');
 const upload = multer({ storage: multer.memoryStorage() });
@@ -15,6 +15,17 @@ const validate = (req, res, next) => {
         return res.status(400).json({
             success: false,
             errors: errors.array()
+        });
+    }
+    next();
+};
+
+const authorize = (...roles) => (req, res, next) => {
+    const activeRole = req.user?.role || req.user?.companyRole;
+    if (!roles.includes(activeRole)) {
+        return res.status(403).json({
+            success: false,
+            message: `User role ${activeRole || 'unknown'} is not authorized to access this route`
         });
     }
     next();

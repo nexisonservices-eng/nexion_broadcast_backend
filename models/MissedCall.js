@@ -8,6 +8,11 @@ const MissedCallSchema = new mongoose.Schema(
       required: true,
       index: true
     },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'company',
+      index: true
+    },
     fromNumber: { type: String, required: true, index: true },
     toNumber: { type: String, default: '', index: true },
     callerName: { type: String, default: '' },
@@ -60,6 +65,6 @@ const MissedCallSchema = new mongoose.Schema(
   }
 );
 
-MissedCallSchema.index({ userId: 1, calledAt: -1 });
+MissedCallSchema.index({ companyId: 1, userId: 1, calledAt: -1 });
 
 module.exports = mongoose.model('MissedCall', MissedCallSchema);

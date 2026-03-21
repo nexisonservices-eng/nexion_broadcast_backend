@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 
 const ContactSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'company', index: true },
   name: { type: String, default: '' },
   phone: { type: String, required: true, index: true },
   email: String,
@@ -24,7 +25,8 @@ ContactSchema.pre('save', function(next) {
   next();
 });
 
-ContactSchema.index({ userId: 1, phone: 1 }, { unique: true });
+ContactSchema.index({ companyId: 1, userId: 1, phone: 1 }, { unique: true });
 ContactSchema.index({ userId: 1, lastContact: -1 });
+ContactSchema.index({ companyId: 1, lastContact: -1 });
 
 module.exports = mongoose.model('Contact', ContactSchema);

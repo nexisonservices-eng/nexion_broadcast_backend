@@ -7,7 +7,7 @@ class ConversationController {
   async getConversations(req, res) {
     try {
       const { status, assignedTo, search } = req.query;
-      const filters = { userId: req.user.id };
+      const filters = { userId: req.user.id, companyId: req.companyId };
       
       if (status) filters.status = status;
       if (assignedTo) filters.assignedTo = assignedTo;
@@ -25,6 +25,7 @@ class ConversationController {
         {
           $match: {
             userId: userMatchId,
+            companyId: req.companyId,
             conversationId: { $in: conversationIds },
             sender: 'contact',
             status: 'received'
@@ -72,7 +73,7 @@ class ConversationController {
   async getContacts(req, res) {
     try {
       const { search, tags } = req.query;
-      const filters = { userId: req.user.id };
+      const filters = { userId: req.user.id, companyId: req.companyId };
       
       if (search) {
         filters.$or = [
@@ -100,7 +101,7 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const contact = await Contact.findOne({ _id: id, userId: req.user.id });
+      const contact = await Contact.findOne({ _id: id, userId: req.user.id, companyId: req.companyId });
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -119,6 +120,7 @@ class ConversationController {
       // Get all unique contacts from conversations
       const conversations = await Conversation.find({
         userId: req.user.id,
+        companyId: req.companyId,
         status: { $in: ['active', 'pending'] }
       })
         .select('contactPhone contactName')
@@ -152,7 +154,7 @@ class ConversationController {
       const { name, phone, email, tags, notes } = req.body;
       
       // Check if contact already exists
-      const existingContact = await Contact.findOne({ phone, userId: req.user.id });
+      const existingContact = await Contact.findOne({ phone, userId: req.user.id, companyId: req.companyId });
       if (existingContact) {
         return res.status(400).json({ 
           success: false, 
@@ -162,6 +164,7 @@ class ConversationController {
       
       const contact = await Contact.create({
         userId: req.user.id,
+        companyId: req.companyId,
         name,
         phone,
         email,
@@ -182,7 +185,7 @@ class ConversationController {
       const { name, phone, email, tags, notes, isBlocked } = req.body;
       
       // Find contact by ID
-      const contact = await Contact.findOne({ _id: id, userId: req.user.id });
+      const contact = await Contact.findOne({ _id: id, userId: req.user.id, companyId: req.companyId });
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -192,7 +195,7 @@ class ConversationController {
       
       // Check if phone number is being changed and if it conflicts with existing contact
       if (phone && phone !== contact.phone) {
-        const existingContact = await Contact.findOne({ phone, _id: { $ne: id }, userId: req.user.id });
+        const existingContact = await Contact.findOne({ phone, _id: { $ne: id }, userId: req.user.id, companyId: req.companyId });
         if (existingContact) {
           return res.status(400).json({ 
             success: false, 
@@ -211,7 +214,7 @@ class ConversationController {
       if (isBlocked !== undefined) updateData.isBlocked = isBlocked;
       
       const updatedContact = await Contact.findOneAndUpdate(
-        { _id: id, userId: req.user.id },
+        { _id: id, userId: req.user.id, companyId: req.companyId },
         updateData, 
         { new: true, runValidators: true }
       );
@@ -234,7 +237,7 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const contact = await Contact.findOne({ _id: id, userId: req.user.id });
+      const contact = await Contact.findOne({ _id: id, userId: req.user.id, companyId: req.companyId });
       if (!contact) {
         return res.status(404).json({ 
           success: false, 

@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 
 const BroadcastSchema = new mongoose.Schema({
   name: { type: String, required: true },
+  companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'company', index: true },
   messageType: { type: String, enum: ['template', 'text'], default: 'text' },
   message: String,
   templateName: String,
@@ -92,6 +93,7 @@ BroadcastSchema.set('toJSON', { virtuals: true });
 BroadcastSchema.set('toObject', { virtuals: true });
 
 BroadcastSchema.index({ status: 1, createdAt: -1 });
+BroadcastSchema.index({ companyId: 1, status: 1, createdAt: -1 });
 BroadcastSchema.index({ createdBy: 1 });
 BroadcastSchema.index({ createdById: 1, createdAt: -1 });
 BroadcastSchema.index({ createdById: 1, status: 1, createdAt: -1 });

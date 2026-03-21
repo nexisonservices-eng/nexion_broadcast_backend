@@ -23,7 +23,7 @@ class TemplateController {
   async getAllTemplates(req, res) {
     try {
       const { status, isActive, category } = req.query;
-      const filters = { userId: req.user.id };
+      const filters = { userId: req.user.id, companyId: req.companyId };
       
       if (status) filters.status = status;
       if (isActive !== undefined) filters.isActive = isActive === 'true';
@@ -38,7 +38,7 @@ class TemplateController {
 
   async getTemplateById(req, res) {
     try {
-      const template = await Template.findOne({ _id: req.params.id, userId: req.user.id });
+      const template = await Template.findOne({ _id: req.params.id, userId: req.user.id, companyId: req.companyId });
       if (!template) {
         return res.status(404).json({ success: false, error: 'Template not found' });
       }
@@ -95,6 +95,7 @@ class TemplateController {
 
       const templateData = {
         userId: req.user.id,
+        companyId: req.companyId,
         name: normalizedName,
         type,
         category: category || 'marketing',
@@ -148,7 +149,7 @@ class TemplateController {
 
       // Save locally only after Meta creation is successful.
       const template = await Template.findOneAndUpdate(
-        { userId: req.user.id, name: normalizedName },
+        { userId: req.user.id, companyId: req.companyId, name: normalizedName },
         {
           ...templateData,
           ...(metaTemplateId ? { whatsappTemplateId: metaTemplateId } : {})
@@ -172,7 +173,7 @@ class TemplateController {
   async updateTemplate(req, res) {
     try {
       const template = await Template.findOneAndUpdate(
-        { _id: req.params.id, userId: req.user.id },
+        { _id: req.params.id, userId: req.user.id, companyId: req.companyId },
         req.body,
         { new: true, runValidators: true }
       );
@@ -187,7 +188,7 @@ class TemplateController {
 
   async deleteTemplate(req, res) {
     try {
-      const template = await Template.findOneAndDelete({ _id: req.params.id, userId: req.user.id });
+      const template = await Template.findOneAndDelete({ _id: req.params.id, userId: req.user.id, companyId: req.companyId });
       if (!template) {
         return res.status(404).json({ success: false, error: 'Template not found' });
       }
@@ -218,6 +219,7 @@ class TemplateController {
 
       const localDeleteResult = await Template.deleteMany({
         userId: req.user.id,
+        companyId: req.companyId,
         name: templateName
       });
 
@@ -266,6 +268,7 @@ class TemplateController {
           // Check if template already exists
           const existingTemplate = await Template.findOne({
             userId,
+            companyId: req.companyId,
             whatsappTemplateId: wt.id
           });
 
@@ -307,6 +310,7 @@ class TemplateController {
             const headerComponent = components.find(c => c.type === 'header');
             const templateData = {
               userId,
+              companyId: req.companyId,
               name: wt.name,
               type: 'official',
               category: wt.category || 'utility',

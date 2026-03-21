@@ -4,8 +4,46 @@ const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
 const whatsappService = require('./whatsappService');
 const { getWhatsAppCredentialsForUser } = require('./userWhatsAppCredentialsService');
+const axios = require('axios');
+
+const ADMIN_USAGE_ENDPOINT =
+  process.env.ADMIN_USAGE_ENDPOINT || '/internal/usage/record';
+const ADMIN_API_BASE_URLS = [
+  process.env.ADMIN_API_BASE_URL,
+  process.env.ADMIN_BACKEND_URL,
+  'http://localhost:8000',
+  'http://localhost:5000'
+]
+  .map((url) => (url || '').trim())
+  .filter(Boolean)
+  .filter((url, index, arr) => arr.indexOf(url) === index);
+const ADMIN_INTERNAL_API_KEY = process.env.ADMIN_INTERNAL_API_KEY || '';
 
 class BroadcastService {
+  async reportUsage(companyId, count = 1) {
+    if (!companyId || !ADMIN_INTERNAL_API_KEY) return;
+    for (const baseUrl of ADMIN_API_BASE_URLS) {
+      try {
+        await axios.post(
+          `${baseUrl}${ADMIN_USAGE_ENDPOINT}`,
+          {
+            companyId,
+            usageType: 'whatsapp_message',
+            count
+          },
+          {
+            headers: {
+              'x-internal-api-key': ADMIN_INTERNAL_API_KEY
+            },
+            timeout: 10000
+          }
+        );
+        return;
+      } catch (error) {
+        continue;
+      }
+    }
+  }
   normalizePhoneNumber(phone) {
     return String(phone || '').replace(/\D/g, '');
   }
@@ -50,6 +88,7 @@ class BroadcastService {
 
     let outboundMessages = await Message.find({
       userId: broadcast.createdById,
+      companyId: broadcast.companyId,
       sender: 'agent',
       broadcastId: broadcast._id
     })
@@ -64,6 +103,7 @@ class BroadcastService {
       const recipientPhoneRegex = recipientPhoneVariants.map((phone) => new RegExp(`${phone}$`));
       const legacyConversations = await Conversation.find({
         userId: broadcast.createdById,
+        companyId: broadcast.companyId,
         $or: [
           { contactPhone: { $in: recipientPhoneVariants } },
           ...recipientPhoneRegex.map((phoneRegex) => ({ contactPhone: phoneRegex }))
@@ -76,6 +116,7 @@ class BroadcastService {
       if (legacyConversationIds.length > 0) {
         outboundMessages = await Message.find({
           userId: broadcast.createdById,
+          companyId: broadcast.companyId,
           sender: 'agent',
           conversationId: { $in: legacyConversationIds },
           timestamp: { $gte: startTime, $lte: endTime }
@@ -91,7 +132,7 @@ class BroadcastService {
     );
 
     const conversations = conversationIds.length
-      ? await Conversation.find({ _id: { $in: conversationIds } })
+      ? await Conversation.find({ _id: { $in: conversationIds }, companyId: broadcast.companyId })
           .select('_id contactPhone contactName')
           .lean()
       : [];
@@ -173,6 +214,7 @@ class BroadcastService {
     const incomingMessages = conversationIds.length
       ? await Message.find({
           userId: broadcast.createdById,
+          companyId: broadcast.companyId,
           sender: 'contact',
           conversationId: { $in: conversationIds },
           timestamp: { $gte: startTime }
@@ -227,6 +269,7 @@ class BroadcastService {
       const contactPhoneRegex = missingNamePhones.map((phone) => new RegExp(`${phone}$`));
       const contacts = await Contact.find({
         userId: broadcast.createdById,
+        companyId: broadcast.companyId,
         $or: [
           { phone: { $in: missingNamePhones } },
           ...contactPhoneRegex.map((phoneRegex) => ({ phone: phoneRegex }))
@@ -428,6 +471,8 @@ class BroadcastService {
       const results = [];
       let successful = 0;
       let failed = 0;
+      let usageBatchCount = 0;
+      const usageBatchSize = Number(process.env.BROADCAST_USAGE_BATCH || 50);
       let templatePreviewText = broadcast.templateContent || null;
 
       // If templateContent is not stored, try to resolve from Meta
@@ -503,7 +548,8 @@ class BroadcastService {
               messageTextForInbox,
               result.data,
               broadcast._id,
-              broadcast.createdById
+              broadcast.createdById,
+              broadcast.companyId
             );
 
             if (typeof broadcaster === 'function' && conversation && message) {
@@ -512,6 +558,11 @@ class BroadcastService {
                 conversation: conversation.toObject(),
                 message: message.toObject()
               });
+            }
+            usageBatchCount += 1;
+            if (usageBatchCount >= usageBatchSize) {
+              await this.reportUsage(broadcast.companyId, usageBatchCount);
+              usageBatchCount = 0;
             }
           } else {
             failed++;
@@ -542,6 +593,10 @@ class BroadcastService {
       broadcast.completedAt = new Date();
       await broadcast.save();
 
+      if (usageBatchCount > 0) {
+        await this.reportUsage(broadcast.companyId, usageBatchCount);
+      }
+
       // Note: Don't sync stats immediately after completion
       // Stats will be updated in real-time via message status updates
       // This prevents premature 100% read rates for first broadcasts
@@ -564,12 +619,13 @@ class BroadcastService {
     }
   }
 
-  async updateConversation(phone, message, whatsappResponse, broadcastId, userId) {
+  async updateConversation(phone, message, whatsappResponse, broadcastId, userId, companyId) {
     try {
-      let contact = await Contact.findOne({ userId, phone });
+      let contact = await Contact.findOne({ userId, companyId, phone });
       if (!contact) {
         contact = await Contact.create({
           userId,
+          companyId,
           phone,
           name: '',
           sourceType: 'incoming_message'
@@ -580,10 +636,16 @@ class BroadcastService {
         await contact.save();
       }
 
-      let conversation = await Conversation.findOne({ userId, contactPhone: phone, status: { $in: ['active', 'pending'] } });
+      let conversation = await Conversation.findOne({
+        userId,
+        companyId,
+        contactPhone: phone,
+        status: { $in: ['active', 'pending'] }
+      });
       if (!conversation) {
         conversation = await Conversation.create({
           userId,
+          companyId,
           contactId: contact._id,
           contactPhone: phone,
           contactName: contact.name,
@@ -601,6 +663,7 @@ class BroadcastService {
       const whatsappMessageId = whatsappResponse?.messages?.[0]?.id;
       const savedMessage = await Message.create({
         userId,
+        companyId,
         conversationId: conversation._id,
         sender: 'agent',
         text: message,
@@ -658,6 +721,7 @@ class BroadcastService {
 
       const broadcastIdQuery = {
         userId: broadcast.createdById,
+        companyId: broadcast.companyId,
         sender: 'agent',
         broadcastId: broadcast._id,
         timestamp: { $gte: startTime, $lte: endTime }
@@ -738,6 +802,7 @@ class BroadcastService {
 
       const replyMessages = await Message.find({
         userId: broadcast.createdById,
+        companyId: broadcast.companyId,
         conversationId: { $in: conversationIds },
         sender: 'contact',
         timestamp: { $gte: replyStartTime }

@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 
 const MessageSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'company', index: true },
   conversationId: { 
     type: mongoose.Schema.Types.ObjectId, 
     ref: 'Conversation', 
@@ -31,7 +32,8 @@ const MessageSchema = new mongoose.Schema({
   replyTo: { type: mongoose.Schema.Types.ObjectId, ref: 'Message' }
 });
 
-MessageSchema.index({ userId: 1, conversationId: 1, timestamp: 1 });
-MessageSchema.index({ userId: 1, whatsappMessageId: 1 }, { unique: true, sparse: true });
+MessageSchema.index({ companyId: 1, userId: 1, conversationId: 1, timestamp: 1 });
+MessageSchema.index({ companyId: 1, userId: 1, whatsappMessageId: 1 }, { unique: true, sparse: true });
+MessageSchema.index({ companyId: 1, broadcastId: 1, status: 1 });
 
 module.exports = mongoose.model('Message', MessageSchema);

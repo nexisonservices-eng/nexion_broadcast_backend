@@ -50,6 +50,7 @@ const normalizeCredentials = (data) => {
   const twilioId = trimOrNull(data.twilioId);
   const phoneNumber = trimOrNull(data.phoneNumber);
   const missedCallWebhook = trimOrNull(data.missedCallWebhook);
+  const companyId = trimOrNull(data.companyId);
 
   const missedCallTemplateName = trimOrNull(
     data.missedCallTemplateName || data.missedcalltemplatename
@@ -122,6 +123,7 @@ const normalizeCredentials = (data) => {
     whatsappId: phoneNumberId,
     twilioId,
     phoneNumber,
+    companyId,
     missedCallWebhook,
     missedCallTemplateName,
     missedCallTemplateLanguage,

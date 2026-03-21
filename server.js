@@ -5,14 +5,7 @@ const http = require('http');
 const cors = require('cors');
 const WebSocket = require('ws');
 const cron = require('node-cron');
-
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled promise rejection:', reason);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught exception:', error);
-});
+const crypto = require('crypto');
 
 // Database connection
 const connectDB = require('./config/database');
@@ -38,6 +31,7 @@ const auth = require('./middleware/auth');
 const metaAdsService = require('./services/metaAdsService');
 const { validateMetaAdsEnv } = require('./config/metaAdsConfig');
 const requireWhatsAppCredentials = require('./middleware/requireWhatsAppCredentials');
+const requirePlanFeature = require('./middleware/planGuard');
 const {
   resolveUserIdByPhoneNumberId,
   getWhatsAppCredentialsForUser
@@ -112,10 +106,13 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+app.options("*", cors());
 
-app.options("*", cors(corsOptions));
-
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 app.use(express.urlencoded({ extended: true }));
 
 // Backward-compatible redirect for older Meta OAuth callback URLs.
@@ -241,32 +238,62 @@ app.get('/webhook', (req, res) => {
   }
 });
 
+const verifyMetaSignature = (req) => {
+  const signature = req.headers['x-hub-signature-256'];
+  const secret = process.env.WHATSAPP_APP_SECRET || process.env.META_APP_SECRET || '';
+  if (!signature || !secret || !req.rawBody) return false;
+  const expected = `sha256=${crypto
+    .createHmac('sha256', secret)
+    .update(req.rawBody)
+    .digest('hex')}`;
+  return signature === expected;
+};
+
+const processWebhookPayload = async (data) => {
+  if (data.object !== 'whatsapp_business_account') return;
+  for (const entry of data.entry || []) {
+    for (const change of entry.changes || []) {
+      if (change.field === 'messages') {
+        const messageData = change.value.messages?.[0];
+        const statusData = change.value.statuses?.[0];
+        const phoneNumberId = change.value?.metadata?.phone_number_id;
+        const userId = await resolveUserIdByPhoneNumberId(phoneNumberId);
+        const credentials = userId
+          ? await getWhatsAppCredentialsByUserId(userId)
+          : null;
+        const companyId = credentials?.companyId || null;
+
+        if (messageData && userId && companyId) {
+          await handleIncomingMessage(messageData, change.value, userId, companyId);
+        }
+        if (statusData && userId && companyId) {
+          await handleMessageStatus(statusData, userId, companyId);
+        }
+      }
+    }
+  }
+};
+
+app.post('/webhooks/whatsapp', async (req, res) => {
+  try {
+    if (!verifyMetaSignature(req)) {
+      return res.sendStatus(401);
+    }
+    await processWebhookPayload(req.body);
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('❌ Webhook error:', error);
+    res.sendStatus(500);
+  }
+});
+
 app.post('/webhook', async (req, res) => {
   try {
     const data = req.body;
     
     console.log('📨 Webhook received:', JSON.stringify(data, null, 2));
 
-    if (data.object === 'whatsapp_business_account') {
-      for (const entry of data.entry) {
-        for (const change of entry.changes) {
-          if (change.field === 'messages') {
-            const messageData = change.value.messages?.[0];
-            if (messageData) {
-              console.log('💬 New message from:', messageData.from);
-              await handleIncomingMessage(messageData, change.value);
-            }
-
-            // Handle status updates
-            const statusData = change.value.statuses?.[0];
-            if (statusData) {
-              console.log('📊 Status update:', statusData.status);
-              await handleMessageStatus(statusData);
-            }
-          }
-        }
-      }
-    }
+    await processWebhookPayload(data);
 
     res.sendStatus(200);
   } catch (error) {
@@ -275,26 +302,20 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-async function handleIncomingMessage(messageData, value) {
+async function handleIncomingMessage(messageData, value, userId, companyId) {
   try {
     console.log('📥 Processing incoming message...');
     
     const from = messageData.from;
     const text = messageData.text?.body || '';
     const messageId = messageData.id;
-    const phoneNumberId = value?.metadata?.phone_number_id;
-    const userId = await resolveUserIdByPhoneNumberId(phoneNumberId);
-
-    if (!userId) {
-      console.warn(`Skipping incoming message: no user mapping found for phone_number_id=${phoneNumberId || 'unknown'}`);
-      return;
-    }
 
     // Find or create contact
-    let contact = await Contact.findOne({ userId, phone: from });
+    let contact = await Contact.findOne({ userId, companyId, phone: from });
     if (!contact) {
       contact = await Contact.create({
         userId,
+        companyId,
         phone: from,
         name: value.contacts?.[0]?.profile?.name || from,
         sourceType: 'incoming_message',
@@ -306,10 +327,11 @@ async function handleIncomingMessage(messageData, value) {
     }
 
     // Find or create conversation
-    let conversation = await Conversation.findOne({ userId, contactPhone: from, status: { $in: ['active', 'pending'] } });
+    let conversation = await Conversation.findOne({ userId, companyId, contactPhone: from, status: { $in: ['active', 'pending'] } });
     if (!conversation) {
       conversation = await Conversation.create({
         userId,
+        companyId,
         contactId: contact._id,
         contactPhone: from,
         contactName: contact.name,
@@ -332,6 +354,7 @@ async function handleIncomingMessage(messageData, value) {
     // Save message
     const message = await Message.create({
       userId,
+      companyId,
       conversationId: conversation._id,
       sender: 'contact',
       senderName: contact.name,
@@ -344,6 +367,7 @@ async function handleIncomingMessage(messageData, value) {
 
     // Check if this is a reply to a broadcast message
     const broadcast = await Broadcast.findOne({
+      companyId,
       createdById: userId,
       'recipients.phone': from,
       status: { $in: ['sending', 'completed'] }, // Only check active/completed broadcasts
@@ -400,7 +424,7 @@ async function handleIncomingMessage(messageData, value) {
   }
 }
 
-async function handleMessageStatus(statusData) {
+async function handleMessageStatus(statusData, userId, companyId) {
   try {
     const messageId = statusData.id;
     const status = statusData.status; // sent, delivered, read, failed
@@ -415,7 +439,7 @@ async function handleMessageStatus(statusData) {
     });
 
     // Find message by WhatsApp message id
-    const message = await Message.findOne({ whatsappMessageId: messageId });
+    const message = await Message.findOne({ whatsappMessageId: messageId, companyId });
     if (!message) {
       console.log('DEBUG: No message found for whatsappMessageId:', messageId);
       return;
@@ -448,6 +472,7 @@ async function handleMessageStatus(statusData) {
         const broadcast = await Broadcast.findOne({
           _id: updatedMessage.broadcastId,
           createdById: message.userId,
+          companyId,
           status: { $in: ['sending', 'completed'] }
         });
 
@@ -507,10 +532,7 @@ async function handleMessageStatus(statusData) {
 }
 
 // ============ API ROUTES ============
-
-// Campaign Management Routes - Already added above with app.use('/api/campaigns', campaignRoutes)
-
-app.post('/api/messages/send', auth, requireWhatsAppCredentials, async (req, res) => {
+app.post('/api/messages/send', auth, requirePlanFeature('broadcastMessaging'), requireWhatsAppCredentials, async (req, res) => {
   try {
     const { to, text, conversationId, mediaUrl, mediaType } = req.body;
     
@@ -535,13 +557,18 @@ app.post('/api/messages/send', auth, requireWhatsAppCredentials, async (req, res
     const whatsappMessageId = result.data.messages[0].id;
 
     // Save to database
-    const conversation = await Conversation.findOne({ _id: conversationId, userId: req.user.id });
+    const conversation = await Conversation.findOne({
+      _id: conversationId,
+      userId: req.user.id,
+      companyId: req.companyId
+    });
     if (!conversation) {
       return res.status(404).json({ success: false, error: 'Conversation not found' });
     }
 
     const message = await Message.create({
       userId: req.user.id,
+      companyId: req.companyId,
       conversationId: conversationId,
       sender: 'agent',
       text: text,
@@ -553,7 +580,7 @@ app.post('/api/messages/send', auth, requireWhatsAppCredentials, async (req, res
     });
 
     // Update conversation
-    await Conversation.findOneAndUpdate({ _id: conversationId, userId: req.user.id }, {
+    await Conversation.findOneAndUpdate({ _id: conversationId, userId: req.user.id, companyId: req.companyId }, {
       lastMessageTime: new Date(),
       lastMessage: text,
       lastMessageFrom: 'agent'
@@ -576,7 +603,7 @@ app.post('/api/messages/send', auth, requireWhatsAppCredentials, async (req, res
 app.get('/api/conversations', auth, async (req, res) => {
   try {
     const { status, assignedTo, search } = req.query;
-    const filters = { userId: req.user.id };
+    const filters = { userId: req.user.id, companyId: req.companyId };
     
     if (status) filters.status = status;
     if (assignedTo) filters.assignedTo = assignedTo;
@@ -605,6 +632,7 @@ app.post('/api/conversations', auth, async (req, res) => {
     // Check if conversation already exists
     const existingConversation = await Conversation.findOne({ 
       userId: req.user.id,
+      companyId: req.companyId,
       contactPhone: contactPhone,
       status: { $in: ['active', 'pending'] }
     });
@@ -616,6 +644,7 @@ app.post('/api/conversations', auth, async (req, res) => {
     // Create new conversation
     const conversation = await Conversation.create({
       userId: req.user.id,
+      companyId: req.companyId,
       contactId: contactId,
       contactPhone: contactPhone,
       contactName: contactName,
@@ -633,7 +662,7 @@ app.post('/api/conversations', auth, async (req, res) => {
 // Get single conversation
 app.get('/api/conversations/:id', auth, async (req, res) => {
   try {
-    const conversation = await Conversation.findOne({ _id: req.params.id, userId: req.user.id })
+    const conversation = await Conversation.findOne({ _id: req.params.id, userId: req.user.id, companyId: req.companyId })
       .populate('contactId', 'name phone email tags');
     if (!conversation) {
       return res.status(404).json({ error: 'Conversation not found' });
@@ -648,7 +677,7 @@ app.get('/api/conversations/:id', auth, async (req, res) => {
 app.put('/api/conversations/:id', auth, async (req, res) => {
   try {
     const conversation = await Conversation.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user.id },
+      { _id: req.params.id, userId: req.user.id, companyId: req.companyId },
       req.body,
       { new: true }
     );
@@ -668,6 +697,7 @@ app.put('/api/conversations/:id/read', auth, async (req, res) => {
       {
         conversationId: req.params.id,
         userId: req.user.id,
+        companyId: req.companyId,
         sender: 'contact',
         status: 'received'
       },
@@ -675,7 +705,7 @@ app.put('/api/conversations/:id/read', auth, async (req, res) => {
     );
 
     const conversation = await Conversation.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user.id },
+      { _id: req.params.id, userId: req.user.id, companyId: req.companyId },
       { unreadCount: 0 },
       { new: true }
     );
@@ -699,7 +729,7 @@ app.put('/api/conversations/:id/read', auth, async (req, res) => {
 // Get messages for conversation
 app.get('/api/conversations/:id/messages', auth, async (req, res) => {
   try {
-    const messages = await Message.find({ conversationId: req.params.id, userId: req.user.id })
+    const messages = await Message.find({ conversationId: req.params.id, userId: req.user.id, companyId: req.companyId })
       .sort({ timestamp: 1 });
     res.json(messages);
   } catch (error) {
@@ -711,7 +741,7 @@ app.get('/api/conversations/:id/messages', auth, async (req, res) => {
 app.get('/api/contacts', auth, async (req, res) => {
   try {
     const { search, tags } = req.query;
-    const filters = { userId: req.user.id };
+    const filters = { userId: req.user.id, companyId: req.companyId };
     
     if (search) {
       filters.$or = [
@@ -734,7 +764,7 @@ app.get('/api/contacts', auth, async (req, res) => {
 // Create contact
 app.post('/api/contacts', auth, async (req, res) => {
   try {
-    const contact = await Contact.create({ ...req.body, userId: req.user.id, sourceType: 'manual' });
+    const contact = await Contact.create({ ...req.body, userId: req.user.id, companyId: req.companyId, sourceType: 'manual' });
     res.json(contact);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -748,14 +778,14 @@ app.put('/api/contacts/:id', auth, async (req, res) => {
     const { name, phone, email, tags, notes, isBlocked } = req.body;
     
     // Find current contact
-    const currentContact = await Contact.findOne({ _id: id, userId: req.user.id });
+    const currentContact = await Contact.findOne({ _id: id, userId: req.user.id, companyId: req.companyId });
     if (!currentContact) {
       return res.status(404).json({ error: 'Contact not found' });
     }
     
     // Check if phone number is being changed and if it conflicts with existing contact
     if (phone && phone !== currentContact.phone) {
-      const existingContact = await Contact.findOne({ phone, _id: { $ne: id }, userId: req.user.id });
+      const existingContact = await Contact.findOne({ phone, _id: { $ne: id }, userId: req.user.id, companyId: req.companyId });
       if (existingContact) {
         return res.status(400).json({ error: 'Another contact with this phone number already exists' });
       }
@@ -771,7 +801,7 @@ app.put('/api/contacts/:id', auth, async (req, res) => {
     if (isBlocked !== undefined) updateData.isBlocked = isBlocked;
     
     const contact = await Contact.findOneAndUpdate(
-      { _id: id, userId: req.user.id },
+      { _id: id, userId: req.user.id, companyId: req.companyId },
       updateData,
       { new: true, runValidators: true }
     );
@@ -779,7 +809,7 @@ app.put('/api/contacts/:id', auth, async (req, res) => {
     // If name was updated, also update all conversations for this contact
     if (name !== undefined && name !== currentContact.name) {
       await Conversation.updateMany(
-        { contactId: id, userId: req.user.id },
+        { contactId: id, userId: req.user.id, companyId: req.companyId },
         { contactName: name }
       );
     }
@@ -804,8 +834,8 @@ app.get('/api/debug-broadcasts', auth, async (req, res) => {
 // Get analytics
 app.get('/api/analytics', auth, async (req, res) => {
   try {
-    const totalConversations = await Conversation.countDocuments({ userId: req.user.id });
-    const activeConversations = await Conversation.countDocuments({ userId: req.user.id, status: 'active' });
+    const totalConversations = await Conversation.countDocuments({ userId: req.user.id, companyId: req.companyId });
+    const activeConversations = await Conversation.countDocuments({ userId: req.user.id, companyId: req.companyId, status: 'active' });
     
     const last7Days = new Date();
     last7Days.setDate(last7Days.getDate() - 7);
@@ -813,11 +843,13 @@ app.get('/api/analytics', auth, async (req, res) => {
     // Message metrics - count all agent messages first, then break down by status
     const allAgentMessages = await Message.find({
       userId: req.user.id,
+      companyId: req.companyId,
       sender: 'agent',
       timestamp: { $gte: last7Days }
     });
     
     const userBroadcasts = await Broadcast.find({
+      companyId: req.companyId,
       $or: [
         { createdById: req.user.id },
         { createdBy: req.user.username || req.user.email || req.user.id }
@@ -841,6 +873,7 @@ app.get('/api/analytics', auth, async (req, res) => {
       {
         $match: {
           userId: req.user.id,
+          companyId: req.companyId,
           sender: 'agent'
         }
       },
@@ -881,6 +914,7 @@ app.get('/api/analytics', auth, async (req, res) => {
     
     const messagesReceived = await Message.countDocuments({
       userId: req.user.id,
+      companyId: req.companyId,
       sender: 'contact',
       timestamp: { $gte: last7Days }
     });

@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
 
 const TemplateSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'company', index: true },
   name: { type: String, required: true },
   type: { 
     type: String, 
@@ -50,7 +51,7 @@ TemplateSchema.pre('save', function(next) {
   next();
 });
 
-TemplateSchema.index({ userId: 1, status: 1, isActive: 1 });
-TemplateSchema.index({ userId: 1, name: 1 }, { unique: true });
+TemplateSchema.index({ companyId: 1, userId: 1, status: 1, isActive: 1 });
+TemplateSchema.index({ companyId: 1, userId: 1, name: 1 }, { unique: true });
 
 module.exports = mongoose.model('Template', TemplateSchema);
