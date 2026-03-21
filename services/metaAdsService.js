@@ -24,13 +24,23 @@ const toCanonicalAdAccountId = (value) => {
 const getEnvConfig = () => getMetaAdsConfig();
 
 const graphRequest = async ({ method = 'GET', path, params, data, headers, accessToken: overrideToken, apiVersion: overrideApiVersion }) => {
-  const { apiVersion, accessToken } = getEnvConfig();
-  const url = `${GRAPH_BASE_URL}/${apiVersion}/${path.replace(/^\/+/, '')}`;
+  const { apiVersion } = getEnvConfig();
+  const resolvedAccessToken = String(overrideToken || '').trim();
+  if (!resolvedAccessToken) {
+    throw buildStageErrorWithDetails(
+      'Meta access',
+      'A user or admin Meta access token is required for this request.',
+      { path: String(path || '').trim() },
+      400
+    );
+  }
+
+  const url = `${GRAPH_BASE_URL}/${(overrideApiVersion || apiVersion).replace(/^\/+/, '')}/${path.replace(/^\/+/, '')}`;
   const requestConfig = {
     url,
     method,
     params: {
-      access_token: overrideToken || accessToken,
+      access_token: resolvedAccessToken,
       ...(params || {})
     },
     data,
@@ -239,23 +249,21 @@ const uploadCreativeAsset = async ({ fileBuffer, fileName, mediaUrl, userId, adA
 
 const getSetupBundle = async ({ userId } = {}) => {
   if (shouldUseMockMode()) {
-    const env = getEnvConfig();
     const connection = userId ? await MetaAdsConnection.findOne({ userId }).lean() : null;
-    const envAdAccountId = toCanonicalAdAccountId(env.adAccountId);
     return {
       mode: 'mock',
       connected: true,
-      adAccountId: connection?.selectedAdAccountId || envAdAccountId || 'mock-ad-account',
-      pageId: connection?.selectedPageId || env.pageId || 'mock-page',
+      adAccountId: connection?.selectedAdAccountId || 'act_mock_account',
+      pageId: connection?.selectedPageId || 'mock-page',
       selectedWhatsappNumber: connection?.selectedWhatsappNumber || '',
       pages: [
-        { id: connection?.selectedPageId || env.pageId || '615785750230178', name: 'Technovo Demo Page' }
+        { id: connection?.selectedPageId || '615785750230178', name: 'Technovo Demo Page' }
       ],
       businesses: [
         { id: 'mock-business-1', name: 'Technovo Demo Business' }
       ],
       adAccounts: [
-        { id: connection?.selectedAdAccountId || envAdAccountId || 'act_mock_account', name: 'Technovo Demo Ad Account' }
+        { id: connection?.selectedAdAccountId || 'act_mock_account', name: 'Technovo Demo Ad Account' }
       ],
       whatsappNumbers: [
         { id: 'mock-waba-1', display_phone_number: connection?.selectedWhatsappNumber || '+91 98765 43210' }
@@ -956,6 +964,7 @@ const resolveAdIdFromCreation = async ({
 };
 
 const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
+  const env = getEnvConfig();
   const accessContext = await ensureConnectedMetaUser(userId, 'Campaign creation');
   let resolvedAccessToken = accessContext.accessToken;
   const initialDeliveryStatus =
@@ -1522,6 +1531,7 @@ const createMetaAdStackFromCrud = async ({
   imageFileName,
   status
 }) => {
+  const env = getEnvConfig();
   const accessContext = await ensureConnectedMetaUser(userId, 'Campaign creation');
   const normalizedStatus = String(status || '').trim().toUpperCase() === 'ACTIVE' ? 'ACTIVE' : 'PAUSED';
   const allowedOptimizationGoals = getAllowedOptimizationGoalsForCrudObjective(objective);

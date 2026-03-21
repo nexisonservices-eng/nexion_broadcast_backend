@@ -9,10 +9,7 @@ const parseNumber = (value, fallback) => {
 };
 
 const getMetaAdsConfig = () => {
-  const accessToken = String(process.env.META_ACCESS_TOKEN || '').trim();
   const apiVersion = String(process.env.META_API_VERSION || 'v22.0').trim();
-  const adAccountId = String(process.env.META_AD_ACCOUNT_ID || '').trim();
-  const pageId = String(process.env.META_PAGE_ID || '').trim();
   const pixelId = String(process.env.META_PIXEL_ID || '').trim();
   const appId = String(process.env.META_APP_ID || '').trim();
   const appSecret = String(process.env.META_APP_SECRET || '').trim();
@@ -27,10 +24,7 @@ const getMetaAdsConfig = () => {
   const bidAmount = parseNumber(process.env.META_BID_AMOUNT, 5000);
 
   return {
-    accessToken,
     apiVersion,
-    adAccountId,
-    pageId,
     pixelId,
     appId,
     appSecret,
@@ -39,7 +33,6 @@ const getMetaAdsConfig = () => {
     advantageAudience,
     bidStrategy,
     bidAmount,
-    hasCredentials: Boolean(accessToken && adAccountId),
     hasOAuthConfig: Boolean(appId && appSecret)
   };
 };

@@ -360,6 +360,17 @@ exports.createCampaign = async (req, res) => {
             });
         }
 
+        if (error.name === 'ValidationError') {
+            return res.status(400).json({
+                success: false,
+                message: 'Campaign validation failed',
+                errors: Object.values(error.errors || {}).map((item) => ({
+                    field: item.path,
+                    message: item.message
+                }))
+            });
+        }
+
         res.status(500).json({
             success: false,
             message: 'Error creating campaign',
