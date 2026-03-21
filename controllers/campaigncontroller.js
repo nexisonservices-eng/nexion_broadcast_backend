@@ -371,6 +371,13 @@ exports.createCampaign = async (req, res) => {
             });
         }
 
+        if (Number(error.status) >= 400 && Number(error.status) < 600) {
+            return res.status(Number(error.status)).json({
+                success: false,
+                message: error.message || 'Error creating campaign'
+            });
+        }
+
         res.status(500).json({
             success: false,
             message: 'Error creating campaign',
