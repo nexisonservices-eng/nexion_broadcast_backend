@@ -10,6 +10,8 @@ const { getMetaConfigForUser, getMetaConfigByUserId } = require('../services/use
 
 const router = express.Router();
 const STATE_SECRET = process.env.JWT_SECRET || 'technova_jwt_secret_key_2024';
+const OAUTH_STATE_CACHE_TTL_MS = 15 * 60 * 1000;
+const oauthStateConfigCache = new Map();
 
 const normalizeOrigin = (value) => String(value || '').trim().replace(/\/+$/, '');
 const isSafeFrontendOrigin = (value) => /^https?:\/\/[^/\s]+$/i.test(normalizeOrigin(value));
@@ -49,6 +51,36 @@ const buildSignedState = ({ userId, origin, credentialOwnerUserId }) => {
   return `${payload}.${signature}`;
 };
 
+const setCachedOAuthConfig = (state, metaConfig) => {
+  const cacheKey = String(state || '').trim();
+  if (!cacheKey || !metaConfig?.appId || !metaConfig?.appSecret) return;
+
+  oauthStateConfigCache.set(cacheKey, {
+    metaConfig,
+    expiresAt: Date.now() + OAUTH_STATE_CACHE_TTL_MS
+  });
+};
+
+const getCachedOAuthConfig = (state) => {
+  const cacheKey = String(state || '').trim();
+  if (!cacheKey) return null;
+
+  const cached = oauthStateConfigCache.get(cacheKey);
+  if (!cached) return null;
+  if (Number(cached.expiresAt || 0) < Date.now()) {
+    oauthStateConfigCache.delete(cacheKey);
+    return null;
+  }
+
+  return cached.metaConfig || null;
+};
+
+const deleteCachedOAuthConfig = (state) => {
+  const cacheKey = String(state || '').trim();
+  if (!cacheKey) return;
+  oauthStateConfigCache.delete(cacheKey);
+};
+
 const parseSignedState = (state) => {
   const [payload = '', signature = ''] = String(state || '').split('.');
   if (!payload || !signature) {
@@ -83,6 +115,8 @@ const buildFacebookAuthUrl = async (req) => {
     credentialOwnerUserId: metaConfig.credentialOwnerUserId || req.user.id,
     origin: req.body?.origin || process.env.FRONTEND_URL || ''
   });
+
+  setCachedOAuthConfig(state, metaConfig);
 
   return metaAdsService.getLoginDialogUrl({
     redirectUri: getResolvedRedirectUri(req, metaConfig),
@@ -259,9 +293,13 @@ router.get('/oauth/callback', async (req, res) => {
   try {
     const { payload, signature, decoded } = parseSignedState(state);
     const credentialLookupUserId = decoded.credentialOwnerUserId || decoded.userId;
-    const metaConfig = resolveMetaOAuthConfig(await getMetaConfigByUserId(credentialLookupUserId));
+    const metaConfig = resolveMetaOAuthConfig(
+      getCachedOAuthConfig(state) || (await getMetaConfigByUserId(credentialLookupUserId))
+    );
     if (!metaConfig.appId || !metaConfig.appSecret) {
-      throw new Error('Meta app credentials are not configured for this admin.');
+      throw new Error(
+        'Meta app credentials are not configured for this admin. Save Meta App ID and Meta App Secret for the company admin in the admin backend, then try reconnecting again.'
+      );
     }
 
     const expectedSignature = signStatePayload(payload, STATE_SECRET);
@@ -285,6 +323,7 @@ router.get('/oauth/callback', async (req, res) => {
       accessToken: tokenData.access_token,
       scopes: Array.isArray(tokenData.granted_scopes) ? tokenData.granted_scopes : []
     });
+    deleteCachedOAuthConfig(state);
 
     const setup = await metaAdsService.getSetupBundle({ userId: decoded.userId });
     const targetOrigin = isSafeFrontendOrigin(decoded.origin)
@@ -301,6 +340,7 @@ router.get('/oauth/callback', async (req, res) => {
         })
       );
   } catch (error) {
+    deleteCachedOAuthConfig(state);
     return res
       .status(200)
       .send(
