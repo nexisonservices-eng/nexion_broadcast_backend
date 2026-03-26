@@ -39,7 +39,8 @@ const normalizeMetaConfig = (data) => {
     userAccessToken,
     adAccountId,
     apiVersion,
-    jwtSecret: trim(data.metaJwtSecret || data.metajwtsecret)
+    jwtSecret: trim(data.metaJwtSecret || data.metajwtsecret),
+    credentialOwnerUserId: trim(data.credentialOwnerUserId || data.credentialowneruserid || data.userId || data.userid)
   };
 };
 

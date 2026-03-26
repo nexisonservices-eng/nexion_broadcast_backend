@@ -29,16 +29,18 @@ const resolveMetaOAuthConfig = (metaConfig = null) => ({
   appId: String(metaConfig?.appId || '').trim(),
   appSecret: String(metaConfig?.appSecret || '').trim(),
   redirectUri: normalizeOrigin(metaConfig?.redirectUri),
-  apiVersion: String(metaConfig?.apiVersion || 'v22.0').trim()
+  apiVersion: String(metaConfig?.apiVersion || 'v22.0').trim(),
+  credentialOwnerUserId: String(metaConfig?.credentialOwnerUserId || '').trim()
 });
 
 const encodeStatePayload = (payload) => Buffer.from(JSON.stringify(payload)).toString('base64url');
 const signStatePayload = (payload, secret) =>
   crypto.createHmac('sha256', String(secret || '')).update(payload).digest('hex');
 
-const buildSignedState = ({ userId, origin }) => {
+const buildSignedState = ({ userId, origin, credentialOwnerUserId }) => {
   const payload = encodeStatePayload({
     userId,
+    credentialOwnerUserId,
     origin,
     issuedAt: Date.now(),
     expiresAt: Date.now() + 10 * 60 * 1000
@@ -78,6 +80,7 @@ const buildFacebookAuthUrl = async (req) => {
 
   const state = buildSignedState({
     userId: req.user.id,
+    credentialOwnerUserId: metaConfig.credentialOwnerUserId || req.user.id,
     origin: req.body?.origin || process.env.FRONTEND_URL || ''
   });
 
@@ -255,7 +258,8 @@ router.get('/oauth/callback', async (req, res) => {
 
   try {
     const { payload, signature, decoded } = parseSignedState(state);
-    const metaConfig = resolveMetaOAuthConfig(await getMetaConfigByUserId(decoded.userId));
+    const credentialLookupUserId = decoded.credentialOwnerUserId || decoded.userId;
+    const metaConfig = resolveMetaOAuthConfig(await getMetaConfigByUserId(credentialLookupUserId));
     if (!metaConfig.appId || !metaConfig.appSecret) {
       throw new Error('Meta app credentials are not configured for this admin.');
     }

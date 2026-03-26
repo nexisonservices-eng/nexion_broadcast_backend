@@ -59,6 +59,7 @@ const allowedOrigins = [
   process.env.FRONTEND_URL,
   "https://www.technovahub.in",
   "https://technovahub.in",
+  "https://technovahub.in/nexion",
   "https://technovo-automation-afplwwbfj-technovas-projects-37226de2.vercel.app",
   "https://technovo-automation-m9n8fz6sl-technovas-projects-37226de2.vercel.app",
   "https://technovo-automation.vercel.app",
