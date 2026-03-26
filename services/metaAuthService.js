@@ -54,8 +54,8 @@ const getAccessContextForUser = async (userId) => {
 const exchangeCodeForAccessToken = async ({ code, redirectUri, appId, appSecret, apiVersion }) => {
   const env = getMetaAdsConfig();
   const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v22.0').trim();
-  const resolvedAppId = String(appId || env.appId || '').trim();
-  const resolvedAppSecret = String(appSecret || env.appSecret || '').trim();
+  const resolvedAppId = String(appId || '').trim();
+  const resolvedAppSecret = String(appSecret || '').trim();
 
   const response = await axios.get(`${GRAPH_BASE_URL}/${resolvedApiVersion}/oauth/access_token`, {
     params: {
@@ -71,7 +71,7 @@ const exchangeCodeForAccessToken = async ({ code, redirectUri, appId, appSecret,
 const getLoginDialogUrl = ({ redirectUri, state, appId, apiVersion }) => {
   const env = getMetaAdsConfig();
   const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v22.0').trim();
-  const resolvedAppId = String(appId || env.appId || '').trim();
+  const resolvedAppId = String(appId || '').trim();
   const scopes = [
     'public_profile',
     'email',

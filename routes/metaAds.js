@@ -12,11 +12,25 @@ const router = express.Router();
 const STATE_SECRET = process.env.JWT_SECRET || 'technova_jwt_secret_key_2024';
 
 const normalizeOrigin = (value) => String(value || '').trim().replace(/\/+$/, '');
+const isSafeFrontendOrigin = (value) => /^https?:\/\/[^/\s]+$/i.test(normalizeOrigin(value));
+const escapeHtml = (value) =>
+  String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 const getBackendOrigin = (req) =>
   normalizeOrigin(process.env.PUBLIC_BACKEND_URL) || `${req.protocol}://${req.get('host')}`;
 const getCallbackUrl = (req) => `${getBackendOrigin(req)}/api/meta-ads/oauth/callback`;
 const getResolvedRedirectUri = (req, metaConfig = null) =>
   normalizeOrigin(metaConfig?.redirectUri) || getCallbackUrl(req);
+const resolveMetaOAuthConfig = (metaConfig = null) => ({
+  appId: String(metaConfig?.appId || '').trim(),
+  appSecret: String(metaConfig?.appSecret || '').trim(),
+  redirectUri: normalizeOrigin(metaConfig?.redirectUri),
+  apiVersion: String(metaConfig?.apiVersion || 'v22.0').trim()
+});
 
 const encodeStatePayload = (payload) => Buffer.from(JSON.stringify(payload)).toString('base64url');
 const signStatePayload = (payload, secret) =>
@@ -55,8 +69,8 @@ const parseSignedState = (state) => {
 
 const buildFacebookAuthUrl = async (req) => {
   const authHeader = req.headers.authorization || '';
-  const metaConfig = await getMetaConfigForUser({ authHeader });
-  if (!metaConfig?.appId || !metaConfig?.appSecret) {
+  const metaConfig = resolveMetaOAuthConfig(await getMetaConfigForUser({ authHeader }));
+  if (!metaConfig.appId || !metaConfig.appSecret) {
     const error = new Error('Meta App ID and Meta App Secret must be configured by super admin for this admin.');
     error.status = 400;
     throw error;
@@ -188,7 +202,7 @@ router.post('/auth/facebook', auth, async (req, res) => {
 router.get('/oauth/callback', async (req, res) => {
   const { code, state, error: authError, error_message: authErrorMessage } = req.query;
 
-  const renderCallbackPage = ({ message, payload, targetOrigin = '*' }) => `
+  const renderCallbackPage = ({ message, payload, targetOrigin = '' }) => `
       <!doctype html>
       <html lang="en">
         <head>
@@ -200,20 +214,23 @@ router.get('/oauth/callback', async (req, res) => {
             .card { background:#fff; padding:24px 28px; border-radius:16px; box-shadow:0 18px 48px rgba(16,32,66,.14); max-width:480px; width:calc(100% - 32px); }
             h1 { margin:0 0 12px; font-size:22px; }
             p { margin:0 0 16px; line-height:1.5; }
+            .detail { background:#eff6ff; color:#1e3a8a; border-radius:10px; padding:12px; font-size:14px; word-break:break-word; }
             button { border:0; border-radius:10px; background:#2563eb; color:#fff; padding:10px 16px; font-weight:600; cursor:pointer; }
           </style>
         </head>
         <body>
           <div class="card">
             <h1>${message}</h1>
+            ${payload?.error ? `<p class="detail">${escapeHtml(payload.error)}</p>` : ''}
             <p>You can close this window and return to the app if it does not close automatically.</p>
             <button onclick="window.close()">Close Window</button>
           </div>
           <script>
             (function () {
               try {
-                if (window.opener && !window.opener.closed) {
-                  window.opener.postMessage(${JSON.stringify(payload)}, ${JSON.stringify(targetOrigin === '*' ? '*' : targetOrigin)});
+                var targetOrigin = ${JSON.stringify(targetOrigin)};
+                if (window.opener && !window.opener.closed && targetOrigin) {
+                  window.opener.postMessage(${JSON.stringify(payload)}, targetOrigin);
                   setTimeout(function () { window.close(); }, 250);
                 }
               } catch (error) {
@@ -238,8 +255,8 @@ router.get('/oauth/callback', async (req, res) => {
 
   try {
     const { payload, signature, decoded } = parseSignedState(state);
-    const metaConfig = await getMetaConfigByUserId(decoded.userId);
-    if (!metaConfig?.appId || !metaConfig?.appSecret) {
+    const metaConfig = resolveMetaOAuthConfig(await getMetaConfigByUserId(decoded.userId));
+    if (!metaConfig.appId || !metaConfig.appSecret) {
       throw new Error('Meta app credentials are not configured for this admin.');
     }
 
@@ -266,7 +283,9 @@ router.get('/oauth/callback', async (req, res) => {
     });
 
     const setup = await metaAdsService.getSetupBundle({ userId: decoded.userId });
-    const targetOrigin = decoded.origin || process.env.FRONTEND_URL || '*';
+    const targetOrigin = isSafeFrontendOrigin(decoded.origin)
+      ? normalizeOrigin(decoded.origin)
+      : (isSafeFrontendOrigin(process.env.FRONTEND_URL) ? normalizeOrigin(process.env.FRONTEND_URL) : '');
 
     return res
       .status(200)
