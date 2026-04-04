@@ -47,6 +47,8 @@ const normalizeCredentials = (data) => {
   const accessToken = trimOrNull(data.whatsappToken || data.accessToken);
   const businessAccountId = trimOrNull(data.whatsappBusiness || data.businessAccountId);
   const phoneNumberId = trimOrNull(data.whatsappId || data.phoneNumberId);
+  const username = trimOrNull(data.username);
+  const email = trimOrNull(data.email);
   const twilioId = trimOrNull(data.twilioId);
   const phoneNumber = trimOrNull(data.phoneNumber);
   const missedCallWebhook = trimOrNull(data.missedCallWebhook);
@@ -115,6 +117,8 @@ const normalizeCredentials = (data) => {
   if (!accessToken || !businessAccountId || !phoneNumberId) return null;
 
   return {
+    username,
+    email,
     accessToken,
     businessAccountId,
     phoneNumberId,

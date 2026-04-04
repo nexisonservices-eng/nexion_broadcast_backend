@@ -21,6 +21,18 @@ const hasCloudinaryCredentials = () =>
     process.env.CLOUDINARY_API_SECRET
   );
 
+const resolveResourceType = (file, preferredType = '') => {
+  const normalizedPreferred = String(preferredType || '').trim().toLowerCase();
+  if (['image', 'video', 'raw', 'auto'].includes(normalizedPreferred)) {
+    return normalizedPreferred === 'auto' ? 'auto' : normalizedPreferred;
+  }
+
+  const mimeType = String(file?.mimetype || '').trim().toLowerCase();
+  if (mimeType.startsWith('video/')) return 'video';
+  if (mimeType.startsWith('image/')) return 'image';
+  return 'auto';
+};
+
 const uploadCampaignCreative = async (file, options = {}) => {
   if (!file?.buffer) {
     return null;
@@ -35,11 +47,12 @@ const uploadCampaignCreative = async (file, options = {}) => {
   ensureCloudinaryConfig();
 
   const folder = options.folder || process.env.CLOUDINARY_FOLDER || 'meta-ads';
+  const resourceType = resolveResourceType(file, options.resourceType);
   const dataUri = `data:${file.mimetype || 'image/jpeg'};base64,${file.buffer.toString('base64')}`;
 
   const result = await cloudinary.uploader.upload(dataUri, {
     folder,
-    resource_type: 'image',
+    resource_type: resourceType,
     use_filename: true,
     unique_filename: true,
     overwrite: false

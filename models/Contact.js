@@ -7,6 +7,22 @@ const ContactSchema = new mongoose.Schema({
   phone: { type: String, required: true, index: true },
   email: String,
   tags: [{ type: String }],
+  stage: {
+    type: String,
+    enum: ['new', 'contacted', 'nurturing', 'qualified', 'proposal', 'won', 'lost'],
+    default: 'new',
+    index: true
+  },
+  status: {
+    type: String,
+    enum: ['new', 'nurturing', 'qualified', 'unqualified', 'won', 'lost'],
+    default: 'nurturing',
+    index: true
+  },
+  source: { type: String, default: '', index: true },
+  ownerId: { type: String, default: null, index: true },
+  nextFollowUpAt: { type: Date, default: null, index: true },
+  lastContactAt: { type: Date, default: null, index: true },
   customFields: mongoose.Schema.Types.Mixed,
   notes: String,
   sourceType: {
@@ -17,16 +33,28 @@ const ContactSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
   lastContact: Date,
-  isBlocked: { type: Boolean, default: false }
+  isBlocked: { type: Boolean, default: false },
+  leadScore: { type: Number, default: 0, index: true },
+  leadScoreBreakdown: {
+    read: { type: Number, default: 0 },
+    reply: { type: Number, default: 0 },
+    keyword: { type: Number, default: 0 }
+  },
+  lastLeadScoreAt: Date
 });
 
 ContactSchema.pre('save', function(next) {
   this.updatedAt = Date.now();
+  if (!this.lastContactAt && this.lastContact) {
+    this.lastContactAt = this.lastContact;
+  }
   next();
 });
 
 ContactSchema.index({ companyId: 1, userId: 1, phone: 1 }, { unique: true });
 ContactSchema.index({ userId: 1, lastContact: -1 });
 ContactSchema.index({ companyId: 1, lastContact: -1 });
+ContactSchema.index({ companyId: 1, userId: 1, stage: 1, status: 1 });
+ContactSchema.index({ companyId: 1, userId: 1, ownerId: 1, nextFollowUpAt: 1 });
 
 module.exports = mongoose.model('Contact', ContactSchema);

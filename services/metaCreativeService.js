@@ -91,6 +91,7 @@ const uploadCreativeAsset = async ({
   fileBuffer,
   fileName,
   mediaUrl,
+  mediaType,
   userId,
   adAccountId,
   shouldUseMockMode,
@@ -101,14 +102,19 @@ const uploadCreativeAsset = async ({
   buildStageErrorWithDetails,
   extractApiErrorMessage
 }) => {
+  const normalizedMediaType = String(mediaType || '').trim().toLowerCase() === 'video' ? 'video' : 'image';
+
   if (!fileBuffer && !mediaUrl) {
-    return { mediaHash: '', mediaUrl: '' };
+    return { mediaType: normalizedMediaType, mediaHash: '', mediaUrl: '', videoId: '' };
   }
 
   if (shouldUseMockMode()) {
+    const now = Date.now();
     return {
-      mediaHash: `mock_${Date.now()}`,
-      mediaUrl: mediaUrl || `mock://${fileName || 'upload'}`
+      mediaType: normalizedMediaType,
+      mediaHash: normalizedMediaType === 'image' ? `mock_${now}` : '',
+      mediaUrl: mediaUrl || `mock://${fileName || 'upload'}`,
+      videoId: normalizedMediaType === 'video' ? `mock_video_${now}` : ''
     };
   }
 
@@ -120,6 +126,43 @@ const uploadCreativeAsset = async ({
   const tokenCandidates = [...new Set([accessContext.accessToken].filter(Boolean))];
 
   const tryUpload = async ({ effectiveAdAccountId, accessToken }) => {
+    if (normalizedMediaType === 'video') {
+      if (mediaUrl) {
+        const response = await graphRequest({
+          method: 'POST',
+          path: buildAdAccountPath(effectiveAdAccountId, 'advideos'),
+          data: { file_url: mediaUrl },
+          accessToken
+        });
+        const videoId = String(response?.id || response?.video_id || '').trim();
+        return {
+          mediaType: 'video',
+          mediaHash: '',
+          mediaUrl,
+          videoId
+        };
+      }
+
+      const form = new FormData();
+      form.append('source', fileBuffer, { filename: fileName || `creative-${Date.now()}.mp4` });
+
+      const response = await graphRequest({
+        method: 'POST',
+        path: buildAdAccountPath(effectiveAdAccountId, 'advideos'),
+        data: form,
+        headers: form.getHeaders(),
+        accessToken
+      });
+      const videoId = String(response?.id || response?.video_id || '').trim();
+
+      return {
+        mediaType: 'video',
+        mediaHash: '',
+        mediaUrl: '',
+        videoId
+      };
+    }
+
     if (mediaUrl) {
       const response = await graphRequest({
         method: 'POST',
@@ -129,8 +172,10 @@ const uploadCreativeAsset = async ({
       });
       const image = response?.images ? Object.values(response.images)[0] : null;
       return {
+        mediaType: 'image',
         mediaHash: image?.hash || '',
-        mediaUrl
+        mediaUrl,
+        videoId: ''
       };
     }
 
@@ -147,8 +192,10 @@ const uploadCreativeAsset = async ({
     const image = response?.images ? Object.values(response.images)[0] : null;
 
     return {
+      mediaType: 'image',
       mediaHash: image?.hash || '',
-      mediaUrl: ''
+      mediaUrl: '',
+      videoId: ''
     };
   };
 
@@ -165,8 +212,10 @@ const uploadCreativeAsset = async ({
             /application does not have the capability/i.test(message)
           ) {
             return {
+              mediaType: normalizedMediaType,
               mediaHash: '',
-              mediaUrl
+              mediaUrl,
+              videoId: ''
             };
           }
         }
@@ -184,6 +233,7 @@ const uploadCreativeAsset = async ({
       'Creative upload',
       extractApiErrorMessage(lastError.error),
       {
+        mediaType: normalizedMediaType,
         mediaUrl: '',
         fileName: fileName || '',
         adAccountId: lastError.effectiveAdAccountId,
@@ -194,8 +244,10 @@ const uploadCreativeAsset = async ({
   }
 
   return {
+    mediaType: normalizedMediaType,
     mediaHash: '',
-    mediaUrl: ''
+    mediaUrl: '',
+    videoId: ''
   };
 };
 
@@ -234,8 +286,29 @@ const createCreative = async ({
         };
 
   const objectStorySpec = {
-    page_id: configuredPageId,
-    link_data: {
+    page_id: configuredPageId
+  };
+
+  const normalizedMediaType =
+    String(creative?.mediaType || '').trim().toLowerCase() === 'video' || creativeUpload?.videoId
+      ? 'video'
+      : 'image';
+
+  if (normalizedMediaType === 'video') {
+    objectStorySpec.video_data = {
+      video_id: creativeUpload?.videoId,
+      message: creative?.primaryText || campaignName || 'Learn more',
+      title: creative?.headline || campaignName,
+      call_to_action: {
+        type: effectiveCtaType,
+        value: callToActionValue
+      }
+    };
+    if (creative?.description) {
+      objectStorySpec.video_data.description = creative.description;
+    }
+  } else {
+    objectStorySpec.link_data = {
       link: destinationUrl,
       message: creative?.primaryText || campaignName || 'Learn more',
       name: creative?.headline || campaignName,
@@ -244,42 +317,57 @@ const createCreative = async ({
         type: effectiveCtaType,
         value: callToActionValue
       }
-    }
-  };
+    };
 
-  if (creativeUpload?.mediaHash) {
-    objectStorySpec.link_data.image_hash = creativeUpload.mediaHash;
-  } else if (creativeUpload?.mediaUrl) {
-    objectStorySpec.link_data.picture = creativeUpload.mediaUrl;
+    if (creativeUpload?.mediaHash) {
+      objectStorySpec.link_data.image_hash = creativeUpload.mediaHash;
+    } else if (creativeUpload?.mediaUrl) {
+      objectStorySpec.link_data.picture = creativeUpload.mediaUrl;
+    }
   }
   if (instagramActorId) {
     objectStorySpec.instagram_actor_id = instagramActorId;
   }
 
-  try {
-    return await graphRequest({
-      method: 'POST',
-      path: buildAdAccountPath(adAccountId, 'adcreatives'),
-      data: {
-        name: `${campaignName} - Creative`,
-        object_story_spec: objectStorySpec
-      },
-      accessToken
-    });
-  } catch (error) {
-    throw buildStageErrorWithDetails(
-      'Creative creation',
-      extractApiErrorMessage(error),
-      {
-        metaError: error?.response?.data || null,
-        requestedPageId: creativePageContext.requestedPageId,
-        resolvedPageId: creativePageContext.pageId,
-        resolvedPageName: creativePageContext.pageName,
-        accessiblePages: creativePageContext.accessiblePages
-      },
-      error?.response?.status || 400
-    );
+  const isVideoProcessingError = (error) =>
+    /video/i.test(extractApiErrorMessage(error)) &&
+    /(processing|not ready|transcod)/i.test(extractApiErrorMessage(error));
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const maxAttempts = normalizedMediaType === 'video' && creativeUpload?.videoId ? 4 : 1;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await graphRequest({
+        method: 'POST',
+        path: buildAdAccountPath(adAccountId, 'adcreatives'),
+        data: {
+          name: `${campaignName} - Creative`,
+          object_story_spec: objectStorySpec
+        },
+        accessToken
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts || !isVideoProcessingError(error)) {
+        break;
+      }
+      await wait(3000);
+    }
   }
+
+  throw buildStageErrorWithDetails(
+    'Creative creation',
+    extractApiErrorMessage(lastError),
+    {
+      metaError: lastError?.response?.data || null,
+      requestedPageId: creativePageContext.requestedPageId,
+      resolvedPageId: creativePageContext.pageId,
+      resolvedPageName: creativePageContext.pageName,
+      accessiblePages: creativePageContext.accessiblePages
+    },
+    lastError?.response?.status || 400
+  );
 };
 
 module.exports = {

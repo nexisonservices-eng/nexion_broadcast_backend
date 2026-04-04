@@ -9,20 +9,32 @@ router.use(auth);
 router.get('/', async (req, res) => {
   try {
     const { search, tags } = req.query;
-    const filters = { userId: req.user.id };
+    const conditions = [{ userId: req.user.id }];
+    if (req.companyId) {
+      conditions.push({
+        $or: [
+        { companyId: req.companyId },
+        { companyId: null },
+        { companyId: { $exists: false } }
+      ]
+      });
+    }
     
     if (search) {
-      filters.$or = [
+      conditions.push({
+        $or: [
         { name: { $regex: search, $options: 'i' } },
         { phone: { $regex: search, $options: 'i' } },
         { email: { $regex: search, $options: 'i' } }
-      ];
+      ]
+      });
     }
     
     if (tags) {
-      filters.tags = { $in: tags.split(',') };
+      conditions.push({ tags: { $in: tags.split(',') } });
     }
 
+    const filters = conditions.length === 1 ? conditions[0] : { $and: conditions };
     const contacts = await Contact.find(filters).sort({ lastContact: -1 });
     res.json(contacts);
   } catch (error) {
@@ -36,6 +48,7 @@ router.post('/', async (req, res) => {
     const contact = await Contact.create({
       ...req.body,
       userId: req.user.id,
+      companyId: req.companyId || null,
       sourceType: 'manual'
     });
     res.status(201).json(contact);
@@ -80,7 +93,11 @@ router.post('/import', async (req, res) => {
           }
 
           // Check for duplicate phone numbers
-          const existingContact = await Contact.findOne({ phone: contactData.phone, userId: req.user.id });
+          const existingContact = await Contact.findOne({
+            phone: contactData.phone,
+            userId: req.user.id,
+            ...(req.companyId ? { companyId: req.companyId } : {})
+          });
           if (existingContact) {
             results.failed++;
             results.errors.push({
@@ -94,6 +111,7 @@ router.post('/import', async (req, res) => {
           // Create contact
           const contact = new Contact({
             userId: req.user.id,
+            companyId: req.companyId || null,
             name: contactData.name || '',
             phone: contactData.phone,
             email: contactData.email || '',
@@ -147,16 +165,30 @@ router.post('/import', async (req, res) => {
 // Update contact
 router.put('/:id', async (req, res) => {
   try {
-    const contact = await Contact.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user.id },
-      req.body,
-      { new: true, runValidators: true }
-    );
-    
-    if (!contact) {
+    const existingContact = await Contact.findOne({
+      _id: req.params.id,
+      userId: req.user.id,
+      ...(req.companyId ? { $or: [{ companyId: req.companyId }, { companyId: null }, { companyId: { $exists: false } }] } : {})
+    });
+
+    if (!existingContact) {
       return res.status(404).json({ error: 'Contact not found' });
     }
-    
+
+    const updatePayload = { ...req.body };
+    if (updatePayload.customFields && typeof updatePayload.customFields === 'object') {
+      updatePayload.customFields = {
+        ...(existingContact.customFields && typeof existingContact.customFields === 'object' ? existingContact.customFields : {}),
+        ...updatePayload.customFields
+      };
+    }
+
+    const contact = await Contact.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user.id },
+      updatePayload,
+      { new: true, runValidators: true }
+    );
+
     res.json(contact);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -166,7 +198,11 @@ router.put('/:id', async (req, res) => {
 // Delete contact
 router.delete('/:id', async (req, res) => {
   try {
-    const contact = await Contact.findOneAndDelete({ _id: req.params.id, userId: req.user.id });
+    const contact = await Contact.findOneAndDelete({
+      _id: req.params.id,
+      userId: req.user.id,
+      ...(req.companyId ? { $or: [{ companyId: req.companyId }, { companyId: null }, { companyId: { $exists: false } }] } : {})
+    });
     
     if (!contact) {
       return res.status(404).json({ error: 'Contact not found' });

@@ -151,7 +151,7 @@ class ConversationController {
 
   async createContact(req, res) {
     try {
-      const { name, phone, email, tags, notes } = req.body;
+      const { name, phone, email, tags, notes, stage, status, source, ownerId, nextFollowUpAt } = req.body;
       
       // Check if contact already exists
       const existingContact = await Contact.findOne({ phone, userId: req.user.id, companyId: req.companyId });
@@ -170,6 +170,11 @@ class ConversationController {
         email,
         tags: tags || [],
         notes,
+        stage: stage || 'new',
+        status: status || 'nurturing',
+        source: source || '',
+        ownerId: ownerId || null,
+        nextFollowUpAt: nextFollowUpAt || null,
         sourceType: 'manual'
       });
       
@@ -182,7 +187,21 @@ class ConversationController {
   async updateContact(req, res) {
     try {
       const { id } = req.params;
-      const { name, phone, email, tags, notes, isBlocked } = req.body;
+      const {
+        name,
+        phone,
+        email,
+        tags,
+        notes,
+        isBlocked,
+        stage,
+        status,
+        source,
+        ownerId,
+        nextFollowUpAt,
+        lastContactAt,
+        customFields
+      } = req.body;
       
       // Find contact by ID
       const contact = await Contact.findOne({ _id: id, userId: req.user.id, companyId: req.companyId });
@@ -212,6 +231,18 @@ class ConversationController {
       if (tags !== undefined) updateData.tags = tags;
       if (notes !== undefined) updateData.notes = notes;
       if (isBlocked !== undefined) updateData.isBlocked = isBlocked;
+      if (stage !== undefined) updateData.stage = stage;
+      if (status !== undefined) updateData.status = status;
+      if (source !== undefined) updateData.source = source;
+      if (ownerId !== undefined) updateData.ownerId = ownerId;
+      if (nextFollowUpAt !== undefined) updateData.nextFollowUpAt = nextFollowUpAt || null;
+      if (lastContactAt !== undefined) updateData.lastContactAt = lastContactAt || null;
+      if (customFields !== undefined) {
+        updateData.customFields = {
+          ...(contact.customFields && typeof contact.customFields === 'object' ? contact.customFields : {}),
+          ...(customFields && typeof customFields === 'object' ? customFields : {})
+        };
+      }
       
       const updatedContact = await Contact.findOneAndUpdate(
         { _id: id, userId: req.user.id, companyId: req.companyId },

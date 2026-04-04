@@ -7,6 +7,10 @@ const protect = require('../middleware/auth');
 const Campaign = require('../models/campaign');
 const campaignController = require('../controllers/campaigncontroller');
 const upload = multer({ storage: multer.memoryStorage() });
+const creativeUpload = upload.fields([
+    { name: 'creativeImage', maxCount: 1 },
+    { name: 'creativeVideo', maxCount: 1 }
+]);
 
 // Validation middleware
 const validate = (req, res, next) => {
@@ -53,6 +57,12 @@ const campaignValidation = [
         .isIn(['awareness', 'traffic', 'engagement', 'leads', 'sales', 'catalog'])
         .withMessage('Invalid campaign objective')
         .default('awareness'),
+
+    body('mediaType')
+        .optional()
+        .isIn(['image', 'video'])
+        .withMessage('Media type must be image or video')
+        .default('image'),
     
     body('status')
         .optional()
@@ -220,7 +230,7 @@ router.get(
  */
 router.post(
     '/',
-    upload.single('creativeImage'),
+    creativeUpload,
     campaignValidation,
     validate,
     campaignController.createCampaign
@@ -249,7 +259,7 @@ router.get(
  */
 router.put(
     '/:id',
-    upload.single('creativeImage'),
+    creativeUpload,
     [
         param('id').isMongoId().withMessage('Invalid campaign ID'),
         ...campaignValidation
@@ -394,6 +404,25 @@ router.get(
     ],
     validate,
     campaignController.getCampaignPerformance
+);
+
+router.post(
+    '/meta/sync/:id',
+    [
+        param('id').isMongoId().withMessage('Invalid campaign ID'),
+        body('dateRange').optional().isIn(['today', 'yesterday', 'last7days', 'last30days', 'thisMonth', 'lastMonth'])
+    ],
+    validate,
+    campaignController.syncWithMeta
+);
+
+router.post(
+    '/meta/sync-all',
+    [
+        body('dateRange').optional().isIn(['today', 'yesterday', 'last7days', 'last30days', 'thisMonth', 'lastMonth'])
+    ],
+    validate,
+    campaignController.syncAllWithMeta
 );
 
 // ==================== BULK OPERATIONS ROUTES (Admin only) ====================

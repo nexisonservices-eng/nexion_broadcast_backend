@@ -651,11 +651,17 @@ class BroadcastService {
           contactName: contact.name,
           lastMessage: message,
           lastMessageTime: new Date(),
+          lastMessageMediaType: '',
+          lastMessageAttachmentName: '',
+          lastMessageAttachmentPages: null,
           lastMessageFrom: 'agent'
         });
       } else {
         conversation.lastMessage = message;
         conversation.lastMessageTime = new Date();
+        conversation.lastMessageMediaType = '';
+        conversation.lastMessageAttachmentName = '';
+        conversation.lastMessageAttachmentPages = null;
         conversation.lastMessageFrom = 'agent';
         await conversation.save();
       }

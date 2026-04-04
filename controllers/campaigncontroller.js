@@ -170,6 +170,19 @@ const normalizeLifecycleState = ({ requestedStatus, existingCampaign } = {}) => 
     };
 };
 
+const getUploadedCreativeFiles = (req = {}) => {
+    const imageFromFields = Array.isArray(req.files?.creativeImage) ? req.files.creativeImage[0] : null;
+    const videoFromFields = Array.isArray(req.files?.creativeVideo) ? req.files.creativeVideo[0] : null;
+    const legacySingleFile = req.file || null;
+    const legacyMimeType = String(legacySingleFile?.mimetype || '').toLowerCase();
+    const legacyIsVideo = legacyMimeType.startsWith('video/');
+
+    return {
+        imageFile: imageFromFields || (legacySingleFile && !legacyIsVideo ? legacySingleFile : null),
+        videoFile: videoFromFields || (legacySingleFile && legacyIsVideo ? legacySingleFile : null)
+    };
+};
+
 // @desc    Get all campaigns
 // @route   GET /api/campaigns
 // @access  Private
@@ -330,9 +343,36 @@ exports.createCampaign = async (req, res) => {
             });
         }
 
-        if (req.file?.buffer) {
-            req.body.imageUrl = await uploadCampaignCreative(req.file, {
-                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads'
+        const { imageFile, videoFile } = getUploadedCreativeFiles(req);
+        const requestedMediaType = String(req.body.mediaType || '').toLowerCase() === 'video' ? 'video' : 'image';
+        req.body.mediaType = requestedMediaType;
+        if (requestedMediaType === 'video') {
+            req.body.imageUrl = '';
+        } else {
+            req.body.videoUrl = '';
+        }
+
+        if (requestedMediaType === 'video' && videoFile?.buffer) {
+            req.body.videoUrl = await uploadCampaignCreative(videoFile, {
+                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                resourceType: 'video'
+            });
+        } else if (requestedMediaType === 'image' && imageFile?.buffer) {
+            req.body.imageUrl = await uploadCampaignCreative(imageFile, {
+                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                resourceType: 'image'
+            });
+        } else if (videoFile?.buffer && !imageFile?.buffer) {
+            req.body.mediaType = 'video';
+            req.body.videoUrl = await uploadCampaignCreative(videoFile, {
+                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                resourceType: 'video'
+            });
+        } else if (imageFile?.buffer && !videoFile?.buffer) {
+            req.body.mediaType = 'image';
+            req.body.imageUrl = await uploadCampaignCreative(imageFile, {
+                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                resourceType: 'image'
             });
         }
 
@@ -428,15 +468,75 @@ exports.updateCampaign = async (req, res) => {
             });
         }
 
-        if (req.file?.buffer) {
-            req.body.imageUrl = await uploadCampaignCreative(req.file, {
-                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads'
-            });
-        }
-
+        const { imageFile, videoFile } = getUploadedCreativeFiles(req);
         const nextName = req.body.name || campaign.name;
         const nextStatus = req.body.status || campaign.status;
         const isPublished = Boolean(campaign.metaCampaignId);
+
+        if (isPublished) {
+            const restrictedPublishedFields = new Set([
+                'platform',
+                'dailyBudget',
+                'lifetimeBudget',
+                'startDate',
+                'endDate',
+                'targeting',
+                'ageMin',
+                'ageMax',
+                'gender',
+                'interests',
+                'behaviors',
+                'primaryText',
+                'headline',
+                'description',
+                'destinationUrl',
+                'callToAction',
+                'optimizationGoal',
+                'bidStrategy',
+                'imageUrl',
+                'videoUrl',
+                'mediaType'
+            ]);
+            const hasRestrictedFieldUpdate = Object.keys(req.body || {}).some((key) =>
+                restrictedPublishedFields.has(key)
+            );
+            const hasCreativeUpdate = Boolean(imageFile?.buffer || videoFile?.buffer);
+
+            if (hasRestrictedFieldUpdate || hasCreativeUpdate) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Published campaigns only support name/status updates in this screen. Duplicate the campaign to change targeting, budget, or creative.',
+                    details: {
+                        allowedFields: ['name', 'status']
+                    }
+                });
+            }
+        }
+
+        if (!isPublished) {
+            const requestedMediaType = String(req.body.mediaType || campaign.mediaType || '').toLowerCase() === 'video' ? 'video' : 'image';
+
+            if (videoFile?.buffer) {
+                req.body.videoUrl = await uploadCampaignCreative(videoFile, {
+                    folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                    resourceType: 'video'
+                });
+                req.body.mediaType = 'video';
+                req.body.imageUrl = '';
+            } else if (imageFile?.buffer) {
+                req.body.imageUrl = await uploadCampaignCreative(imageFile, {
+                    folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                    resourceType: 'image'
+                });
+                req.body.mediaType = 'image';
+                req.body.videoUrl = '';
+            } else {
+                req.body.mediaType = requestedMediaType;
+                if (requestedMediaType === 'video') req.body.imageUrl = '';
+                if (requestedMediaType === 'image') req.body.videoUrl = '';
+            }
+        }
 
         if (isPublished) {
             try {
@@ -908,13 +1008,17 @@ exports.publishCampaign = async (req, res) => {
                     userId: req.user.id,
                     campaignName: campaign.name,
                     objective: campaign.objective,
-                    dailyBudget: campaign.dailyBudget || campaign.lifetimeBudget,
+                    dailyBudget: campaign.dailyBudget,
+                    lifetimeBudget: campaign.lifetimeBudget,
                     startDate: campaign.startDate,
                     endDate: campaign.endDate,
+                    platform: campaign.platform,
                     targeting: campaign.targeting,
                     ageMin: campaign.ageMin,
                     ageMax: campaign.ageMax,
                     gender: campaign.gender,
+                    interests: campaign.interests,
+                    behaviors: campaign.behaviors,
                     primaryText: campaign.primaryText,
                     headline: campaign.headline,
                     description: campaign.description,
@@ -922,7 +1026,9 @@ exports.publishCampaign = async (req, res) => {
                     callToAction: campaign.callToAction,
                     optimizationGoal: campaign.optimizationGoal,
                     bidStrategy: campaign.bidStrategy,
+                    mediaType: campaign.mediaType || (campaign.videoUrl ? 'video' : 'image'),
                     imageUrl: campaign.imageUrl,
+                    videoUrl: campaign.videoUrl,
                     status: 'ACTIVE'
                 });
             } catch (metaError) {
@@ -949,6 +1055,7 @@ exports.publishCampaign = async (req, res) => {
                 campaign.metaAdId = metaCampaign.adId;
                 campaign.metaCreativeId = metaCampaign.creativeId;
                 campaign.metaImageHash = metaCampaign.imageHash;
+                campaign.metaVideoId = metaCampaign.videoId || '';
                 campaign.metaResponse = metaCampaign;
             }
         }
@@ -1218,14 +1325,69 @@ exports.exportCampaigns = async (req, res) => {
 
 // ======== PLACEHOLDER / BASIC IMPLEMENTATIONS FOR ROUTES EXPECTED BY campaignRoutes ========
 
-// @desc    Get campaign performance metrics (placeholder)
+// @desc    Get campaign performance metrics
 // @route   GET /api/campaigns/:id/performance
 exports.getCampaignPerformance = async (req, res) => {
-    return res.status(200).json({
-        success: true,
-        message: 'Performance endpoint not yet implemented',
-        data: {}
-    });
+    try {
+        const campaign = await Campaign.findById(req.params.id);
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to view this campaign performance')) return;
+
+        let refreshed = null;
+        if (campaign.metaCampaignId) {
+            try {
+                refreshed = await metaAdsService.refreshCrudCampaignAnalytics({
+                    campaignId: campaign._id,
+                    userId: String(campaign.createdBy || ''),
+                    range: req.query.dateRange || 'last30days'
+                });
+            } catch (syncError) {
+                console.warn('Campaign performance sync warning:', syncError.message || syncError);
+            }
+        }
+
+        const effectiveCampaign = refreshed?.campaign || campaign;
+        const latestInsights =
+            refreshed?.insights ||
+            effectiveCampaign?.metaResponse?.latestInsights ||
+            null;
+
+        const spent = Number(effectiveCampaign?.spent || latestInsights?.spend || 0);
+        const clicks = Number(effectiveCampaign?.clicks || latestInsights?.clicks || 0);
+        const impressions = Number(effectiveCampaign?.impressions || latestInsights?.impressions || 0);
+        const ctr = Number(effectiveCampaign?.ctr || latestInsights?.ctr || 0);
+        const cpc = Number(effectiveCampaign?.cpc || latestInsights?.cpc || 0);
+        const leads = Number(latestInsights?.leads || 0);
+        const cpl = Number(latestInsights?.cpl || 0);
+
+        res.status(200).json({
+            success: true,
+            data: {
+                campaignId: effectiveCampaign._id,
+                name: effectiveCampaign.name,
+                status: effectiveCampaign.status,
+                lifecycleStatus: effectiveCampaign.lifecycleStatus,
+                deliveryStatus: effectiveCampaign.deliveryStatus,
+                metrics: {
+                    spent,
+                    clicks,
+                    impressions,
+                    ctr,
+                    cpc,
+                    leads,
+                    cpl,
+                    revenue: Number(effectiveCampaign?.revenue || 0),
+                    roas: spent > 0 ? Number((Number(effectiveCampaign?.revenue || 0) / spent).toFixed(2)) : 0
+                },
+                syncedAt: effectiveCampaign?.metaResponse?.analyticsLastSyncedAt || latestInsights?.lastSyncedAt || null
+            }
+        });
+    } catch (error) {
+        console.error('Error loading campaign performance:', error);
+        res.status(error.status || 500).json({
+            success: false,
+            message: error.message || 'Error loading campaign performance'
+        });
+    }
 };
 
 // @desc    Bulk delete campaigns
@@ -1319,22 +1481,63 @@ exports.bulkUpdateStatus = async (req, res) => {
     }
 };
 
-// @desc    Sync a single campaign with Meta Ads (placeholder)
+// @desc    Sync a single campaign with Meta Ads
 // @route   POST /api/campaigns/meta/sync/:id
 exports.syncWithMeta = async (req, res) => {
-    return res.status(200).json({
-        success: true,
-        message: 'Meta sync not yet implemented'
-    });
+    try {
+        const campaign = await Campaign.findById(req.params.id);
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to sync this campaign')) return;
+
+        if (!campaign.metaCampaignId) {
+            return res.status(400).json({
+                success: false,
+                message: 'Campaign is not published to Meta yet.'
+            });
+        }
+
+        const syncResult = await metaAdsService.refreshCrudCampaignAnalytics({
+            campaignId: campaign._id,
+            userId: String(campaign.createdBy || ''),
+            range: req.body?.dateRange || req.query?.dateRange || 'last30days'
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: 'Campaign synced with Meta successfully.',
+            data: {
+                campaignId: String(syncResult?.campaign?._id || campaign._id),
+                insights: syncResult?.insights || null
+            }
+        });
+    } catch (error) {
+        console.error('Error syncing campaign with Meta:', error);
+        return res.status(error.status || 500).json({
+            success: false,
+            message: error.message || 'Error syncing campaign with Meta'
+        });
+    }
 };
 
-// @desc    Sync all campaigns with Meta Ads (placeholder)
+// @desc    Sync all campaigns with Meta Ads
 // @route   POST /api/campaigns/meta/sync-all
-exports.syncAllWithMeta = async (_req, res) => {
-    return res.status(200).json({
-        success: true,
-        message: 'Meta sync-all not yet implemented'
-    });
+exports.syncAllWithMeta = async (req, res) => {
+    try {
+        const syncResult = await metaAdsService.syncAllCrudCampaignAnalytics({
+            userId: req.user.role === 'superadmin' ? undefined : req.user.id
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: 'Meta sync completed.',
+            data: syncResult
+        });
+    } catch (error) {
+        console.error('Error syncing campaigns with Meta:', error);
+        return res.status(error.status || 500).json({
+            success: false,
+            message: error.message || 'Error syncing campaigns with Meta'
+        });
+    }
 };
 
 // @desc    Create campaign from template (placeholder)

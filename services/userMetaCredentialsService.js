@@ -68,19 +68,22 @@ const getMetaConfigForUser = async ({ authHeader = '' }) => {
 };
 
 const getMetaConfigByUserId = async (userId) => {
-  if (!userId || !ADMIN_INTERNAL_API_KEY) return null;
+  if (!userId) return null;
 
   const normalizedUserId = String(userId).trim();
   if (!normalizedUserId) return null;
 
   for (const baseUrl of ADMIN_API_BASE_URLS) {
     try {
+      const headers = {};
+      if (ADMIN_INTERNAL_API_KEY) {
+        headers['x-internal-api-key'] = ADMIN_INTERNAL_API_KEY;
+      }
+
       const response = await axios.get(
         `${baseUrl}${ADMIN_USER_CREDENTIALS_BY_ID_ENDPOINT}/${encodeURIComponent(normalizedUserId)}`,
         {
-          headers: {
-            'x-internal-api-key': ADMIN_INTERNAL_API_KEY
-          },
+          headers,
           timeout: 10000
         }
       );

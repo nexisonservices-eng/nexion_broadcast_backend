@@ -18,17 +18,46 @@ const getAccessContextForUser = async (userId) => {
     };
   }
 
-  const connection = await MetaAdsConnection.findOne({ userId }).lean();
-  if (connection?.accessToken) {
+  const resolveConnectionAccessContext = (connection, source) => {
+    const decryptedToken = decryptMetaToken(connection?.accessToken || '');
+    if (!decryptedToken) return null;
+
     return {
-      accessToken: decryptMetaToken(connection.accessToken),
+      accessToken: decryptedToken,
       apiVersion: env.apiVersion,
-      source: 'user',
+      source,
       connection
     };
+  };
+
+  const resolveInvalidUserTokenContext = (connection) => ({
+    accessToken: null,
+    apiVersion: env.apiVersion,
+    source: 'user-token-invalid',
+    connection
+  });
+
+  const connection = await MetaAdsConnection.findOne({ userId }).lean();
+  if (connection?.accessToken) {
+    const directUserContext = resolveConnectionAccessContext(connection, 'user');
+    if (directUserContext) {
+      return directUserContext;
+    }
   }
 
   const adminMetaConfig = await getMetaConfigByUserId(userId);
+  const credentialOwnerUserId = String(adminMetaConfig?.credentialOwnerUserId || '').trim();
+
+  if (credentialOwnerUserId && credentialOwnerUserId !== String(userId)) {
+    const ownerConnection = await MetaAdsConnection.findOne({ userId: credentialOwnerUserId }).lean();
+    if (ownerConnection?.accessToken) {
+      const ownerContext = resolveConnectionAccessContext(ownerConnection, 'company-admin');
+      if (ownerContext) {
+        return ownerContext;
+      }
+    }
+  }
+
   if (adminMetaConfig?.userAccessToken) {
     return {
       accessToken: adminMetaConfig.userAccessToken,
@@ -41,6 +70,10 @@ const getAccessContextForUser = async (userId) => {
       },
       adminMetaConfig
     };
+  }
+
+  if (connection?.accessToken) {
+    return resolveInvalidUserTokenContext(connection);
   }
 
   return {

@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const { fetchUserContext } = require('../services/adminAuthService');
+const { requireJwtSecret } = require('../utils/securityConfig');
 
 module.exports = (req, res, next) => {
   const run = async () => {
@@ -39,7 +40,7 @@ module.exports = (req, res, next) => {
       }
 
       const token = authHeader.split(' ')[1];
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'technova_jwt_secret_key_2024');
+      const decoded = jwt.verify(token, requireJwtSecret('auth token verification'));
       req.user = {
         id: decoded.userId || decoded.id,
         email: decoded.email,
@@ -65,6 +66,12 @@ module.exports = (req, res, next) => {
       }
       next();
     } catch (error) {
+      if (String(error?.message || '').includes('JWT_SECRET is required')) {
+        return res.status(500).json({
+          success: false,
+          error: 'Server auth configuration error. Please set JWT_SECRET.'
+        });
+      }
       return res.status(401).json({ success: false, error: 'Unauthorized: invalid token' });
     }
   };

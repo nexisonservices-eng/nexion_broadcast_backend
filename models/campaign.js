@@ -188,6 +188,10 @@ const campaignSchema = new mongoose.Schema({
         type: String,
         trim: true
     },
+    metaVideoId: {
+        type: String,
+        trim: true
+    },
     ageMin: {
         type: Number,
         min: 13,
@@ -237,6 +241,15 @@ const campaignSchema = new mongoose.Schema({
     imageUrl: {
         type: String,
         trim: true
+    },
+    videoUrl: {
+        type: String,
+        trim: true
+    },
+    mediaType: {
+        type: String,
+        enum: ['image', 'video'],
+        default: 'image'
     },
     callToAction: {
         type: String,

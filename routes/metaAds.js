@@ -7,9 +7,9 @@ const MetaAdsTransaction = require('../models/MetaAdsTransaction');
 const MetaAdsWallet = require('../models/MetaAdsWallet');
 const metaAdsService = require('../services/metaAdsService');
 const { getMetaConfigForUser, getMetaConfigByUserId } = require('../services/userMetaCredentialsService');
+const { requireJwtSecret } = require('../utils/securityConfig');
 
 const router = express.Router();
-const STATE_SECRET = process.env.JWT_SECRET || 'technova_jwt_secret_key_2024';
 const OAUTH_STATE_CACHE_TTL_MS = 15 * 60 * 1000;
 const oauthStateConfigCache = new Map();
 
@@ -28,16 +28,19 @@ const getCallbackUrl = (req) => `${getBackendOrigin(req)}/api/meta-ads/oauth/cal
 const getResolvedRedirectUri = (req, metaConfig = null) =>
   normalizeOrigin(metaConfig?.redirectUri) || getCallbackUrl(req);
 const resolveMetaOAuthConfig = (metaConfig = null) => ({
-  appId: String(metaConfig?.appId || '').trim(),
-  appSecret: String(metaConfig?.appSecret || '').trim(),
+  appId: String(metaConfig?.appId || process.env.META_APP_ID || '').trim(),
+  appSecret: String(metaConfig?.appSecret || process.env.META_APP_SECRET || '').trim(),
   redirectUri: normalizeOrigin(metaConfig?.redirectUri),
-  apiVersion: String(metaConfig?.apiVersion || 'v22.0').trim(),
+  apiVersion: String(metaConfig?.apiVersion || process.env.META_API_VERSION || 'v22.0').trim(),
   credentialOwnerUserId: String(metaConfig?.credentialOwnerUserId || '').trim()
 });
 
 const encodeStatePayload = (payload) => Buffer.from(JSON.stringify(payload)).toString('base64url');
 const signStatePayload = (payload, secret) =>
-  crypto.createHmac('sha256', String(secret || '')).update(payload).digest('hex');
+  crypto
+    .createHmac('sha256', String(secret || requireJwtSecret('Meta OAuth state signing')))
+    .update(payload)
+    .digest('hex');
 
 const buildSignedState = ({ userId, origin, credentialOwnerUserId }) => {
   const payload = encodeStatePayload({
@@ -47,7 +50,7 @@ const buildSignedState = ({ userId, origin, credentialOwnerUserId }) => {
     issuedAt: Date.now(),
     expiresAt: Date.now() + 10 * 60 * 1000
   });
-  const signature = signStatePayload(payload, STATE_SECRET);
+  const signature = signStatePayload(payload);
   return `${payload}.${signature}`;
 };
 
@@ -105,7 +108,9 @@ const buildFacebookAuthUrl = async (req) => {
   const authHeader = req.headers.authorization || '';
   const metaConfig = resolveMetaOAuthConfig(await getMetaConfigForUser({ authHeader }));
   if (!metaConfig.appId || !metaConfig.appSecret) {
-    const error = new Error('Meta App ID and Meta App Secret must be configured by super admin for this admin.');
+    const error = new Error(
+      'Meta App ID and Meta App Secret are missing. Configure them in admin credentials for this company admin, or set META_APP_ID and META_APP_SECRET in backend environment variables.'
+    );
     error.status = 400;
     throw error;
   }
@@ -217,7 +222,8 @@ router.post('/connect/auth-url', auth, async (req, res) => {
   try {
     res.json({
       success: true,
-      authUrl: await buildFacebookAuthUrl(req)
+      authUrl: await buildFacebookAuthUrl(req),
+      backendOrigin: getBackendOrigin(req)
     });
   } catch (error) {
     res.status(error.status || 500).json({ success: false, error: error.message });
@@ -229,6 +235,7 @@ router.post('/auth/facebook', auth, async (req, res) => {
     res.json({
       success: true,
       authUrl: await buildFacebookAuthUrl(req),
+      backendOrigin: getBackendOrigin(req),
       message: 'Facebook OAuth URL generated successfully.'
     });
   } catch (error) {
@@ -298,11 +305,11 @@ router.get('/oauth/callback', async (req, res) => {
     );
     if (!metaConfig.appId || !metaConfig.appSecret) {
       throw new Error(
-        'Meta app credentials are not configured for this admin. Save Meta App ID and Meta App Secret for the company admin in the admin backend, then try reconnecting again.'
+        'Meta app credentials are not configured. Save Meta App ID and Meta App Secret for the company admin in the admin backend, or set META_APP_ID and META_APP_SECRET in backend env, then try reconnecting again.'
       );
     }
 
-    const expectedSignature = signStatePayload(payload, STATE_SECRET);
+    const expectedSignature = signStatePayload(payload);
     if (signature !== expectedSignature) {
       throw new Error('Meta OAuth state signature mismatch.');
     }
@@ -335,7 +342,7 @@ router.get('/oauth/callback', async (req, res) => {
       .send(
         renderCallbackPage({
           message: 'Meta account connected',
-          payload: { type: 'meta_oauth_success', setup },
+          payload: { type: 'meta_oauth_success', setup, backendOrigin: getBackendOrigin(req) },
           targetOrigin
         })
       );
@@ -346,7 +353,11 @@ router.get('/oauth/callback', async (req, res) => {
       .send(
         renderCallbackPage({
           message: 'Meta connection failed',
-          payload: { type: 'meta_oauth_error', error: String(error.message || 'Meta OAuth failed.') }
+          payload: {
+            type: 'meta_oauth_error',
+            error: String(error.message || 'Meta OAuth failed.'),
+            backendOrigin: getBackendOrigin(req)
+          }
         })
       );
   }

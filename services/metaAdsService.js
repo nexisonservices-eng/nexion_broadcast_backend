@@ -3,6 +3,7 @@ const MetaAdCampaign = require('../models/MetaAdCampaign');
 const MetaAdsConnection = require('../models/MetaAdsConnection');
 const MetaAdsTransaction = require('../models/MetaAdsTransaction');
 const MetaAdsWallet = require('../models/MetaAdsWallet');
+const Campaign = require('../models/campaign');
 const { getMetaAdsConfig } = require('../config/metaAdsConfig');
 const metaAuthService = require('./metaAuthService');
 const metaCreativeService = require('./metaCreativeService');
@@ -20,6 +21,71 @@ const toCanonicalAdAccountId = (value) => {
   const normalizedId = normalizeAdAccountId(value);
   return normalizedId ? `act_${normalizedId}` : '';
 };
+
+const normalizeCountryToken = (value) =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z]/g, '');
+const COUNTRY_NAME_TO_CODE = {
+  india: 'IN',
+  unitedstates: 'US',
+  usa: 'US',
+  us: 'US',
+  canada: 'CA',
+  unitedkingdom: 'GB',
+  uk: 'GB',
+  greatbritain: 'GB',
+  england: 'GB',
+  australia: 'AU',
+  newzealand: 'NZ',
+  singapore: 'SG',
+  unitedarabemirates: 'AE',
+  uae: 'AE',
+  saudiarabia: 'SA',
+  qatar: 'QA',
+  oman: 'OM',
+  kuwait: 'KW',
+  bahrain: 'BH',
+  malaysia: 'MY',
+  indonesia: 'ID',
+  philippines: 'PH',
+  thailand: 'TH',
+  vietnam: 'VN',
+  southafrica: 'ZA',
+  nigeria: 'NG',
+  kenya: 'KE',
+  germany: 'DE',
+  france: 'FR',
+  italy: 'IT',
+  spain: 'ES',
+  netherlands: 'NL',
+  sweden: 'SE',
+  norway: 'NO',
+  denmark: 'DK',
+  switzerland: 'CH',
+  belgium: 'BE',
+  portugal: 'PT',
+  ireland: 'IE',
+  austria: 'AT',
+  poland: 'PL',
+  czechrepublic: 'CZ',
+  turkey: 'TR',
+  mexico: 'MX',
+  brazil: 'BR',
+  argentina: 'AR',
+  chile: 'CL',
+  colombia: 'CO',
+  peru: 'PE'
+};
+
+const parseDelimitedTerms = (value) =>
+  [...new Set(
+    String(value || '')
+      .split(/[\n,;]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  )];
 
 const getEnvConfig = () => getMetaAdsConfig();
 
@@ -178,6 +244,12 @@ const buildTargeting = (targeting = {}) => {
       name: String(interest.name || '').trim()
     }))
     .filter((interest) => /^\d+$/.test(interest.id) && interest.name);
+  const behaviors = normalizeArray(targeting.behaviors)
+    .map((behavior) => ({
+      id: String(behavior.id || '').trim(),
+      name: String(behavior.name || '').trim()
+    }))
+    .filter((behavior) => /^\d+$/.test(behavior.id) && behavior.name);
   const customAudienceIds = normalizeArray(targeting.customAudienceIds);
 
   const result = {
@@ -197,8 +269,11 @@ const buildTargeting = (targeting = {}) => {
   if (genders.length) {
     result.genders = genders;
   }
-  if (interests.length) {
-    result.flexible_spec = [{ interests }];
+  if (interests.length || behaviors.length) {
+    const flexibleEntry = {};
+    if (interests.length) flexibleEntry.interests = interests;
+    if (behaviors.length) flexibleEntry.behaviors = behaviors;
+    result.flexible_spec = [flexibleEntry];
   }
   if (customAudienceIds.length) {
     result.custom_audiences = customAudienceIds.map((id) => ({ id }));
@@ -207,16 +282,80 @@ const buildTargeting = (targeting = {}) => {
   return result;
 };
 
-const buildPlacement = (placement = {}) => {
+const buildPlacement = (placement = {}, platform = 'both') => {
   const publisherPlatforms = normalizeArray(placement.publisherPlatforms);
   const facebookPositions = normalizeArray(placement.facebookPositions);
   const instagramPositions = normalizeArray(placement.instagramPositions);
+  const normalizedPlatform = String(platform || 'both').trim().toLowerCase();
+
+  if (normalizedPlatform === 'facebook') {
+    return {
+      publisher_platforms: ['facebook'],
+      facebook_positions: facebookPositions.length ? facebookPositions : ['feed', 'marketplace', 'video_feeds']
+    };
+  }
+  if (normalizedPlatform === 'instagram') {
+    return {
+      publisher_platforms: ['instagram'],
+      instagram_positions: instagramPositions.length ? instagramPositions : ['stream', 'story', 'reels']
+    };
+  }
 
   return {
     publisher_platforms: publisherPlatforms.length ? publisherPlatforms : ['facebook', 'instagram'],
     facebook_positions: facebookPositions.length ? facebookPositions : ['feed', 'marketplace', 'video_feeds'],
     instagram_positions: instagramPositions.length ? instagramPositions : ['stream', 'story', 'reels']
   };
+};
+
+const findBestTargetingMatch = (entries = [], term = '') => {
+  const normalizedTerm = String(term || '').trim().toLowerCase();
+  if (!normalizedTerm) return null;
+
+  const exact = entries.find(
+    (entry) => String(entry?.name || '').trim().toLowerCase() === normalizedTerm
+  );
+  if (exact) return exact;
+
+  return entries.find((entry) =>
+    String(entry?.name || '').trim().toLowerCase().includes(normalizedTerm)
+  ) || entries[0] || null;
+};
+
+const resolveMetaTargetingEntries = async ({ accessToken, terms = [], type = 'adinterest', extraParams = {} }) => {
+  const results = [];
+  const seenIds = new Set();
+
+  for (const term of terms) {
+    try {
+      const response = await graphRequest({
+        path: 'search',
+        params: {
+          type,
+          q: term,
+          limit: 10,
+          ...extraParams
+        },
+        accessToken
+      });
+
+      const entries = Array.isArray(response?.data) ? response.data : [];
+      const best = findBestTargetingMatch(entries, term);
+      const id = String(best?.id || '').trim();
+      const name = String(best?.name || term).trim();
+      if (!id || seenIds.has(id)) continue;
+
+      seenIds.add(id);
+      results.push({ id, name });
+    } catch (error) {
+      console.warn(
+        '[Meta Ads] Targeting lookup failed:',
+        JSON.stringify({ term, type, message: extractApiErrorMessage(error) })
+      );
+    }
+  }
+
+  return results;
 };
 
 const sanitizeWhatsappNumber = metaCreativeService.sanitizeWhatsappNumber;
@@ -231,11 +370,12 @@ const resolveCreativePageContext = async ({ requestedPageId, accessToken }) =>
     env: getEnvConfig(),
     buildStageErrorWithDetails
   });
-const uploadCreativeAsset = async ({ fileBuffer, fileName, mediaUrl, userId, adAccountId }) =>
+const uploadCreativeAsset = async ({ fileBuffer, fileName, mediaUrl, mediaType, userId, adAccountId }) =>
   metaCreativeService.uploadCreativeAsset({
     fileBuffer,
     fileName,
     mediaUrl,
+    mediaType,
     userId,
     adAccountId,
     shouldUseMockMode,
@@ -273,6 +413,11 @@ const getSetupBundle = async ({ userId } = {}) => {
 
   const accessContext = await getAccessContextForUser(userId);
   if (!userId || !accessContext?.accessToken || !['user', 'admin'].includes(accessContext.source)) {
+    const setupError =
+      accessContext?.source === 'user-token-invalid'
+        ? 'Stored Meta token could not be decrypted in this backend environment. Use the same backend for OAuth + dashboard, or keep META_TOKEN_ENCRYPTION_KEY/JWT_SECRET consistent, then reconnect Meta.'
+        : 'Meta access is not configured for this admin.';
+
     return {
       mode: 'disconnected',
       connected: false,
@@ -283,7 +428,7 @@ const getSetupBundle = async ({ userId } = {}) => {
       businesses: [],
       adAccounts: [],
       whatsappNumbers: [],
-      setupError: 'Meta access is not configured for this admin.',
+      setupError,
       authSource: accessContext?.source || 'none',
       profileName: ''
     };
@@ -400,7 +545,10 @@ const getSetupBundle = async ({ userId } = {}) => {
     warnings.push('Page access: Reconnect Facebook and grant page access so a valid Facebook Page can be used for ad creatives.');
   }
 
-  const hasAnyLiveData = Boolean(pages.length || businesses.length || adAccounts.length || whatsappNumbers.length || selectedAdAccountId);
+  const hasConnectedAuth = Boolean(accessContext?.accessToken && ['user', 'admin'].includes(accessContext.source));
+  const hasAnyLiveData = Boolean(
+    pages.length || businesses.length || adAccounts.length || whatsappNumbers.length || selectedAdAccountId
+  );
   if (hasAnyLiveData) {
     return {
       mode: warnings.length ? 'live-partial' : 'live',
@@ -413,6 +561,27 @@ const getSetupBundle = async ({ userId } = {}) => {
       adAccounts,
       whatsappNumbers,
       setupError: warnings.join(' | '),
+      authSource: accessContext.source,
+      profileName: accessContext.connection?.name || ''
+    };
+  }
+
+  if (hasConnectedAuth) {
+    const setupWarning =
+      warnings.join(' | ') ||
+      'Meta account is connected, but ad accounts/pages could not be loaded. Reconnect and grant required Meta permissions.';
+
+    return {
+      mode: 'live-partial',
+      connected: true,
+      adAccountId: savedSelection.selectedAdAccountId || '',
+      pageId: savedSelection.selectedPageId || '',
+      selectedWhatsappNumber: savedSelection.selectedWhatsappNumber || '',
+      pages,
+      businesses,
+      adAccounts,
+      whatsappNumbers,
+      setupError: setupWarning,
       authSource: accessContext.source,
       profileName: accessContext.connection?.name || ''
     };
@@ -459,6 +628,11 @@ const getConnectionDiagnostics = async ({ userId } = {}) => {
   const selectedAdAccountId = toCanonicalAdAccountId(accessContext?.connection?.selectedAdAccountId || '');
 
   if (!userId || !accessContext?.accessToken || !['user', 'admin'].includes(accessContext.source)) {
+    const disconnectedError =
+      accessContext?.source === 'user-token-invalid'
+        ? 'Stored Meta token could not be decrypted in this backend environment. Reconnect Meta after aligning META_TOKEN_ENCRYPTION_KEY/JWT_SECRET across environments.'
+        : 'Meta access is not configured for this admin.';
+
     return {
       env: {
         apiVersion: env.apiVersion,
@@ -470,13 +644,13 @@ const getConnectionDiagnostics = async ({ userId } = {}) => {
         connectedProfileName: ''
       },
       checks: {
-        profile: { ok: false, error: 'Meta access is not configured for this admin.' },
-        businesses: { ok: false, error: 'Meta access is not configured for this admin.' },
-        pages: { ok: false, error: 'Meta access is not configured for this admin.' },
+        profile: { ok: false, error: disconnectedError },
+        businesses: { ok: false, error: disconnectedError },
+        pages: { ok: false, error: disconnectedError },
         pageDetails: { ok: false, error: 'No page selected for this admin.' },
         adAccount: { ok: false, error: 'No ad account selected for this admin.' }
       },
-      warnings: ['Meta access is not configured for this admin.'],
+      warnings: [disconnectedError],
       summary: {
         healthy: false,
         mode: 'disconnected',
@@ -982,7 +1156,8 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
       adSetId: `mock-adset-${now}`,
       creativeId: `mock-creative-${now}`,
       adId: `mock-ad-${now}`,
-      mediaHash: creativeUpload?.mediaHash || `mock_${now}`
+      mediaHash: creativeUpload?.mediaHash || `mock_${now}`,
+      videoId: creativeUpload?.videoId || ''
     };
   }
 
@@ -996,7 +1171,7 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
   }
 
   const objective = campaign.objective || 'OUTCOME_LEADS';
-  const deliveryObjective = objective === 'OUTCOME_LEADS' ? 'OUTCOME_TRAFFIC' : objective;
+  const deliveryObjective = objective;
   const requestedPageId = campaign.configuredPageId || accessContext.connection?.selectedPageId;
   if (!requestedPageId) {
     throw buildStageErrorWithDetails(
@@ -1018,15 +1193,31 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
   });
   const resolvedDestinationUrl = String(campaign?.metaOverrides?.destinationUrl || destinationUrl).trim();
   const targeting = buildTargeting(campaign.targeting);
-  const placement = buildPlacement(campaign.placement);
+  const placement = buildPlacement(campaign.placement, campaign.platform);
   const promotedObject = buildPromotedObject({
     objective,
     destinationUrl: resolvedDestinationUrl,
     pageId: configuredPageId
   });
-  const dailyBudget = Math.max(100, Number(campaign.budget?.dailyBudget || 500));
+  const rawDailyBudget = Number(campaign?.budget?.dailyBudget || 0);
+  const rawLifetimeBudget = Number(campaign?.budget?.lifetimeBudget || 0);
+  const hasDailyBudget = Number.isFinite(rawDailyBudget) && rawDailyBudget > 0;
+  const hasLifetimeBudget = Number.isFinite(rawLifetimeBudget) && rawLifetimeBudget > 0;
+  const useLifetimeBudget = hasLifetimeBudget && !hasDailyBudget;
+  const resolvedBudgetAmount = useLifetimeBudget
+    ? rawLifetimeBudget
+    : (hasDailyBudget ? rawDailyBudget : 500);
+  const budgetInMinorUnit = Math.max(1, Math.round(resolvedBudgetAmount * 100));
   const startTime = campaign.schedule?.startTime ? new Date(campaign.schedule.startTime).toISOString() : new Date().toISOString();
   const endTime = campaign.schedule?.endTime ? new Date(campaign.schedule.endTime).toISOString() : undefined;
+  if (useLifetimeBudget && !endTime) {
+    throw buildStageErrorWithDetails(
+      'Ad set creation',
+      'Lifetime budget requires an end date.',
+      { budget: resolvedBudgetAmount, campaignName: campaign?.campaignName || '' },
+      400
+    );
+  }
 
   let createdCampaign;
   try {
@@ -1048,7 +1239,7 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
   const adSetPayload = {
     name: `${campaign.campaignName} - Ad Set`,
     campaign_id: createdCampaign.id,
-    daily_budget: Math.round(dailyBudget * 100),
+    ...(useLifetimeBudget ? { lifetime_budget: budgetInMinorUnit } : { daily_budget: budgetInMinorUnit }),
     billing_event: 'IMPRESSIONS',
     optimization_goal:
       campaign?.metaOverrides?.optimizationGoal ||
@@ -1093,7 +1284,7 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
       {
         name: `${campaign.campaignName} - Ad Set`,
         campaign_id: createdCampaign.id,
-        daily_budget: Math.round(dailyBudget * 100),
+        ...(useLifetimeBudget ? { lifetime_budget: budgetInMinorUnit } : { daily_budget: budgetInMinorUnit }),
         billing_event: 'IMPRESSIONS',
         optimization_goal: 'REACH',
         bid_strategy: 'LOWEST_COST_WITH_BID_CAP',
@@ -1240,6 +1431,7 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
     creativeId: createdCreative.id,
     adId: resolvedAdId,
     mediaHash: creativeUpload?.mediaHash || '',
+    videoId: creativeUpload?.videoId || '',
     destinationUrl: resolvedDestinationUrl,
     pageId: configuredPageId
   };
@@ -1499,12 +1691,17 @@ const createMetaCampaignFromCrud = async ({ userId, name, objective, status }) =
 };
 
 const parseTargetingCountriesFromCrud = (targeting) => {
-  const tokens = String(targeting || '')
-    .split(',')
-    .map((item) => item.trim().toUpperCase())
+  const tokens = parseDelimitedTerms(targeting);
+  const countries = tokens
+    .map((token) => {
+      const normalizedToken = String(token || '').trim().toUpperCase();
+      if (/^[A-Z]{2}$/.test(normalizedToken)) {
+        return normalizedToken;
+      }
+      return COUNTRY_NAME_TO_CODE[normalizeCountryToken(token)] || '';
+    })
     .filter(Boolean);
 
-  const countries = tokens.filter((token) => /^[A-Z]{2}$/.test(token));
   return countries.length ? countries : ['IN'];
 };
 
@@ -1513,12 +1710,16 @@ const createMetaAdStackFromCrud = async ({
   campaignName,
   objective,
   dailyBudget,
+  lifetimeBudget,
   startDate,
   endDate,
+  platform,
   targeting,
   ageMin,
   ageMax,
   gender,
+  interests,
+  behaviors,
   primaryText,
   headline,
   description,
@@ -1526,9 +1727,13 @@ const createMetaAdStackFromCrud = async ({
   callToAction,
   optimizationGoal,
   bidStrategy,
+  mediaType,
   imageUrl,
   imageFileBuffer,
   imageFileName,
+  videoUrl,
+  videoFileBuffer,
+  videoFileName,
   status
 }) => {
   const env = getEnvConfig();
@@ -1562,15 +1767,61 @@ const createMetaAdStackFromCrud = async ({
       400
     );
   }
+  const normalizedMediaType = String(mediaType || '').trim().toLowerCase() === 'video' ? 'video' : 'image';
+  const parsedDailyBudget = Number(dailyBudget || 0);
+  const parsedLifetimeBudget = Number(lifetimeBudget || 0);
+  const hasDailyBudget = Number.isFinite(parsedDailyBudget) && parsedDailyBudget > 0;
+  const hasLifetimeBudget = Number.isFinite(parsedLifetimeBudget) && parsedLifetimeBudget > 0;
+  const resolvedDailyBudget = hasDailyBudget ? parsedDailyBudget : (!hasLifetimeBudget ? 50 : 0);
+  const resolvedLifetimeBudget = !hasDailyBudget && hasLifetimeBudget ? parsedLifetimeBudget : 0;
+  if (resolvedLifetimeBudget > 0 && !endDate) {
+    throw buildStageErrorWithDetails(
+      'Campaign creation',
+      'Lifetime budget campaigns require an end date.',
+      { lifetimeBudget: resolvedLifetimeBudget },
+      400
+    );
+  }
+
+  const interestTerms = parseDelimitedTerms(interests);
+  const behaviorTerms = parseDelimitedTerms(behaviors);
+  const [resolvedInterests, resolvedBehaviors] = await Promise.all([
+    interestTerms.length
+      ? resolveMetaTargetingEntries({
+          accessToken: accessContext.accessToken,
+          terms: interestTerms,
+          type: 'adinterest'
+        })
+      : Promise.resolve([]),
+    behaviorTerms.length
+      ? resolveMetaTargetingEntries({
+          accessToken: accessContext.accessToken,
+          terms: behaviorTerms,
+          type: 'adTargetingCategory',
+          extraParams: { class: 'behaviors' }
+        })
+      : Promise.resolve([])
+  ]);
+
   const creativeUpload = await uploadCreativeAsset({
-    fileBuffer: imageFileBuffer,
-    fileName: imageFileName,
-    mediaUrl: imageUrl,
+    fileBuffer: normalizedMediaType === 'video' ? videoFileBuffer : imageFileBuffer,
+    fileName: normalizedMediaType === 'video' ? videoFileName : imageFileName,
+    mediaUrl: normalizedMediaType === 'video' ? videoUrl : imageUrl,
+    mediaType: normalizedMediaType,
     userId,
     adAccountId: selectedAdAccountId
   });
 
-  if (!creativeUpload?.mediaHash && !creativeUpload?.mediaUrl) {
+  if (normalizedMediaType === 'video' && !creativeUpload?.videoId) {
+    throw buildStageErrorWithDetails(
+      'Creative upload',
+      'Ad video is required. Upload a video or provide a valid video URL.',
+      { videoUrl: videoUrl || '', fileName: videoFileName || '' },
+      400
+    );
+  }
+
+  if (normalizedMediaType === 'image' && !creativeUpload?.mediaHash && !creativeUpload?.mediaUrl) {
     throw buildStageErrorWithDetails(
       'Creative upload',
       'Ad image is required. Upload an image or provide a valid image URL.',
@@ -1586,24 +1837,35 @@ const createMetaAdStackFromCrud = async ({
       campaignName,
       objective: mapCrudObjectiveToMetaObjective(objective),
       status: normalizedStatus,
+      platform: ['facebook', 'instagram', 'both'].includes(String(platform || '').toLowerCase())
+        ? String(platform || '').toLowerCase()
+        : 'both',
       configuredPageId,
       budget: {
-        dailyBudget: Math.max(1, Number(dailyBudget || 50)),
+        dailyBudget: Math.max(0, Number(resolvedDailyBudget || 0)),
+        lifetimeBudget: Math.max(0, Number(resolvedLifetimeBudget || 0)),
         currency: 'INR'
       },
       targeting: {
         countries: parseTargetingCountriesFromCrud(targeting),
         ageMin: Math.max(13, Number(ageMin || 18)),
         ageMax: Math.min(65, Number(ageMax || 65)),
-        genders
+        genders,
+        interests: resolvedInterests,
+        behaviors: resolvedBehaviors
       },
       creative: {
         primaryText: String(primaryText || campaignName).trim(),
         headline: String(headline || campaignName).trim(),
         description: String(description || '').trim(),
         callToAction: String(callToAction || 'LEARN_MORE').trim().toUpperCase(),
-        mediaUrl: creativeUpload.mediaUrl || imageUrl || '',
-        mediaHash: creativeUpload.mediaHash
+        mediaType: normalizedMediaType,
+        mediaUrl:
+          creativeUpload.mediaUrl ||
+          (normalizedMediaType === 'video' ? videoUrl : imageUrl) ||
+          '',
+        mediaHash: creativeUpload.mediaHash,
+        videoId: creativeUpload.videoId || ''
       },
       schedule: {
         startTime: startDate || undefined,
@@ -1622,6 +1884,8 @@ const createMetaAdStackFromCrud = async ({
   return {
     ...stack,
     imageHash: creativeUpload.mediaHash,
+    videoId: creativeUpload.videoId || '',
+    mediaType: normalizedMediaType,
     status: normalizedStatus,
     destinationUrl:
       String(destinationUrl || stack.destinationUrl || `https://www.facebook.com/${configuredPageId || ''}`).trim(),
@@ -1812,6 +2076,183 @@ const syncAllCampaignAnalytics = async () => {
   }
 
   return results;
+};
+
+const mapCrudDateRangeToMetaPreset = (range = 'last30days') => {
+  switch (String(range || '').trim().toLowerCase()) {
+    case 'today':
+      return 'today';
+    case 'yesterday':
+      return 'yesterday';
+    case 'last7days':
+      return 'last_7d';
+    case 'thismonth':
+      return 'this_month';
+    case 'lastmonth':
+      return 'last_month';
+    case 'last30days':
+    default:
+      return 'last_30d';
+  }
+};
+
+const fetchCrudCampaignInsights = async ({ campaign, userId, range = 'last30days' }) => {
+  if (!campaign?.metaCampaignId) return null;
+
+  if (shouldUseMockMode()) {
+    const budgetReference = Number(campaign?.dailyBudget || campaign?.lifetimeBudget || 0);
+    const spend = Number((budgetReference * 0.74).toFixed(2));
+    const clicks = Math.max(1, Math.round(spend / 6));
+    const impressions = Math.max(100, clicks * 42);
+    const ctr = impressions ? Number(((clicks / impressions) * 100).toFixed(2)) : 0;
+    const cpc = clicks ? Number((spend / clicks).toFixed(2)) : 0;
+
+    return {
+      impressions,
+      reach: Math.round(impressions * 0.72),
+      clicks,
+      spend,
+      ctr,
+      cpc,
+      leads: 0,
+      cpl: 0,
+      lastSyncedAt: new Date()
+    };
+  }
+
+  const ownerUserId = String(userId || campaign?.createdBy || '').trim();
+  const accessContext = await ensureConnectedMetaUser(ownerUserId, 'Insights sync');
+  const effectiveAdAccountId =
+    campaign?.metaResponse?.adAccountId ||
+    campaign?.metaAdAccountId ||
+    accessContext.connection?.selectedAdAccountId;
+  if (!effectiveAdAccountId) {
+    throw buildStageErrorWithDetails(
+      'Insights sync',
+      'Select a Meta ad account before syncing campaign analytics.',
+      { campaignId: String(campaign?._id || ''), userId: ownerUserId },
+      400
+    );
+  }
+
+  let response;
+  try {
+    response = await graphRequest({
+      path: buildAdAccountPath(effectiveAdAccountId, 'insights'),
+      params: {
+        fields: 'impressions,reach,clicks,spend,ctr,cpc,actions',
+        date_preset: mapCrudDateRangeToMetaPreset(range),
+        filtering: JSON.stringify([
+          { field: 'campaign.id', operator: 'EQUAL', value: String(campaign.metaCampaignId) }
+        ]),
+        limit: 1
+      },
+      accessToken: accessContext.accessToken
+    });
+  } catch (error) {
+    throw buildStageError('Insights sync', error);
+  }
+
+  const row = Array.isArray(response?.data) ? response.data[0] : null;
+  const actions = Array.isArray(row?.actions) ? row.actions : [];
+  const leadAction = actions.find((item) => String(item.action_type || '').includes('lead'));
+  const leads = Number(leadAction?.value || 0);
+
+  return {
+    impressions: Number(row?.impressions || 0),
+    reach: Number(row?.reach || 0),
+    clicks: Number(row?.clicks || 0),
+    spend: Number(row?.spend || 0),
+    ctr: Number(row?.ctr || 0),
+    cpc: Number(row?.cpc || 0),
+    leads,
+    cpl: leads ? Number((Number(row?.spend || 0) / leads).toFixed(2)) : 0,
+    lastSyncedAt: new Date()
+  };
+};
+
+const syncCrudCampaignAnalyticsRecord = async ({ campaign, userId, range = 'last30days' }) => {
+  const latestInsights = await fetchCrudCampaignInsights({ campaign, userId, range });
+  if (!latestInsights) return null;
+
+  const persistedCampaign = campaign;
+  persistedCampaign.spent = Number(latestInsights.spend || 0);
+  persistedCampaign.impressions = Number(latestInsights.impressions || 0);
+  persistedCampaign.clicks = Number(latestInsights.clicks || 0);
+  persistedCampaign.ctr = Number(latestInsights.ctr || 0);
+  persistedCampaign.cpc = Number(latestInsights.cpc || 0);
+
+  const existingMetaResponse =
+    persistedCampaign.metaResponse && typeof persistedCampaign.metaResponse === 'object'
+      ? persistedCampaign.metaResponse
+      : {};
+  persistedCampaign.metaResponse = {
+    ...existingMetaResponse,
+    latestInsights,
+    analyticsLastSyncedAt: new Date().toISOString()
+  };
+  persistedCampaign.markModified('metaResponse');
+  await persistedCampaign.save();
+
+  return {
+    campaign: persistedCampaign,
+    insights: latestInsights
+  };
+};
+
+const syncAllCrudCampaignAnalytics = async ({ userId } = {}) => {
+  const query = {
+    metaCampaignId: { $exists: true, $ne: '' },
+    status: { $in: ['active', 'paused'] }
+  };
+  if (userId) {
+    query.createdBy = userId;
+  }
+
+  const campaigns = await Campaign.find(query);
+  const results = {
+    synced: 0,
+    warnings: []
+  };
+
+  for (const campaign of campaigns) {
+    try {
+      await syncCrudCampaignAnalyticsRecord({
+        campaign,
+        userId: String(campaign.createdBy || userId || '')
+      });
+      results.synced += 1;
+    } catch (error) {
+      results.warnings.push({
+        campaignId: String(campaign._id || ''),
+        campaignName: String(campaign.name || ''),
+        error: error.message || 'Campaign analytics sync failed'
+      });
+    }
+  }
+
+  return results;
+};
+
+const refreshCrudCampaignAnalytics = async ({ campaignId, userId, range = 'last30days' }) => {
+  const campaign = await Campaign.findById(campaignId);
+  if (!campaign) {
+    const error = new Error('Campaign not found');
+    error.status = 404;
+    throw error;
+  }
+
+  if (userId && String(campaign.createdBy || '') !== String(userId)) {
+    const error = new Error('Not authorized to sync this campaign');
+    error.status = 403;
+    throw error;
+  }
+
+  return syncCrudCampaignAnalyticsRecord({
+    campaign,
+    userId: String(campaign.createdBy || ''),
+    range
+  });
 };
 
 const updateCampaignDeliveryStatus = async ({ campaign, userId, status }) => {
@@ -2273,8 +2714,13 @@ module.exports = {
   updateMetaCrudDeliveryStatus,
   fetchInsights,
   fetchCampaignInsights,
+  fetchCrudCampaignInsights,
   syncCampaignAnalyticsRecord,
   syncAllCampaignAnalytics,
+  syncCrudCampaignAnalyticsRecord,
+  syncAllCrudCampaignAnalytics,
+  refreshCrudCampaignAnalytics,
+  mapCrudDateRangeToMetaPreset,
   updateCampaignDeliveryStatus,
   getOrCreateWalletRecord,
   ensureWalletBalance,

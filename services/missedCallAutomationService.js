@@ -319,12 +319,18 @@ async function updateConversationForMissedCallAutomation({
       contactName: contact.name,
       lastMessage: messageText,
       lastMessageTime: new Date(),
+      lastMessageMediaType: '',
+      lastMessageAttachmentName: '',
+      lastMessageAttachmentPages: null,
       lastMessageFrom: 'agent'
     });
   } else {
     conversation.contactName = conversation.contactName || contact.name;
     conversation.lastMessage = messageText;
     conversation.lastMessageTime = new Date();
+    conversation.lastMessageMediaType = '';
+    conversation.lastMessageAttachmentName = '';
+    conversation.lastMessageAttachmentPages = null;
     conversation.lastMessageFrom = 'agent';
     await conversation.save();
   }
