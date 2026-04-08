@@ -28,6 +28,24 @@ const LEAD_STATUSES = ['new', 'nurturing', 'qualified', 'unqualified', 'won', 'l
 const TASK_PRIORITIES = ['low', 'medium', 'high'];
 const TASK_STATUSES = ['pending', 'in_progress', 'completed', 'cancelled'];
 const DOCUMENT_ACCESS_MODES = ['view', 'download'];
+const CRM_CONTACT_LIST_FIELDS = [
+  '_id',
+  'name',
+  'phone',
+  'email',
+  'tags',
+  'stage',
+  'status',
+  'ownerId',
+  'nextFollowUpAt',
+  'lastContact',
+  'lastContactAt',
+  'leadScore',
+  'isBlocked',
+  'createdAt',
+  'updatedAt'
+].join(' ');
+const CRM_TASK_CONTACT_FIELDS = 'name phone stage status leadScore';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -319,9 +337,11 @@ router.get('/contacts', async (req, res) => {
 
     const [contacts, total] = await Promise.all([
       Contact.find(scopedFilter)
+        .select(CRM_CONTACT_LIST_FIELDS)
         .sort({ nextFollowUpAt: 1, leadScore: -1, lastContact: -1, createdAt: -1 })
         .skip(skip)
-        .limit(pageSize),
+        .limit(pageSize)
+        .lean(),
       Contact.countDocuments(scopedFilter)
     ]);
 
@@ -754,10 +774,11 @@ router.get('/tasks', async (req, res) => {
 
     const [tasks, total] = await Promise.all([
       LeadTask.find(scopedFilter)
-        .populate('contactId', 'name phone stage status leadScore')
+        .populate('contactId', CRM_TASK_CONTACT_FIELDS)
         .sort({ dueAt: 1, priority: -1, createdAt: -1 })
         .skip(skip)
-        .limit(pageSize),
+        .limit(pageSize)
+        .lean(),
       LeadTask.countDocuments(scopedFilter)
     ]);
 
@@ -983,31 +1004,83 @@ router.delete('/documents/:id', async (req, res) => {
 router.get('/metrics', async (req, res) => {
   try {
     const contactFilter = buildScopedFilter(req);
-    const contacts = await Contact.find(contactFilter).select('stage status leadScore tags').lean();
     const now = new Date();
     const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const endOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
 
-    const byStage = {};
-    const byStatus = {};
-    let totalLeadScore = 0;
-    let qualifiedCount = 0;
-
-    contacts.forEach((contact) => {
-      const stage = toCleanString(contact.stage).toLowerCase() || 'new';
-      const status = toCleanString(contact.status).toLowerCase() || 'nurturing';
-      byStage[stage] = (byStage[stage] || 0) + 1;
-      byStatus[status] = (byStatus[status] || 0) + 1;
-      totalLeadScore += Number(contact.leadScore || 0);
-
-      const tags = Array.isArray(contact.tags) ? contact.tags.map((item) => toCleanString(item).toLowerCase()) : [];
-      if (status === 'qualified' || stage === 'qualified' || tags.includes('qualified')) {
-        qualifiedCount += 1;
-      }
-    });
-
     const taskScope = buildScopedFilter(req);
-    const [openTasksCount, overdueTasksCount, dueTodayCount, completedTasksCount] = await Promise.all([
+    const [contactMetrics, openTasksCount, overdueTasksCount, dueTodayCount, completedTasksCount] = await Promise.all([
+      Contact.aggregate([
+        { $match: contactFilter },
+        {
+          $project: {
+            stage: { $toLower: { $ifNull: ['$stage', 'new'] } },
+            status: { $toLower: { $ifNull: ['$status', 'nurturing'] } },
+            leadScore: { $ifNull: ['$leadScore', 0] },
+            normalizedTags: {
+              $map: {
+                input: { $ifNull: ['$tags', []] },
+                as: 'tag',
+                in: {
+                  $toLower: {
+                    $trim: {
+                      input: { $toString: '$$tag' }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          $project: {
+            stage: 1,
+            status: 1,
+            leadScore: 1,
+            isQualified: {
+              $or: [
+                { $eq: ['$status', 'qualified'] },
+                { $eq: ['$stage', 'qualified'] },
+                { $in: ['qualified', '$normalizedTags'] }
+              ]
+            }
+          }
+        },
+        {
+          $facet: {
+            summary: [
+              {
+                $group: {
+                  _id: null,
+                  total: { $sum: 1 },
+                  qualified: {
+                    $sum: {
+                      $cond: ['$isQualified', 1, 0]
+                    }
+                  },
+                  averageLeadScore: { $avg: '$leadScore' }
+                }
+              }
+            ],
+            byStage: [
+              {
+                $group: {
+                  _id: '$stage',
+                  count: { $sum: 1 }
+                }
+              }
+            ],
+            byStatus: [
+              {
+                $group: {
+                  _id: '$status',
+                  count: { $sum: 1 }
+                }
+              }
+            ]
+          }
+        }
+      ]),
       LeadTask.countDocuments({
         $and: [taskScope, { status: { $in: ['pending', 'in_progress'] } }]
       }),
@@ -1022,15 +1095,29 @@ router.get('/metrics', async (req, res) => {
       })
     ]);
 
+    const contactMetricsData = Array.isArray(contactMetrics) ? contactMetrics[0] || {} : {};
+    const contactSummary = contactMetricsData.summary?.[0] || {};
+    const byStage = (contactMetricsData.byStage || []).reduce((acc, item) => {
+      const key = toCleanString(item?._id).toLowerCase() || 'new';
+      acc[key] = Number(item?.count || 0);
+      return acc;
+    }, {});
+    const byStatus = (contactMetricsData.byStatus || []).reduce((acc, item) => {
+      const key = toCleanString(item?._id).toLowerCase() || 'nurturing';
+      acc[key] = Number(item?.count || 0);
+      return acc;
+    }, {});
+    const totalContacts = Number(contactSummary.total || 0);
+
     res.json({
       success: true,
       data: {
         contacts: {
-          total: contacts.length,
-          qualified: qualifiedCount,
+          total: totalContacts,
+          qualified: Number(contactSummary.qualified || 0),
           byStage,
           byStatus,
-          averageLeadScore: contacts.length > 0 ? Number((totalLeadScore / contacts.length).toFixed(2)) : 0
+          averageLeadScore: totalContacts > 0 ? Number(Number(contactSummary.averageLeadScore || 0).toFixed(2)) : 0
         },
         tasks: {
           open: openTasksCount,

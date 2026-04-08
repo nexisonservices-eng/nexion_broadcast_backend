@@ -1,7 +1,35 @@
 const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
-const Message = require('../models/Message');
-const mongoose = require('mongoose');
+
+const TEAM_INBOX_CONTACT_FIELDS =
+  '_id name phone email notes tags status stage customFields nextFollowUpAt leadScore leadScoreBreakdown isBlocked';
+const CONTACT_LIST_FIELDS =
+  '_id name phone email tags stage status source ownerId sourceType lastContact lastContactAt nextFollowUpAt isBlocked leadScore createdAt updatedAt';
+
+const TEAM_INBOX_CONVERSATION_FIELDS = [
+  '_id',
+  'userId',
+  'companyId',
+  'contactId',
+  'contactPhone',
+  'contactName',
+  'status',
+  'assignedTo',
+  'assignedToId',
+  'tags',
+  'priority',
+  'lastMessageTime',
+  'lastMessage',
+  'lastMessageMediaType',
+  'lastMessageAttachmentName',
+  'lastMessageAttachmentPages',
+  'lastMessageFrom',
+  'unreadCount',
+  'notes',
+  'createdAt',
+  'updatedAt',
+  'resolvedAt'
+].join(' ');
 
 class ConversationController {
   async getConversations(req, res) {
@@ -13,45 +41,14 @@ class ConversationController {
       if (assignedTo) filters.assignedTo = assignedTo;
       
       let conversations = await Conversation.find(filters)
-        .populate('contactId')
+        .select(TEAM_INBOX_CONVERSATION_FIELDS)
+        .populate('contactId', TEAM_INBOX_CONTACT_FIELDS)
         .sort({ lastMessageTime: -1 })
         .lean();
 
-      const conversationIds = conversations.map((conv) => conv._id);
-      const userMatchId = mongoose.Types.ObjectId.isValid(req.user.id)
-        ? new mongoose.Types.ObjectId(req.user.id)
-        : req.user.id;
-
-      const unreadRows = await Message.aggregate([
-        {
-          $match: {
-            userId: userMatchId,
-            companyId: req.companyId,
-            conversationId: { $in: conversationIds },
-            sender: 'contact',
-            status: 'received'
-          }
-        },
-        {
-          $group: {
-            _id: '$conversationId',
-            unreadCount: { $sum: 1 }
-          }
-        }
-      ]);
-
-      const unreadMap = new Map(
-        unreadRows.map((row) => [String(row._id), Number(row.unreadCount) || 0])
-      );
-
       conversations = conversations.map((conv) => {
-        const fromMessages = unreadMap.get(String(conv._id));
         const fromConversation = Number(conv.unreadCount || 0);
-        conv.unreadCount = Number.isFinite(fromMessages)
-          ? Math.max(0, fromMessages)
-          : Number.isFinite(fromConversation)
-            ? Math.max(0, fromConversation)
-            : 0;
+        conv.unreadCount = Number.isFinite(fromConversation) ? Math.max(0, fromConversation) : 0;
         return conv;
       });
       
@@ -90,6 +87,7 @@ class ConversationController {
       }
       
       const contacts = await Contact.find(filters)
+        .select(CONTACT_LIST_FIELDS)
         .sort({ lastContact: -1, createdAt: -1 })
         .lean();
       
@@ -125,7 +123,7 @@ class ConversationController {
         companyId: req.companyId,
         status: { $in: ['active', 'pending'] }
       })
-        .select('contactPhone contactName')
+        .select('contactPhone contactName lastMessageTime lastMessage status')
         .sort({ lastMessageTime: -1 })
         .lean();
       

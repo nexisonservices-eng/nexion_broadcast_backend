@@ -4,6 +4,25 @@ const auth = require('../middleware/auth');
 
 const router = express.Router();
 router.use(auth);
+const CONTACT_LIST_FIELDS = [
+  '_id',
+  'name',
+  'phone',
+  'email',
+  'tags',
+  'stage',
+  'status',
+  'source',
+  'ownerId',
+  'sourceType',
+  'lastContact',
+  'lastContactAt',
+  'nextFollowUpAt',
+  'isBlocked',
+  'leadScore',
+  'createdAt',
+  'updatedAt'
+].join(' ');
 
 // Get all contacts
 router.get('/', async (req, res) => {
@@ -35,7 +54,10 @@ router.get('/', async (req, res) => {
     }
 
     const filters = conditions.length === 1 ? conditions[0] : { $and: conditions };
-    const contacts = await Contact.find(filters).sort({ lastContact: -1 });
+    const contacts = await Contact.find(filters)
+      .select(CONTACT_LIST_FIELDS)
+      .sort({ lastContact: -1, createdAt: -1 })
+      .lean();
     res.json(contacts);
   } catch (error) {
     res.status(500).json({ error: error.message });

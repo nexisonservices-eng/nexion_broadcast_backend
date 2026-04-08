@@ -409,7 +409,7 @@ const registerLegacyCoreRoutes = (app, deps) => {
           'replyTo',
           '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
         )
-        .sort(hasPagination ? { timestamp: -1, _id: -1 } : { timestamp: 1, _id: 1 })
+        .sort(hasPagination ? { timestamp: -1 } : { timestamp: 1 })
         .lean();
 
       const messages = hasPagination
@@ -538,30 +538,67 @@ const registerLegacyCoreRoutes = (app, deps) => {
 
   app.get('/api/analytics', auth, async (req, res) => {
     try {
-      const totalConversations = await Conversation.countDocuments({ userId: req.user.id, companyId: req.companyId });
-      const activeConversations = await Conversation.countDocuments({
-        userId: req.user.id,
-        companyId: req.companyId,
-        status: 'active'
-      });
-
       const last7Days = new Date();
       last7Days.setDate(last7Days.getDate() - 7);
-
-      const allAgentMessages = await Message.find({
-        userId: req.user.id,
-        companyId: req.companyId,
-        sender: 'agent',
-        timestamp: { $gte: last7Days }
-      });
-
-      const userBroadcasts = await Broadcast.find({
-        companyId: req.companyId,
-        $or: [
-          { createdById: req.user.id },
-          { createdBy: req.user.username || req.user.email || req.user.id }
-        ]
-      }).select('stats').lean();
+      const [totalConversations, activeConversations, allAgentMessages, userBroadcasts, messageTotals, messagesReceived] = await Promise.all([
+        Conversation.countDocuments({ userId: req.user.id, companyId: req.companyId }),
+        Conversation.countDocuments({
+          userId: req.user.id,
+          companyId: req.companyId,
+          status: 'active'
+        }),
+        Message.find({
+          userId: req.user.id,
+          companyId: req.companyId,
+          sender: 'agent',
+          timestamp: { $gte: last7Days }
+        })
+          .select('timestamp conversationId status mediaType')
+          .lean(),
+        Broadcast.find({
+          companyId: req.companyId,
+          $or: [
+            { createdById: req.user.id },
+            { createdBy: req.user.username || req.user.email || req.user.id }
+          ]
+        }).select('stats').lean(),
+        Message.aggregate([
+          {
+            $match: {
+              userId: req.user.id,
+              companyId: req.companyId,
+              sender: 'agent'
+            }
+          },
+          {
+            $group: {
+              _id: null,
+              sent: { $sum: 1 },
+              delivered: {
+                $sum: {
+                  $cond: [{ $in: ['$status', ['delivered', 'read']] }, 1, 0]
+                }
+              },
+              read: {
+                $sum: {
+                  $cond: [{ $eq: ['$status', 'read'] }, 1, 0]
+                }
+              },
+              failed: {
+                $sum: {
+                  $cond: [{ $eq: ['$status', 'failed'] }, 1, 0]
+                }
+              }
+            }
+          }
+        ]),
+        Message.countDocuments({
+          userId: req.user.id,
+          companyId: req.companyId,
+          sender: 'contact',
+          timestamp: { $gte: last7Days }
+        })
+      ]);
 
       const campaignTotals = userBroadcasts.reduce(
         (acc, b) => {
@@ -579,37 +616,6 @@ const registerLegacyCoreRoutes = (app, deps) => {
         { sent: 0, delivered: 0, read: 0, failed: 0 }
       );
 
-      const messageTotals = await Message.aggregate([
-        {
-          $match: {
-            userId: req.user.id,
-            companyId: req.companyId,
-            sender: 'agent'
-          }
-        },
-        {
-          $group: {
-            _id: null,
-            sent: { $sum: 1 },
-            delivered: {
-              $sum: {
-                $cond: [{ $in: ['$status', ['delivered', 'read']] }, 1, 0]
-              }
-            },
-            read: {
-              $sum: {
-                $cond: [{ $eq: ['$status', 'read'] }, 1, 0]
-              }
-            },
-            failed: {
-              $sum: {
-                $cond: [{ $eq: ['$status', 'failed'] }, 1, 0]
-              }
-            }
-          }
-        }
-      ]);
-
       const headlineTotals = messageTotals[0] || { sent: 0, delivered: 0, read: 0, failed: 0 };
       const messagesFailed = Math.max(Number(headlineTotals.failed || 0), Number(campaignTotals.failed || 0));
       const messagesRead = Math.max(Number(headlineTotals.read || 0), Number(campaignTotals.read || 0));
@@ -622,13 +628,6 @@ const registerLegacyCoreRoutes = (app, deps) => {
         Number(campaignTotals.sent || 0),
         totalDeliveredOrRead + messagesFailed
       );
-
-      const messagesReceived = await Message.countDocuments({
-        userId: req.user.id,
-        companyId: req.companyId,
-        sender: 'contact',
-        timestamp: { $gte: last7Days }
-      });
 
       const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
       const dailyMap = new Map();
