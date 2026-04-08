@@ -1,6 +1,7 @@
 const axios = require('axios');
 const FormData = require('form-data');
 const { isDebugLoggingEnabled } = require('../utils/securityConfig');
+const META_REQUEST_TIMEOUT_MS = Number(process.env.WHATSAPP_META_REQUEST_TIMEOUT_MS || 12000);
 
 const debugLog = (...args) => {
   if (isDebugLoggingEnabled()) {
@@ -707,6 +708,7 @@ class WhatsAppService {
         `${this.apiUrl}/${this.wabaId}/message_templates`,
         {
           headers: this.getHeaders(),
+          timeout: META_REQUEST_TIMEOUT_MS,
           params: {
             fields: 'id,name,language,status,category,components',
             limit: 200
