@@ -381,17 +381,62 @@ const registerLegacyCoreRoutes = (app, deps) => {
 
   app.get('/api/conversations/:id/messages', auth, async (req, res) => {
     try {
-      const messages = await Message.find({
+      const parsedLimit = Number(req.query?.limit);
+      const hasPagination = Number.isFinite(parsedLimit) && parsedLimit > 0;
+      const limit = hasPagination ? Math.max(1, Math.min(parsedLimit, 80)) : 0;
+      const cursor = String(req.query?.cursor || '').trim();
+      const filters = {
         conversationId: req.params.id,
-        userId: req.user.id,
-        companyId: req.companyId
-      })
-        .populate('replyTo', '_id text sender whatsappMessageId mediaType mediaCaption timestamp')
-        .sort({ timestamp: 1 })
+        userId: req.user.id
+      };
+
+      if (req.companyId) {
+        filters.companyId = req.companyId;
+      }
+
+      if (hasPagination && cursor) {
+        const cursorDate = new Date(cursor);
+        if (!Number.isNaN(cursorDate.valueOf())) {
+          filters.timestamp = { $lt: cursorDate };
+        }
+      }
+
+      const baseQuery = Message.find(filters)
+        .select(
+          '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
+        )
+        .populate(
+          'replyTo',
+          '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
+        )
+        .sort(hasPagination ? { timestamp: -1, _id: -1 } : { timestamp: 1, _id: 1 })
         .lean();
-      res.json(messages);
+
+      const messages = hasPagination
+        ? await baseQuery.limit(limit + 1)
+        : await baseQuery;
+
+      if (!hasPagination) {
+        return res.json(messages);
+      }
+
+      const hasMore = messages.length > limit;
+      const trimmedMessages = hasMore ? messages.slice(0, limit) : messages;
+      const chronologicalMessages = [...trimmedMessages].reverse();
+      const nextCursor = hasMore
+        ? new Date(trimmedMessages[trimmedMessages.length - 1]?.timestamp || Date.now()).toISOString()
+        : null;
+
+      return res.json({
+        data: chronologicalMessages,
+        meta: {
+          limit,
+          hasMore,
+          nextCursor
+        }
+      });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      return res.status(500).json({ error: error.message });
     }
   });
 
