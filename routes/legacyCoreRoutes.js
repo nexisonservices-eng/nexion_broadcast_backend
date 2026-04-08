@@ -271,7 +271,8 @@ const registerLegacyCoreRoutes = (app, deps) => {
       const conversations = await Conversation.find(filters)
         .populate('contactId', 'name phone email tags')
         .sort({ lastMessageTime: -1 })
-        .limit(100);
+        .limit(100)
+        .lean();
       res.json(conversations);
     } catch (error) {
       res.status(500).json({ error: error.message });
@@ -316,7 +317,9 @@ const registerLegacyCoreRoutes = (app, deps) => {
         _id: req.params.id,
         userId: req.user.id,
         companyId: req.companyId
-      }).populate('contactId', 'name phone email tags');
+      })
+        .populate('contactId', 'name phone email tags')
+        .lean();
       if (!conversation) {
         return res.status(404).json({ error: 'Conversation not found' });
       }
@@ -384,7 +387,8 @@ const registerLegacyCoreRoutes = (app, deps) => {
         companyId: req.companyId
       })
         .populate('replyTo', '_id text sender whatsappMessageId mediaType mediaCaption timestamp')
-        .sort({ timestamp: 1 });
+        .sort({ timestamp: 1 })
+        .lean();
       res.json(messages);
     } catch (error) {
       res.status(500).json({ error: error.message });
@@ -407,7 +411,7 @@ const registerLegacyCoreRoutes = (app, deps) => {
         filters.tags = { $in: tags.split(',') };
       }
 
-      const contacts = await Contact.find(filters).sort({ lastContact: -1 });
+      const contacts = await Contact.find(filters).sort({ lastContact: -1 }).lean();
       res.json(contacts);
     } catch (error) {
       res.status(500).json({ error: error.message });

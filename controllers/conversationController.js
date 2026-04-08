@@ -14,7 +14,8 @@ class ConversationController {
       
       let conversations = await Conversation.find(filters)
         .populate('contactId')
-        .sort({ lastMessageTime: -1 });
+        .sort({ lastMessageTime: -1 })
+        .lean();
 
       const conversationIds = conversations.map((conv) => conv._id);
       const userMatchId = mongoose.Types.ObjectId.isValid(req.user.id)
@@ -89,7 +90,8 @@ class ConversationController {
       }
       
       const contacts = await Contact.find(filters)
-        .sort({ lastContact: -1, createdAt: -1 });
+        .sort({ lastContact: -1, createdAt: -1 })
+        .lean();
       
       res.json({ success: true, data: contacts });
     } catch (error) {
@@ -101,7 +103,7 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const contact = await Contact.findOne({ _id: id, userId: req.user.id, companyId: req.companyId });
+      const contact = await Contact.findOne({ _id: id, userId: req.user.id, companyId: req.companyId }).lean();
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -124,7 +126,8 @@ class ConversationController {
         status: { $in: ['active', 'pending'] }
       })
         .select('contactPhone contactName')
-        .sort({ lastMessageTime: -1 });
+        .sort({ lastMessageTime: -1 })
+        .lean();
       
       // Extract unique contacts
       const uniqueContacts = [];
