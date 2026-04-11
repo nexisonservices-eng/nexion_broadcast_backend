@@ -11,6 +11,11 @@ const Contact = require('../models/Contact');
 const Conversation = require('../models/Conversation');
 const Message = require('../models/Message');
 const { isDebugLoggingEnabled } = require('../utils/securityConfig');
+const { buildPhoneCandidates } = require('../services/whatsappOutreach/conversationResolver');
+const {
+  buildBroadcastAudienceValidation,
+  toCleanString
+} = require('../services/whatsappOutreach/policy');
 
 const router = express.Router();
 router.use(auth);
@@ -49,6 +54,57 @@ const reportUsage = async (companyId, count) => {
       continue;
     }
   }
+};
+
+const buildScopedContactFilter = (req, extra = {}) => {
+  const scopedConditions = [{ userId: req.user.id }];
+  if (req.companyId) {
+    scopedConditions.push({
+      $or: [
+        { companyId: req.companyId },
+        { companyId: null },
+        { companyId: { $exists: false } }
+      ]
+    });
+  }
+  if (extra && Object.keys(extra).length > 0) {
+    scopedConditions.push(extra);
+  }
+
+  return scopedConditions.length === 1 ? scopedConditions[0] : { $and: scopedConditions };
+};
+
+const buildContactsByPhoneMap = async (req, recipients = []) => {
+  const allPhoneCandidates = Array.from(
+    new Set(
+      (Array.isArray(recipients) ? recipients : [])
+        .flatMap((recipient) => buildPhoneCandidates(recipient?.phone || ''))
+        .filter(Boolean)
+    )
+  );
+
+  if (!allPhoneCandidates.length) {
+    return new Map();
+  }
+
+  const contacts = await Contact.find(
+    buildScopedContactFilter(req, { phone: { $in: allPhoneCandidates } })
+  )
+    .select(
+      '_id phone isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptOutAt serviceWindowClosesAt'
+    )
+    .lean();
+
+  const contactsByPhone = new Map();
+  for (const contact of contacts) {
+    for (const candidate of buildPhoneCandidates(contact?.phone || '')) {
+      if (!contactsByPhone.has(candidate)) {
+        contactsByPhone.set(candidate, contact);
+      }
+    }
+  }
+
+  return contactsByPhone;
 };
 
 async function sendTemplateDirectViaMeta({ phone, templateName, language, variables, credentials }) {
@@ -321,11 +377,64 @@ router.post('/upload', async (req, res) => {
   }
 });
 
+router.post(
+  '/validate-audience',
+  requirePlanFeature('broadcastMessaging'),
+  async (req, res) => {
+    try {
+      const recipients = Array.isArray(req.body?.recipients) ? req.body.recipients : [];
+      const messageType = toCleanString(req.body?.messageType || req.body?.message_type || 'template');
+      const templateCategory = toCleanString(req.body?.templateCategory || '');
+
+      if (!recipients.length) {
+        return res.status(400).json({
+          success: false,
+          error: 'Recipients are required for validation'
+        });
+      }
+
+      const contactsByPhone = await buildContactsByPhoneMap(req, recipients);
+      const validation = buildBroadcastAudienceValidation({
+        recipients,
+        contactsByPhone,
+        messageType,
+        templateCategory
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          ...validation,
+          canProceed: validation.summary.eligible > 0
+        }
+      });
+    } catch (error) {
+      console.error('Bulk audience validation error:', error);
+      return res.status(500).json({
+        success: false,
+        error: error.message || 'Failed to validate audience'
+      });
+    }
+  }
+);
+
 // Bulk send endpoint with rate limiting and enhanced processing
 router.post('/send', requirePlanFeature('broadcastMessaging'), requireWhatsAppCredentials, async (req, res) => {
   try {
     debugLog('📥 Received bulk send request:', req.body);
-    const { message_type, template_name, language, custom_message, broadcast_name, recipients, messageType, customMessage, templateName, templateContent } = req.body;
+    const {
+      message_type,
+      template_name,
+      language,
+      custom_message,
+      broadcast_name,
+      recipients,
+      messageType,
+      customMessage,
+      templateName,
+      templateContent,
+      templateCategory = ''
+    } = req.body;
     
     // Support both camelCase and snake_case parameter names
     const msgType = message_type || messageType || (templateName ? 'template' : 'text');
@@ -373,6 +482,24 @@ router.post('/send', requirePlanFeature('broadcastMessaging'), requireWhatsAppCr
         message: 'No valid recipients found'
       });
     }
+
+    const contactsByPhone = await buildContactsByPhoneMap(req, parsedRecipients);
+    const audienceValidation = buildBroadcastAudienceValidation({
+      recipients: parsedRecipients,
+      contactsByPhone,
+      messageType: msgType,
+      templateCategory
+    });
+
+    if (!audienceValidation.summary.eligible) {
+      return res.status(400).json({
+        success: false,
+        message: 'No eligible recipients found for this WhatsApp campaign',
+        audienceValidation
+      });
+    }
+
+    parsedRecipients = audienceValidation.eligibleRecipients;
 
     const results = [];
     let successful = 0;
@@ -603,7 +730,8 @@ router.post('/send', requirePlanFeature('broadcastMessaging'), requireWhatsAppCr
       total_sent: parsedRecipients.length,
       successful,
       failed,
-      results
+      results,
+      audienceValidation
     });
   } catch (error) {
     console.error('Bulk send error:', error);

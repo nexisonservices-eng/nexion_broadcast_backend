@@ -13,5 +13,19 @@ services:
         description: MongoDB connection string (get this from MongoDB Atlas)
       - key: JWT_SECRET
         generateValue: true
+      - key: PUBLIC_BACKEND_URL
+        description: Public HTTPS URL for this backend (for OAuth callbacks and public consent links)
+      - key: FRONTEND_URL
+        description: Frontend app URL
+      - key: META_APP_ID
+        description: Meta app ID used for Meta Ads / lead sync
+      - key: META_APP_SECRET
+        description: Meta app secret used for Meta Ads / lead sync
+      - key: META_API_VERSION
+        value: v22.0
+      - key: META_TOKEN_ENCRYPTION_KEY
+        description: 32+ character encryption key for stored Meta tokens
+      - key: WHATSAPP_OPTIN_PUBLIC_KEY
+        description: Shared public key used by website / landing page opt-in forms
     plan: free
     autoDeploy: true

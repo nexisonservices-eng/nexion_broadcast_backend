@@ -1,3 +1,7 @@
+const {
+  validateFreeformOutboundSend
+} = require('../services/whatsappOutreach/policy');
+
 const registerLegacyCoreRoutes = (app, deps) => {
   const {
     auth,
@@ -97,6 +101,60 @@ const registerLegacyCoreRoutes = (app, deps) => {
     }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
   };
 
+  const resolveContactForConversation = async ({ userId, companyId, conversation }) => {
+    if (!conversation?._id || !userId) return null;
+
+    if (conversation.contactId) {
+      const contactById =
+        (companyId
+          ? await Contact.findOne({ _id: conversation.contactId, userId, companyId })
+          : null) ||
+        (await Contact.findOne({
+          _id: conversation.contactId,
+          userId,
+          ...(companyId
+            ? {
+                $or: [
+                  { companyId },
+                  { companyId: null },
+                  { companyId: { $exists: false } }
+                ]
+              }
+            : {})
+        }));
+
+      if (contactById) return contactById;
+    }
+
+    const normalizedPhone = normalizePhoneDigits(conversation.contactPhone);
+    if (!normalizedPhone) return null;
+
+    const phoneCandidates = Array.from(
+      new Set(
+        [
+          String(conversation.contactPhone || '').trim(),
+          normalizedPhone,
+          `+${normalizedPhone}`,
+          normalizedPhone.length > 10 ? normalizedPhone.slice(-10) : ''
+        ].filter(Boolean)
+      )
+    );
+
+    return Contact.findOne({
+      userId,
+      ...(companyId
+        ? {
+            $or: [
+              { companyId },
+              { companyId: null },
+              { companyId: { $exists: false } }
+            ]
+          }
+        : {}),
+      phone: { $in: phoneCandidates }
+    });
+  };
+
   app.post(
     '/api/messages/send',
     auth,
@@ -133,6 +191,22 @@ const registerLegacyCoreRoutes = (app, deps) => {
           return res.status(400).json({
             success: false,
             error: 'Conversation not found for provided conversationId'
+          });
+        }
+
+        const outboundContact = await resolveContactForConversation({
+          userId: req.user.id,
+          companyId: conversation.companyId || req.companyId || null,
+          conversation
+        });
+        const freeformValidation = outboundContact
+          ? validateFreeformOutboundSend(outboundContact)
+          : { ok: true, policy: null };
+        if (!freeformValidation.ok) {
+          return res.status(freeformValidation.statusCode || 403).json({
+            success: false,
+            error: freeformValidation.error,
+            policy: freeformValidation.policy
           });
         }
 

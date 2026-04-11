@@ -8,6 +8,16 @@ const MetaAdsWallet = require('../models/MetaAdsWallet');
 const metaAdsService = require('../services/metaAdsService');
 const { getMetaConfigForUser, getMetaConfigByUserId } = require('../services/userMetaCredentialsService');
 const { requireJwtSecret } = require('../utils/securityConfig');
+const {
+  DEFAULT_PHONE_KEYS,
+  DEFAULT_NAME_KEYS,
+  DEFAULT_EMAIL_KEYS,
+  DEFAULT_CONSENT_KEYS,
+  DEFAULT_APPROVED_VALUES,
+  fetchMetaLead,
+  buildResolvedLeadPayload,
+  syncMetaLeadConsent
+} = require('../services/metaLeadConsentService');
 
 const router = express.Router();
 const OAUTH_STATE_CACHE_TTL_MS = 15 * 60 * 1000;
@@ -461,6 +471,88 @@ router.post('/save-adaccount', auth, async (req, res) => {
     });
   } catch (error) {
     res.status(error.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+router.get('/leads/:leadId/preview', auth, async (req, res) => {
+  try {
+    const leadData = await fetchMetaLead({ userId: req.user.id, leadId: req.params.leadId });
+    const mapping = {
+      phoneFieldKeys: req.query.phoneFieldKeys ? String(req.query.phoneFieldKeys).split(',') : DEFAULT_PHONE_KEYS,
+      nameFieldKeys: req.query.nameFieldKeys ? String(req.query.nameFieldKeys).split(',') : DEFAULT_NAME_KEYS,
+      emailFieldKeys: req.query.emailFieldKeys ? String(req.query.emailFieldKeys).split(',') : DEFAULT_EMAIL_KEYS,
+      consentFieldKeys: req.query.consentFieldKeys ? String(req.query.consentFieldKeys).split(',') : DEFAULT_CONSENT_KEYS,
+      consentApprovedValues: req.query.consentApprovedValues
+        ? String(req.query.consentApprovedValues).split(',')
+        : DEFAULT_APPROVED_VALUES
+    };
+
+    res.json({
+      success: true,
+      data: {
+        lead: leadData,
+        resolved: buildResolvedLeadPayload(leadData, mapping),
+        mapping
+      }
+    });
+  } catch (error) {
+    res.status(error.status || 500).json({
+      success: false,
+      error: error.message,
+      details: error.details || null
+    });
+  }
+});
+
+router.post('/leads/sync-consent', auth, async (req, res) => {
+  try {
+    const leadId = String(req.body?.leadId || '').trim();
+    if (!leadId) {
+      return res.status(400).json({ success: false, error: 'leadId is required.' });
+    }
+
+    const mapping = {
+      phoneFieldKeys: Array.isArray(req.body?.mapping?.phoneFieldKeys)
+        ? req.body.mapping.phoneFieldKeys
+        : DEFAULT_PHONE_KEYS,
+      nameFieldKeys: Array.isArray(req.body?.mapping?.nameFieldKeys)
+        ? req.body.mapping.nameFieldKeys
+        : DEFAULT_NAME_KEYS,
+      emailFieldKeys: Array.isArray(req.body?.mapping?.emailFieldKeys)
+        ? req.body.mapping.emailFieldKeys
+        : DEFAULT_EMAIL_KEYS,
+      consentFieldKeys: Array.isArray(req.body?.mapping?.consentFieldKeys)
+        ? req.body.mapping.consentFieldKeys
+        : DEFAULT_CONSENT_KEYS,
+      consentApprovedValues: Array.isArray(req.body?.mapping?.consentApprovedValues)
+        ? req.body.mapping.consentApprovedValues
+        : DEFAULT_APPROVED_VALUES,
+      consentText: req.body?.mapping?.consentText,
+      scope: req.body?.mapping?.scope || 'marketing'
+    };
+
+    const result = await syncMetaLeadConsent({
+      userId: req.user.id,
+      leadId,
+      companyId: req.companyId || req.body?.companyId || null,
+      mapping,
+      capturedBy: req.user?.email || req.user?.name || req.user?.id || 'meta_lead_sync'
+    });
+
+    res.json({
+      success: true,
+      data: {
+        contact: result.contact,
+        lead: result.leadData,
+        resolved: result.resolvedLead
+      }
+    });
+  } catch (error) {
+    res.status(error.status || 500).json({
+      success: false,
+      error: error.message,
+      details: error.details || null
+    });
   }
 });
 

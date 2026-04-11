@@ -6,6 +6,7 @@ const originalFetch = global.fetch;
 const authPath = require.resolve('../middleware/auth');
 const planGuardPath = require.resolve('../middleware/planGuard');
 const credentialsPath = require.resolve('../middleware/requireWhatsAppCredentials');
+const contactModelPath = require.resolve('../models/Contact');
 const messageModelPath = require.resolve('../models/Message');
 const conversationModelPath = require.resolve('../models/Conversation');
 const whatsappServicePath = require.resolve('../services/whatsappService');
@@ -17,6 +18,7 @@ const originalCacheEntries = new Map(
     authPath,
     planGuardPath,
     credentialsPath,
+    contactModelPath,
     messageModelPath,
     conversationModelPath,
     whatsappServicePath,
@@ -39,6 +41,14 @@ const buildMockMessageDoc = (payload = {}) => ({
   }
 });
 
+const buildMockContactDoc = (payload = {}) => ({
+  _id: payload._id || 'contact-test-1',
+  ...payload,
+  async save() {
+    return this;
+  }
+});
+
 const mockState = {
   sendTemplateResult: { success: true, data: { messages: [{ id: 'wamid.test.1' }] } },
   lastSendTemplateArgs: null,
@@ -48,7 +58,11 @@ const mockState = {
   lastUploadMediaArgs: null,
   findOneQueue: [],
   findOneQueries: [],
+  conversationCreateCalls: [],
   updateOneCalls: [],
+  contactFindOneQueue: [],
+  contactFindOneQueries: [],
+  contactCreateCalls: [],
   lastMessagePayload: null,
   createdMessageDoc: null,
   messageFindResults: [],
@@ -70,7 +84,11 @@ const resetState = () => {
   mockState.lastUploadMediaArgs = null;
   mockState.findOneQueue = [];
   mockState.findOneQueries = [];
+  mockState.conversationCreateCalls = [];
   mockState.updateOneCalls = [];
+  mockState.contactFindOneQueue = [];
+  mockState.contactFindOneQueries = [];
+  mockState.contactCreateCalls = [];
   mockState.lastMessagePayload = null;
   mockState.createdMessageDoc = null;
   mockState.messageFindResults = [];
@@ -119,6 +137,24 @@ const messageModelMock = {
   }
 };
 
+const contactModelMock = {
+  findOne: (query) => {
+    mockState.contactFindOneQueries.push(query);
+    if (mockState.contactFindOneQueue.length === 0) {
+      return null;
+    }
+
+    const next = mockState.contactFindOneQueue.shift();
+    if (!next) return null;
+    return buildMockContactDoc(next);
+  },
+  create: async (payload) => {
+    mockState.contactCreateCalls.push(payload);
+    return buildMockContactDoc(payload);
+  },
+  deleteOne: async () => ({ acknowledged: true, deletedCount: 1 })
+};
+
 const conversationModelMock = {
   findOne: (query) => {
     mockState.findOneQueries.push(query);
@@ -130,7 +166,15 @@ const conversationModelMock = {
   updateOne: async (filter, update) => {
     mockState.updateOneCalls.push({ filter, update });
     return { acknowledged: true, modifiedCount: 1 };
-  }
+  },
+  create: async (payload) => {
+    mockState.conversationCreateCalls.push(payload);
+    return {
+      _id: payload._id || 'conversation-created-1',
+      ...payload
+    };
+  },
+  deleteOne: async () => ({ acknowledged: true, deletedCount: 1 })
 };
 
 const whatsappServiceMock = {
@@ -215,6 +259,13 @@ require.cache[messageModelPath] = {
   filename: messageModelPath,
   loaded: true,
   exports: messageModelMock
+};
+
+require.cache[contactModelPath] = {
+  id: contactModelPath,
+  filename: contactModelPath,
+  loaded: true,
+  exports: contactModelMock
 };
 
 require.cache[conversationModelPath] = {
@@ -315,8 +366,7 @@ test.beforeEach(() => {
 test('POST /send-template returns 400 when required fields are missing', async () => {
   const { status, data } = await requestJson('POST', '/api/messages/send-template', {
     body: {
-      to: '+919999999999',
-      templateName: 'meeting_details'
+      to: '+919999999999'
     }
   });
 
@@ -329,7 +379,17 @@ test('POST /send-template returns provider error when WhatsApp send fails', asyn
   mockState.findOneQueue = [
     {
       _id: 'conversation-provider-error-1',
-      companyId: 'messages-test-company'
+      companyId: 'messages-test-company',
+      contactId: 'contact-provider-error-1',
+      contactPhone: '+919999999999',
+      contactName: 'Provider Error Lead'
+    }
+  ];
+  mockState.contactFindOneQueue = [
+    {
+      _id: 'contact-provider-error-1',
+      phone: '+919999999999',
+      name: 'Provider Error Lead'
     }
   ];
 
@@ -355,37 +415,49 @@ test('POST /send-template returns provider error when WhatsApp send fails', asyn
   assert.ok(Array.isArray(mockState.lastSendTemplateArgs));
 });
 
-test('POST /send-template returns 400 when conversation is not found', async () => {
-  mockState.findOneQueue = [
-    null,
-    null,
-    {
-      sort: async () => null
-    }
-  ];
+test('POST /send-template auto-creates contact and conversation when no conversationId exists', async () => {
+  mockState.contactFindOneQueue = [null, null];
+  mockState.findOneQueue = [null];
 
   const { status, data } = await requestJson('POST', '/api/messages/send-template', {
+    token: 'agent-77',
     body: {
       to: '+919999999999',
-      conversationId: 'conversation-2',
       templateName: 'meeting_details',
       language: 'en_US',
-      variables: ['Lead User']
+      variables: ['Lead User'],
+      contactName: 'Lead User'
     }
   });
 
-  assert.equal(status, 400);
-  assert.equal(data.success, false);
-  assert.match(String(data.error || ''), /Conversation not found/i);
-  assert.equal(mockState.findOneQueries.length, 3);
+  assert.equal(status, 200);
+  assert.equal(data.success, true);
+  assert.equal(data.createdContact, true);
+  assert.equal(data.createdConversation, true);
+  assert.equal(mockState.contactCreateCalls.length, 1);
+  assert.equal(mockState.contactCreateCalls[0]?.phone, '+919999999999');
+  assert.equal(mockState.conversationCreateCalls.length, 1);
+  assert.equal(mockState.conversationCreateCalls[0]?.contactName, 'Lead User');
+  assert.equal(mockState.lastMessagePayload?.conversationId, 'conversation-created-1');
+  assert.equal(mockState.updateOneCalls[0]?.filter?._id, 'conversation-created-1');
 });
 
 test('POST /send-template creates outbound message and emits realtime event on success', async () => {
   const conversation = {
     _id: 'conversation-success-1',
-    companyId: 'messages-test-company'
+    companyId: 'messages-test-company',
+    contactId: 'contact-success-1',
+    contactPhone: '+919999999999',
+    contactName: 'Alice'
   };
   mockState.findOneQueue = [conversation];
+  mockState.contactFindOneQueue = [
+    {
+      _id: 'contact-success-1',
+      phone: '+919999999999',
+      name: 'Alice'
+    }
+  ];
 
   const { status, data } = await requestJson('POST', '/api/messages/send-template', {
     token: 'agent-42',

@@ -3,6 +3,10 @@ const {
   resolveInboxStorageUsername,
   downloadAndStoreIncomingWhatsAppMedia
 } = require('../services/inboxMediaService');
+const {
+  applyContactOptOut,
+  detectWhatsAppOptOutKeyword
+} = require('../services/whatsappOutreach/policy');
 
 const registerWhatsAppWebhookRoutes = (app, deps) => {
   const {
@@ -284,6 +288,9 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         }
       }
 
+      const inboundActivityAt = new Date();
+      const serviceWindowClosesAt = new Date(inboundActivityAt.getTime() + 24 * 60 * 60 * 1000);
+
       let contact = await Contact.findOne({ userId, companyId, phone: from });
       if (!contact) {
         contact = await Contact.create({
@@ -292,10 +299,23 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           phone: from,
           name: value.contacts?.[0]?.profile?.name || from,
           sourceType: 'incoming_message',
-          lastContact: new Date()
+          lastContact: inboundActivityAt,
+          lastContactAt: inboundActivityAt,
+          lastInboundMessageAt: inboundActivityAt,
+          serviceWindowClosesAt
         });
+        if (detectWhatsAppOptOutKeyword(text)) {
+          applyContactOptOut(contact, { source: 'keyword' });
+          await contact.save();
+        }
       } else {
-        contact.lastContact = new Date();
+        contact.lastContact = inboundActivityAt;
+        contact.lastContactAt = inboundActivityAt;
+        contact.lastInboundMessageAt = inboundActivityAt;
+        contact.serviceWindowClosesAt = serviceWindowClosesAt;
+        if (detectWhatsAppOptOutKeyword(text)) {
+          applyContactOptOut(contact, { source: 'keyword' });
+        }
         await contact.save();
       }
 
@@ -314,7 +334,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           contactId: contact._id,
           contactPhone: from,
           contactName: contact.name,
-          lastMessageTime: new Date(),
+          lastMessageTime: inboundActivityAt,
           lastMessage: text,
           lastMessageMediaType: String(mediaType || '').trim(),
           lastMessageAttachmentName:
@@ -330,7 +350,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         });
       } else {
         if (!isReactionMessage) {
-          conversation.lastMessageTime = new Date();
+          conversation.lastMessageTime = inboundActivityAt;
           conversation.lastMessage = text;
           conversation.lastMessageMediaType = String(mediaType || '').trim();
           conversation.lastMessageAttachmentName =

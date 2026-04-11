@@ -1,6 +1,12 @@
 const express = require('express');
 const Contact = require('../models/Contact');
 const auth = require('../middleware/auth');
+const {
+  applyContactOptIn,
+  applyContactOptOut,
+  getWhatsAppMessagingPolicy,
+  toCleanString
+} = require('../services/whatsappOutreach/policy');
 
 const router = express.Router();
 router.use(auth);
@@ -19,10 +25,92 @@ const CONTACT_LIST_FIELDS = [
   'lastContactAt',
   'nextFollowUpAt',
   'isBlocked',
+  'whatsappOptInStatus',
+  'whatsappOptInAt',
+  'whatsappOptInSource',
+  'whatsappOptInScope',
+  'whatsappOptInTextSnapshot',
+  'whatsappOptInProofType',
+  'whatsappOptInProofId',
+  'whatsappOptInProofUrl',
+  'whatsappOptInCapturedBy',
+  'whatsappOptInPageUrl',
+  'whatsappOptInIp',
+  'whatsappOptInUserAgent',
+  'whatsappOptInMetadata',
+  'whatsappOptOutAt',
+  'lastInboundMessageAt',
+  'serviceWindowClosesAt',
   'leadScore',
   'createdAt',
   'updatedAt'
 ].join(' ');
+
+const buildScopedContactFilter = (req, extra = {}) => {
+  const scopedConditions = [{ userId: req.user.id }];
+  if (req.companyId) {
+    scopedConditions.push({
+      $or: [
+        { companyId: req.companyId },
+        { companyId: null },
+        { companyId: { $exists: false } }
+      ]
+    });
+  }
+
+  if (extra && Object.keys(extra).length > 0) {
+    scopedConditions.push(extra);
+  }
+
+  return scopedConditions.length === 1 ? scopedConditions[0] : { $and: scopedConditions };
+};
+
+const toContactResponse = (contact) => {
+  if (!contact || typeof contact.toObject !== 'function') return contact;
+  return contact.toObject();
+};
+
+const normalizeOptInScope = (value = '') => {
+  const normalized = toCleanString(value).toLowerCase();
+  if (['marketing', 'service', 'both'].includes(normalized)) return normalized;
+  return 'unknown';
+};
+
+const buildOptInAuditPayload = (body = {}, req) => ({
+  source: toCleanString(body?.source) || 'manual',
+  scope: normalizeOptInScope(body?.scope),
+  textSnapshot: toCleanString(body?.consentText || body?.textSnapshot),
+  proofType: toCleanString(body?.proofType),
+  proofId: toCleanString(body?.proofId),
+  proofUrl: toCleanString(body?.proofUrl),
+  capturedBy: toCleanString(body?.capturedBy),
+  pageUrl: toCleanString(body?.pageUrl),
+  ip: toCleanString(
+    req.headers['x-forwarded-for']?.split(',')?.[0] ||
+      req.ip ||
+      req.socket?.remoteAddress
+  ),
+  userAgent: toCleanString(req.headers['user-agent']),
+  metadata:
+    body?.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+      ? body.metadata
+      : null
+});
+
+const applyOptInAuditPayload = (contact, auditPayload) => {
+  if (!contact || !auditPayload) return;
+  contact.whatsappOptInSource = auditPayload.source;
+  contact.whatsappOptInScope = auditPayload.scope;
+  contact.whatsappOptInTextSnapshot = auditPayload.textSnapshot;
+  contact.whatsappOptInProofType = auditPayload.proofType;
+  contact.whatsappOptInProofId = auditPayload.proofId;
+  contact.whatsappOptInProofUrl = auditPayload.proofUrl;
+  contact.whatsappOptInCapturedBy = auditPayload.capturedBy;
+  contact.whatsappOptInPageUrl = auditPayload.pageUrl;
+  contact.whatsappOptInIp = auditPayload.ip;
+  contact.whatsappOptInUserAgent = auditPayload.userAgent;
+  contact.whatsappOptInMetadata = auditPayload.metadata;
+};
 
 // Get all contacts
 router.get('/', async (req, res) => {
@@ -61,6 +149,131 @@ router.get('/', async (req, res) => {
     res.json(contacts);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/:id/whatsapp-status', async (req, res) => {
+  try {
+    const contact = await Contact.findOne(
+      buildScopedContactFilter(req, { _id: req.params.id })
+    )
+      .select(CONTACT_LIST_FIELDS)
+      .lean();
+
+    if (!contact) {
+      return res.status(404).json({ success: false, error: 'Contact not found' });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        contact,
+        policy: getWhatsAppMessagingPolicy(contact)
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.get('/:id/whatsapp-consent-audit', async (req, res) => {
+  try {
+    const contact = await Contact.findOne(
+      buildScopedContactFilter(req, { _id: req.params.id })
+    )
+      .select(CONTACT_LIST_FIELDS)
+      .lean();
+
+    if (!contact) {
+      return res.status(404).json({ success: false, error: 'Contact not found' });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        contactId: contact._id,
+        phone: contact.phone,
+        whatsappOptInStatus: contact.whatsappOptInStatus || 'unknown',
+        whatsappOptInAt: contact.whatsappOptInAt || null,
+        whatsappOptInSource: contact.whatsappOptInSource || null,
+        whatsappOptInScope: contact.whatsappOptInScope || null,
+        whatsappOptInTextSnapshot: contact.whatsappOptInTextSnapshot || null,
+        whatsappOptInProofType: contact.whatsappOptInProofType || null,
+        whatsappOptInProofId: contact.whatsappOptInProofId || null,
+        whatsappOptInProofUrl: contact.whatsappOptInProofUrl || null,
+        whatsappOptInCapturedBy: contact.whatsappOptInCapturedBy || null,
+        whatsappOptInPageUrl: contact.whatsappOptInPageUrl || null,
+        whatsappOptInIp: contact.whatsappOptInIp || null,
+        whatsappOptInUserAgent: contact.whatsappOptInUserAgent || null,
+        whatsappOptInMetadata: contact.whatsappOptInMetadata || null,
+        whatsappOptOutAt: contact.whatsappOptOutAt || null
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.post('/:id/whatsapp-opt-in', async (req, res) => {
+  try {
+    const contact = await Contact.findOne(buildScopedContactFilter(req, { _id: req.params.id }));
+    if (!contact) {
+      return res.status(404).json({ success: false, error: 'Contact not found' });
+    }
+
+    const auditPayload = buildOptInAuditPayload(req.body, req);
+    if (!auditPayload.textSnapshot) {
+      return res.status(400).json({
+        success: false,
+        error: 'Consent text is required before marking a contact as opted in.'
+      });
+    }
+    if (!auditPayload.proofType) {
+      return res.status(400).json({
+        success: false,
+        error: 'Proof type is required before marking a contact as opted in.'
+      });
+    }
+
+    applyContactOptIn(contact, {
+      source: auditPayload.source
+    });
+    applyOptInAuditPayload(contact, auditPayload);
+    await contact.save();
+
+    return res.json({
+      success: true,
+      data: {
+        contact: toContactResponse(contact),
+        policy: getWhatsAppMessagingPolicy(contact)
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.post('/:id/whatsapp-opt-out', async (req, res) => {
+  try {
+    const contact = await Contact.findOne(buildScopedContactFilter(req, { _id: req.params.id }));
+    if (!contact) {
+      return res.status(404).json({ success: false, error: 'Contact not found' });
+    }
+
+    applyContactOptOut(contact, {
+      source: toCleanString(req.body?.source) || 'manual'
+    });
+    await contact.save();
+
+    return res.json({
+      success: true,
+      data: {
+        contact: toContactResponse(contact),
+        policy: getWhatsAppMessagingPolicy(contact)
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -145,6 +358,29 @@ router.post('/import', async (req, res) => {
             updatedAt: new Date()
           });
 
+          const normalizedStatus = String(contactData.status || '').trim().toLowerCase();
+          if (normalizedStatus === 'opted-out') {
+            applyContactOptOut(contact, { source: 'import' });
+          } else if (normalizedStatus === 'opted-in') {
+            applyContactOptIn(contact, { source: 'import' });
+            applyOptInAuditPayload(
+              contact,
+              buildOptInAuditPayload(
+                {
+                  source: 'import',
+                  scope: 'marketing',
+                  consentText: 'Imported with existing WhatsApp opt-in consent.',
+                  proofType: 'import_record',
+                  proofId: String(contactData.lineNumber || ''),
+                  metadata: {
+                    importLineNumber: contactData.lineNumber || null
+                  }
+                },
+                req
+              )
+            );
+          }
+
           await contact.save();
           results.success++;
           
@@ -203,6 +439,66 @@ router.put('/:id', async (req, res) => {
         ...(existingContact.customFields && typeof existingContact.customFields === 'object' ? existingContact.customFields : {}),
         ...updatePayload.customFields
       };
+    }
+
+    const requestedOptInStatus = String(updatePayload.whatsappOptInStatus || '').trim().toLowerCase();
+    if (requestedOptInStatus === 'opted_in') {
+      const auditPayload = buildOptInAuditPayload(req.body, req);
+      const existingOptInStatus = String(existingContact.whatsappOptInStatus || '').trim().toLowerCase();
+
+      if (existingOptInStatus !== 'opted_in') {
+        if (!auditPayload.textSnapshot) {
+          return res.status(400).json({
+            error: 'Consent text is required before marking a contact as opted in.'
+          });
+        }
+
+        if (!auditPayload.proofType) {
+          return res.status(400).json({
+            error: 'Proof type is required before marking a contact as opted in.'
+          });
+        }
+      }
+
+      updatePayload.whatsappOptInStatus = 'opted_in';
+      updatePayload.whatsappOptInAt = updatePayload.whatsappOptInAt || new Date();
+      updatePayload.whatsappOptOutAt = null;
+      updatePayload.isBlocked = false;
+      updatePayload.whatsappOptInSource =
+        toCleanString(updatePayload.whatsappOptInSource) || auditPayload.source || 'manual';
+      updatePayload.whatsappOptInScope = normalizeOptInScope(updatePayload.whatsappOptInScope || auditPayload.scope);
+
+      if (auditPayload.textSnapshot) {
+        updatePayload.whatsappOptInTextSnapshot = auditPayload.textSnapshot;
+      }
+      if (auditPayload.proofType) {
+        updatePayload.whatsappOptInProofType = auditPayload.proofType;
+      }
+      if (auditPayload.proofId) {
+        updatePayload.whatsappOptInProofId = auditPayload.proofId;
+      }
+      if (auditPayload.proofUrl) {
+        updatePayload.whatsappOptInProofUrl = auditPayload.proofUrl;
+      }
+      if (auditPayload.capturedBy) {
+        updatePayload.whatsappOptInCapturedBy = auditPayload.capturedBy;
+      }
+      if (auditPayload.pageUrl) {
+        updatePayload.whatsappOptInPageUrl = auditPayload.pageUrl;
+      }
+      if (auditPayload.ip) {
+        updatePayload.whatsappOptInIp = auditPayload.ip;
+      }
+      if (auditPayload.userAgent) {
+        updatePayload.whatsappOptInUserAgent = auditPayload.userAgent;
+      }
+      if (auditPayload.metadata) {
+        updatePayload.whatsappOptInMetadata = auditPayload.metadata;
+      }
+    } else if (requestedOptInStatus === 'opted_out' || updatePayload.isBlocked === true) {
+      updatePayload.whatsappOptInStatus = 'opted_out';
+      updatePayload.whatsappOptOutAt = updatePayload.whatsappOptOutAt || new Date();
+      updatePayload.isBlocked = true;
     }
 
     const contact = await Contact.findOneAndUpdate(

@@ -56,6 +56,7 @@ const broadcastRoutes = require('./routes/broadcasts');
 const conversationRoutes = require('./routes/conversations');
 const messageRoutes = require('./routes/messages');
 const contactRoutes = require('./routes/contacts');
+const publicOptInRoutes = require('./routes/publicOptIn');
 const missedCallRoutes = require('./routes/missedCalls');
 const metaAdsRoutes = require('./routes/metaAds');
 const insightsRoutes = require('./routes/insights');
@@ -126,7 +127,13 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'ngrok-skip-browser-warning'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Requested-With',
+    'ngrok-skip-browser-warning',
+    'x-opt-in-public-key'
+  ],
   preflightContinue: false,
   optionsSuccessStatus: 204
 };
@@ -161,6 +168,7 @@ app.use('/api/broadcasts', broadcastRoutes);
 app.use('/api/conversations', conversationRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/contacts', contactRoutes);
+app.use('/api/public', publicOptInRoutes);
 app.use('/api/missedcalls', missedCallRoutes);
 app.use('/api/meta-ads', metaAdsRoutes);
 app.use('/api/insights', insightsRoutes);

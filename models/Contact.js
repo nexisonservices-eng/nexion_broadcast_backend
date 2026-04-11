@@ -30,6 +30,30 @@ const ContactSchema = new mongoose.Schema({
     enum: ['manual', 'imported', 'incoming_message', 'incoming_call'],
     default: 'manual'
   },
+  whatsappOptInStatus: {
+    type: String,
+    enum: ['unknown', 'opted_in', 'opted_out'],
+    default: 'unknown'
+  },
+  whatsappOptInAt: { type: Date, default: null },
+  whatsappOptInSource: { type: String, default: '' },
+  whatsappOptInScope: {
+    type: String,
+    enum: ['marketing', 'service', 'both', 'unknown'],
+    default: 'unknown'
+  },
+  whatsappOptInTextSnapshot: { type: String, default: '' },
+  whatsappOptInProofType: { type: String, default: '' },
+  whatsappOptInProofId: { type: String, default: '' },
+  whatsappOptInProofUrl: { type: String, default: '' },
+  whatsappOptInCapturedBy: { type: String, default: '' },
+  whatsappOptInPageUrl: { type: String, default: '' },
+  whatsappOptInIp: { type: String, default: '' },
+  whatsappOptInUserAgent: { type: String, default: '' },
+  whatsappOptInMetadata: { type: mongoose.Schema.Types.Mixed, default: null },
+  whatsappOptOutAt: { type: Date, default: null },
+  lastInboundMessageAt: { type: Date, default: null },
+  serviceWindowClosesAt: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
   lastContact: Date,

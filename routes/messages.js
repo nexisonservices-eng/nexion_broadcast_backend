@@ -3,6 +3,7 @@ const router = express.Router();
 const multer = require('multer');
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
+const Contact = require('../models/Contact');
 const whatsappService = require('../services/whatsappService');
 const {
   resolveInboxStorageUsername,
@@ -15,6 +16,17 @@ const {
 const auth = require('../middleware/auth');
 const requireWhatsAppCredentials = require('../middleware/requireWhatsAppCredentials');
 const requirePlanFeature = require('../middleware/planGuard');
+const {
+  buildPhoneCandidates,
+  resolveConversationForOutboundSend,
+  resolveOrCreateConversationForTemplateSend,
+  markOutboundTemplateContactActivity,
+  cleanupCreatedTemplateOutreachTarget
+} = require('../services/whatsappOutreach/conversationResolver');
+const {
+  validateFreeformOutboundSend,
+  validateTemplateOutboundSend
+} = require('../services/whatsappOutreach/policy');
 
 router.use(auth);
 
@@ -25,47 +37,7 @@ const upload = multer({
   }
 });
 
-const normalizePhoneDigits = (value = '') => String(value || '').replace(/\D/g, '');
 const isValidObjectId = (value = '') => /^[a-f\d]{24}$/i.test(String(value || '').trim());
-
-const resolveConversationForOutboundSend = async ({ req, conversationId, to }) => {
-  const userId = req?.user?.id;
-  if (!userId || !conversationId) return null;
-
-  const baseIdQuery = { _id: conversationId, userId };
-
-  if (req.companyId) {
-    const strict = await Conversation.findOne({ ...baseIdQuery, companyId: req.companyId });
-    if (strict) return strict;
-  }
-
-  const byUserOnly = await Conversation.findOne(baseIdQuery);
-  if (byUserOnly) return byUserOnly;
-
-  const normalizedPhone = normalizePhoneDigits(to);
-  if (!normalizedPhone) return null;
-
-  const phoneCandidates = Array.from(
-    new Set(
-      [
-        String(to || '').trim(),
-        normalizedPhone,
-        `+${normalizedPhone}`,
-        normalizedPhone.length > 10 ? normalizedPhone.slice(-10) : ''
-      ].filter(Boolean)
-    )
-  );
-
-  const companyFallbackFilter = req.companyId
-    ? { $or: [{ companyId: req.companyId }, { companyId: null }, { companyId: { $exists: false } }] }
-    : {};
-
-  return Conversation.findOne({
-    userId,
-    ...companyFallbackFilter,
-    contactPhone: { $in: phoneCandidates }
-  }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
-};
 
 const resolveReplyReferenceForOutboundSend = async ({
   userId,
@@ -166,6 +138,41 @@ const buildAttachmentLabel = (mediaType = '') => {
   if (normalized === 'document') return '[Document]';
   if (normalized) return `[${normalized.charAt(0).toUpperCase()}${normalized.slice(1)}]`;
   return '[Attachment]';
+};
+
+const resolveContactForConversation = async ({ userId, companyId, conversation }) => {
+  if (!conversation?._id || !userId) return null;
+
+  if (conversation.contactId) {
+    const contactById =
+      (companyId
+        ? await Contact.findOne({ _id: conversation.contactId, userId, companyId })
+        : null) ||
+      (await Contact.findOne({
+        _id: conversation.contactId,
+        userId,
+        ...(companyId
+          ? {
+              $or: [{ companyId }, { companyId: null }, { companyId: { $exists: false } }]
+            }
+          : {})
+      }));
+
+    if (contactById) return contactById;
+  }
+
+  const phoneCandidates = buildPhoneCandidates(conversation.contactPhone || '');
+  if (!phoneCandidates.length) return null;
+
+  return Contact.findOne({
+    userId,
+    ...(companyId
+      ? {
+          $or: [{ companyId }, { companyId: null }, { companyId: { $exists: false } }]
+        }
+      : {}),
+    phone: { $in: phoneCandidates }
+  });
 };
 
 const resolveAttachmentMessageFilters = ({ req, messageId }) => {
@@ -348,7 +355,8 @@ router.post(
       }
 
       const conversation = await resolveConversationForOutboundSend({
-        req,
+        userId: req.user.id,
+        companyId: req.companyId || null,
         conversationId,
         to
       });
@@ -462,13 +470,16 @@ router.post(
         language = 'en_US',
         variables = [],
         conversationId,
-        components = []
+        contactId,
+        contactName = '',
+        components = [],
+        templateCategory = ''
       } = req.body || {};
 
-      if (!to || !conversationId || !templateName) {
+      if (!to || !templateName) {
         return res.status(400).json({
           success: false,
-          error: 'to, conversationId, and templateName are required'
+          error: 'to and templateName are required'
         });
       }
 
@@ -477,15 +488,36 @@ router.post(
         : [];
       const normalizedComponents = Array.isArray(components) ? components : [];
 
-      const conversation = await resolveConversationForOutboundSend({
-        req,
+      const outreachTarget = await resolveOrCreateConversationForTemplateSend({
+        userId: req.user.id,
+        companyId: req.companyId || null,
         conversationId,
+        contactId,
+        contactName,
         to
       });
+      const {
+        conversation,
+        contact,
+        createdContact,
+        createdConversation
+      } = outreachTarget;
       if (!conversation) {
         return res.status(400).json({
           success: false,
-          error: 'Conversation not found for provided conversationId'
+          error: 'Unable to resolve or create a conversation for this contact'
+        });
+      }
+
+      const templateValidation = validateTemplateOutboundSend(contact || {}, {
+        templateCategory
+      });
+      if (!templateValidation.ok) {
+        await cleanupCreatedTemplateOutreachTarget(outreachTarget);
+        return res.status(templateValidation.statusCode || 403).json({
+          success: false,
+          error: templateValidation.error,
+          policy: templateValidation.policy
         });
       }
 
@@ -500,6 +532,7 @@ router.post(
       );
 
       if (!result.success) {
+        await cleanupCreatedTemplateOutreachTarget(outreachTarget);
         return res.status(400).json({ success: false, error: result.error });
       }
 
@@ -512,6 +545,7 @@ router.post(
           ? ` (${normalizedVariables.filter(Boolean).join(', ')})`
           : '';
       const previewText = `Template: ${templateName}${previewSuffix}`;
+      const messageTimestamp = new Date();
 
       const message = await Message.create({
         userId: req.user.id,
@@ -521,18 +555,26 @@ router.post(
         text: previewText,
         whatsappMessageId,
         status: 'sent',
-        timestamp: new Date()
+        timestamp: messageTimestamp
+      });
+
+      await markOutboundTemplateContactActivity({
+        contact,
+        contactName
       });
 
       await Conversation.updateOne(
         { _id: conversation._id },
         {
-          lastMessageTime: new Date(),
+          lastMessageTime: messageTimestamp,
           lastMessage: previewText,
           lastMessageMediaType: '',
           lastMessageAttachmentName: '',
           lastMessageAttachmentPages: null,
-          lastMessageFrom: 'agent'
+          lastMessageFrom: 'agent',
+          contactName:
+            String(contact?.name || conversation.contactName || contactName || '').trim() ||
+            conversation.contactName
         }
       );
 
@@ -544,7 +586,14 @@ router.post(
         });
       }
 
-      return res.json({ success: true, message });
+      return res.json({
+        success: true,
+        message,
+        conversationId: conversation._id,
+        contactId: contact?._id || conversation.contactId,
+        createdConversation,
+        createdContact
+      });
     } catch (error) {
       console.error('Send template message error:', error);
       return res.status(500).json({ success: false, error: error.message });
@@ -582,7 +631,8 @@ router.post(
       }
 
       const conversation = await resolveConversationForOutboundSend({
-        req,
+        userId: req.user.id,
+        companyId: req.companyId || null,
         conversationId,
         to
       });
@@ -590,6 +640,22 @@ router.post(
         return res.status(400).json({
           success: false,
           error: 'Conversation not found for provided conversationId'
+        });
+      }
+
+      const outboundContact = await resolveContactForConversation({
+        userId: req.user.id,
+        companyId: conversation.companyId || req.companyId || null,
+        conversation
+      });
+      const freeformValidation = outboundContact
+        ? validateFreeformOutboundSend(outboundContact)
+        : { ok: true, policy: null };
+      if (!freeformValidation.ok) {
+        return res.status(freeformValidation.statusCode || 403).json({
+          success: false,
+          error: freeformValidation.error,
+          policy: freeformValidation.policy
         });
       }
 

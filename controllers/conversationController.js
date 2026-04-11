@@ -2,9 +2,9 @@ const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
 
 const TEAM_INBOX_CONTACT_FIELDS =
-  '_id name phone email notes tags status stage customFields nextFollowUpAt leadScore leadScoreBreakdown isBlocked';
+  '_id name phone email notes tags status stage customFields nextFollowUpAt leadScore leadScoreBreakdown isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt';
 const CONTACT_LIST_FIELDS =
-  '_id name phone email tags stage status source ownerId sourceType lastContact lastContactAt nextFollowUpAt isBlocked leadScore createdAt updatedAt';
+  '_id name phone email tags stage status source ownerId sourceType lastContact lastContactAt nextFollowUpAt isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt leadScore createdAt updatedAt';
 
 const TEAM_INBOX_CONVERSATION_FIELDS = [
   '_id',
