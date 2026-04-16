@@ -45,8 +45,9 @@ const escapeHtml = (value) =>
 const getBackendOrigin = (req) =>
   normalizeOrigin(process.env.PUBLIC_BACKEND_URL) || `${req.protocol}://${req.get('host')}`;
 const getCallbackUrl = (req) => `${getBackendOrigin(req)}/api/meta-ads/oauth/callback`;
+const getForcedRedirectUri = () => normalizeOrigin(process.env.META_OAUTH_REDIRECT_URI);
 const getResolvedRedirectUri = (req, metaConfig = null) =>
-  normalizeOrigin(metaConfig?.redirectUri) || getCallbackUrl(req);
+  getForcedRedirectUri() || normalizeOrigin(metaConfig?.redirectUri) || getCallbackUrl(req);
 const resolveMetaOAuthConfig = (metaConfig = null) => ({
   appId: String(metaConfig?.appId || process.env.META_APP_ID || '').trim(),
   appSecret: String(metaConfig?.appSecret || process.env.META_APP_SECRET || '').trim(),
