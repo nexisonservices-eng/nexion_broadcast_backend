@@ -15,6 +15,26 @@ Set these environment variables in Render:
 - `META_API_VERSION`
 - `META_TOKEN_ENCRYPTION_KEY`
 - `WHATSAPP_OPTIN_PUBLIC_KEY`
+- `WHATSAPP_MARKETING_TEMPLATE_MAX_PER_24H`
+- `WHATSAPP_MARKETING_TEMPLATE_WINDOW_HOURS`
+- `META_LEAD_WEBHOOK_VERIFY_TOKEN`
+- `META_LEAD_PHONE_KEYS`
+- `META_LEAD_NAME_KEYS`
+- `META_LEAD_EMAIL_KEYS`
+- `META_LEAD_CONSENT_KEYS`
+- `META_LEAD_APPROVED_VALUES`
+- `META_LEAD_CONSENT_TEXT`
+- `META_LEAD_SCOPE`
+- `CONSENT_EXPORT_EMAIL_ENABLED`
+- `CONSENT_EXPORT_EMAIL_FROM`
+- `CONSENT_EXPORT_MAX_ROWS`
+- `CONSENT_LOG_ARCHIVE_ENABLED`
+- `CONSENT_LOG_RETENTION_DAYS`
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_USER`
+- `SMTP_PASS`
+- `SMTP_SECURE`
 
 Recommended:
 - use a long random value for `WHATSAPP_OPTIN_PUBLIC_KEY`
@@ -58,6 +78,7 @@ Make sure the frontend points to the correct backend:
 
 1. Open frontend route:
    - `/whatsapp-opt-in-demo`
+   - `/whatsapp-opt-in` (production landing)
 2. Enter:
    - backend URL
    - public key
@@ -80,6 +101,28 @@ Make sure the frontend points to the correct backend:
 5. Click `Sync Lead Consent`
 6. Open the contact and verify consent audit
 
+### Meta Lead webhook
+
+1. Configure Meta Lead Ads webhook URL:
+   - `/api/meta-ads/webhook`
+2. Set verify token to `META_LEAD_WEBHOOK_VERIFY_TOKEN`
+3. Trigger a test lead submission
+4. Confirm contact is created/updated with `meta_lead_ads` proof
+
+### Consent export email
+
+1. Set SMTP env values
+2. Set `CONSENT_EXPORT_EMAIL_ENABLED=true`
+3. POST `/api/consent/export-email` with an email
+4. GET `/api/consent/export-jobs` to confirm job status
+5. Verify CSV is delivered
+
+### Consent retention
+
+1. Set `CONSENT_LOG_ARCHIVE_ENABLED=true`
+2. Set `CONSENT_LOG_RETENTION_DAYS`
+3. Verify old logs are archived nightly
+
 ## Broadcast Safety Check
 
 Before sending a marketing template:
@@ -92,6 +135,7 @@ Before sending a marketing template:
 ## Known Safe Behavior
 
 - marketing template send is blocked without valid opt-in
+- marketing template sends are throttled per contact (default 1 per 24h)
 - opted-out contacts are blocked from marketing outreach
 - proof-backed opt-in is enforced server-side
 - public forms require `WHATSAPP_OPTIN_PUBLIC_KEY`

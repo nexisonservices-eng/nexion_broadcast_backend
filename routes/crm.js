@@ -6,6 +6,7 @@ const Contact = require('../models/Contact');
 const Conversation = require('../models/Conversation');
 const LeadTask = require('../models/LeadTask');
 const LeadActivity = require('../models/LeadActivity');
+const WhatsAppConsentLog = require('../models/WhatsAppConsentLog');
 const {
   ContactDocument,
   CONTACT_DOCUMENT_TYPES,
@@ -914,13 +915,41 @@ router.get('/activities/:contactId', async (req, res) => {
     }
 
     const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 300);
-    const activities = await LeadActivity.find(
-      buildScopedFilter(req, { contactId })
-    )
-      .sort({ createdAt: -1 })
-      .limit(limit);
+    const scopedFilter = buildScopedFilter(req, { contactId });
+    const [activities, consentLogs] = await Promise.all([
+      LeadActivity.find(scopedFilter)
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean(),
+      WhatsAppConsentLog.find(scopedFilter)
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean()
+    ]);
 
-    res.json({ success: true, data: activities });
+    const consentActivities = (consentLogs || []).map((log) => ({
+      _id: log._id,
+      userId: log.userId,
+      companyId: log.companyId,
+      contactId: log.contactId,
+      conversationId: null,
+      type: log.action === 'opt_out' ? 'whatsapp_opt_out' : 'whatsapp_opt_in',
+      meta: {
+        source: log.source,
+        scope: log.scope,
+        proofType: log.proofType,
+        proofId: log.proofId,
+        capturedBy: log.capturedBy,
+        consentText: log.consentText
+      },
+      createdAt: log.createdAt
+    }));
+
+    const merged = [...activities, ...consentActivities]
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, limit);
+
+    res.json({ success: true, data: merged });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }

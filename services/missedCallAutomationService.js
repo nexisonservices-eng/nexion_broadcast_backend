@@ -5,6 +5,14 @@ const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
 const whatsappService = require('./whatsappService');
 const { getWhatsAppCredentialsByUserId } = require('./userWhatsAppCredentialsService');
+const {
+  buildPhoneCandidates
+} = require('./whatsappOutreach/conversationResolver');
+const {
+  toCleanString,
+  validateTemplateOutboundSend,
+  applyMarketingTemplateSent
+} = require('./whatsappOutreach/policy');
 
 const DEFAULT_RETRY_DELAY_MINUTES = 2;
 
@@ -347,6 +355,48 @@ async function updateConversationForMissedCallAutomation({
   return { conversation, message };
 }
 
+const resolveTemplateCategory = async ({ userId, companyId, templateName, credentials }) => {
+  const normalizedName = toCleanString(templateName).toLowerCase();
+  if (!normalizedName) return '';
+
+  const byName = await Template.findOne({
+    userId,
+    companyId,
+    name: templateName
+  })
+    .select('category')
+    .lean();
+  if (byName?.category) return toCleanString(byName.category).toLowerCase();
+
+  try {
+    const metaResult = await whatsappService.getTemplateList(credentials || null);
+    if (!metaResult?.success) return '';
+    const templates = metaResult.data?.data || [];
+    const found = templates.find(
+      (tpl) => String(tpl?.name || '').trim().toLowerCase() === normalizedName
+    );
+    return toCleanString(found?.category || '').toLowerCase();
+  } catch (_error) {
+    return '';
+  }
+};
+
+const resolveContactForMissedCall = async ({ userId, companyId, phone }) => {
+  const candidates = buildPhoneCandidates(phone);
+  if (!userId || candidates.length === 0) return null;
+
+  if (companyId) {
+    const scoped = await Contact.findOne({ userId, companyId, phone: { $in: candidates } });
+    if (scoped) return scoped;
+  }
+
+  return Contact.findOne({
+    userId,
+    $or: [{ companyId }, { companyId: null }, { companyId: { $exists: false } }],
+    phone: { $in: candidates }
+  });
+};
+
 async function processSingleMissedCall(missedCall, sendToUser) {
   const now = new Date();
 
@@ -367,6 +417,52 @@ async function processSingleMissedCall(missedCall, sendToUser) {
     if (!templateName) {
       throw new Error('Missed call automation template name is empty');
     }
+
+    const contact = await resolveContactForMissedCall({
+      userId: missedCall.userId,
+      companyId: missedCall.companyId || null,
+      phone: missedCall.fromNumber
+    });
+    if (!contact) {
+      await MissedCall.findByIdAndUpdate(
+        missedCall._id,
+        {
+          $set: {
+            'automation.status': 'disabled',
+            'automation.lastError': 'Contact record not found for compliance checks.'
+          },
+          $inc: { 'automation.attempts': 1 }
+        },
+        { new: true }
+      ).lean();
+      return { success: false, error: 'Contact record not found for compliance checks.' };
+    }
+
+    const templateCategoryRaw = await resolveTemplateCategory({
+      userId: missedCall.userId,
+      companyId: missedCall.companyId || null,
+      templateName,
+      credentials
+    });
+    const templateCategory = toCleanString(templateCategoryRaw).toLowerCase() || 'marketing';
+    const templateValidation = validateTemplateOutboundSend(contact, {
+      templateCategory
+    });
+    if (!templateValidation.ok) {
+      await MissedCall.findByIdAndUpdate(
+        missedCall._id,
+        {
+          $set: {
+            'automation.status': 'disabled',
+            'automation.lastError': templateValidation.error
+          },
+          $inc: { 'automation.attempts': 1 }
+        },
+        { new: true }
+      ).lean();
+      return { success: false, error: templateValidation.error };
+    }
+
     const bodyText = await resolveTemplateBodyText({
       missedCall,
       templateName,
@@ -400,6 +496,11 @@ async function processSingleMissedCall(missedCall, sendToUser) {
       bodyText,
       variables: templateVariables
     });
+
+    if (templateCategory === 'marketing') {
+      applyMarketingTemplateSent(contact, { now });
+      await contact.save();
+    }
 
     let conversation = null;
     let message = null;

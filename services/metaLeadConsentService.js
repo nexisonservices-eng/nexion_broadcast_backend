@@ -3,6 +3,7 @@ const Contact = require('../models/Contact');
 const { getAccessContextForUser, GRAPH_BASE_URL } = require('./metaAuthService');
 const { applyContactOptIn, toCleanString } = require('./whatsappOutreach/policy');
 const { normalizePhoneDigits } = require('./whatsappOutreach/conversationResolver');
+const { logConsentEvent } = require('./whatsappConsentLogService');
 
 const DEFAULT_PHONE_KEYS = ['phone', 'phone number', 'mobile', 'mobile number', 'whatsapp', 'whatsapp number'];
 const DEFAULT_NAME_KEYS = ['full name', 'name'];
@@ -192,6 +193,23 @@ const syncMetaLeadConsent = async ({
   };
 
   await contact.save();
+  await logConsentEvent({
+    contact,
+    action: 'opt_in',
+    payload: {
+      source: 'meta_lead_ads',
+      scope: contact.whatsappOptInScope,
+      consentText: contact.whatsappOptInTextSnapshot,
+      proofType: contact.whatsappOptInProofType,
+      proofId: contact.whatsappOptInProofId,
+      proofUrl: contact.whatsappOptInProofUrl,
+      capturedBy: contact.whatsappOptInCapturedBy,
+      pageUrl: contact.whatsappOptInPageUrl,
+      ip: contact.whatsappOptInIp,
+      userAgent: contact.whatsappOptInUserAgent,
+      metadata: contact.whatsappOptInMetadata
+    }
+  });
 
   return {
     contact,

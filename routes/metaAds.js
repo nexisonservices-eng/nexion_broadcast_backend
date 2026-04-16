@@ -5,8 +5,18 @@ const auth = require('../middleware/auth');
 const Campaign = require('../models/campaign');
 const MetaAdsTransaction = require('../models/MetaAdsTransaction');
 const MetaAdsWallet = require('../models/MetaAdsWallet');
+const MetaAdsConnection = require('../models/MetaAdsConnection');
+const Contact = require('../models/Contact');
 const metaAdsService = require('../services/metaAdsService');
 const { getMetaConfigForUser, getMetaConfigByUserId } = require('../services/userMetaCredentialsService');
+const { getWhatsAppCredentialsForUser } = require('../services/userWhatsAppCredentialsService');
+const whatsappService = require('../services/whatsappService');
+const { buildPhoneCandidates } = require('../services/whatsappOutreach/conversationResolver');
+const {
+  buildBroadcastAudienceValidation,
+  applyMarketingTemplateSent,
+  toCleanString
+} = require('../services/whatsappOutreach/policy');
 const { requireJwtSecret } = require('../utils/securityConfig');
 const {
   DEFAULT_PHONE_KEYS,
@@ -44,6 +54,35 @@ const resolveMetaOAuthConfig = (metaConfig = null) => ({
   apiVersion: String(metaConfig?.apiVersion || process.env.META_API_VERSION || 'v22.0').trim(),
   credentialOwnerUserId: String(metaConfig?.credentialOwnerUserId || '').trim()
 });
+
+const parseCsvEnv = (value, fallback = []) => {
+  const parsed = String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return parsed.length ? parsed : fallback;
+};
+
+const resolveLeadMappingFromEnv = () => ({
+  phoneFieldKeys: parseCsvEnv(process.env.META_LEAD_PHONE_KEYS, DEFAULT_PHONE_KEYS),
+  nameFieldKeys: parseCsvEnv(process.env.META_LEAD_NAME_KEYS, DEFAULT_NAME_KEYS),
+  emailFieldKeys: parseCsvEnv(process.env.META_LEAD_EMAIL_KEYS, DEFAULT_EMAIL_KEYS),
+  consentFieldKeys: parseCsvEnv(process.env.META_LEAD_CONSENT_KEYS, DEFAULT_CONSENT_KEYS),
+  consentApprovedValues: parseCsvEnv(process.env.META_LEAD_APPROVED_VALUES, DEFAULT_APPROVED_VALUES),
+  consentText: String(process.env.META_LEAD_CONSENT_TEXT || '').trim(),
+  scope: String(process.env.META_LEAD_SCOPE || 'marketing').trim().toLowerCase()
+});
+
+const verifyMetaLeadSignature = (req) => {
+  const signature = req.headers['x-hub-signature-256'];
+  const secret = process.env.META_APP_SECRET || '';
+  if (!signature || !secret || !req.rawBody) return false;
+  const expected = `sha256=${crypto
+    .createHmac('sha256', secret)
+    .update(req.rawBody)
+    .digest('hex')}`;
+  return signature === expected;
+};
 
 const encodeStatePayload = (payload) => Buffer.from(JSON.stringify(payload)).toString('base64url');
 const signStatePayload = (payload, secret) =>
@@ -474,6 +513,74 @@ router.post('/save-adaccount', auth, async (req, res) => {
   }
 });
 
+// Meta Lead Ads webhook verification
+router.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  const expectedToken = String(process.env.META_LEAD_WEBHOOK_VERIFY_TOKEN || '').trim();
+  if (mode === 'subscribe' && expectedToken && token === expectedToken) {
+    return res.status(200).send(challenge);
+  }
+
+  return res.sendStatus(403);
+});
+
+// Meta Lead Ads webhook receiver (leadgen)
+router.post('/webhook', async (req, res) => {
+  if (!verifyMetaLeadSignature(req)) {
+    return res.sendStatus(401);
+  }
+
+  // Acknowledge immediately for Meta retry safety.
+  res.sendStatus(200);
+
+  const payload = req.body || {};
+  if (payload.object !== 'page') return;
+
+  const mapping = resolveLeadMappingFromEnv();
+
+  const processLeadgenChange = async (change) => {
+    if (change.field !== 'leadgen') return;
+    const leadId = String(change?.value?.leadgen_id || '').trim();
+    const pageId = String(change?.value?.page_id || '').trim();
+    if (!leadId || !pageId) return;
+
+    const connection = await MetaAdsConnection.findOne({ selectedPageId: pageId }).lean();
+    if (!connection?.userId) return;
+
+    const alreadyCaptured = await Contact.findOne({
+      userId: connection.userId,
+      whatsappOptInSource: 'meta_lead_ads',
+      whatsappOptInProofId: leadId
+    })
+      .select('_id')
+      .lean();
+    if (alreadyCaptured) return;
+
+    await syncMetaLeadConsent({
+      userId: connection.userId,
+      leadId,
+      companyId: null,
+      mapping,
+      capturedBy: 'meta_lead_webhook'
+    });
+  };
+
+  (async () => {
+    try {
+      for (const entry of payload.entry || []) {
+        for (const change of entry.changes || []) {
+          await processLeadgenChange(change);
+        }
+      }
+    } catch (error) {
+      console.error('Meta lead webhook processing failed:', error?.message || error);
+    }
+  })();
+});
+
 router.get('/leads/:leadId/preview', auth, async (req, res) => {
   try {
     const leadData = await fetchMetaLead({ userId: req.user.id, leadId: req.params.leadId });
@@ -549,6 +656,196 @@ router.post('/leads/sync-consent', auth, async (req, res) => {
     });
   } catch (error) {
     res.status(error.status || 500).json({
+      success: false,
+      error: error.message,
+      details: error.details || null
+    });
+  }
+});
+
+router.post('/leads/sync-consent/batch', auth, async (req, res) => {
+  try {
+    const rawLeadIds = Array.isArray(req.body?.leadIds) ? req.body.leadIds : [];
+    const leadIds = Array.from(
+      new Set(
+        rawLeadIds
+          .map((leadId) => String(leadId || '').trim())
+          .filter(Boolean)
+      )
+    );
+
+    if (!leadIds.length) {
+      return res.status(400).json({ success: false, error: 'leadIds array is required.' });
+    }
+
+    const mapping = {
+      phoneFieldKeys: Array.isArray(req.body?.mapping?.phoneFieldKeys)
+        ? req.body.mapping.phoneFieldKeys
+        : DEFAULT_PHONE_KEYS,
+      nameFieldKeys: Array.isArray(req.body?.mapping?.nameFieldKeys)
+        ? req.body.mapping.nameFieldKeys
+        : DEFAULT_NAME_KEYS,
+      emailFieldKeys: Array.isArray(req.body?.mapping?.emailFieldKeys)
+        ? req.body.mapping.emailFieldKeys
+        : DEFAULT_EMAIL_KEYS,
+      consentFieldKeys: Array.isArray(req.body?.mapping?.consentFieldKeys)
+        ? req.body.mapping.consentFieldKeys
+        : DEFAULT_CONSENT_KEYS,
+      consentApprovedValues: Array.isArray(req.body?.mapping?.consentApprovedValues)
+        ? req.body.mapping.consentApprovedValues
+        : DEFAULT_APPROVED_VALUES,
+      consentText: req.body?.mapping?.consentText,
+      scope: req.body?.mapping?.scope || 'marketing'
+    };
+
+    const syncResults = [];
+    const syncedContacts = [];
+    const companyId = req.companyId || req.body?.companyId || null;
+    const capturedBy = req.user?.email || req.user?.name || req.user?.id || 'meta_lead_sync_batch';
+
+    for (const leadId of leadIds) {
+      try {
+        const result = await syncMetaLeadConsent({
+          userId: req.user.id,
+          leadId,
+          companyId,
+          mapping,
+          capturedBy
+        });
+
+        syncedContacts.push(result.contact);
+        syncResults.push({
+          leadId,
+          success: true,
+          contactId: String(result.contact?._id || ''),
+          phone: String(result.contact?.phone || ''),
+          consentApproved: Boolean(result.resolvedLead?.consentApproved)
+        });
+      } catch (error) {
+        syncResults.push({
+          leadId,
+          success: false,
+          error: String(error.message || 'Failed to sync consent'),
+          details: error.details || null
+        });
+      }
+    }
+
+    const sendTemplatePayload = req.body?.sendTemplate || null;
+    const shouldSendTemplate = Boolean(sendTemplatePayload && sendTemplatePayload.templateName);
+    const sendTemplateDryRun = Boolean(req.body?.dryRun);
+    const sendResults = [];
+    let audienceValidation = null;
+
+    if (shouldSendTemplate && syncedContacts.length) {
+      const authHeader = req.headers.authorization || '';
+      const credentials = await getWhatsAppCredentialsForUser({
+        authHeader,
+        userId: req.user.id
+      });
+
+      if (!credentials) {
+        return res.status(400).json({
+          success: false,
+          error:
+            'WhatsApp credentials are not configured for this user. Please configure credentials before sending templates.',
+          data: {
+            syncResults
+          }
+        });
+      }
+
+      const templateCategory =
+        toCleanString(sendTemplatePayload.templateCategory || 'marketing').toLowerCase() || 'marketing';
+      const recipients = syncedContacts.map((contact) => ({
+        phone: String(contact?.phone || '').trim()
+      }));
+      const contactsByPhone = new Map();
+
+      for (const contact of syncedContacts) {
+        for (const candidate of buildPhoneCandidates(contact?.phone || '')) {
+          if (!contactsByPhone.has(candidate)) {
+            contactsByPhone.set(candidate, contact);
+          }
+        }
+      }
+
+      audienceValidation = buildBroadcastAudienceValidation({
+        recipients,
+        contactsByPhone,
+        messageType: 'template',
+        templateCategory
+      });
+
+      if (!sendTemplateDryRun) {
+        const language = String(sendTemplatePayload.language || 'en_US').trim() || 'en_US';
+        const templateName = String(sendTemplatePayload.templateName || '').trim();
+        const variables = Array.isArray(sendTemplatePayload.variables)
+          ? sendTemplatePayload.variables.map((value) => String(value ?? ''))
+          : [];
+        const templateComponents = Array.isArray(sendTemplatePayload.templateComponents)
+          ? sendTemplatePayload.templateComponents
+          : null;
+
+        for (const recipient of audienceValidation.eligibleRecipients || []) {
+          const phone = String(recipient?.phone || '').trim();
+          const contact = contactsByPhone.get(phone) || null;
+
+          const sendResult = await whatsappService.sendTemplateMessage(
+            phone,
+            templateName,
+            language,
+            variables,
+            credentials,
+            true,
+            templateComponents
+          );
+
+          if (sendResult.success && templateCategory === 'marketing' && contact?._id) {
+            const contactModel = await Contact.findById(contact._id);
+            if (contactModel) {
+              applyMarketingTemplateSent(contactModel, { now: new Date() });
+              await contactModel.save();
+            }
+          }
+
+          sendResults.push({
+            leadId:
+              syncResults.find(
+                (item) => item.success && String(item.phone || '') === phone
+              )?.leadId || '',
+            phone,
+            success: Boolean(sendResult.success),
+            error: sendResult.success ? null : String(sendResult.error || 'Template send failed')
+          });
+        }
+      }
+    }
+
+    const syncedSuccessCount = syncResults.filter((result) => result.success).length;
+    const syncedFailedCount = syncResults.length - syncedSuccessCount;
+    const sendSuccessCount = sendResults.filter((result) => result.success).length;
+    const sendFailedCount = sendResults.length - sendSuccessCount;
+
+    return res.json({
+      success: true,
+      data: {
+        syncResults,
+        sendResults,
+        audienceValidation,
+        dryRun: sendTemplateDryRun,
+        summary: {
+          totalLeadIds: leadIds.length,
+          syncedSuccess: syncedSuccessCount,
+          syncedFailed: syncedFailedCount,
+          templateSendAttempted: shouldSendTemplate,
+          templateSendSuccess: sendSuccessCount,
+          templateSendFailed: sendFailedCount
+        }
+      }
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
       success: false,
       error: error.message,
       details: error.details || null

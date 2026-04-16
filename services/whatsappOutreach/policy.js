@@ -13,6 +13,94 @@ const normalizeWhatsAppOptInStatus = (value, isBlocked = false) => {
   return isBlocked ? 'opted_out' : 'unknown';
 };
 
+const normalizeOptInScope = (value = '') => {
+  const normalized = toCleanString(value).toLowerCase();
+  if (normalized === 'marketing' || normalized === 'service' || normalized === 'both') {
+    return normalized;
+  }
+  return 'unknown';
+};
+
+const marketingScopeAllowed = (scope = '') => {
+  const normalized = normalizeOptInScope(scope);
+  return normalized === 'marketing' || normalized === 'both';
+};
+
+const getMarketingRateLimitConfig = () => {
+  const rawMax = Number(process.env.WHATSAPP_MARKETING_TEMPLATE_MAX_PER_24H || 1);
+  const rawWindow = Number(process.env.WHATSAPP_MARKETING_TEMPLATE_WINDOW_HOURS || 24);
+  return {
+    max: Number.isFinite(rawMax) && rawMax > 0 ? Math.floor(rawMax) : 1,
+    windowHours: Number.isFinite(rawWindow) && rawWindow > 0 ? rawWindow : 24
+  };
+};
+
+const getMarketingRateLimitState = (contact = {}, { now = new Date(), max, windowHours } = {}) => {
+  const config = getMarketingRateLimitConfig();
+  const limit = Number.isFinite(max) && max > 0 ? Math.floor(max) : config.max;
+  const windowHrs =
+    Number.isFinite(windowHours) && windowHours > 0 ? windowHours : config.windowHours;
+  const windowMs = windowHrs * 60 * 60 * 1000;
+
+  const windowStart = toSafeDate(
+    contact?.whatsappMarketingWindowStartedAt || contact?.whatsappMarketingLastSentAt
+  );
+  const sentCount = Number(contact?.whatsappMarketingSendCount || 0) || 0;
+
+  if (!windowStart || Number.isNaN(windowStart.getTime())) {
+    return {
+      limited: false,
+      remaining: limit,
+      count: 0,
+      windowStartAt: null,
+      nextAllowedAt: null
+    };
+  }
+
+  const expiresAt = new Date(windowStart.getTime() + windowMs);
+  if (expiresAt.getTime() <= now.getTime()) {
+    return {
+      limited: false,
+      remaining: limit,
+      count: 0,
+      windowStartAt: null,
+      nextAllowedAt: null
+    };
+  }
+
+  const remaining = Math.max(limit - sentCount, 0);
+  const limited = remaining <= 0;
+
+  return {
+    limited,
+    remaining,
+    count: sentCount,
+    windowStartAt: windowStart,
+    nextAllowedAt: limited ? expiresAt : null
+  };
+};
+
+const applyMarketingTemplateSent = (contact = {}, { now = new Date() } = {}) => {
+  if (!contact || typeof contact !== 'object') return contact;
+  const { windowHours } = getMarketingRateLimitConfig();
+  const windowMs = windowHours * 60 * 60 * 1000;
+  const windowStart = toSafeDate(contact?.whatsappMarketingWindowStartedAt);
+  const hasActiveWindow =
+    windowStart && !Number.isNaN(windowStart.getTime()) &&
+    now.getTime() - windowStart.getTime() < windowMs;
+
+  if (!hasActiveWindow) {
+    contact.whatsappMarketingWindowStartedAt = now;
+    contact.whatsappMarketingSendCount = 1;
+  } else {
+    const current = Number(contact.whatsappMarketingSendCount || 0) || 0;
+    contact.whatsappMarketingSendCount = current + 1;
+  }
+
+  contact.whatsappMarketingLastSentAt = now;
+  return contact;
+};
+
 const detectWhatsAppOptOutKeyword = (text = '') => {
   const normalized = toCleanString(text).toLowerCase().replace(/\s+/g, ' ');
   if (!normalized) return false;
@@ -36,6 +124,7 @@ const getWhatsAppMessagingPolicy = (contact = {}, options = {}) => {
     contact?.whatsappOptInStatus,
     contact?.isBlocked
   );
+  const normalizedOptInScope = normalizeOptInScope(contact?.whatsappOptInScope);
   const serviceWindowClosesAt = toSafeDate(contact?.serviceWindowClosesAt);
   const serviceWindowOpen = Boolean(
     serviceWindowClosesAt && serviceWindowClosesAt.getTime() > now.getTime()
@@ -44,7 +133,13 @@ const getWhatsAppMessagingPolicy = (contact = {}, options = {}) => {
   const freeformAllowed = serviceWindowOpen && !optedOut;
   const templateOnly = !optedOut && !freeformAllowed;
   const templateCategory = toCleanString(options?.templateCategory).toLowerCase();
-  const marketingTemplateAllowed = !optedOut && normalizedOptInStatus === 'opted_in';
+  const marketingTemplateAllowed =
+    !optedOut && normalizedOptInStatus === 'opted_in' && marketingScopeAllowed(normalizedOptInScope);
+  const marketingRateState = getMarketingRateLimitState(contact, {
+    now,
+    max: options?.marketingLimit,
+    windowHours: options?.marketingWindowHours
+  });
   const templateAllowed =
     !optedOut &&
     (templateCategory !== 'marketing' || marketingTemplateAllowed);
@@ -58,6 +153,7 @@ const getWhatsAppMessagingPolicy = (contact = {}, options = {}) => {
 
   return {
     normalizedOptInStatus,
+    normalizedOptInScope,
     serviceWindowClosesAt,
     serviceWindowOpen,
     freeformAllowed,
@@ -65,6 +161,9 @@ const getWhatsAppMessagingPolicy = (contact = {}, options = {}) => {
     optedOut,
     templateAllowed,
     marketingTemplateAllowed,
+    marketingRateLimited: marketingRateState.limited,
+    marketingRateRemaining: marketingRateState.remaining,
+    marketingNextAllowedAt: marketingRateState.nextAllowedAt,
     statusLabel
   };
 };
@@ -139,6 +238,16 @@ const validateTemplateOutboundSend = (contact = {}, { templateCategory = '' } = 
     };
   }
 
+  if (normalizedCategory === 'marketing' && policy.marketingRateLimited) {
+    return {
+      ok: false,
+      policy,
+      statusCode: 429,
+      error:
+        'Marketing template limit reached for this contact. Try again after the cooldown window.'
+    };
+  }
+
   return { ok: true, policy };
 };
 
@@ -159,6 +268,7 @@ const buildBroadcastAudienceValidation = ({
     optedOut: 0,
     freeformWindowClosed: 0,
     missingMarketingOptIn: 0,
+    marketingRateLimited: 0,
     invalidPhone: 0
   };
 
@@ -198,9 +308,17 @@ const buildBroadcastAudienceValidation = ({
 
     if (!validation.ok) {
       summary.invalid += 1;
-      if (validation.policy?.optedOut) summary.optedOut += 1;
-      else if (normalizedMessageType === 'template') summary.missingMarketingOptIn += 1;
-      else summary.freeformWindowClosed += 1;
+      if (validation.policy?.optedOut) {
+        summary.optedOut += 1;
+      } else if (normalizedMessageType === 'template') {
+        if (validation.policy?.marketingRateLimited) {
+          summary.marketingRateLimited += 1;
+        } else {
+          summary.missingMarketingOptIn += 1;
+        }
+      } else {
+        summary.freeformWindowClosed += 1;
+      }
 
       invalidRecipients.push({
         recipient,
@@ -210,7 +328,9 @@ const buildBroadcastAudienceValidation = ({
           validation.policy?.optedOut
             ? 'opted_out'
             : normalizedMessageType === 'template'
-              ? 'missing_marketing_opt_in'
+              ? validation.policy?.marketingRateLimited
+                ? 'marketing_rate_limited'
+                : 'missing_marketing_opt_in'
               : 'freeform_window_closed',
         error: validation.error
       });
@@ -241,5 +361,9 @@ module.exports = {
   applyContactOptOut,
   validateFreeformOutboundSend,
   validateTemplateOutboundSend,
+  normalizeOptInScope,
+  marketingScopeAllowed,
+  getMarketingRateLimitState,
+  applyMarketingTemplateSent,
   buildBroadcastAudienceValidation
 };

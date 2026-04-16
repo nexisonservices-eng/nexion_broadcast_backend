@@ -2332,6 +2332,21 @@ const dedupeById = (items = []) => {
   });
 };
 
+const buildInsightsFilteringParam = ({ campaignId, adSetId } = {}) => {
+  const normalizedAdSetId = String(adSetId || '').trim();
+  const normalizedCampaignId = String(campaignId || '').trim();
+
+  if (normalizedAdSetId) {
+    return JSON.stringify([{ field: 'adset.id', operator: 'IN', value: [normalizedAdSetId] }]);
+  }
+
+  if (normalizedCampaignId) {
+    return JSON.stringify([{ field: 'campaign.id', operator: 'IN', value: [normalizedCampaignId] }]);
+  }
+
+  return '';
+};
+
 const resolveInsightsAccess = async ({ userId } = {}) => {
   const accessContext = await getAccessContextForUser(userId);
   if (!userId || !accessContext?.accessToken || !['user', 'admin'].includes(accessContext.source)) {
@@ -2605,73 +2620,66 @@ const fetchInsightsDashboard = async ({ userId, range = '30d', campaignId, adSet
 
   const insightRows = [];
   const demographicRows = [];
+  const timeseriesErrors = [];
+  const demographicErrors = [];
+  const filtering = buildInsightsFilteringParam({ campaignId, adSetId });
 
-  const entityPath = adSetId
-    ? `${String(adSetId).trim()}/insights`
-    : campaignId
-      ? `${String(campaignId).trim()}/insights`
-      : null;
-
-  if (entityPath) {
-    const timeseriesResponse = await requestMetaAcrossTokens({
-      path: entityPath,
-      params: {
-        fields: 'date_start,reach,impressions,spend,clicks',
-        date_preset: datePreset,
-        time_increment: 1,
-        limit: 100
-      },
-      tokenCandidates
-    });
-    insightRows.push(...(Array.isArray(timeseriesResponse?.data) ? timeseriesResponse.data : []));
-
-    const demographicsResponse = await requestMetaAcrossTokens({
-      path: entityPath,
-      params: {
-        fields: 'reach',
-        date_preset: datePreset,
-        breakdowns: 'age,gender',
-        limit: 100
-      },
-      tokenCandidates
-    });
-    demographicRows.push(...(Array.isArray(demographicsResponse?.data) ? demographicsResponse.data : []));
-  } else {
-    for (const account of adAccounts) {
-      try {
-        const timeseriesResponse = await requestMetaAcrossTokens({
-          path: buildAdAccountPath(account.id, 'insights'),
-          params: {
-            fields: 'date_start,reach,impressions,spend,clicks',
-            date_preset: datePreset,
-            time_increment: 1,
-            level: 'campaign',
-            limit: 500
-          },
-          tokenCandidates
-        });
-        insightRows.push(...(Array.isArray(timeseriesResponse?.data) ? timeseriesResponse.data : []));
-      } catch (error) {
-        console.warn('[Meta Insights] Timeseries fetch failed:', extractApiErrorMessage(error));
-      }
-
-      try {
-        const demographicsResponse = await requestMetaAcrossTokens({
-          path: buildAdAccountPath(account.id, 'insights'),
-          params: {
-            fields: 'reach',
-            date_preset: datePreset,
-            breakdowns: 'age,gender',
-            level: 'campaign',
-            limit: 500
-          },
-          tokenCandidates
-        });
-        demographicRows.push(...(Array.isArray(demographicsResponse?.data) ? demographicsResponse.data : []));
-      } catch (error) {
-        console.warn('[Meta Insights] Demographics fetch failed:', extractApiErrorMessage(error));
-      }
+  for (const account of adAccounts) {
+    const insightsPath = buildAdAccountPath(account.id, 'insights');
+    try {
+      const timeseriesResponse = await requestMetaAcrossTokens({
+        path: insightsPath,
+        params: {
+          fields: 'date_start,reach,impressions,spend,clicks',
+          date_preset: datePreset,
+          time_increment: 1,
+          level: 'campaign',
+          filtering: filtering || undefined,
+          limit: 500
+        },
+        tokenCandidates
+      });
+      insightRows.push(...(Array.isArray(timeseriesResponse?.data) ? timeseriesResponse.data : []));
+    } catch (error) {
+      const message = extractApiErrorMessage(error);
+      timeseriesErrors.push({ accountId: account.id, message });
+      console.warn('[Meta Insights] Timeseries fetch failed:', message);
     }
+
+    try {
+      const demographicsResponse = await requestMetaAcrossTokens({
+        path: insightsPath,
+        params: {
+          fields: 'reach',
+          date_preset: datePreset,
+          breakdowns: 'age,gender',
+          level: 'campaign',
+          filtering: filtering || undefined,
+          limit: 500
+        },
+        tokenCandidates
+      });
+      demographicRows.push(...(Array.isArray(demographicsResponse?.data) ? demographicsResponse.data : []));
+    } catch (error) {
+      const message = extractApiErrorMessage(error);
+      demographicErrors.push({ accountId: account.id, message });
+      console.warn('[Meta Insights] Demographics fetch failed:', message);
+    }
+  }
+
+  if (!insightRows.length && timeseriesErrors.length > 0) {
+    throw buildStageErrorWithDetails(
+      'Insights',
+      'Meta insights request failed. Verify ad-account access, campaign permissions, and selected date range.',
+      {
+        range,
+        campaignId: campaignId || '',
+        adSetId: adSetId || '',
+        timeseriesErrors: timeseriesErrors.slice(0, 5),
+        demographicErrors: demographicErrors.slice(0, 5)
+      },
+      502
+    );
   }
 
   const aggregated = aggregateInsightRows(insightRows);
@@ -2679,7 +2687,14 @@ const fetchInsightsDashboard = async ({ userId, range = '30d', campaignId, adSet
   return {
     summary: aggregated.summary,
     timeseries: aggregated.timeseries,
-    demographics: aggregateDemographicsRows(demographicRows)
+    demographics: aggregateDemographicsRows(demographicRows),
+    meta: {
+      dataSource: 'meta-graph',
+      hasData: aggregated.timeseries.length > 0,
+      timeseriesRows: insightRows.length,
+      demographicRows: demographicRows.length,
+      warningCount: timeseriesErrors.length + demographicErrors.length
+    }
   };
 };
 

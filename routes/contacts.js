@@ -7,6 +7,7 @@ const {
   getWhatsAppMessagingPolicy,
   toCleanString
 } = require('../services/whatsappOutreach/policy');
+const { logConsentEvent } = require('../services/whatsappConsentLogService');
 
 const router = express.Router();
 router.use(auth);
@@ -38,6 +39,9 @@ const CONTACT_LIST_FIELDS = [
   'whatsappOptInIp',
   'whatsappOptInUserAgent',
   'whatsappOptInMetadata',
+  'whatsappMarketingWindowStartedAt',
+  'whatsappMarketingSendCount',
+  'whatsappMarketingLastSentAt',
   'whatsappOptOutAt',
   'lastInboundMessageAt',
   'serviceWindowClosesAt',
@@ -240,6 +244,23 @@ router.post('/:id/whatsapp-opt-in', async (req, res) => {
     });
     applyOptInAuditPayload(contact, auditPayload);
     await contact.save();
+    await logConsentEvent({
+      contact,
+      action: 'opt_in',
+      payload: {
+        source: auditPayload.source,
+        scope: auditPayload.scope,
+        consentText: auditPayload.textSnapshot,
+        proofType: auditPayload.proofType,
+        proofId: auditPayload.proofId,
+        proofUrl: auditPayload.proofUrl,
+        capturedBy: auditPayload.capturedBy,
+        pageUrl: auditPayload.pageUrl,
+        ip: auditPayload.ip,
+        userAgent: auditPayload.userAgent,
+        metadata: auditPayload.metadata
+      }
+    });
 
     return res.json({
       success: true,
@@ -264,6 +285,23 @@ router.post('/:id/whatsapp-opt-out', async (req, res) => {
       source: toCleanString(req.body?.source) || 'manual'
     });
     await contact.save();
+    await logConsentEvent({
+      contact,
+      action: 'opt_out',
+      payload: {
+        source: toCleanString(req.body?.source) || 'manual',
+        scope: contact.whatsappOptInScope,
+        consentText: contact.whatsappOptInTextSnapshot,
+        proofType: contact.whatsappOptInProofType,
+        proofId: contact.whatsappOptInProofId,
+        proofUrl: contact.whatsappOptInProofUrl,
+        capturedBy: contact.whatsappOptInCapturedBy,
+        pageUrl: contact.whatsappOptInPageUrl,
+        ip: contact.whatsappOptInIp,
+        userAgent: contact.whatsappOptInUserAgent,
+        metadata: contact.whatsappOptInMetadata
+      }
+    });
 
     return res.json({
       success: true,

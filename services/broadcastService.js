@@ -2,8 +2,17 @@ const Broadcast = require('../models/Broadcast');
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
+const Template = require('../models/Template');
 const whatsappService = require('./whatsappService');
 const { getWhatsAppCredentialsForUser } = require('./userWhatsAppCredentialsService');
+const {
+  buildPhoneCandidates
+} = require('./whatsappOutreach/conversationResolver');
+const {
+  toCleanString,
+  validateTemplateOutboundSend,
+  validateFreeformOutboundSend
+} = require('./whatsappOutreach/policy');
 const axios = require('axios');
 
 const ADMIN_USAGE_ENDPOINT =
@@ -20,6 +29,58 @@ const ADMIN_API_BASE_URLS = [
 const ADMIN_INTERNAL_API_KEY = process.env.ADMIN_INTERNAL_API_KEY || '';
 
 class BroadcastService {
+  async resolveContactForRecipient({ userId, companyId, phone }) {
+    const phoneCandidates = buildPhoneCandidates(phone);
+    if (!userId || phoneCandidates.length === 0) return null;
+
+    if (companyId) {
+      const scoped = await Contact.findOne({
+        userId,
+        companyId,
+        phone: { $in: phoneCandidates }
+      });
+      if (scoped) return scoped;
+    }
+
+    return Contact.findOne({
+      userId,
+      $or: [{ companyId }, { companyId: null }, { companyId: { $exists: false } }],
+      phone: { $in: phoneCandidates }
+    });
+  }
+
+  async resolveTemplateCategoryForBroadcast({ broadcast, credentials }) {
+    const templateName = toCleanString(broadcast?.templateName || '');
+    if (!templateName) return '';
+
+    if (broadcast?.templateId) {
+      const byId = await Template.findOne({
+        _id: broadcast.templateId,
+        userId: broadcast.createdById,
+        companyId: broadcast.companyId
+      }).select('category').lean();
+      if (byId?.category) return toCleanString(byId.category).toLowerCase();
+    }
+
+    const byName = await Template.findOne({
+      userId: broadcast.createdById,
+      companyId: broadcast.companyId,
+      name: templateName
+    }).select('category').lean();
+    if (byName?.category) return toCleanString(byName.category).toLowerCase();
+
+    try {
+      const listResult = await whatsappService.getTemplateList(credentials || null);
+      if (!listResult?.success) return '';
+      const templates = listResult?.data?.data || [];
+      const requested = templateName.toLowerCase();
+      const match = templates.find((tpl) => String(tpl?.name || '').trim().toLowerCase() === requested);
+      return toCleanString(match?.category || '').toLowerCase();
+    } catch (_error) {
+      return '';
+    }
+  }
+
   async reportUsage(companyId, count = 1) {
     if (!companyId || !ADMIN_INTERNAL_API_KEY) return;
     for (const baseUrl of ADMIN_API_BASE_URLS) {
@@ -474,6 +535,14 @@ class BroadcastService {
       let usageBatchCount = 0;
       const usageBatchSize = Number(process.env.BROADCAST_USAGE_BATCH || 50);
       let templatePreviewText = broadcast.templateContent || null;
+      const templateCategoryRaw =
+        broadcast.messageType === 'template'
+          ? await this.resolveTemplateCategoryForBroadcast({
+              broadcast,
+              credentials: resolvedCredentials
+            })
+          : '';
+      const templateCategory = toCleanString(templateCategoryRaw).toLowerCase() || 'marketing';
 
       // If templateContent is not stored, try to resolve from Meta
       if (!templatePreviewText && broadcast.templateName) {
@@ -488,6 +557,22 @@ class BroadcastService {
         try {
           let result;
           const phoneNumber = recipient.phone || recipient;
+          const contact = await this.resolveContactForRecipient({
+            userId: broadcast.createdById,
+            companyId: broadcast.companyId,
+            phone: phoneNumber
+          });
+
+          if (!contact) {
+            failed++;
+            broadcast.stats.failed++;
+            results.push({
+              phone: phoneNumber,
+              success: false,
+              error: 'Contact record not found for compliance checks.'
+            });
+            continue;
+          }
           
           let messageTextForInbox = broadcast.message;
           if (broadcast.templateName) {
@@ -500,6 +585,21 @@ class BroadcastService {
               });
               failed++;
               broadcast.stats.failed++;
+              continue;
+            }
+
+            const templateValidation = validateTemplateOutboundSend(contact, {
+              templateCategory
+            });
+            if (!templateValidation.ok) {
+              failed++;
+              broadcast.stats.failed++;
+              results.push({
+                phone: phoneNumber,
+                success: false,
+                error: templateValidation.error,
+                policy: templateValidation.policy
+              });
               continue;
             }
 
@@ -523,6 +623,19 @@ class BroadcastService {
               ? this.processTemplateVariables(templatePreviewText, recipient.variables || broadcast.variables || [])
               : `Template: ${normalizedTemplateName}`;
           } else if (broadcast.message) {
+            const freeformValidation = validateFreeformOutboundSend(contact);
+            if (!freeformValidation.ok) {
+              failed++;
+              broadcast.stats.failed++;
+              results.push({
+                phone: phoneNumber,
+                success: false,
+                error: freeformValidation.error,
+                policy: freeformValidation.policy
+              });
+              continue;
+            }
+
             // Process custom message with variable replacement
             const processedMessage = this.processTemplateVariables(broadcast.message, recipient.variables || broadcast.variables || []);
             result = await whatsappService.sendTextMessage(phoneNumber, processedMessage, resolvedCredentials);
@@ -551,6 +664,11 @@ class BroadcastService {
               broadcast.createdById,
               broadcast.companyId
             );
+
+            if (broadcast.templateName && templateCategory === 'marketing') {
+              applyMarketingTemplateSent(contact, { now: new Date() });
+              await contact.save();
+            }
 
             if (typeof broadcaster === 'function' && conversation && message) {
               broadcaster({

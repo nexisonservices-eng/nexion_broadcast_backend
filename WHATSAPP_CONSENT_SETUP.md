@@ -4,7 +4,7 @@ This backend now supports:
 
 1. Manual proof-based opt-in from Contacts / Team Inbox
 2. Public website or landing-page opt-in
-3. Meta Lead Ads preview and consent sync
+3. Meta Lead Ads preview, consent sync, and webhook auto-sync
 
 ## Required Backend Environment Variables
 
@@ -12,6 +12,8 @@ Add these values in backend environment:
 
 ```env
 WHATSAPP_OPTIN_PUBLIC_KEY=generate_a_long_random_public_opt_in_key
+WHATSAPP_MARKETING_TEMPLATE_MAX_PER_24H=1
+WHATSAPP_MARKETING_TEMPLATE_WINDOW_HOURS=24
 PUBLIC_BACKEND_URL=https://your-backend-domain.onrender.com
 FRONTEND_URL=https://your-frontend-domain.vercel.app
 META_APP_ID=your_meta_app_id
@@ -19,10 +21,31 @@ META_APP_SECRET=your_meta_app_secret
 META_API_VERSION=v22.0
 META_TOKEN_ENCRYPTION_KEY=32_characters_minimum_random_key
 JWT_SECRET=generate_a_secure_random_secret
+META_LEAD_WEBHOOK_VERIFY_TOKEN=your_meta_lead_webhook_verify_token
+META_LEAD_PHONE_KEYS=phone number, phone, mobile, whatsapp number
+META_LEAD_NAME_KEYS=full name, name
+META_LEAD_EMAIL_KEYS=email, email address
+META_LEAD_CONSENT_KEYS=whatsapp consent, receive whatsapp updates, consent
+META_LEAD_APPROVED_VALUES=yes, true, checked
+META_LEAD_CONSENT_TEXT=Meta lead form consent for WhatsApp marketing updates.
+META_LEAD_SCOPE=marketing
+CONSENT_EXPORT_EMAIL_ENABLED=false
+CONSENT_EXPORT_EMAIL_FROM=no-reply@example.com
+CONSENT_EXPORT_MAX_ROWS=5000
+CONSENT_LOG_ARCHIVE_ENABLED=false
+CONSENT_LOG_RETENTION_DAYS=365
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASS=
+SMTP_SECURE=false
 ```
 
 Notes:
 - `WHATSAPP_OPTIN_PUBLIC_KEY` is required for `POST /api/public/whatsapp-opt-in`
+- Marketing template throttles are configured via:
+  - `WHATSAPP_MARKETING_TEMPLATE_MAX_PER_24H`
+  - `WHATSAPP_MARKETING_TEMPLATE_WINDOW_HOURS`
 - Meta lead sync also requires a valid Meta connection for the current user
 
 ## Manual Opt-In Flow
@@ -97,6 +120,12 @@ Frontend demo route:
 /whatsapp-opt-in-demo
 ```
 
+Production landing route:
+
+```text
+/whatsapp-opt-in
+```
+
 ## Meta Lead Ads Consent Sync
 
 Available backend endpoints:
@@ -104,6 +133,8 @@ Available backend endpoints:
 ```http
 GET  /api/meta-ads/leads/:leadId/preview
 POST /api/meta-ads/leads/sync-consent
+GET  /api/meta-ads/webhook
+POST /api/meta-ads/webhook
 ```
 
 Use preview first:
@@ -133,6 +164,25 @@ Recommended mapping example:
 
 This flow is also available inside Meta Connect UI.
 
+## Meta Lead Ads Webhook (Auto Sync)
+
+Configure a Meta leadgen webhook to:
+
+```
+https://your-backend-domain/api/meta-ads/webhook
+```
+
+Verification token:
+
+```
+META_LEAD_WEBHOOK_VERIFY_TOKEN
+```
+
+The webhook will:
+- verify signature using `META_APP_SECRET`
+- resolve the user by selected page ID
+- apply consent only when approved mapping is detected
+
 ## Stored Consent Fields
 
 Contacts can now store:
@@ -150,6 +200,9 @@ Contacts can now store:
 - `whatsappOptInIp`
 - `whatsappOptInUserAgent`
 - `whatsappOptInMetadata`
+- `whatsappMarketingWindowStartedAt`
+- `whatsappMarketingSendCount`
+- `whatsappMarketingLastSentAt`
 - `whatsappOptOutAt`
 - `lastInboundMessageAt`
 - `serviceWindowClosesAt`
@@ -171,6 +224,33 @@ Current behavior:
 4. Test public opt-in via `/whatsapp-opt-in-demo`
 5. Test Meta lead preview with a real `leadId`
 6. Run Meta consent sync only after preview confirms field mapping
+
+## Consent Export Email (Optional)
+
+Endpoint:
+
+```http
+POST /api/consent/export-email
+GET  /api/consent/export-jobs
+```
+
+Required:
+- SMTP config
+- `CONSENT_EXPORT_EMAIL_ENABLED=true`
+- `email` in payload
+
+Exports are processed by the scheduler and emailed as CSV attachments.
+
+## Retention / Archive Policy (Optional)
+
+Set:
+
+```env
+CONSENT_LOG_ARCHIVE_ENABLED=true
+CONSENT_LOG_RETENTION_DAYS=365
+```
+
+Older logs are archived nightly and excluded from default views.
 
 ## Important Safety Note
 

@@ -5,6 +5,7 @@ const {
   toCleanString
 } = require('../services/whatsappOutreach/policy');
 const { normalizePhoneDigits } = require('../services/whatsappOutreach/conversationResolver');
+const { logConsentEvent } = require('../services/whatsappConsentLogService');
 
 const router = express.Router();
 
@@ -159,6 +160,23 @@ router.post('/whatsapp-opt-in', async (req, res) => {
     contact.whatsappOptInMetadata = payload.metadata;
 
     await contact.save();
+    await logConsentEvent({
+      contact,
+      action: 'opt_in',
+      payload: {
+        source: payload.source,
+        scope: payload.scope,
+        consentText: payload.consentText,
+        proofType: payload.proofType,
+        proofId: payload.proofId,
+        proofUrl: payload.proofUrl,
+        capturedBy: payload.capturedBy,
+        pageUrl: payload.pageUrl,
+        ip: payload.ip,
+        userAgent: payload.userAgent,
+        metadata: payload.metadata
+      }
+    });
 
     return res.status(201).json({
       success: true,

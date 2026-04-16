@@ -25,7 +25,9 @@ const {
 } = require('../services/whatsappOutreach/conversationResolver');
 const {
   validateFreeformOutboundSend,
-  validateTemplateOutboundSend
+  validateTemplateOutboundSend,
+  applyMarketingTemplateSent,
+  toCleanString
 } = require('../services/whatsappOutreach/policy');
 
 router.use(auth);
@@ -509,8 +511,12 @@ router.post(
         });
       }
 
+      // Default to utility when category is not provided so existing template sends
+      // are not incorrectly blocked by marketing opt-in policy.
+      const normalizedTemplateCategory =
+        toCleanString(templateCategory).toLowerCase() || 'utility';
       const templateValidation = validateTemplateOutboundSend(contact || {}, {
-        templateCategory
+        templateCategory: normalizedTemplateCategory
       });
       if (!templateValidation.ok) {
         await cleanupCreatedTemplateOutreachTarget(outreachTarget);
@@ -562,6 +568,11 @@ router.post(
         contact,
         contactName
       });
+
+      if (normalizedTemplateCategory === 'marketing' && contact) {
+        applyMarketingTemplateSent(contact, { now: messageTimestamp });
+        await contact.save();
+      }
 
       await Conversation.updateOne(
         { _id: conversation._id },

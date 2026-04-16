@@ -3,3 +3,5 @@ node_modules/
 *.log
 *.err.log
 *.out.log
+
+.env.example

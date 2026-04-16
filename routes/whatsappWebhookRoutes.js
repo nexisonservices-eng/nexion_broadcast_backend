@@ -7,6 +7,7 @@ const {
   applyContactOptOut,
   detectWhatsAppOptOutKeyword
 } = require('../services/whatsappOutreach/policy');
+const { logConsentEvent } = require('../services/whatsappConsentLogService');
 
 const registerWhatsAppWebhookRoutes = (app, deps) => {
   const {
@@ -307,6 +308,13 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         if (detectWhatsAppOptOutKeyword(text)) {
           applyContactOptOut(contact, { source: 'keyword' });
           await contact.save();
+          await logConsentEvent({
+            contact,
+            action: 'opt_out',
+            payload: {
+              source: 'keyword'
+            }
+          });
         }
       } else {
         contact.lastContact = inboundActivityAt;
@@ -317,6 +325,15 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           applyContactOptOut(contact, { source: 'keyword' });
         }
         await contact.save();
+        if (detectWhatsAppOptOutKeyword(text)) {
+          await logConsentEvent({
+            contact,
+            action: 'opt_out',
+            payload: {
+              source: 'keyword'
+            }
+          });
+        }
       }
 
       const isReactionMessage = String(rawMessageType || '').trim().toLowerCase() === 'reaction';

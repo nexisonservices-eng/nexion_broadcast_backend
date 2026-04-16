@@ -29,6 +29,8 @@ const LeadScoringConfig = require('./models/LeadScoringConfig');
 const GoogleCalendarConnection = require('./models/GoogleCalendarConnection');
 const Campaign = require('./models/campaign');
 const { ContactDocument } = require('./models/ContactDocument');
+const WhatsAppConsentLog = require('./models/WhatsAppConsentLog');
+const ConsentExportJob = require('./models/ConsentExportJob');
 
 // Middleware / config / helpers
 const auth = require('./middleware/auth');
@@ -57,6 +59,7 @@ const conversationRoutes = require('./routes/conversations');
 const messageRoutes = require('./routes/messages');
 const contactRoutes = require('./routes/contacts');
 const publicOptInRoutes = require('./routes/publicOptIn');
+const consentLogsRoutes = require('./routes/consentLogs');
 const missedCallRoutes = require('./routes/missedCalls');
 const metaAdsRoutes = require('./routes/metaAds');
 const insightsRoutes = require('./routes/insights');
@@ -84,11 +87,46 @@ if (securityEnvValidation.errors.length) {
 }
 
 // Middleware
+const toTrimmed = (value) => String(value || '').trim();
+
+const normalizeOriginValue = (value) => {
+  const raw = toTrimmed(value);
+  if (!raw) return '';
+  try {
+    return new URL(raw).origin;
+  } catch {
+    return '';
+  }
+};
+
+const isLocalOrigin = (origin) => {
+  try {
+    const { hostname } = new URL(origin);
+    return /^(localhost|127\.0\.0\.1)$/i.test(hostname);
+  } catch {
+    return false;
+  }
+};
+
+const isTrustedDomainOrigin = (origin) => {
+  try {
+    const { hostname } = new URL(origin);
+    if (!hostname) return false;
+    const normalizedHost = hostname.toLowerCase();
+    return (
+      normalizedHost === 'technovahub.in' ||
+      normalizedHost.endsWith('.technovahub.in') ||
+      normalizedHost.endsWith('.vercel.app')
+    );
+  } catch {
+    return false;
+  }
+};
+
 const allowedOrigins = [
   process.env.FRONTEND_URL,
   'https://www.technovahub.in',
   'https://technovahub.in',
-  'https://technovahub.in/nexion',
   'https://technovo-automation-afplwwbfj-technovas-projects-37226de2.vercel.app',
   'https://technovo-automation-m9n8fz6sl-technovas-projects-37226de2.vercel.app',
   'https://technovo-automation.vercel.app',
@@ -107,23 +145,29 @@ const allowedOrigins = [
   'http://localhost:5175',
   'http://127.0.0.1:5174',
   'http://127.0.0.1:5175'
-].filter(Boolean);
+]
+  .map(normalizeOriginValue)
+  .filter(Boolean);
 
 const corsOptions = {
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
 
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
+    const normalizedRequestOrigin = normalizeOriginValue(origin);
+    if (!normalizedRequestOrigin) {
+      console.log(`CORS blocked (invalid origin): ${origin}`);
+      return callback(new Error(`CORS blocked: ${origin}`));
     }
 
-    if (origin.includes('.vercel.app')) {
-      console.log(`CORS allowed for Vercel deployment: ${origin}`);
+    if (
+      allowedOrigins.includes(normalizedRequestOrigin) ||
+      isTrustedDomainOrigin(normalizedRequestOrigin) ||
+      isLocalOrigin(normalizedRequestOrigin)
+    ) {
       return callback(null, true);
     }
-
-    console.log(`CORS blocked: ${origin}`);
-    return callback(new Error(`CORS blocked: ${origin}`));
+    console.log(`CORS blocked: ${normalizedRequestOrigin}`);
+    return callback(new Error(`CORS blocked: ${normalizedRequestOrigin}`));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -169,6 +213,7 @@ app.use('/api/conversations', conversationRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/contacts', contactRoutes);
 app.use('/api/public', publicOptInRoutes);
+app.use('/api/consent', consentLogsRoutes);
 app.use('/api/missedcalls', missedCallRoutes);
 app.use('/api/meta-ads', metaAdsRoutes);
 app.use('/api/insights', insightsRoutes);
@@ -232,7 +277,9 @@ server.listen(PORT, async () => {
       LeadScoringConfig.syncIndexes(),
       GoogleCalendarConnection.syncIndexes(),
       Campaign.syncIndexes(),
-      ContactDocument.syncIndexes()
+      ContactDocument.syncIndexes(),
+      WhatsAppConsentLog.syncIndexes(),
+      ConsentExportJob.syncIndexes()
     ]);
     console.log('MongoDB indexes synced for all models including Campaigns.');
   } catch (indexError) {

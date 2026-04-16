@@ -14,7 +14,8 @@ const { isDebugLoggingEnabled } = require('../utils/securityConfig');
 const { buildPhoneCandidates } = require('../services/whatsappOutreach/conversationResolver');
 const {
   buildBroadcastAudienceValidation,
-  toCleanString
+  toCleanString,
+  applyMarketingTemplateSent
 } = require('../services/whatsappOutreach/policy');
 
 const router = express.Router();
@@ -384,7 +385,8 @@ router.post(
     try {
       const recipients = Array.isArray(req.body?.recipients) ? req.body.recipients : [];
       const messageType = toCleanString(req.body?.messageType || req.body?.message_type || 'template');
-      const templateCategory = toCleanString(req.body?.templateCategory || '');
+      const templateCategory =
+        toCleanString(req.body?.templateCategory || '') || 'marketing';
 
       if (!recipients.length) {
         return res.status(400).json({
@@ -438,6 +440,7 @@ router.post('/send', requirePlanFeature('broadcastMessaging'), requireWhatsAppCr
     
     // Support both camelCase and snake_case parameter names
     const msgType = message_type || messageType || (templateName ? 'template' : 'text');
+    const normalizedTemplateCategory = toCleanString(templateCategory) || 'marketing';
     const rawTemplateName = template_name || templateName;
     const finalTemplateName = rawTemplateName
       ? String(rawTemplateName).trim().toLowerCase()
@@ -488,7 +491,7 @@ router.post('/send', requirePlanFeature('broadcastMessaging'), requireWhatsAppCr
       recipients: parsedRecipients,
       contactsByPhone,
       messageType: msgType,
-      templateCategory
+      templateCategory: normalizedTemplateCategory
     });
 
     if (!audienceValidation.summary.eligible) {
@@ -664,6 +667,11 @@ router.post('/send', requirePlanFeature('broadcastMessaging'), requireWhatsAppCr
             whatsappMessageId,
             broadcastId: broadcast._id
           });
+
+          if (msgType === 'template' && normalizedTemplateCategory === 'marketing') {
+            applyMarketingTemplateSent(contact, { now: new Date() });
+            await contact.save();
+          }
           
           debugLog(`🔍 DEBUG: Created message with ID: ${savedMessage._id} and text: "${savedMessage.text}"`);
 

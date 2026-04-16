@@ -1,4 +1,6 @@
 const cron = require('node-cron');
+const { processConsentExportJobs } = require('../services/consentExportJobRunner');
+const { archiveOldConsentLogs } = require('../services/consentRetentionService');
 
 const startAppScheduler = ({
   app,
@@ -120,6 +122,27 @@ const startAppScheduler = ({
   });
 
   console.log('Template auto-sync disabled: run per user via authenticated API.');
+
+  cron.schedule('*/2 * * * *', async () => {
+    try {
+      if (mongoose.connection.readyState !== 1) return;
+      await processConsentExportJobs();
+    } catch (error) {
+      console.error('Consent export job error:', error.message);
+    }
+  });
+
+  cron.schedule('0 2 * * *', async () => {
+    try {
+      if (mongoose.connection.readyState !== 1) return;
+      const result = await archiveOldConsentLogs();
+      if (result?.archived) {
+        console.log(`Archived ${result.archived} consent logs.`);
+      }
+    } catch (error) {
+      console.error('Consent retention error:', error.message);
+    }
+  });
 };
 
 module.exports = {
