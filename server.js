@@ -23,6 +23,8 @@ const Template = require('./models/Template');
 const Conversation = require('./models/Conversation');
 const Message = require('./models/Message');
 const Broadcast = require('./models/Broadcast');
+const Deal = require('./models/Deal');
+const CrmAutomationRun = require('./models/CrmAutomationRun');
 const MetaAdsTransaction = require('./models/MetaAdsTransaction');
 const MetaAdsWallet = require('./models/MetaAdsWallet');
 const LeadScoringConfig = require('./models/LeadScoringConfig');
@@ -67,6 +69,7 @@ const whatsappWorkflowRoutes = require('./routes/whatsappWorkflows');
 const crmRoutes = require('./routes/crm');
 const googleCalendarRoutes = require('./routes/googleCalendar');
 const campaignRoutes = require('./routes/campaignroutes');
+const usageRoutes = require('./routes/usage');
 const { registerWhatsAppWebhookRoutes } = require('./routes/whatsappWebhookRoutes');
 const { registerLegacyCoreRoutes } = require('./routes/legacyCoreRoutes');
 const { createWebSocketHub } = require('./realtime/websocketHub');
@@ -75,6 +78,8 @@ const { startAppScheduler } = require('./jobs/appScheduler');
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+const ENABLE_LEGACY_CORE_ROUTES =
+  String(process.env.ENABLE_LEGACY_CORE_ROUTES || 'false').trim().toLowerCase() === 'true';
 const ENABLE_DEBUG_LOGS = isDebugLoggingEnabled();
 const securityEnvValidation = validateSecurityEnv();
 
@@ -221,6 +226,106 @@ app.use('/api/whatsapp/workflows', whatsappWorkflowRoutes);
 app.use('/api/crm', crmRoutes);
 app.use('/api/google-calendar', googleCalendarRoutes);
 app.use('/api/campaigns', campaignRoutes);
+app.use('/api/usage', usageRoutes);
+
+// Compatibility endpoints used by older frontend modules when legacy core routes are disabled.
+app.get('/api/version', (req, res) => {
+  res.json({
+    service: 'whatsapp-backend',
+    version: 'bulk_direct_meta_v2',
+    timestamp: new Date().toISOString(),
+    features: ['campaigns', 'broadcasts', 'meta-ads', 'websocket', 'lead-scoring', 'crm', 'google-calendar']
+  });
+});
+
+app.get('/api/lead-scoring/settings', auth, async (req, res) => {
+  try {
+    const settings = await getLeadScoringSettings(req.user.id, req.companyId);
+    return res.json({
+      success: true,
+      data: settings
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/api/lead-scoring/settings', auth, async (req, res) => {
+  try {
+    const updated = await updateLeadScoringSettings(req.user.id, req.companyId, req.body || {});
+    return res.json({
+      success: true,
+      data: updated
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/api/conversations/:id/read', auth, async (req, res) => {
+  try {
+    await Message.updateMany(
+      {
+        conversationId: req.params.id,
+        userId: req.user.id,
+        companyId: req.companyId,
+        sender: 'contact',
+        status: 'received'
+      },
+      { status: 'read' }
+    );
+
+    const conversation = await Conversation.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user.id, companyId: req.companyId },
+      { unreadCount: 0 },
+      { new: true }
+    ).lean();
+
+    if (!conversation) {
+      return res.status(404).json({ success: false, error: 'Conversation not found' });
+    }
+
+    return res.json({ success: true, data: conversation });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/analytics', auth, async (req, res) => {
+  try {
+    const last7Days = new Date();
+    last7Days.setDate(last7Days.getDate() - 7);
+
+    const [totalConversations, activeConversations, sentMessages, receivedMessages] = await Promise.all([
+      Conversation.countDocuments({ userId: req.user.id, companyId: req.companyId }),
+      Conversation.countDocuments({ userId: req.user.id, companyId: req.companyId, status: 'active' }),
+      Message.countDocuments({
+        userId: req.user.id,
+        companyId: req.companyId,
+        sender: 'agent',
+        timestamp: { $gte: last7Days }
+      }),
+      Message.countDocuments({
+        userId: req.user.id,
+        companyId: req.companyId,
+        sender: 'contact',
+        timestamp: { $gte: last7Days }
+      })
+    ]);
+
+    return res.json({
+      success: true,
+      data: {
+        totalConversations,
+        activeConversations,
+        sentMessages,
+        receivedMessages
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 // WebSocket hub
 const websocketHub = createWebSocketHub({ wss });
@@ -242,24 +347,26 @@ registerWhatsAppWebhookRoutes(app, {
   emitRealtimeEvent: websocketHub.emitRealtimeEvent
 });
 
-// Legacy app-level API endpoints preserved for compatibility
-registerLegacyCoreRoutes(app, {
-  auth,
-  requirePlanFeature,
-  requireWhatsAppCredentials,
-  whatsappService,
-  getLeadScoringSettings,
-  updateLeadScoringSettings,
-  Contact,
-  Conversation,
-  Message,
-  Broadcast,
-  broadcastService,
-  getWhatsAppCredentialsForUser,
-  mongoose,
-  ENABLE_DEBUG_LOGS,
-  emitRealtimeEvent: websocketHub.emitRealtimeEvent
-});
+// Legacy app-level API endpoints are opt-in during migration only.
+if (ENABLE_LEGACY_CORE_ROUTES) {
+  registerLegacyCoreRoutes(app, {
+    auth,
+    requirePlanFeature,
+    requireWhatsAppCredentials,
+    whatsappService,
+    getLeadScoringSettings,
+    updateLeadScoringSettings,
+    Contact,
+    Conversation,
+    Message,
+    Broadcast,
+    broadcastService,
+    getWhatsAppCredentialsForUser,
+    mongoose,
+    ENABLE_DEBUG_LOGS,
+    emitRealtimeEvent: websocketHub.emitRealtimeEvent
+  });
+}
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, async () => {
@@ -267,11 +374,14 @@ server.listen(PORT, async () => {
   console.log('WebSocket server ready');
   console.log(`Frontend URL: ${process.env.FRONTEND_URL || 'http://localhost:5173'}`);
   console.log(`Campaign Management API: http://localhost:${PORT}/api/campaigns`);
+  console.log(`Legacy Core Routes: ${ENABLE_LEGACY_CORE_ROUTES ? 'enabled' : 'disabled'}`);
 
   try {
     await Promise.all([
       Contact.syncIndexes(),
       Template.syncIndexes(),
+      Deal.syncIndexes(),
+      CrmAutomationRun.syncIndexes(),
       MetaAdsWallet.syncIndexes(),
       MetaAdsTransaction.syncIndexes(),
       LeadScoringConfig.syncIndexes(),

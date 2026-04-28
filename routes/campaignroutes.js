@@ -4,8 +4,10 @@ const router = express.Router();
 const multer = require('multer');
 const { body, param, query, validationResult } = require('express-validator');
 const protect = require('../middleware/auth');
+const { requireTenantPolicy } = require('../middleware/tenantPolicy');
 const Campaign = require('../models/campaign');
 const campaignController = require('../controllers/campaigncontroller');
+const { normalizeCampaignContractPayload } = require('../utils/campaignContract');
 const upload = multer({ storage: multer.memoryStorage() });
 const creativeUpload = upload.fields([
     { name: 'creativeImage', maxCount: 1 },
@@ -22,6 +24,11 @@ const validate = (req, res, next) => {
         });
     }
     next();
+};
+
+const normalizeCampaignContractRequest = (req, _res, next) => {
+    req.body = normalizeCampaignContractPayload(req.body || {});
+    return next();
 };
 
 const authorize = (...roles) => (req, res, next) => {
@@ -131,37 +138,47 @@ const campaignValidation = [
  * @desc    Test route to check if campaign routes are working
  * @access  Public
  */
-router.get('/test', (req, res) => {
-    res.json({ 
-        success: true, 
-        message: 'Campaign routes are working',
-        timestamp: new Date().toISOString()
+if (process.env.NODE_ENV !== 'production') {
+    router.get('/test', (req, res) => {
+        res.json({
+            success: true,
+            message: 'Campaign routes are working',
+            timestamp: new Date().toISOString()
+        });
     });
-});
+}
 
 /**
  * @route   GET /api/campaigns/debug
  * @desc    Debug endpoint to check if controller is loaded
  * @access  Public
  */
-router.get('/debug', (req, res) => {
-    res.json({
-        success: true,
-        message: 'Campaign routes debug endpoint',
-        controllers: {
-            getCampaigns: typeof campaignController.getCampaigns === 'function',
-            createCampaign: typeof campaignController.createCampaign === 'function',
-            getCampaign: typeof campaignController.getCampaign === 'function',
-            updateCampaign: typeof campaignController.updateCampaign === 'function',
-            deleteCampaign: typeof campaignController.deleteCampaign === 'function'
-        },
-        timestamp: new Date().toISOString()
+if (process.env.NODE_ENV !== 'production') {
+    router.get('/debug', (req, res) => {
+        res.json({
+            success: true,
+            message: 'Campaign routes debug endpoint',
+            controllers: {
+                getCampaigns: typeof campaignController.getCampaigns === 'function',
+                createCampaign: typeof campaignController.createCampaign === 'function',
+                getCampaign: typeof campaignController.getCampaign === 'function',
+                updateCampaign: typeof campaignController.updateCampaign === 'function',
+                deleteCampaign: typeof campaignController.deleteCampaign === 'function'
+            },
+            timestamp: new Date().toISOString()
+        });
     });
-});
+}
 
 // ==================== APPLY AUTH MIDDLEWARE TO ALL OTHER ROUTES ====================
 // All routes after this will require authentication
 router.use(protect);
+router.use(
+    requireTenantPolicy({
+        requiredFeatures: ['adsManager', 'analytics', 'metaConnect'],
+        auditEvent: 'campaign_policy'
+    })
+);
 
 // ==================== STATS AND EXPORT ROUTES ====================
 
@@ -231,6 +248,7 @@ router.get(
 router.post(
     '/',
     creativeUpload,
+    normalizeCampaignContractRequest,
     campaignValidation,
     validate,
     campaignController.createCampaign
@@ -260,6 +278,7 @@ router.get(
 router.put(
     '/:id',
     creativeUpload,
+    normalizeCampaignContractRequest,
     [
         param('id').isMongoId().withMessage('Invalid campaign ID'),
         ...campaignValidation

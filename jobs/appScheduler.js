@@ -1,6 +1,7 @@
 const cron = require('node-cron');
 const { processConsentExportJobs } = require('../services/consentExportJobRunner');
 const { archiveOldConsentLogs } = require('../services/consentRetentionService');
+const { runCrmFollowUpAutomation } = require('../services/crmOpsService');
 
 const startAppScheduler = ({
   app,
@@ -129,6 +130,27 @@ const startAppScheduler = ({
       await processConsentExportJobs();
     } catch (error) {
       console.error('Consent export job error:', error.message);
+    }
+  });
+
+  cron.schedule('*/15 * * * *', async () => {
+    try {
+      if (mongoose.connection.readyState !== 1) {
+        console.log('Skipping CRM automation: database not connected');
+        return;
+      }
+
+      const result = await runCrmFollowUpAutomation({
+        dryRun: false,
+        limit: Number(process.env.CRM_AUTOMATION_SCHEDULER_LIMIT || 100),
+        automationActor: 'system:scheduler'
+      });
+
+      if (result?.createdCount) {
+        console.log(`CRM follow-up automation created ${result.createdCount} task(s).`);
+      }
+    } catch (error) {
+      console.error('CRM automation scheduler error:', error.message);
     }
   });
 

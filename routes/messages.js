@@ -4,6 +4,7 @@ const multer = require('multer');
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
+const Template = require('../models/Template');
 const whatsappService = require('../services/whatsappService');
 const {
   resolveInboxStorageUsername,
@@ -14,6 +15,7 @@ const {
   deleteInboxAttachment
 } = require('../services/inboxMediaService');
 const auth = require('../middleware/auth');
+const { requireTenantPolicy } = require('../middleware/tenantPolicy');
 const requireWhatsAppCredentials = require('../middleware/requireWhatsAppCredentials');
 const requirePlanFeature = require('../middleware/planGuard');
 const {
@@ -31,6 +33,68 @@ const {
 } = require('../services/whatsappOutreach/policy');
 
 router.use(auth);
+router.use(
+  requireTenantPolicy({
+    requiredFeatures: ['teamInbox', 'contacts'],
+    auditEvent: 'messages_policy'
+  })
+);
+
+// Compatibility endpoint for Team Inbox message history when conversation routes are unavailable.
+router.get('/conversation/:id', async (req, res) => {
+  try {
+    const conversationId = String(req.params.id || '').trim();
+    if (!conversationId) {
+      return res.status(400).json({
+        success: false,
+        error: 'conversationId is required'
+      });
+    }
+
+    const parsedLimit = Number(req.query?.limit);
+    const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 80)) : 30;
+    const cursor = String(req.query?.cursor || '').trim();
+
+    const filters = {
+      conversationId,
+      userId: req.user.id,
+      ...(req.companyId ? { companyId: req.companyId } : {})
+    };
+
+    if (cursor) {
+      const cursorDate = new Date(cursor);
+      if (!Number.isNaN(cursorDate.valueOf())) {
+        filters.timestamp = { $lt: cursorDate };
+      }
+    }
+
+    const messages = await Message.find(filters)
+      .sort({ timestamp: -1, _id: -1 })
+      .limit(limit + 1)
+      .lean();
+
+    const hasMore = messages.length > limit;
+    const trimmed = hasMore ? messages.slice(0, limit) : messages;
+    const chronologicalMessages = [...trimmed].reverse();
+    const nextCursor = hasMore
+      ? new Date(trimmed[trimmed.length - 1]?.timestamp || Date.now()).toISOString()
+      : null;
+
+    return res.json({
+      data: chronologicalMessages,
+      meta: {
+        limit,
+        hasMore,
+        nextCursor
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error?.message || 'Failed to fetch conversation messages'
+    });
+  }
+});
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -50,31 +114,19 @@ const resolveReplyReferenceForOutboundSend = async ({
   const normalizedReplyToMessageId = String(replyToMessageId || '').trim();
   if (normalizedReplyToMessageId && isValidObjectId(normalizedReplyToMessageId)) {
     const baseIdFilter = { _id: normalizedReplyToMessageId, userId };
-    if (companyId) {
-      const strictReply = await Message.findOne({ ...baseIdFilter, companyId })
-        .select('_id whatsappMessageId')
-        .lean();
-      if (strictReply) return strictReply;
-    }
-
-    const byUserOnlyReply = await Message.findOne(baseIdFilter)
+    const byScopeReply = await Message.findOne(
+      companyId ? { ...baseIdFilter, companyId } : baseIdFilter
+    )
       .select('_id whatsappMessageId')
       .lean();
-    if (byUserOnlyReply) return byUserOnlyReply;
+    if (byScopeReply) return byScopeReply;
   }
 
   const normalizedContextId = String(whatsappContextMessageId || '').trim();
   if (!normalizedContextId) return null;
 
   const baseContextFilter = { userId, whatsappMessageId: normalizedContextId };
-  if (companyId) {
-    const strictContextReply = await Message.findOne({ ...baseContextFilter, companyId })
-      .select('_id whatsappMessageId')
-      .lean();
-    if (strictContextReply) return strictContextReply;
-  }
-
-  return Message.findOne(baseContextFilter)
+  return Message.findOne(companyId ? { ...baseContextFilter, companyId } : baseContextFilter)
     .select('_id whatsappMessageId')
     .lean();
 };
@@ -94,17 +146,12 @@ const resolveReactionTargetForOutboundSend = async ({
   const normalizedTargetMessageId = String(targetMessageId || '').trim();
   if (normalizedTargetMessageId && isValidObjectId(normalizedTargetMessageId)) {
     const baseIdFilter = { ...baseFilters, _id: normalizedTargetMessageId };
-    if (companyId) {
-      const strictTarget = await Message.findOne({ ...baseIdFilter, companyId })
-        .select('_id whatsappMessageId rawMessageType timestamp whatsappTimestamp createdAt')
-        .lean();
-      if (strictTarget) return strictTarget;
-    }
-
-    const byUserOnlyTarget = await Message.findOne(baseIdFilter)
+    const byScopeTarget = await Message.findOne(
+      companyId ? { ...baseIdFilter, companyId } : baseIdFilter
+    )
       .select('_id whatsappMessageId rawMessageType timestamp whatsappTimestamp createdAt')
       .lean();
-    if (byUserOnlyTarget) return byUserOnlyTarget;
+    if (byScopeTarget) return byScopeTarget;
   }
 
   const normalizedTargetWhatsAppMessageId = String(targetWhatsAppMessageId || '').trim();
@@ -114,14 +161,9 @@ const resolveReactionTargetForOutboundSend = async ({
     ...baseFilters,
     whatsappMessageId: normalizedTargetWhatsAppMessageId
   };
-  if (companyId) {
-    const strictWhatsAppTarget = await Message.findOne({ ...baseWhatsAppFilter, companyId })
-      .select('_id whatsappMessageId rawMessageType timestamp whatsappTimestamp createdAt')
-      .lean();
-    if (strictWhatsAppTarget) return strictWhatsAppTarget;
-  }
-
-  return Message.findOne(baseWhatsAppFilter)
+  return Message.findOne(
+    companyId ? { ...baseWhatsAppFilter, companyId } : baseWhatsAppFilter
+  )
     .select('_id whatsappMessageId rawMessageType timestamp whatsappTimestamp createdAt')
     .lean();
 };
@@ -146,19 +188,11 @@ const resolveContactForConversation = async ({ userId, companyId, conversation }
   if (!conversation?._id || !userId) return null;
 
   if (conversation.contactId) {
-    const contactById =
-      (companyId
-        ? await Contact.findOne({ _id: conversation.contactId, userId, companyId })
-        : null) ||
-      (await Contact.findOne({
-        _id: conversation.contactId,
-        userId,
-        ...(companyId
-          ? {
-              $or: [{ companyId }, { companyId: null }, { companyId: { $exists: false } }]
-            }
-          : {})
-      }));
+    const contactById = await Contact.findOne({
+      _id: conversation.contactId,
+      userId,
+      ...(companyId ? { companyId } : {})
+    });
 
     if (contactById) return contactById;
   }
@@ -168,11 +202,7 @@ const resolveContactForConversation = async ({ userId, companyId, conversation }
 
   return Contact.findOne({
     userId,
-    ...(companyId
-      ? {
-          $or: [{ companyId }, { companyId: null }, { companyId: { $exists: false } }]
-        }
-      : {}),
+    ...(companyId ? { companyId } : {}),
     phone: { $in: phoneCandidates }
   });
 };
@@ -511,10 +541,21 @@ router.post(
         });
       }
 
-      // Default to utility when category is not provided so existing template sends
-      // are not incorrectly blocked by marketing opt-in policy.
-      const normalizedTemplateCategory =
-        toCleanString(templateCategory).toLowerCase() || 'utility';
+      let normalizedTemplateCategory = toCleanString(templateCategory).toLowerCase();
+      if (!normalizedTemplateCategory && isValidObjectId(req.user.id)) {
+        const templateRecord = await Template.findOne({
+          userId: req.user.id,
+          name: String(templateName || '').trim()
+        })
+          .sort({ updatedAt: -1, createdAt: -1 })
+          .select('category')
+          .lean();
+
+        normalizedTemplateCategory = toCleanString(templateRecord?.category).toLowerCase() || 'utility';
+      }
+      if (!normalizedTemplateCategory) {
+        normalizedTemplateCategory = 'utility';
+      }
       const templateValidation = validateTemplateOutboundSend(contact || {}, {
         templateCategory: normalizedTemplateCategory
       });
@@ -1058,8 +1099,12 @@ router.delete('/delete-selected', async (req, res) => {
       });
     }
     
-    // Delete messages from database
-    const deleteResult = await Message.deleteMany({ _id: { $in: messageIds }, userId: req.user.id });
+    const deleteFilter = { _id: { $in: messageIds }, userId: req.user.id };
+    if (req.companyId) {
+      deleteFilter.companyId = req.companyId;
+    }
+
+    const deleteResult = await Message.deleteMany(deleteFilter);
     
     res.json({ 
       success: true, 

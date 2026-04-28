@@ -176,7 +176,63 @@ const computeNextRunAt = ({
   }
 };
 
-router.post('/webhook', async (req, res) => {
+const resolveRequestOrigin = (req) => {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const protocol = forwardedProto || req.protocol || 'http';
+  const forwardedHost = String(req.headers['x-forwarded-host'] || '').split(',')[0].trim();
+  const host = forwardedHost || req.get('host') || 'localhost:3001';
+  return `${protocol}://${host}`.replace(/\/+$/, '');
+};
+
+const buildUserScopedMissedCallWebhookUrl = ({ req, userId, phoneNumberId = '' }) => {
+  const origin = resolveRequestOrigin(req);
+  const normalizedUserId = encodeURIComponent(String(userId || '').trim());
+  const normalizedPhoneNumberId = String(phoneNumberId || '').trim();
+  if (normalizedPhoneNumberId) {
+    return `${origin}/api/missedcalls/webhook/${normalizedUserId}/${encodeURIComponent(normalizedPhoneNumberId)}`;
+  }
+  return `${origin}/api/missedcalls/webhook/${normalizedUserId}`;
+};
+
+const normalizeWebhookBaseUrl = ({ req, rawWebhookUrl = '' }) => {
+  const fallback = `${resolveRequestOrigin(req)}/api/missedcalls/webhook`;
+  const normalizedRaw = String(rawWebhookUrl || '').trim();
+  if (!normalizedRaw) return fallback;
+
+  try {
+    const parsed = new URL(normalizedRaw);
+    const pathname = String(parsed.pathname || '').replace(/\/+$/, '');
+    if (pathname.endsWith('/api/missedcalls/webhook')) {
+      return `${parsed.origin}${pathname}`;
+    }
+    return fallback;
+  } catch {
+    if (normalizedRaw.startsWith('/')) {
+      const joined = `${resolveRequestOrigin(req)}${normalizedRaw}`.replace(/\/+$/, '');
+      if (joined.endsWith('/api/missedcalls/webhook')) {
+        return joined;
+      }
+    }
+    return fallback;
+  }
+};
+
+const buildUserScopedMissedCallWebhookUrlFromBase = ({
+  req,
+  userId,
+  phoneNumberId = '',
+  baseWebhookUrl = ''
+}) => {
+  const base = normalizeWebhookBaseUrl({ req, rawWebhookUrl: baseWebhookUrl });
+  const normalizedUserId = encodeURIComponent(String(userId || '').trim());
+  const normalizedPhoneNumberId = String(phoneNumberId || '').trim();
+  if (normalizedPhoneNumberId) {
+    return `${base}/${normalizedUserId}/${encodeURIComponent(normalizedPhoneNumberId)}`;
+  }
+  return `${base}/${normalizedUserId}`;
+};
+
+const handleMissedCallWebhook = async (req, res) => {
   try {
     const body = req.body || {};
     const fromNumber = normalizePhone(
@@ -190,11 +246,13 @@ router.post('/webhook', async (req, res) => {
       ? 'outbound'
       : 'inbound';
 
-    const lookupPhoneNumberId = body.phone_number_id || body.phoneNumberId || '';
-    let userId = null;
+    const routeUserId = String(req.params?.userId || '').trim();
+    const routePhoneNumberId = String(req.params?.phoneNumberId || '').trim();
+    const lookupPhoneNumberId = String(body.phone_number_id || body.phoneNumberId || '').trim();
+    let userId = routeUserId || null;
 
-    if (lookupPhoneNumberId) {
-      userId = await resolveUserIdByPhoneNumberId(String(lookupPhoneNumberId));
+    if (!userId && lookupPhoneNumberId) {
+      userId = await resolveUserIdByPhoneNumberId(lookupPhoneNumberId);
     }
     if (!userId && toNumber) {
       userId = await resolveUserIdByRegisteredPhone(toNumber);
@@ -216,6 +274,15 @@ router.post('/webhook', async (req, res) => {
     const isMissed = isMissedStatus(rawStatus);
 
     const credentials = await getWhatsAppCredentialsByUserId(String(userId));
+    if (routePhoneNumberId) {
+      const credentialPhoneNumberId = String(credentials?.phoneNumberId || credentials?.whatsappId || '').trim();
+      if (!credentialPhoneNumberId || credentialPhoneNumberId !== routePhoneNumberId) {
+        return res.status(400).json({
+          success: false,
+          error: 'Webhook phone number id does not match user credentials'
+        });
+      }
+    }
     const delayMinutesRaw = credentials?.missedCallDelayMinutes;
     const delayMinutes = Number.isFinite(Number(delayMinutesRaw)) && Number(delayMinutesRaw) >= 0
       ? Number(delayMinutesRaw)
@@ -298,16 +365,28 @@ router.post('/webhook', async (req, res) => {
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
   }
-});
+};
+
+router.post('/webhook', handleMissedCallWebhook);
+router.post('/webhook/:userId', handleMissedCallWebhook);
+router.post('/webhook/:userId/:phoneNumberId', handleMissedCallWebhook);
 
 router.use(auth);
 router.get('/settings', async (req, res) => {
   try {
     const creds = await getWhatsAppCredentialsByUserId(String(req.user.id));
+    const savedWebhookUrl = String(creds?.missedCallWebhook || '').trim();
+    const generatedWebhookUrl = buildUserScopedMissedCallWebhookUrlFromBase({
+      req,
+      userId: req.user.id,
+      phoneNumberId: creds?.phoneNumberId || creds?.whatsappId || '',
+      baseWebhookUrl: savedWebhookUrl
+    });
     return res.json({
       success: true,
       data: {
-        missedCallWebhook: String(creds?.missedCallWebhook || '').trim(),
+        missedCallWebhook: generatedWebhookUrl,
+        missedCallWebhookRaw: savedWebhookUrl,
         missedCallAutomationEnabled: creds?.missedCallAutomationEnabled !== false,
         missedCallDelayMinutes:
           Number.isFinite(Number(creds?.missedCallDelayMinutes))
@@ -392,7 +471,13 @@ router.put('/settings', async (req, res) => {
     return res.json({
       success: true,
       data: {
-        missedCallWebhook: String(updated?.missedCallWebhook || '').trim(),
+        missedCallWebhook: buildUserScopedMissedCallWebhookUrlFromBase({
+          req,
+          userId: req.user.id,
+          phoneNumberId: updated?.phoneNumberId || updated?.whatsappId || '',
+          baseWebhookUrl: updated?.missedCallWebhook || ''
+        }),
+        missedCallWebhookRaw: String(updated?.missedCallWebhook || '').trim(),
         missedCallAutomationEnabled: updated.missedCallAutomationEnabled !== false,
         missedCallDelayMinutes:
           Number.isFinite(Number(updated.missedCallDelayMinutes))
@@ -504,4 +589,3 @@ router.put('/:id/resolve', async (req, res) => {
 });
 
 module.exports = router;
-

@@ -7,7 +7,16 @@ const DEFAULT_LEAD_SCORING_SETTINGS = Object.freeze({
   readScore: 2,
   replyScore: 5,
   keywordRules: [],
-  isEnabled: true
+  isEnabled: true,
+  automation: {
+    isEnabled: false,
+    stageThreshold: 45,
+    stageOnThreshold: 'qualified',
+    taskThreshold: 60,
+    taskTitle: 'High intent lead follow-up',
+    recommendedTemplate: '',
+    ownerNotification: true
+  }
 });
 
 const toFiniteNumber = (value, fallback = 0) => {
@@ -72,6 +81,35 @@ const normalizeLeadScoringPayload = (payload = {}) => {
     updates.keywordRules = normalizeKeywordRules(payload.keywords);
   }
 
+  const automationPayload =
+    payload?.automation && typeof payload.automation === 'object' ? payload.automation : null;
+  if (automationPayload) {
+    updates.automation = {
+      isEnabled: Boolean(automationPayload.isEnabled),
+      stageThreshold: toNonNegativeNumber(
+        automationPayload.stageThreshold,
+        DEFAULT_LEAD_SCORING_SETTINGS.automation.stageThreshold
+      ),
+      stageOnThreshold: ['new', 'contacted', 'nurturing', 'qualified', 'proposal', 'won', 'lost'].includes(
+        String(automationPayload.stageOnThreshold || '').trim().toLowerCase()
+      )
+        ? String(automationPayload.stageOnThreshold || '').trim().toLowerCase()
+        : DEFAULT_LEAD_SCORING_SETTINGS.automation.stageOnThreshold,
+      taskThreshold: toNonNegativeNumber(
+        automationPayload.taskThreshold,
+        DEFAULT_LEAD_SCORING_SETTINGS.automation.taskThreshold
+      ),
+      taskTitle:
+        String(automationPayload.taskTitle || '').trim() ||
+        DEFAULT_LEAD_SCORING_SETTINGS.automation.taskTitle,
+      recommendedTemplate: String(automationPayload.recommendedTemplate || '').trim(),
+      ownerNotification:
+        automationPayload.ownerNotification === undefined
+          ? DEFAULT_LEAD_SCORING_SETTINGS.automation.ownerNotification
+          : Boolean(automationPayload.ownerNotification)
+    };
+  }
+
   return updates;
 };
 
@@ -79,7 +117,32 @@ const toPlainConfig = (config) => ({
   readScore: toNonNegativeNumber(config?.readScore, DEFAULT_LEAD_SCORING_SETTINGS.readScore),
   replyScore: toNonNegativeNumber(config?.replyScore, DEFAULT_LEAD_SCORING_SETTINGS.replyScore),
   keywordRules: normalizeKeywordRules(config?.keywordRules || []),
-  isEnabled: config?.isEnabled !== false
+  isEnabled: config?.isEnabled !== false,
+  automation: {
+    isEnabled: config?.automation?.isEnabled === true,
+    stageThreshold: toNonNegativeNumber(
+      config?.automation?.stageThreshold,
+      DEFAULT_LEAD_SCORING_SETTINGS.automation.stageThreshold
+    ),
+    stageOnThreshold:
+      ['new', 'contacted', 'nurturing', 'qualified', 'proposal', 'won', 'lost'].includes(
+        String(config?.automation?.stageOnThreshold || '').trim().toLowerCase()
+      )
+        ? String(config?.automation?.stageOnThreshold || '').trim().toLowerCase()
+        : DEFAULT_LEAD_SCORING_SETTINGS.automation.stageOnThreshold,
+    taskThreshold: toNonNegativeNumber(
+      config?.automation?.taskThreshold,
+      DEFAULT_LEAD_SCORING_SETTINGS.automation.taskThreshold
+    ),
+    taskTitle:
+      String(config?.automation?.taskTitle || '').trim() ||
+      DEFAULT_LEAD_SCORING_SETTINGS.automation.taskTitle,
+    recommendedTemplate: String(config?.automation?.recommendedTemplate || '').trim(),
+    ownerNotification:
+      config?.automation?.ownerNotification === undefined
+        ? DEFAULT_LEAD_SCORING_SETTINGS.automation.ownerNotification
+        : Boolean(config?.automation?.ownerNotification)
+  }
 });
 
 const getLeadScoringSettings = async ({ userId, companyId }) => {

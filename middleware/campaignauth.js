@@ -1,6 +1,7 @@
 // middleware/auth.js
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const { normalizeRole } = require('../utils/accessControl');
 
 const protect = async (req, res, next) => {
     let token;
@@ -42,6 +43,7 @@ const protect = async (req, res, next) => {
         
         // Attach user to request
         req.user = user;
+        req.user.normalizedRole = normalizeRole(user.companyRole || user.role);
         next();
     } catch (error) {
         console.error('Auth error:', error);
@@ -69,11 +71,13 @@ const protect = async (req, res, next) => {
 
 // Grant access to specific roles
 const authorize = (...roles) => {
+    const allowedRoles = roles.map((role) => normalizeRole(role));
     return (req, res, next) => {
-        if (!roles.includes(req.user.role)) {
+        const activeRole = normalizeRole(req.user?.normalizedRole || req.user?.companyRole || req.user?.role);
+        if (!allowedRoles.includes(activeRole)) {
             return res.status(403).json({
                 success: false,
-                message: `User role ${req.user.role} is not authorized to access this route`
+                message: `User role ${activeRole} is not authorized to access this route`
             });
         }
         next();

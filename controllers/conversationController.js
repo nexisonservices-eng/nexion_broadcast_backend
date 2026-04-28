@@ -1,5 +1,10 @@
 const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
+const Message = require('../models/Message');
+const {
+  normalizeRole,
+  isTenantWideRole
+} = require('../utils/accessControl');
 
 const TEAM_INBOX_CONTACT_FIELDS =
   '_id name phone email notes tags status stage customFields nextFollowUpAt leadScore leadScoreBreakdown isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata whatsappMarketingWindowStartedAt whatsappMarketingSendCount whatsappMarketingLastSentAt whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt';
@@ -31,11 +36,25 @@ const TEAM_INBOX_CONVERSATION_FIELDS = [
   'resolvedAt'
 ].join(' ');
 
+const buildScopedFilters = (req, extra = {}) => {
+  const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+  const filters = {
+    companyId: req.companyId,
+    ...extra
+  };
+
+  if (!isTenantWideRole(normalizedRole)) {
+    filters.userId = req.user.id;
+  }
+
+  return filters;
+};
+
 class ConversationController {
   async getConversations(req, res) {
     try {
       const { status, assignedTo, search } = req.query;
-      const filters = { userId: req.user.id, companyId: req.companyId };
+      const filters = buildScopedFilters(req);
       
       if (status) filters.status = status;
       if (assignedTo) filters.assignedTo = assignedTo;
@@ -71,7 +90,7 @@ class ConversationController {
   async getContacts(req, res) {
     try {
       const { search, tags } = req.query;
-      const filters = { userId: req.user.id, companyId: req.companyId };
+      const filters = buildScopedFilters(req);
       
       if (search) {
         filters.$or = [
@@ -101,7 +120,7 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const contact = await Contact.findOne({ _id: id, userId: req.user.id, companyId: req.companyId }).lean();
+      const contact = await Contact.findOne(buildScopedFilters(req, { _id: id })).lean();
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -119,8 +138,7 @@ class ConversationController {
     try {
       // Get all unique contacts from conversations
       const conversations = await Conversation.find({
-        userId: req.user.id,
-        companyId: req.companyId,
+        ...buildScopedFilters(req),
         status: { $in: ['active', 'pending'] }
       })
         .select('contactPhone contactName lastMessageTime lastMessage status')
@@ -155,7 +173,7 @@ class ConversationController {
       const { name, phone, email, tags, notes, stage, status, source, ownerId, nextFollowUpAt } = req.body;
       
       // Check if contact already exists
-      const existingContact = await Contact.findOne({ phone, userId: req.user.id, companyId: req.companyId });
+      const existingContact = await Contact.findOne(buildScopedFilters(req, { phone }));
       if (existingContact) {
         return res.status(400).json({ 
           success: false, 
@@ -205,7 +223,7 @@ class ConversationController {
       } = req.body;
       
       // Find contact by ID
-      const contact = await Contact.findOne({ _id: id, userId: req.user.id, companyId: req.companyId });
+      const contact = await Contact.findOne(buildScopedFilters(req, { _id: id }));
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -215,7 +233,9 @@ class ConversationController {
       
       // Check if phone number is being changed and if it conflicts with existing contact
       if (phone && phone !== contact.phone) {
-        const existingContact = await Contact.findOne({ phone, _id: { $ne: id }, userId: req.user.id, companyId: req.companyId });
+        const existingContact = await Contact.findOne(
+          buildScopedFilters(req, { phone, _id: { $ne: id } })
+        );
         if (existingContact) {
           return res.status(400).json({ 
             success: false, 
@@ -246,7 +266,7 @@ class ConversationController {
       }
       
       const updatedContact = await Contact.findOneAndUpdate(
-        { _id: id, userId: req.user.id, companyId: req.companyId },
+        buildScopedFilters(req, { _id: id }),
         updateData, 
         { new: true, runValidators: true }
       );
@@ -254,7 +274,7 @@ class ConversationController {
       // If name was updated, also update all conversations for this contact
       if (name !== undefined && name !== contact.name) {
         await Conversation.updateMany(
-          { contactId: id, userId: req.user.id },
+          buildScopedFilters(req, { contactId: id }),
           { contactName: name }
         );
       }
@@ -269,7 +289,7 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const contact = await Contact.findOne({ _id: id, userId: req.user.id, companyId: req.companyId });
+      const contact = await Contact.findOne(buildScopedFilters(req, { _id: id }));
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -277,7 +297,7 @@ class ConversationController {
         });
       }
       
-      await Contact.deleteOne({ _id: id, userId: req.user.id });
+      await Contact.deleteOne(buildScopedFilters(req, { _id: id }));
       
       res.json({ success: true, message: 'Contact deleted successfully' });
     } catch (error) {
@@ -289,7 +309,7 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const conversation = await Conversation.findOne({ _id: id, userId: req.user.id });
+      const conversation = await Conversation.findOne(buildScopedFilters(req, { _id: id }));
       if (!conversation) {
         return res.status(404).json({ 
           success: false, 
@@ -297,8 +317,8 @@ class ConversationController {
         });
       }
       
-      await Conversation.deleteOne({ _id: id, userId: req.user.id });
-      await Message.deleteMany({ conversationId: id, userId: req.user.id });
+      await Conversation.deleteOne(buildScopedFilters(req, { _id: id }));
+      await Message.deleteMany(buildScopedFilters(req, { conversationId: id }));
       
       res.json({ success: true, message: 'Conversation deleted successfully' });
     } catch (error) {
@@ -308,8 +328,8 @@ class ConversationController {
 
   async deleteAllConversations(req, res) {
     try {
-      await Conversation.deleteMany({ userId: req.user.id });
-      await Message.deleteMany({ userId: req.user.id });
+      await Conversation.deleteMany(buildScopedFilters(req));
+      await Message.deleteMany(buildScopedFilters(req));
       res.json({ success: true, message: 'All conversations deleted successfully' });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
@@ -327,8 +347,8 @@ class ConversationController {
         });
       }
       
-      await Conversation.deleteMany({ _id: { $in: conversationIds }, userId: req.user.id });
-      await Message.deleteMany({ conversationId: { $in: conversationIds }, userId: req.user.id });
+      await Conversation.deleteMany(buildScopedFilters(req, { _id: { $in: conversationIds } }));
+      await Message.deleteMany(buildScopedFilters(req, { conversationId: { $in: conversationIds } }));
       
       res.json({ 
         success: true, 

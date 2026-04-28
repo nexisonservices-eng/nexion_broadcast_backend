@@ -6,6 +6,14 @@ const APIFeatures = require('../utils/apifeature');
 const { validationResult } = require('express-validator');
 const metaAdsService = require('../services/metaAdsService');
 const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
+const { shapeCampaignContract } = require('../utils/campaignContract');
+const {
+    normalizeRole,
+    isTenantWideRole,
+    canAccessOwnedResource,
+    buildTenantResourceFilter
+} = require('../utils/accessControl');
+const { emitAuthAuditLog } = require('../utils/authAuditLogger');
 
 const buildMetaCreateErrorMessage = (metaError) => {
     const details = metaError?.details?.error || {};
@@ -75,6 +83,25 @@ const sendMetaError = (res, metaError, fallbackMessage) =>
     metaStage: metaError.stage || null
   });
 
+const normalizeCreativeImageUrl = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+
+    // Prevent old design placeholder URLs from leaking into live UI cards.
+    if (
+        /lh3\.googleusercontent\.com\/aida-public/i.test(raw) ||
+        /googleusercontent\.com\/aida-public/i.test(raw)
+    ) {
+        return '';
+    }
+
+    if (/^(https?:)?\/\//i.test(raw) || raw.startsWith('/') || raw.startsWith('data:image/')) {
+        return raw;
+    }
+
+    return '';
+};
+
 const serializeCampaignRecord = (campaign) => {
     const source =
         typeof campaign?.toObject === 'function'
@@ -90,8 +117,11 @@ const serializeCampaignRecord = (campaign) => {
             ? source.updatedBy._id || source.updatedBy.id || source.updatedBy
             : source?.updatedBy;
 
+    const contract = shapeCampaignContract(source);
+
     return {
         ...source,
+        imageUrl: normalizeCreativeImageUrl(source?.imageUrl),
         createdById: createdByValue ? String(createdByValue) : '',
         updatedById: updatedByValue ? String(updatedByValue) : '',
         createdBy:
@@ -101,7 +131,27 @@ const serializeCampaignRecord = (campaign) => {
         updatedBy:
             source?.updatedBy && typeof source.updatedBy === 'object' && source.updatedBy !== null
                 ? source.updatedBy
-                : (updatedByValue ? String(updatedByValue) : null)
+                : (updatedByValue ? String(updatedByValue) : null),
+        audience: {
+            ...(source?.audience && typeof source.audience === 'object' ? source.audience : {}),
+            ...contract.audience
+        },
+        deliveryPolicy: {
+            ...(source?.deliveryPolicy && typeof source.deliveryPolicy === 'object' ? source.deliveryPolicy : {}),
+            ...contract.deliveryPolicy
+        },
+        retryPolicy: {
+            ...(source?.retryPolicy && typeof source.retryPolicy === 'object' ? source.retryPolicy : {}),
+            ...contract.retryPolicy
+        },
+        compliancePolicy: {
+            ...(source?.compliancePolicy && typeof source.compliancePolicy === 'object' ? source.compliancePolicy : {}),
+            ...contract.compliancePolicy
+        },
+        analytics: {
+            ...(source?.analytics && typeof source.analytics === 'object' ? source.analytics : {}),
+            ...contract.analytics
+        }
     };
 };
 
@@ -123,6 +173,16 @@ const buildCampaignStats = (campaigns = []) =>
         avgCpcSource: []
     });
 
+const getNormalizedRequestRole = (req) =>
+    normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+
+const buildCampaignScopedFilter = (req, base = {}) =>
+    buildTenantResourceFilter({
+        req,
+        base,
+        ownerField: 'createdBy'
+    });
+
 const ensureCampaignOwnership = (campaign, req, res, actionMessage) => {
     if (!campaign) {
         res.status(404).json({
@@ -132,7 +192,42 @@ const ensureCampaignOwnership = (campaign, req, res, actionMessage) => {
         return false;
     }
 
-    if (req.user.role !== 'superadmin' && campaign.createdBy.toString() !== req.user.id) {
+    if (String(campaign.companyId || '') !== String(req.companyId || '')) {
+        emitAuthAuditLog({
+            event: 'campaign_access',
+            allowed: false,
+            reason: 'cross_tenant_access_denied',
+            req,
+            extra: {
+                resourceCompanyId: String(campaign.companyId || '')
+            }
+        });
+        res.status(404).json({
+            success: false,
+            message: 'Campaign not found'
+        });
+        return false;
+    }
+
+    const normalizedRole = getNormalizedRequestRole(req);
+    const ownerId = campaign.createdBy?._id ? campaign.createdBy._id : campaign.createdBy;
+    const allowed = canAccessOwnedResource({
+        role: normalizedRole,
+        ownerId,
+        userId: req.user?.id
+    });
+
+    if (!allowed) {
+        emitAuthAuditLog({
+            event: 'campaign_access',
+            allowed: false,
+            reason: 'ownership_access_denied',
+            req,
+            extra: {
+                campaignId: String(campaign._id || ''),
+                ownerId: String(ownerId || '')
+            }
+        });
         res.status(403).json({
             success: false,
             message: actionMessage
@@ -188,15 +283,22 @@ const getUploadedCreativeFiles = (req = {}) => {
 // @access  Private
 exports.getCampaigns = async (req, res) => {
     try {
-        // Build query
-        const query = Campaign.find();
-        const ownershipFilter = {};
-        
-        // Add user filter (users can only see their own campaigns)
-        if (req.user.role !== 'superadmin') {
-            query.where('createdBy').equals(req.user.id);
-            ownershipFilter.createdBy = req.user.id;
+        const normalizedRole = getNormalizedRequestRole(req);
+        const isSuperAdmin = normalizedRole === 'superadmin';
+
+        if (String(req.query.includeLiveMetrics || '').toLowerCase() === 'true') {
+            try {
+                await metaAdsService.syncAllCrudCampaignAnalytics({
+                    userId: isSuperAdmin ? undefined : req.user.id
+                });
+            } catch (syncError) {
+                console.warn('Live metric sync warning before campaign list:', syncError.message || syncError);
+            }
         }
+
+        // Build query
+        const scopedBaseFilter = buildCampaignScopedFilter(req);
+        const query = Campaign.find(scopedBaseFilter);
         
         // Apply filters, sorting, pagination
         const features = new APIFeatures(query, req.query)
@@ -213,7 +315,7 @@ exports.getCampaigns = async (req, res) => {
 
         // Get total count for pagination
         const combinedFilter = {
-            ...ownershipFilter,
+            ...scopedBaseFilter,
             ...(features.filterConditions || {})
         };
         const totalCount = await Campaign.countDocuments(combinedFilter);
@@ -279,21 +381,7 @@ exports.getCampaign = async (req, res) => {
     try {
         const campaign = await Campaign.findById(req.params.id);
 
-        if (!campaign) {
-            return res.status(404).json({
-                success: false,
-                message: 'Campaign not found'
-            });
-        }
-
-        // Check authorization
-        const createdById = campaign.createdBy?._id ? campaign.createdBy._id.toString() : String(campaign.createdBy || '');
-        if (req.user.role !== 'superadmin' && createdById !== req.user.id) {
-            return res.status(403).json({
-                success: false,
-                message: 'Not authorized to view this campaign'
-            });
-        }
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to view this campaign')) return;
 
         res.status(200).json({
             success: true,
@@ -334,6 +422,7 @@ exports.createCampaign = async (req, res) => {
 
         // Add user to request body
         req.body.createdBy = req.user.id;
+        req.body.companyId = req.companyId;
 
         // Validate budget
         if (req.body.dailyBudget && req.body.lifetimeBudget) {
@@ -442,23 +531,11 @@ exports.updateCampaign = async (req, res) => {
 
         let campaign = await Campaign.findById(req.params.id);
 
-        if (!campaign) {
-            return res.status(404).json({
-                success: false,
-                message: 'Campaign not found'
-            });
-        }
-
-        // Check authorization
-        if (req.user.role !== 'superadmin' && campaign.createdBy.toString() !== req.user.id) {
-            return res.status(403).json({
-                success: false,
-                message: 'Not authorized to update this campaign'
-            });
-        }
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to update this campaign')) return;
 
         // Add updated by user
         req.body.updatedBy = req.user.id;
+        req.body.companyId = req.companyId;
 
         // Validate budget
         if (req.body.dailyBudget && req.body.lifetimeBudget) {
@@ -634,13 +711,7 @@ exports.deleteCampaign = async (req, res) => {
             });
         }
 
-        // Check authorization
-        if (req.user.role !== 'superadmin' && campaign.createdBy.toString() !== req.user.id) {
-            return res.status(403).json({
-                success: false,
-                message: 'Not authorized to delete this campaign'
-            });
-        }
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to delete this campaign')) return;
 
         let metaDeletion = null;
         if (campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId) {
@@ -795,13 +866,7 @@ exports.duplicateCampaign = async (req, res) => {
             });
         }
 
-        // Check authorization
-        if (req.user.role !== 'superadmin' && campaign.createdBy.toString() !== req.user.id) {
-            return res.status(403).json({
-                success: false,
-                message: 'Not authorized to duplicate this campaign'
-            });
-        }
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to duplicate this campaign')) return;
 
         // Create duplicate campaign
         const duplicateData = campaign.toObject();
@@ -818,6 +883,7 @@ exports.duplicateCampaign = async (req, res) => {
         duplicateData.name = `${duplicateData.name} (Copy)`;
         duplicateData.status = 'draft';
         duplicateData.createdBy = req.user.id;
+        duplicateData.companyId = req.companyId;
         
         // Reset performance metrics
         duplicateData.spent = 0;
@@ -1100,11 +1166,7 @@ exports.publishCampaign = async (req, res) => {
 exports.getCampaignStats = async (req, res) => {
     try {
         // Build filter based on user role
-        const filter = {};
-        
-        if (req.user.role !== 'superadmin') {
-            filter.createdBy = req.user.id;
-        }
+        const filter = buildCampaignScopedFilter(req);
 
         // Add date range filter if provided
         if (req.query.startDate && req.query.endDate) {
@@ -1221,14 +1283,15 @@ exports.bulkUpdateCampaigns = async (req, res) => {
 
         // Check authorization for each campaign
         const campaigns = await Campaign.find({
-            _id: { $in: campaignIds }
+            _id: { $in: campaignIds },
+            companyId: req.companyId
         });
 
-        if (req.user.role !== 'superadmin') {
+        const normalizedRole = getNormalizedRequestRole(req);
+        if (!isTenantWideRole(normalizedRole)) {
             const unauthorized = campaigns.some(
-                campaign => campaign.createdBy.toString() !== req.user.id
+                (campaign) => String(campaign.createdBy) !== String(req.user.id)
             );
-
             if (unauthorized) {
                 return res.status(403).json({
                     success: false,
@@ -1268,11 +1331,7 @@ exports.bulkUpdateCampaigns = async (req, res) => {
 exports.exportCampaigns = async (req, res) => {
     try {
         // Build query
-        const query = Campaign.find();
-        
-        if (req.user.role !== 'superadmin') {
-            query.where('createdBy').equals(req.user.id);
-        }
+        const query = Campaign.find(buildCampaignScopedFilter(req));
 
         // Apply filters
         const features = new APIFeatures(query, req.query)
@@ -1400,13 +1459,16 @@ exports.bulkDeleteCampaigns = async (req, res) => {
             return res.status(400).json({ success: false, message: 'campaignIds array required' });
         }
 
-        const campaigns = await Campaign.find({ _id: { $in: campaignIds } });
+        const campaigns = await Campaign.find({
+            _id: { $in: campaignIds },
+            companyId: req.companyId
+        });
 
-        if (req.user.role !== 'superadmin') {
+        const normalizedRole = getNormalizedRequestRole(req);
+        if (!isTenantWideRole(normalizedRole)) {
             const unauthorized = campaigns.some(
-                (campaign) => campaign.createdBy.toString() !== req.user.id
+                (campaign) => String(campaign.createdBy) !== String(req.user.id)
             );
-
             if (unauthorized) {
                 return res.status(403).json({
                     success: false,
@@ -1443,7 +1505,8 @@ exports.bulkDeleteCampaigns = async (req, res) => {
             }
         }
 
-        const result = await Campaign.deleteMany({ _id: { $in: campaignIds } });
+        const deletionFilter = buildCampaignScopedFilter(req, { _id: { $in: campaignIds } });
+        const result = await Campaign.deleteMany(deletionFilter);
 
         res.status(200).json({
             success: true,
@@ -1466,8 +1529,9 @@ exports.bulkUpdateStatus = async (req, res) => {
             return res.status(400).json({ success: false, message: 'campaignIds array and status are required' });
         }
 
+        const statusFilter = buildCampaignScopedFilter(req, { _id: { $in: campaignIds } });
         const result = await Campaign.updateMany(
-            { _id: { $in: campaignIds } },
+            statusFilter,
             { status, updatedBy: req.user?.id }
         );
 
@@ -1522,8 +1586,10 @@ exports.syncWithMeta = async (req, res) => {
 // @route   POST /api/campaigns/meta/sync-all
 exports.syncAllWithMeta = async (req, res) => {
     try {
+        const normalizedRole = getNormalizedRequestRole(req);
+        const isSuperAdmin = normalizedRole === 'superadmin';
         const syncResult = await metaAdsService.syncAllCrudCampaignAnalytics({
-            userId: req.user.role === 'superadmin' ? undefined : req.user.id
+            userId: isSuperAdmin ? undefined : req.user.id
         });
 
         return res.status(200).json({

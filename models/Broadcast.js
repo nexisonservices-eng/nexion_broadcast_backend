@@ -6,20 +6,24 @@ const BroadcastSchema = new mongoose.Schema({
   messageType: { type: String, enum: ['template', 'text'], default: 'text' },
   message: String,
   templateName: String,
+  templateCategory: String,
   templateContent: String,
   language: String,
   templateId: { type: mongoose.Schema.Types.ObjectId, ref: 'Template' },
+  retryOfBroadcastId: { type: mongoose.Schema.Types.ObjectId, ref: 'Broadcast', index: true },
+  retryAttempt: { type: Number, default: 0 },
   mediaUrl: String,
   mediaType: String,
   recipients: [{ 
     phone: { type: String, required: true },
     name: String,
-    variables: [String]
+    variables: [String],
+    attributes: mongoose.Schema.Types.Mixed
   }],
   recipientCount: { type: Number, default: 0 },
   status: { 
     type: String, 
-    enum: ['draft', 'scheduled', 'sending', 'completed', 'paused', 'cancelled'], 
+    enum: ['draft', 'scheduled', 'sending', 'completed', 'paused', 'cancelled', 'failed'], 
     default: 'draft',
     index: true
   },
@@ -47,7 +51,32 @@ const BroadcastSchema = new mongoose.Schema({
     whatsappId: String,
     twilioId: String
   },
-  authHeaderSnapshot: String
+  authHeaderSnapshot: String,
+  deliveryPolicy: {
+    quietHours: {
+      enabled: { type: Boolean, default: false },
+      startHour: { type: Number, min: 0, max: 23, default: 22 },
+      endHour: { type: Number, min: 0, max: 23, default: 8 },
+      timezone: { type: String, default: 'UTC' },
+      action: { type: String, enum: ['defer', 'skip'], default: 'defer' }
+    }
+  },
+  retryPolicy: {
+    enabled: { type: Boolean, default: true },
+    maxAttempts: { type: Number, min: 1, max: 5, default: 2 },
+    backoffSeconds: { type: Number, min: 0, max: 300, default: 4 },
+    retryableCodes: [{ type: String }]
+  },
+  compliancePolicy: {
+    respectOptOut: { type: Boolean, default: true },
+    suppressionListPhones: [{ type: String }]
+  },
+  analytics: {
+    suppressed: { type: Number, default: 0 },
+    deferred: { type: Number, default: 0 },
+    retried: { type: Number, default: 0 },
+    failureCodeBreakdown: mongoose.Schema.Types.Mixed
+  }
 });
 
 BroadcastSchema.pre('save', function(next) {

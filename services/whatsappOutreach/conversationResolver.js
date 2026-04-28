@@ -19,12 +19,7 @@ const buildPhoneCandidates = (value = '') => {
   );
 };
 
-const buildCompanyFallbackFilter = (companyId) =>
-  companyId
-    ? {
-        $or: [{ companyId }, { companyId: null }, { companyId: { $exists: false } }]
-      }
-    : {};
+const buildCompanyScopeFilter = (companyId) => (companyId ? { companyId } : {});
 
 const maybeApplySort = async (queryLike, sortSpec) => {
   if (!queryLike) return null;
@@ -43,14 +38,11 @@ const resolveConversationForOutboundSend = async ({
   if (!userId || !conversationId) return null;
 
   const baseIdQuery = { _id: conversationId, userId };
-
-  if (companyId) {
-    const strict = await Conversation.findOne({ ...baseIdQuery, companyId });
-    if (strict) return strict;
-  }
-
-  const byUserOnly = await Conversation.findOne(baseIdQuery);
-  if (byUserOnly) return byUserOnly;
+  const byScope = await Conversation.findOne({
+    ...baseIdQuery,
+    ...buildCompanyScopeFilter(companyId)
+  });
+  if (byScope) return byScope;
 
   const phoneCandidates = buildPhoneCandidates(to);
   if (!phoneCandidates.length) return null;
@@ -58,7 +50,7 @@ const resolveConversationForOutboundSend = async ({
   return maybeApplySort(
     Conversation.findOne({
       userId,
-      ...buildCompanyFallbackFilter(companyId),
+      ...buildCompanyScopeFilter(companyId),
       contactPhone: { $in: phoneCandidates }
     }),
     { lastMessageTime: -1, updatedAt: -1, createdAt: -1 }
@@ -83,34 +75,19 @@ const resolveContactForTemplateSend = async ({
   let contact = null;
 
   if (contactId) {
-    if (companyId) {
-      contact = await Contact.findOne({ _id: contactId, userId, companyId });
-    }
-    if (!contact) {
-      contact = await Contact.findOne({
-        _id: contactId,
-        userId,
-        ...buildCompanyFallbackFilter(companyId)
-      });
-    }
+    contact = await Contact.findOne({
+      _id: contactId,
+      userId,
+      ...buildCompanyScopeFilter(companyId)
+    });
   }
 
   if (!contact && phoneCandidates.length > 0) {
-    if (companyId) {
-      contact = await Contact.findOne({
-        userId,
-        companyId,
-        phone: { $in: phoneCandidates }
-      });
-    }
-
-    if (!contact) {
-      contact = await Contact.findOne({
-        userId,
-        ...buildCompanyFallbackFilter(companyId),
-        phone: { $in: phoneCandidates }
-      });
-    }
+    contact = await Contact.findOne({
+      userId,
+      ...buildCompanyScopeFilter(companyId),
+      phone: { $in: phoneCandidates }
+    });
   }
 
   if (contact) {
@@ -174,15 +151,11 @@ const resolveOrCreateConversationForTemplateSend = async ({
   });
 
   const phoneCandidates = buildPhoneCandidates(contact?.phone || to);
-  const companyFallbackFilter = buildCompanyFallbackFilter(companyId);
   const conversationMatchConditions = [
     { userId },
+    buildCompanyScopeFilter(companyId),
     contact?._id ? { $or: [{ contactId: contact._id }, { contactPhone: { $in: phoneCandidates } }] } : null
   ].filter(Boolean);
-
-  if (companyId) {
-    conversationMatchConditions.splice(1, 0, companyFallbackFilter);
-  }
 
   let conversation = await maybeApplySort(
     Conversation.findOne(

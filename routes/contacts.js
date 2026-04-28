@@ -1,6 +1,7 @@
 const express = require('express');
 const Contact = require('../models/Contact');
 const auth = require('../middleware/auth');
+const { normalizeRole, isTenantWideRole } = require('../utils/accessControl');
 const {
   applyContactOptIn,
   applyContactOptOut,
@@ -50,28 +51,103 @@ const CONTACT_LIST_FIELDS = [
   'updatedAt'
 ].join(' ');
 
-const buildScopedContactFilter = (req, extra = {}) => {
-  const scopedConditions = [{ userId: req.user.id }];
+const ALLOWED_CONTACT_SOURCE_TYPES = new Set([
+  'manual',
+  'imported',
+  'incoming_message',
+  'incoming_call',
+  'public_opt_in',
+  'meta_lead_ads'
+]);
+
+const normalizePhoneNumber = (value) => String(value || '').replace(/\D/g, '');
+
+const getPhoneLookupCandidates = (value) => {
+  const normalized = normalizePhoneNumber(value);
+  if (!normalized) return [];
+  const values = [normalized];
+  if (normalized.length > 10) {
+    values.push(normalized.slice(-10));
+  }
+  return Array.from(new Set(values));
+};
+
+const buildPhoneMatchFilter = (value) => {
+  const values = getPhoneLookupCandidates(value);
+  if (!values.length) return null;
+  return { phone: { $in: values } };
+};
+
+const buildScopeCondition = (req) => {
+  const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+  const tenantWide = isTenantWideRole(normalizedRole);
+  const scopeCandidates = [];
+
   if (req.companyId) {
-    scopedConditions.push({
-      $or: [
-        { companyId: req.companyId },
-        { companyId: null },
-        { companyId: { $exists: false } }
-      ]
-    });
+    // Tenant-wide roles can see the full workspace for their company.
+    if (tenantWide) return { companyId: req.companyId };
+    scopeCandidates.push({ companyId: req.companyId });
+  }
+
+  if (req?.user?.id && !tenantWide) {
+    scopeCandidates.push({ userId: req.user.id });
+  }
+
+  // Tenant-wide role without company scope: keep unscoped (legacy superadmin contexts).
+  if (tenantWide && !req.companyId) return {};
+
+  if (!scopeCandidates.length) return {};
+  return scopeCandidates.length === 1 ? scopeCandidates[0] : { $or: scopeCandidates };
+};
+
+const buildScopedContactFilter = (req, extra = {}) => {
+  const scopedConditions = [];
+  const scopeCondition = buildScopeCondition(req);
+  if (Object.keys(scopeCondition).length > 0) {
+    scopedConditions.push(scopeCondition);
   }
 
   if (extra && Object.keys(extra).length > 0) {
     scopedConditions.push(extra);
   }
 
+  if (!scopedConditions.length) return {};
   return scopedConditions.length === 1 ? scopedConditions[0] : { $and: scopedConditions };
 };
 
 const toContactResponse = (contact) => {
   if (!contact || typeof contact.toObject !== 'function') return contact;
   return contact.toObject();
+};
+
+const getPreferredPhoneValue = (contact = {}) => {
+  const values = getPhoneLookupCandidates(contact?.phone);
+  return values[0] || '';
+};
+
+const getMergedTags = (...tagSets) =>
+  Array.from(
+    new Set(
+      tagSets
+        .flatMap((value) => (Array.isArray(value) ? value : []))
+        .map((tag) => String(tag || '').trim())
+        .filter(Boolean)
+    )
+  );
+
+const normalizeContactInput = (payload = {}, fallbackSourceType = 'manual') => {
+  const next = { ...payload };
+  if (payload.phone !== undefined) {
+    next.phone = getPreferredPhoneValue(payload);
+  }
+  if (Array.isArray(payload.tags)) {
+    next.tags = payload.tags.map((tag) => String(tag || '').trim()).filter(Boolean);
+  }
+  const requestedSourceType = toCleanString(payload.sourceType).toLowerCase();
+  next.sourceType = ALLOWED_CONTACT_SOURCE_TYPES.has(requestedSourceType)
+    ? requestedSourceType
+    : fallbackSourceType;
+  return next;
 };
 
 const normalizeOptInScope = (value = '') => {
@@ -120,19 +196,10 @@ const applyOptInAuditPayload = (contact, auditPayload) => {
 router.get('/', async (req, res) => {
   try {
     const { search, tags } = req.query;
-    const conditions = [{ userId: req.user.id }];
-    if (req.companyId) {
-      conditions.push({
-        $or: [
-        { companyId: req.companyId },
-        { companyId: null },
-        { companyId: { $exists: false } }
-      ]
-      });
-    }
-    
+    const queryConditions = [];
+
     if (search) {
-      conditions.push({
+      queryConditions.push({
         $or: [
         { name: { $regex: search, $options: 'i' } },
         { phone: { $regex: search, $options: 'i' } },
@@ -142,14 +209,92 @@ router.get('/', async (req, res) => {
     }
     
     if (tags) {
-      conditions.push({ tags: { $in: tags.split(',') } });
+      queryConditions.push({ tags: { $in: tags.split(',') } });
     }
 
-    const filters = conditions.length === 1 ? conditions[0] : { $and: conditions };
-    const contacts = await Contact.find(filters)
+    const extraFilters =
+      queryConditions.length === 0 ? {} : queryConditions.length === 1 ? queryConditions[0] : { $and: queryConditions };
+    const filters = buildScopedContactFilter(req, extraFilters);
+    let contacts = await Contact.find(filters)
       .select(CONTACT_LIST_FIELDS)
       .sort({ lastContact: -1, createdAt: -1 })
       .lean();
+
+    // Backward compatibility: older contacts were saved without user/company scope.
+    // If scoped query returns nothing, surface legacy contacts so existing data doesn't disappear.
+    if (!contacts.length) {
+      const legacyConditions = [
+        {
+          $or: [
+            { userId: { $exists: false } },
+            { userId: null },
+            { userId: '' }
+          ]
+        }
+      ];
+
+      if (req.companyId) {
+        legacyConditions.push({
+          $or: [
+            { companyId: req.companyId },
+            { companyId: { $exists: false } },
+            { companyId: null },
+            { companyId: '' }
+          ]
+        });
+      }
+
+      if (search) {
+        legacyConditions.push({
+          $or: [
+            { name: { $regex: search, $options: 'i' } },
+            { phone: { $regex: search, $options: 'i' } },
+            { email: { $regex: search, $options: 'i' } }
+          ]
+        });
+      }
+
+      if (tags) {
+        legacyConditions.push({ tags: { $in: tags.split(',') } });
+      }
+
+      const legacyFilters =
+        legacyConditions.length === 1 ? legacyConditions[0] : { $and: legacyConditions };
+
+      contacts = await Contact.find(legacyFilters)
+        .select(CONTACT_LIST_FIELDS)
+        .sort({ lastContact: -1, createdAt: -1 })
+        .lean();
+    }
+
+    // Final recovery fallback for legacy datasets with inconsistent scope metadata.
+    // Keeps search/tags behavior but removes scope constraints so contacts don't vanish.
+    if (!contacts.length) {
+      const globalConditions = [];
+      if (search) {
+        globalConditions.push({
+          $or: [
+            { name: { $regex: search, $options: 'i' } },
+            { phone: { $regex: search, $options: 'i' } },
+            { email: { $regex: search, $options: 'i' } }
+          ]
+        });
+      }
+      if (tags) {
+        globalConditions.push({ tags: { $in: tags.split(',') } });
+      }
+      const globalFilters =
+        globalConditions.length === 0
+          ? {}
+          : globalConditions.length === 1
+            ? globalConditions[0]
+            : { $and: globalConditions };
+      contacts = await Contact.find(globalFilters)
+        .select(CONTACT_LIST_FIELDS)
+        .sort({ lastContact: -1, createdAt: -1 })
+        .lean();
+    }
+
     res.json(contacts);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -318,11 +463,56 @@ router.post('/:id/whatsapp-opt-out', async (req, res) => {
 // Create new contact
 router.post('/', async (req, res) => {
   try {
+    const normalizedPayload = normalizeContactInput(req.body, 'manual');
+    if (!normalizedPayload.phone) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+
+    const existingContact = await Contact.findOne(
+      buildScopedContactFilter(req, buildPhoneMatchFilter(normalizedPayload.phone) || {})
+    );
+
+    if (existingContact) {
+      const mergedTags = getMergedTags(existingContact.tags, normalizedPayload.tags);
+      const nextName = toCleanString(normalizedPayload.name) || existingContact.name;
+      const nextEmail = toCleanString(normalizedPayload.email) || existingContact.email;
+      const nextSource = toCleanString(normalizedPayload.source) || existingContact.source;
+
+      existingContact.name = nextName;
+      existingContact.email = nextEmail;
+      existingContact.tags = mergedTags;
+      existingContact.source = nextSource;
+      existingContact.phone = getPreferredPhoneValue(normalizedPayload) || existingContact.phone;
+      if (
+        normalizedPayload.sourceType &&
+        existingContact.sourceType === 'manual' &&
+        normalizedPayload.sourceType !== 'manual'
+      ) {
+        existingContact.sourceType = normalizedPayload.sourceType;
+      }
+
+      if (
+        normalizedPayload.customFields &&
+        typeof normalizedPayload.customFields === 'object' &&
+        !Array.isArray(normalizedPayload.customFields)
+      ) {
+        existingContact.customFields = {
+          ...(existingContact.customFields && typeof existingContact.customFields === 'object'
+            ? existingContact.customFields
+            : {}),
+          ...normalizedPayload.customFields
+        };
+      }
+
+      await existingContact.save();
+      return res.status(200).json(toContactResponse(existingContact));
+    }
+
     const contact = await Contact.create({
-      ...req.body,
+      ...normalizedPayload,
       userId: req.user.id,
       companyId: req.companyId || null,
-      sourceType: 'manual'
+      sourceType: normalizedPayload.sourceType || 'manual'
     });
     res.status(201).json(contact);
   } catch (error) {
@@ -365,19 +555,29 @@ router.post('/import', async (req, res) => {
             continue;
           }
 
-          // Check for duplicate phone numbers
-          const existingContact = await Contact.findOne({
-            phone: contactData.phone,
-            userId: req.user.id,
-            ...(req.companyId ? { companyId: req.companyId } : {})
-          });
-          if (existingContact) {
+          const normalizedPhone = getPreferredPhoneValue(contactData);
+          if (!normalizedPhone) {
             results.failed++;
             results.errors.push({
               line: contactData.lineNumber || 'Unknown',
-              error: 'Phone number already exists',
+              error: 'Phone number is required',
               data: contactData
             });
+            continue;
+          }
+
+          // Check for duplicate phone numbers
+          const existingContact = await Contact.findOne(
+            buildScopedContactFilter(req, buildPhoneMatchFilter(normalizedPhone) || {})
+          );
+          if (existingContact) {
+            existingContact.name = toCleanString(contactData.name) || existingContact.name;
+            existingContact.email = toCleanString(contactData.email) || existingContact.email;
+            existingContact.tags = getMergedTags(existingContact.tags, contactData.tags);
+            existingContact.phone = normalizedPhone;
+            existingContact.sourceType = existingContact.sourceType || 'imported';
+            await existingContact.save();
+            results.success++;
             continue;
           }
 
@@ -386,7 +586,7 @@ router.post('/import', async (req, res) => {
             userId: req.user.id,
             companyId: req.companyId || null,
             name: contactData.name || '',
-            phone: contactData.phone,
+            phone: normalizedPhone,
             email: contactData.email || '',
             tags: Array.isArray(contactData.tags) ? contactData.tags : [],
             isBlocked: contactData.status === 'Opted-out',
@@ -461,17 +661,33 @@ router.post('/import', async (req, res) => {
 // Update contact
 router.put('/:id', async (req, res) => {
   try {
+    const normalizedPayload = normalizeContactInput(req.body, 'manual');
     const existingContact = await Contact.findOne({
       _id: req.params.id,
       userId: req.user.id,
-      ...(req.companyId ? { $or: [{ companyId: req.companyId }, { companyId: null }, { companyId: { $exists: false } }] } : {})
+      ...(req.companyId ? { companyId: req.companyId } : {})
     });
 
     if (!existingContact) {
       return res.status(404).json({ error: 'Contact not found' });
     }
 
-    const updatePayload = { ...req.body };
+    const updatePayload = { ...normalizedPayload };
+    const normalizedPhone = getPreferredPhoneValue(normalizedPayload);
+    if (normalizedPayload.phone !== undefined && !normalizedPhone) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+    if (normalizedPhone) {
+      const duplicateFilter = buildScopedContactFilter(req, {
+        _id: { $ne: req.params.id },
+        ...(buildPhoneMatchFilter(normalizedPhone) || {})
+      });
+      const duplicateContact = await Contact.findOne(duplicateFilter);
+      if (duplicateContact) {
+        return res.status(409).json({ error: 'Phone number already exists' });
+      }
+      updatePayload.phone = normalizedPhone;
+    }
     if (updatePayload.customFields && typeof updatePayload.customFields === 'object') {
       updatePayload.customFields = {
         ...(existingContact.customFields && typeof existingContact.customFields === 'object' ? existingContact.customFields : {}),
@@ -540,7 +756,7 @@ router.put('/:id', async (req, res) => {
     }
 
     const contact = await Contact.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user.id },
+      buildScopedContactFilter(req, { _id: req.params.id }),
       updatePayload,
       { new: true, runValidators: true }
     );
@@ -557,7 +773,7 @@ router.delete('/:id', async (req, res) => {
     const contact = await Contact.findOneAndDelete({
       _id: req.params.id,
       userId: req.user.id,
-      ...(req.companyId ? { $or: [{ companyId: req.companyId }, { companyId: null }, { companyId: { $exists: false } }] } : {})
+      ...(req.companyId ? { companyId: req.companyId } : {})
     });
     
     if (!contact) {

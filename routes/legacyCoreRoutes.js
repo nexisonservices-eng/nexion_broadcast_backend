@@ -23,6 +23,7 @@ const registerLegacyCoreRoutes = (app, deps) => {
 
   const normalizePhoneDigits = (value = '') => String(value || '').replace(/\D/g, '');
   const isValidObjectId = (value = '') => /^[a-f\d]{24}$/i.test(String(value || '').trim());
+  const buildCompanyScopeFilter = (companyId) => (companyId ? { companyId } : {});
 
   const resolveReplyReferenceForOutboundSend = async ({
     userId,
@@ -33,31 +34,23 @@ const registerLegacyCoreRoutes = (app, deps) => {
     const normalizedReplyToMessageId = String(replyToMessageId || '').trim();
     if (normalizedReplyToMessageId && isValidObjectId(normalizedReplyToMessageId)) {
       const baseIdFilter = { _id: normalizedReplyToMessageId, userId };
-      if (companyId) {
-        const strictReply = await Message.findOne({ ...baseIdFilter, companyId })
-          .select('_id whatsappMessageId')
-          .lean();
-        if (strictReply) return strictReply;
-      }
-
-      const byUserOnlyReply = await Message.findOne(baseIdFilter)
+      const byScopeReply = await Message.findOne({
+        ...baseIdFilter,
+        ...buildCompanyScopeFilter(companyId)
+      })
         .select('_id whatsappMessageId')
         .lean();
-      if (byUserOnlyReply) return byUserOnlyReply;
+      if (byScopeReply) return byScopeReply;
     }
 
     const normalizedContextId = String(whatsappContextMessageId || '').trim();
     if (!normalizedContextId) return null;
 
     const baseContextFilter = { userId, whatsappMessageId: normalizedContextId };
-    if (companyId) {
-      const strictContextReply = await Message.findOne({ ...baseContextFilter, companyId })
-        .select('_id whatsappMessageId')
-        .lean();
-      if (strictContextReply) return strictContextReply;
-    }
-
-    return Message.findOne(baseContextFilter)
+    return Message.findOne({
+      ...baseContextFilter,
+      ...buildCompanyScopeFilter(companyId)
+    })
       .select('_id whatsappMessageId')
       .lean();
   };
@@ -67,14 +60,11 @@ const registerLegacyCoreRoutes = (app, deps) => {
     if (!userId || !conversationId) return null;
 
     const baseIdQuery = { _id: conversationId, userId };
-
-    if (req.companyId) {
-      const strict = await Conversation.findOne({ ...baseIdQuery, companyId: req.companyId });
-      if (strict) return strict;
-    }
-
-    const byUserOnly = await Conversation.findOne(baseIdQuery);
-    if (byUserOnly) return byUserOnly;
+    const byScopeConversation = await Conversation.findOne({
+      ...baseIdQuery,
+      ...buildCompanyScopeFilter(req.companyId)
+    });
+    if (byScopeConversation) return byScopeConversation;
 
     const normalizedPhone = normalizePhoneDigits(to);
     if (!normalizedPhone) return null;
@@ -90,13 +80,9 @@ const registerLegacyCoreRoutes = (app, deps) => {
       )
     );
 
-    const companyFallbackFilter = req.companyId
-      ? { $or: [{ companyId: req.companyId }, { companyId: null }, { companyId: { $exists: false } }] }
-      : {};
-
     return Conversation.findOne({
       userId,
-      ...companyFallbackFilter,
+      ...buildCompanyScopeFilter(req.companyId),
       contactPhone: { $in: phoneCandidates }
     }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
   };
@@ -105,23 +91,11 @@ const registerLegacyCoreRoutes = (app, deps) => {
     if (!conversation?._id || !userId) return null;
 
     if (conversation.contactId) {
-      const contactById =
-        (companyId
-          ? await Contact.findOne({ _id: conversation.contactId, userId, companyId })
-          : null) ||
-        (await Contact.findOne({
-          _id: conversation.contactId,
-          userId,
-          ...(companyId
-            ? {
-                $or: [
-                  { companyId },
-                  { companyId: null },
-                  { companyId: { $exists: false } }
-                ]
-              }
-            : {})
-        }));
+      const contactById = await Contact.findOne({
+        _id: conversation.contactId,
+        userId,
+        ...buildCompanyScopeFilter(companyId)
+      });
 
       if (contactById) return contactById;
     }
@@ -142,15 +116,7 @@ const registerLegacyCoreRoutes = (app, deps) => {
 
     return Contact.findOne({
       userId,
-      ...(companyId
-        ? {
-            $or: [
-              { companyId },
-              { companyId: null },
-              { companyId: { $exists: false } }
-            ]
-          }
-        : {}),
+      ...buildCompanyScopeFilter(companyId),
       phone: { $in: phoneCandidates }
     });
   };

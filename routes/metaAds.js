@@ -46,8 +46,33 @@ const getBackendOrigin = (req) =>
   normalizeOrigin(process.env.PUBLIC_BACKEND_URL) || `${req.protocol}://${req.get('host')}`;
 const getCallbackUrl = (req) => `${getBackendOrigin(req)}/api/meta-ads/oauth/callback`;
 const getForcedRedirectUri = () => normalizeOrigin(process.env.META_OAUTH_REDIRECT_URI);
-const getResolvedRedirectUri = (req, metaConfig = null) =>
-  getForcedRedirectUri() || normalizeOrigin(metaConfig?.redirectUri) || getCallbackUrl(req);
+const getUrlOrigin = (value) => {
+  try {
+    return new URL(normalizeOrigin(value)).origin;
+  } catch {
+    return '';
+  }
+};
+const getResolvedRedirectUri = (req, metaConfig = null) => {
+  const forcedRedirectUri = getForcedRedirectUri();
+  if (forcedRedirectUri) return forcedRedirectUri;
+
+  const callbackUrl = getCallbackUrl(req);
+  const configuredRedirect = normalizeOrigin(metaConfig?.redirectUri);
+  if (!configuredRedirect) return callbackUrl;
+
+  const allowExternalRedirect =
+    String(process.env.META_OAUTH_ALLOW_EXTERNAL_REDIRECT || '').trim().toLowerCase() === 'true';
+  if (allowExternalRedirect) return configuredRedirect;
+
+  const configuredOrigin = getUrlOrigin(configuredRedirect);
+  const backendOrigin = getUrlOrigin(getBackendOrigin(req));
+  if (configuredOrigin && backendOrigin && configuredOrigin === backendOrigin) {
+    return configuredRedirect;
+  }
+
+  return callbackUrl;
+};
 const resolveMetaOAuthConfig = (metaConfig = null) => ({
   appId: String(metaConfig?.appId || process.env.META_APP_ID || '').trim(),
   appSecret: String(metaConfig?.appSecret || process.env.META_APP_SECRET || '').trim(),
@@ -108,6 +133,7 @@ const setCachedOAuthConfig = (state, metaConfig) => {
   const cacheKey = String(state || '').trim();
   if (!cacheKey || !metaConfig?.appId || !metaConfig?.appSecret) return;
 
+  
   oauthStateConfigCache.set(cacheKey, {
     metaConfig,
     expiresAt: Date.now() + OAUTH_STATE_CACHE_TTL_MS
@@ -261,6 +287,19 @@ router.get('/diagnostics', auth, async (req, res) => {
     res.json({ success: true, diagnostics });
   } catch (error) {
     res.status(500).json({
+      success: false,
+      error: error.message,
+      details: error.details || null
+    });
+  }
+});
+
+router.get('/billing-summary', auth, async (req, res) => {
+  try {
+    const billing = await metaAdsService.getAdAccountBillingSummary({ userId: req.user.id });
+    res.json({ success: true, billing });
+  } catch (error) {
+    res.status(error.status || 500).json({
       success: false,
       error: error.message,
       details: error.details || null
@@ -614,6 +653,11 @@ router.get('/leads/:leadId/preview', auth, async (req, res) => {
 
 router.post('/leads/sync-consent', auth, async (req, res) => {
   try {
+    const companyId = String(req.companyId || '').trim();
+    if (!companyId) {
+      return res.status(400).json({ success: false, error: 'companyId is required.' });
+    }
+
     const leadId = String(req.body?.leadId || '').trim();
     if (!leadId) {
       return res.status(400).json({ success: false, error: 'leadId is required.' });
@@ -642,7 +686,7 @@ router.post('/leads/sync-consent', auth, async (req, res) => {
     const result = await syncMetaLeadConsent({
       userId: req.user.id,
       leadId,
-      companyId: req.companyId || req.body?.companyId || null,
+      companyId,
       mapping,
       capturedBy: req.user?.email || req.user?.name || req.user?.id || 'meta_lead_sync'
     });
@@ -666,6 +710,11 @@ router.post('/leads/sync-consent', auth, async (req, res) => {
 
 router.post('/leads/sync-consent/batch', auth, async (req, res) => {
   try {
+    const companyId = String(req.companyId || '').trim();
+    if (!companyId) {
+      return res.status(400).json({ success: false, error: 'companyId is required.' });
+    }
+
     const rawLeadIds = Array.isArray(req.body?.leadIds) ? req.body.leadIds : [];
     const leadIds = Array.from(
       new Set(
@@ -701,7 +750,6 @@ router.post('/leads/sync-consent/batch', auth, async (req, res) => {
 
     const syncResults = [];
     const syncedContacts = [];
-    const companyId = req.companyId || req.body?.companyId || null;
     const capturedBy = req.user?.email || req.user?.name || req.user?.id || 'meta_lead_sync_batch';
 
     for (const leadId of leadIds) {

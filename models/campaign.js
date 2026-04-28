@@ -2,6 +2,12 @@
 const mongoose = require('mongoose');
 
 const campaignSchema = new mongoose.Schema({
+    companyId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'company',
+        required: [true, 'companyId is required for campaign records'],
+        index: true
+    },
     name: {
         type: String,
         required: [true, 'Campaign name is required'],
@@ -133,6 +139,86 @@ const campaignSchema = new mongoose.Schema({
         type: String,
         trim: true,
         maxlength: [500, 'Targeting description cannot exceed 500 characters']
+    },
+    audience: {
+        segmentId: {
+            type: String,
+            trim: true,
+            default: ''
+        },
+        segmentSnapshotAt: {
+            type: Date,
+            default: null
+        },
+        customFilters: {
+            type: mongoose.Schema.Types.Mixed,
+            default: {}
+        }
+    },
+    deliveryPolicy: {
+        quietHours: {
+            enabled: { type: Boolean, default: false },
+            startHour: { type: Number, min: 0, max: 23, default: 21 },
+            endHour: { type: Number, min: 0, max: 23, default: 7 },
+            timezone: { type: String, trim: true, default: 'Asia/Kolkata' },
+            action: {
+                type: String,
+                enum: ['delay', 'skip'],
+                default: 'delay'
+            }
+        },
+        sendWindow: {
+            type: String,
+            trim: true,
+            default: ''
+        }
+    },
+    retryPolicy: {
+        enabled: { type: Boolean, default: false },
+        maxAttempts: { type: Number, min: 0, max: 10, default: 3 },
+        backoffSeconds: { type: Number, min: 0, max: 3600, default: 30 },
+        retryOnFailureCodes: {
+            type: [String],
+            default: []
+        }
+    },
+    compliancePolicy: {
+        respectOptOut: { type: Boolean, default: true },
+        suppressionListPhones: {
+            type: [String],
+            default: []
+        },
+        legalBasis: {
+            type: String,
+            trim: true,
+            default: ''
+        },
+        retentionDays: {
+            type: Number,
+            min: 1,
+            max: 3650,
+            default: null
+        }
+    },
+    analytics: {
+        segmentRoi: {
+            type: mongoose.Schema.Types.Mixed,
+            default: {}
+        },
+        ownerPerformance: {
+            type: mongoose.Schema.Types.Mixed,
+            default: {}
+        },
+        latencyMsP50: {
+            type: Number,
+            min: 0,
+            default: 0
+        },
+        latencyMsP95: {
+            type: Number,
+            min: 0,
+            default: 0
+        }
     },
     // Performance metrics
     spent: {
@@ -286,9 +372,9 @@ const campaignSchema = new mongoose.Schema({
 });
 
 // Indexes for better query performance
-campaignSchema.index({ status: 1, platform: 1 });
+campaignSchema.index({ companyId: 1, status: 1, platform: 1 });
 campaignSchema.index({ lifecycleStatus: 1, paymentStatus: 1, reviewStatus: 1, deliveryStatus: 1 });
-campaignSchema.index({ createdBy: 1 });
+campaignSchema.index({ companyId: 1, createdBy: 1 });
 campaignSchema.index({ startDate: 1, endDate: 1 });
 campaignSchema.index({ name: 'text', objective: 'text' });
 

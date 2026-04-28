@@ -756,6 +756,62 @@ const getConnectionDiagnostics = async ({ userId } = {}) => {
   return diagnostics;
 };
 
+const getAdAccountBillingSummary = async ({ userId } = {}) => {
+  const accessContext = await ensureConnectedMetaUser(userId, 'Meta billing');
+  const selectedAdAccountId = toCanonicalAdAccountId(accessContext?.connection?.selectedAdAccountId || '');
+
+  if (!selectedAdAccountId) {
+    throw buildStageErrorWithDetails(
+      'Meta billing',
+      'No Meta ad account selected for this user.',
+      { userId: userId || '' },
+      400
+    );
+  }
+
+  const adAccount = await graphRequest({
+    path: buildAdAccountPath(selectedAdAccountId),
+    params: {
+      fields:
+        'id,name,account_status,currency,amount_spent,balance,spend_cap,funding_source_details,business,owner'
+    },
+    accessToken: accessContext.accessToken
+  });
+
+  const normalizedCurrency = String(adAccount?.currency || 'INR').trim() || 'INR';
+  const parseMoney = (value) => {
+    const amount = Number(value);
+    return Number.isFinite(amount) ? amount : null;
+  };
+
+  return {
+    adAccount: {
+      id: String(adAccount?.id || selectedAdAccountId),
+      name: String(adAccount?.name || ''),
+      currency: normalizedCurrency,
+      accountStatus: adAccount?.account_status ?? null,
+      ownerName: String(adAccount?.owner?.name || ''),
+      businessName: String(adAccount?.business?.name || '')
+    },
+    billing: {
+      amountSpent: parseMoney(adAccount?.amount_spent),
+      currentBalance: parseMoney(adAccount?.balance),
+      spendCap: parseMoney(adAccount?.spend_cap),
+      fundingSourceType: String(adAccount?.funding_source_details?.type || ''),
+      fundingSourceDisplay: String(
+        adAccount?.funding_source_details?.display_string ||
+          adAccount?.funding_source_details?.id ||
+          ''
+      )
+    },
+    meta: {
+      source: 'meta-graph',
+      note:
+        'Depending on your Meta billing model, currentBalance may represent billed balance or may be unavailable.'
+    }
+  };
+};
+
 const exchangeCodeForAccessToken = async ({ code, redirectUri, appId, appSecret, apiVersion }) =>
   metaAuthService.exchangeCodeForAccessToken({ code, redirectUri, appId, appSecret, apiVersion });
 
@@ -2707,6 +2763,7 @@ module.exports = {
   getUserAdAccounts,
   getSetupBundle,
   getConnectionDiagnostics,
+  getAdAccountBillingSummary,
   exchangeCodeForAccessToken,
   getLoginDialogUrl,
   saveUserConnection,

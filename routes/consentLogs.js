@@ -10,6 +10,18 @@ const { logConsentEvent } = require('../services/whatsappConsentLogService');
 const router = express.Router();
 router.use(auth);
 
+const isSuperAdminRole = (role = '') => {
+  const normalizedRole = String(role || '').trim().toLowerCase();
+  return normalizedRole === 'super_admin' || normalizedRole === 'superadmin';
+};
+
+const ensureTenantCompanyId = (req, res) => {
+  if (isSuperAdminRole(req.user?.role)) return true;
+  if (toCleanString(req.companyId)) return true;
+  res.status(400).json({ success: false, error: 'companyId is required for tenant-scoped requests.' });
+  return false;
+};
+
 const buildConsentFilters = (req) => {
   const filters = {};
   const requestedUserId = toCleanString(req.query?.userId);
@@ -20,14 +32,12 @@ const buildConsentFilters = (req) => {
   const endDate = toCleanString(req.query?.endDate);
   const includeArchived = String(req.query?.includeArchived || '').toLowerCase() === 'true';
 
-  if (req.user?.role === 'super_admin') {
+  if (isSuperAdminRole(req.user?.role)) {
     if (requestedUserId) filters.userId = requestedUserId;
     if (requestedCompanyId) filters.companyId = requestedCompanyId;
   } else {
     filters.userId = req.user.id;
-    if (req.companyId) {
-      filters.companyId = req.companyId;
-    }
+    filters.companyId = req.companyId;
   }
 
   if (requestedPhone) {
@@ -88,6 +98,7 @@ const setExportCooldown = (req) => {
 
 router.get('/', async (req, res) => {
   try {
+    if (!ensureTenantCompanyId(req, res)) return;
     const page = Math.max(1, Number(req.query?.page || 1));
     const limit = Math.min(100, Math.max(10, Number(req.query?.limit || 20)));
     const skip = (page - 1) * limit;
@@ -118,6 +129,7 @@ router.get('/', async (req, res) => {
 
 router.get('/export', async (req, res) => {
   try {
+    if (!ensureTenantCompanyId(req, res)) return;
     if (hasExportCooldown(req)) {
       return res.status(429).json({ success: false, error: 'Export rate limited. Try again shortly.' });
     }
@@ -138,23 +150,20 @@ router.get('/export', async (req, res) => {
 
 router.post('/force-opt-out', async (req, res) => {
   try {
+    if (!ensureTenantCompanyId(req, res)) return;
     const contactId = toCleanString(req.body?.contactId);
     if (!contactId) {
       return res.status(400).json({ success: false, error: 'contactId is required.' });
     }
 
-    const isSuperAdmin = req.user?.role === 'super_admin';
+    const isSuperAdmin = isSuperAdminRole(req.user?.role);
     const contact = await Contact.findOne(
       isSuperAdmin
         ? { _id: contactId }
         : {
             _id: contactId,
             userId: req.user.id,
-            ...(req.companyId
-              ? {
-                  $or: [{ companyId: req.companyId }, { companyId: null }, { companyId: { $exists: false } }]
-                }
-              : {})
+            companyId: req.companyId
           }
     );
 
@@ -197,6 +206,7 @@ router.post('/force-opt-out', async (req, res) => {
 
 router.post('/export-email', async (req, res) => {
   try {
+    if (!ensureTenantCompanyId(req, res)) return;
     const email = toCleanString(req.body?.email);
     if (!email) {
       return res.status(400).json({ success: false, error: 'email is required.' });
@@ -205,7 +215,7 @@ router.post('/export-email', async (req, res) => {
     const filters = buildConsentFilters(req);
     const job = await ConsentExportJob.create({
       userId: req.user?.id || null,
-      companyId: req.companyId || null,
+      companyId: req.companyId,
       requestedBy: req.user?.email || req.user?.id || 'unknown',
       email,
       filters,
@@ -226,8 +236,9 @@ router.post('/export-email', async (req, res) => {
 
 router.get('/export-jobs', async (req, res) => {
   try {
+    if (!ensureTenantCompanyId(req, res)) return;
     const filters = {};
-    if (req.user?.role === 'super_admin') {
+    if (isSuperAdminRole(req.user?.role)) {
       if (req.query?.userId) filters.userId = toCleanString(req.query.userId);
       if (req.query?.companyId) filters.companyId = toCleanString(req.query.companyId);
     } else {
@@ -248,12 +259,13 @@ router.get('/export-jobs', async (req, res) => {
 
 router.get('/export-jobs/:id/download', async (req, res) => {
   try {
+    if (!ensureTenantCompanyId(req, res)) return;
     const jobId = toCleanString(req.params.id);
     if (!jobId) {
       return res.status(400).json({ success: false, error: 'Job id is required.' });
     }
 
-    const isSuperAdmin = req.user?.role === 'super_admin';
+    const isSuperAdmin = isSuperAdminRole(req.user?.role);
     const job = await ConsentExportJob.findOne(
       isSuperAdmin
         ? { _id: jobId }

@@ -1,4 +1,8 @@
+const fs = require('fs');
+const path = require('path');
+const dotenv = require('dotenv');
 const express = require('express');
+const mongoose = require('mongoose');
 const Contact = require('../models/Contact');
 const {
   applyContactOptIn,
@@ -8,6 +12,13 @@ const { normalizePhoneDigits } = require('../services/whatsappOutreach/conversat
 const { logConsentEvent } = require('../services/whatsappConsentLogService');
 
 const router = express.Router();
+const publicOptInRateWindowMs = Math.max(
+  Number(process.env.PUBLIC_OPTIN_RATE_WINDOW_MS || 60_000),
+  10_000
+);
+const publicOptInRateLimit = Math.max(Number(process.env.PUBLIC_OPTIN_RATE_LIMIT || 30), 5);
+const publicOptInRateState = new Map();
+const envFilePath = path.resolve(__dirname, '..', '.env');
 
 const normalizeScope = (value = '') => {
   const normalized = toCleanString(value).toLowerCase();
@@ -21,6 +32,99 @@ const getRequestIp = (req) =>
       req.ip ||
       req.socket?.remoteAddress
   );
+
+const getRequestOrigin = (req) =>
+  toCleanString(req.headers.origin || req.headers.referer);
+
+const getRequestHost = (req) =>
+  toCleanString(req.headers.host || req.hostname);
+
+const isLocalDevOrigin = (value = '') => {
+  try {
+    const parsed = new URL(String(value || '').trim());
+    return /^(localhost|127\.0\.0\.1)$/i.test(parsed.hostname);
+  } catch {
+    return false;
+  }
+};
+
+const isLocalHostValue = (value = '') =>
+  /(^|:\/\/)(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(String(value || '').trim());
+
+const isValidObjectId = (value = '') => mongoose.Types.ObjectId.isValid(String(value || '').trim());
+
+const getRateLimitKey = (req) => {
+  const ip = getRequestIp(req) || 'unknown-ip';
+  const userId = toCleanString(req.body?.userId) || 'unknown-user';
+  return `${ip}::${userId}`;
+};
+
+const isRateLimited = (req) => {
+  const key = getRateLimitKey(req);
+  const now = Date.now();
+  const state = publicOptInRateState.get(key);
+
+  if (!state || now > state.resetAt) {
+    publicOptInRateState.set(key, { count: 1, resetAt: now + publicOptInRateWindowMs });
+    return false;
+  }
+
+  if (state.count >= publicOptInRateLimit) {
+    return true;
+  }
+
+  state.count += 1;
+  publicOptInRateState.set(key, state);
+  return false;
+};
+
+const splitCandidateKeys = (value = '') =>
+  String(value || '')
+    .split(',')
+    .map((item) => toCleanString(item))
+    .filter(Boolean);
+
+const readEnvFilePublicKeys = () => {
+  try {
+    if (!fs.existsSync(envFilePath)) return [];
+    const parsed = dotenv.parse(fs.readFileSync(envFilePath));
+    return splitCandidateKeys(parsed.WHATSAPP_OPTIN_PUBLIC_KEY);
+  } catch {
+    return [];
+  }
+};
+
+const getConfiguredPublicKeys = () => {
+  const keys = new Set([
+    ...splitCandidateKeys(process.env.WHATSAPP_OPTIN_PUBLIC_KEY),
+    ...readEnvFilePublicKeys()
+  ]);
+
+  return Array.from(keys);
+};
+
+const shouldAllowLocalDevOptIn = (req, configuredPublicKeys, requestPublicKey) => {
+  if (String(process.env.NODE_ENV || '').trim().toLowerCase() === 'production') {
+    return false;
+  }
+
+  if (!configuredPublicKeys.length) return false;
+
+  const origin = getRequestOrigin(req);
+  const referer = toCleanString(req.headers.referer);
+  const localRequest =
+    isLocalDevOrigin(origin) ||
+    isLocalHostValue(origin) ||
+    isLocalHostValue(referer);
+
+  if (!localRequest) return false;
+
+  const userId = toCleanString(req.body?.userId);
+  const phone = normalizePhoneDigits(req.body?.phone);
+  if (!userId || !phone) return false;
+
+  return !requestPublicKey || !configuredPublicKeys.includes(requestPublicKey);
+};
 
 const buildPublicOptInPayload = (req) => {
   const body = req.body || {};
@@ -58,8 +162,15 @@ const buildPublicOptInPayload = (req) => {
 
 router.post('/whatsapp-opt-in', async (req, res) => {
   try {
-    const configuredPublicKey = toCleanString(process.env.WHATSAPP_OPTIN_PUBLIC_KEY);
-    if (!configuredPublicKey) {
+    if (isRateLimited(req)) {
+      return res.status(429).json({
+        success: false,
+        error: 'Too many opt-in requests. Please retry in a minute.'
+      });
+    }
+
+    const configuredPublicKeys = getConfiguredPublicKeys();
+    if (!configuredPublicKeys.length) {
       return res.status(503).json({
         success: false,
         error: 'Public WhatsApp opt-in is not configured on this server.'
@@ -69,7 +180,10 @@ router.post('/whatsapp-opt-in', async (req, res) => {
     const requestPublicKey = toCleanString(
       req.headers['x-opt-in-public-key'] || req.body?.publicKey
     );
-    if (!requestPublicKey || requestPublicKey !== configuredPublicKey) {
+    const isValidRequestKey =
+      requestPublicKey && configuredPublicKeys.includes(requestPublicKey);
+
+    if (!isValidRequestKey && !shouldAllowLocalDevOptIn(req, configuredPublicKeys, requestPublicKey)) {
       return res.status(401).json({
         success: false,
         error: 'Invalid public opt-in key.'
@@ -83,6 +197,20 @@ router.post('/whatsapp-opt-in', async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'userId is required for public opt-in.'
+      });
+    }
+
+    if (!isValidObjectId(payload.userId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'userId must be a valid Mongo ObjectId for public opt-in.'
+      });
+    }
+
+    if (payload.companyId && !isValidObjectId(payload.companyId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'companyId must be a valid Mongo ObjectId when provided.'
       });
     }
 

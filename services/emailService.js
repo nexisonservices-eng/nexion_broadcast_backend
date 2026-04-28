@@ -5,6 +5,13 @@ const toCleanString = (value = '') => String(value || '').trim();
 const isEmailEnabled = () =>
   String(process.env.CONSENT_EXPORT_EMAIL_ENABLED || '').toLowerCase() === 'true';
 
+const isSmtpConfigured = () =>
+  Boolean(
+    toCleanString(process.env.SMTP_HOST) &&
+      toCleanString(process.env.SMTP_USER) &&
+      toCleanString(process.env.SMTP_PASS)
+  );
+
 const buildTransport = () => {
   const host = toCleanString(process.env.SMTP_HOST);
   const port = Number(process.env.SMTP_PORT || 587);
@@ -57,7 +64,31 @@ const sendConsentExportEmail = async ({ to, subject, text, csvBuffer, fileName }
   });
 };
 
+const sendAppEmail = async ({ to, subject, text, html }) => {
+  const transport = buildTransport();
+  if (!transport) {
+    const error = new Error('SMTP transport is not configured.');
+    error.code = 'SMTP_NOT_CONFIGURED';
+    throw error;
+  }
+
+  const from =
+    toCleanString(process.env.SMTP_FROM) ||
+    toCleanString(process.env.CONSENT_EXPORT_EMAIL_FROM) ||
+    toCleanString(process.env.SMTP_USER);
+
+  await transport.sendMail({
+    from,
+    to,
+    subject,
+    text,
+    html
+  });
+};
+
 module.exports = {
   sendConsentExportEmail,
-  isEmailEnabled
+  isEmailEnabled,
+  isSmtpConfigured,
+  sendAppEmail
 };

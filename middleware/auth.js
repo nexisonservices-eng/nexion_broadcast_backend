@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const { fetchUserContext } = require('../services/adminAuthService');
 const { requireJwtSecret } = require('../utils/securityConfig');
+const { normalizeRole } = require('../utils/accessControl');
 
 module.exports = (req, res, next) => {
   const run = async () => {
@@ -33,6 +34,12 @@ module.exports = (req, res, next) => {
           };
           req.companyId = context.companyId || null;
           req.planFeatures = context.featureFlags || {};
+          req.user.normalizedRole = normalizeRole(req.user.companyRole || req.user.role);
+          req.authContext = {
+            tenant: req.companyId || null,
+            role: req.user.normalizedRole,
+            feature: req.planFeatures || {}
+          };
           return next();
         }
       } catch (error) {
@@ -60,6 +67,12 @@ module.exports = (req, res, next) => {
       };
       req.companyId = decoded.companyId || null;
       req.planFeatures = decoded.featureFlags || {};
+      req.user.normalizedRole = normalizeRole(req.user.companyRole || req.user.role);
+      req.authContext = {
+        tenant: req.companyId || null,
+        role: req.user.normalizedRole,
+        feature: req.planFeatures || {}
+      };
 
       if (!req.user.id && !req.user.email) {
         return res.status(401).json({ success: false, error: 'Unauthorized: invalid token payload' });
