@@ -31,6 +31,15 @@ const ADMIN_API_BASE_URLS = [
 const ADMIN_INTERNAL_API_KEY = process.env.ADMIN_INTERNAL_API_KEY || '';
 
 class BroadcastService {
+  emitBroadcastRealtimeEvent(broadcaster, payload) {
+    if (typeof broadcaster !== 'function') return;
+    try {
+      broadcaster(payload);
+    } catch (error) {
+      console.error('Broadcast realtime emit failed:', error?.message || error);
+    }
+  }
+
   async logBroadcastContactActivity({
     broadcast,
     contact,
@@ -763,7 +772,7 @@ class BroadcastService {
       errorMessage: raw
     };
   }
-  async createBroadcast(broadcastData) {
+  async createBroadcast(broadcastData, broadcaster = null) {
     try {
       broadcastData = this.normalizeBroadcastPolicies(broadcastData || {});
       // If scheduledAt is provided, set status to 'scheduled'
@@ -794,6 +803,10 @@ class BroadcastService {
       
       const broadcast = await Broadcast.create(broadcastData);
       console.log('✅ Created broadcast with scheduledAt:', broadcast.scheduledAt);
+      this.emitBroadcastRealtimeEvent(broadcaster, {
+        type: 'broadcast_created',
+        broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
+      });
       return { success: true, data: broadcast };
     } catch (error) {
       console.error('❌ Error creating broadcast:', error);
@@ -823,6 +836,11 @@ class BroadcastService {
             deferred: Number(broadcast?.analytics?.deferred || 0) + 1
           };
           await broadcast.save();
+          this.emitBroadcastRealtimeEvent(broadcaster, {
+            type: 'broadcast_updated',
+            action: 'deferred',
+            broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
+          });
           return {
             success: true,
             data: {
@@ -845,6 +863,11 @@ class BroadcastService {
               Number(broadcast?.analytics?.skippedQuietHours || 0) + skippedRecipients
           };
           await broadcast.save();
+          this.emitBroadcastRealtimeEvent(broadcaster, {
+            type: 'broadcast_updated',
+            action: 'quiet_hours_skip',
+            broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
+          });
           return {
             success: true,
             data: {
@@ -876,6 +899,11 @@ class BroadcastService {
       broadcast.status = 'sending';
       broadcast.startedAt = new Date();
       await broadcast.save();
+      this.emitBroadcastRealtimeEvent(broadcaster, {
+        type: 'broadcast_updated',
+        action: 'sending',
+        broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
+      });
 
       const results = [];
       let successful = 0;
@@ -1169,6 +1197,11 @@ class BroadcastService {
       broadcast.status = 'completed';
       broadcast.completedAt = new Date();
       await broadcast.save();
+      this.emitBroadcastRealtimeEvent(broadcaster, {
+        type: 'broadcast_updated',
+        action: 'completed',
+        broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
+      });
 
       if (usageBatchCount > 0) {
         await this.reportUsage(broadcast.companyId, usageBatchCount);
@@ -1491,7 +1524,7 @@ class BroadcastService {
   }
 
   // Sync broadcast stats from actual messages in team inbox
-  async syncBroadcastStats(broadcastId) {
+  async syncBroadcastStats(broadcastId, broadcaster = null) {
     try {
       const broadcast = await Broadcast.findById(broadcastId);
       if (!broadcast) {
@@ -1609,6 +1642,7 @@ class BroadcastService {
         currentStats.read !== stats.read ||
         currentStats.failed !== stats.failed ||
         currentStats.replied !== stats.replied;
+      let updatedBroadcast = null;
 
       if (statsChanged) {
         // Update only the stats field without touching other fields
@@ -1618,7 +1652,7 @@ class BroadcastService {
         );
         
         // Get updated broadcast with virtual fields
-        const updatedBroadcast = await Broadcast.findById(broadcastId);
+        updatedBroadcast = await Broadcast.findById(broadcastId);
         const repliedPercentage = updatedBroadcast.repliedPercentage;
         const repliedPercentageOfTotal = updatedBroadcast.repliedPercentageOfTotal;
         const readPercentage = updatedBroadcast.readPercentage;
@@ -1631,6 +1665,13 @@ class BroadcastService {
       } else {
         console.log(`📊 No stat changes for broadcast ${broadcast.name}`);
       }
+
+      this.emitBroadcastRealtimeEvent(broadcaster, {
+        type: 'broadcast_stats_updated',
+        broadcastId: String(broadcastId),
+        stats,
+        broadcast: updatedBroadcast ? (updatedBroadcast.toObject ? updatedBroadcast.toObject() : updatedBroadcast) : null
+      });
 
       return { success: true, data: { broadcast, stats, messagesFound: messages.length } };
     } catch (error) {
@@ -1699,7 +1740,7 @@ class BroadcastService {
     }
   }
 
-  async pauseBroadcast(broadcastId) {
+  async pauseBroadcast(broadcastId, broadcaster = null) {
     try {
       const broadcast = await Broadcast.findById(broadcastId);
       if (!broadcast) {
@@ -1712,6 +1753,11 @@ class BroadcastService {
 
       broadcast.status = 'paused';
       await broadcast.save();
+      this.emitBroadcastRealtimeEvent(broadcaster, {
+        type: 'broadcast_updated',
+        action: 'paused',
+        broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
+      });
 
       return { success: true, data: broadcast };
     } catch (error) {
@@ -1720,7 +1766,7 @@ class BroadcastService {
     }
   }
 
-  async resumeBroadcast(broadcastId) {
+  async resumeBroadcast(broadcastId, broadcaster = null) {
     try {
       const broadcast = await Broadcast.findById(broadcastId);
       if (!broadcast) {
@@ -1738,6 +1784,11 @@ class BroadcastService {
 
       broadcast.status = 'scheduled';
       await broadcast.save();
+      this.emitBroadcastRealtimeEvent(broadcaster, {
+        type: 'broadcast_updated',
+        action: 'resumed',
+        broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
+      });
 
       return { success: true, data: broadcast };
     } catch (error) {
@@ -1746,7 +1797,7 @@ class BroadcastService {
     }
   }
 
-  async cancelScheduledBroadcast(broadcastId) {
+  async cancelScheduledBroadcast(broadcastId, broadcaster = null) {
     try {
       const broadcast = await Broadcast.findById(broadcastId);
       if (!broadcast) {
@@ -1759,6 +1810,11 @@ class BroadcastService {
 
       broadcast.status = 'cancelled';
       await broadcast.save();
+      this.emitBroadcastRealtimeEvent(broadcaster, {
+        type: 'broadcast_updated',
+        action: 'cancelled',
+        broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
+      });
 
       return { success: true, data: broadcast };
     } catch (error) {
@@ -1767,12 +1823,18 @@ class BroadcastService {
     }
   }
 
-  async deleteBroadcast(broadcastId) {
+  async deleteBroadcast(broadcastId, broadcaster = null) {
     try {
       const broadcast = await Broadcast.findById(broadcastId);
       if (!broadcast) {
         return { success: false, error: 'Broadcast not found' };
       }
+
+      this.emitBroadcastRealtimeEvent(broadcaster, {
+        type: 'broadcast_deleted',
+        broadcastId: String(broadcastId),
+        broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
+      });
 
       // Delete the broadcast from database
       await Broadcast.findByIdAndDelete(broadcastId);

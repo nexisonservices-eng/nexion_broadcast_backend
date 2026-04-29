@@ -42,6 +42,12 @@ class BroadcastController {
 
   async createBroadcast(req, res) {
     try {
+      const broadcaster = (payload) => {
+        const sendToUser = req.app?.locals?.sendToUser;
+        if (typeof sendToUser === 'function') {
+          sendToUser(String(req.user.id), payload);
+        }
+      };
       const creds = req.whatsappCredentials || null;
       const payload = {
         ...req.body,
@@ -63,7 +69,7 @@ class BroadcastController {
           : undefined
       };
 
-      const result = await broadcastService.createBroadcast(payload);
+      const result = await broadcastService.createBroadcast(payload, broadcaster);
       if (result.success) {
         res.status(201).json(result);
       } else {
@@ -189,6 +195,12 @@ class BroadcastController {
 
   async syncBroadcastStats(req, res) {
     try {
+      const broadcaster = (payload) => {
+        const sendToUser = req.app?.locals?.sendToUser;
+        if (typeof sendToUser === 'function') {
+          sendToUser(String(req.user.id), payload);
+        }
+      };
       const { id } = req.params;
       const ownership = await this.assertOwnership(
         id,
@@ -200,7 +212,7 @@ class BroadcastController {
       if (!ownership.ok) {
         return res.status(ownership.status).json(ownership.body);
       }
-      const result = await broadcastService.syncBroadcastStats(id);
+      const result = await broadcastService.syncBroadcastStats(id, broadcaster);
       if (result.success) {
         res.json(result);
       } else {
@@ -213,6 +225,12 @@ class BroadcastController {
 
   async deleteBroadcast(req, res) {
     try {
+      const broadcaster = (payload) => {
+        const sendToUser = req.app?.locals?.sendToUser;
+        if (typeof sendToUser === 'function') {
+          sendToUser(String(req.user.id), payload);
+        }
+      };
       const { id } = req.params;
       const ownership = await this.assertOwnership(
         id,
@@ -224,7 +242,7 @@ class BroadcastController {
       if (!ownership.ok) {
         return res.status(ownership.status).json(ownership.body);
       }
-      const result = await broadcastService.deleteBroadcast(id);
+      const result = await broadcastService.deleteBroadcast(id, broadcaster);
       if (result.success) {
         res.json(result);
       } else {
@@ -237,6 +255,12 @@ class BroadcastController {
 
   async pauseBroadcast(req, res) {
     try {
+      const broadcaster = (payload) => {
+        const sendToUser = req.app?.locals?.sendToUser;
+        if (typeof sendToUser === 'function') {
+          sendToUser(String(req.user.id), payload);
+        }
+      };
       const { id } = req.params;
       const ownership = await this.assertOwnership(
         id,
@@ -248,7 +272,7 @@ class BroadcastController {
       if (!ownership.ok) {
         return res.status(ownership.status).json(ownership.body);
       }
-      const result = await broadcastService.pauseBroadcast(id);
+      const result = await broadcastService.pauseBroadcast(id, broadcaster);
       if (result.success) {
         res.json(result);
       } else {
@@ -261,6 +285,12 @@ class BroadcastController {
 
   async resumeBroadcast(req, res) {
     try {
+      const broadcaster = (payload) => {
+        const sendToUser = req.app?.locals?.sendToUser;
+        if (typeof sendToUser === 'function') {
+          sendToUser(String(req.user.id), payload);
+        }
+      };
       const { id } = req.params;
       const ownership = await this.assertOwnership(
         id,
@@ -272,7 +302,7 @@ class BroadcastController {
       if (!ownership.ok) {
         return res.status(ownership.status).json(ownership.body);
       }
-      const result = await broadcastService.resumeBroadcast(id);
+      const result = await broadcastService.resumeBroadcast(id, broadcaster);
       if (result.success) {
         res.json(result);
       } else {
@@ -285,6 +315,12 @@ class BroadcastController {
 
   async cancelScheduledBroadcast(req, res) {
     try {
+      const broadcaster = (payload) => {
+        const sendToUser = req.app?.locals?.sendToUser;
+        if (typeof sendToUser === 'function') {
+          sendToUser(String(req.user.id), payload);
+        }
+      };
       const { id } = req.params;
       const ownership = await this.assertOwnership(
         id,
@@ -296,7 +332,7 @@ class BroadcastController {
       if (!ownership.ok) {
         return res.status(ownership.status).json(ownership.body);
       }
-      const result = await broadcastService.cancelScheduledBroadcast(id);
+      const result = await broadcastService.cancelScheduledBroadcast(id, broadcaster);
       if (result.success) {
         res.json(result);
       } else {

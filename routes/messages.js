@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
+const axios = require('axios');
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
@@ -311,8 +312,12 @@ const fetchAttachmentUpstream = async (urls = []) => {
 
   for (const candidateUrl of urls) {
     try {
-      const upstreamResponse = await fetch(candidateUrl, { redirect: 'follow' });
-      if (upstreamResponse.ok) {
+      const upstreamResponse = await axios.get(candidateUrl, {
+        responseType: 'arraybuffer',
+        maxRedirects: 5,
+        validateStatus: () => true
+      });
+      if (upstreamResponse.status >= 200 && upstreamResponse.status < 300) {
         return upstreamResponse;
       }
 
@@ -981,12 +986,12 @@ router.get('/attachments/:messageId/download', async (req, res) => {
 
     const upstreamResponse = await fetchAttachmentUpstream(urls);
 
-    const buffer = Buffer.from(await upstreamResponse.arrayBuffer());
+    const buffer = Buffer.from(upstreamResponse.data);
     const contentType =
-      String(upstreamResponse.headers.get('content-type') || '').trim() ||
+      String(upstreamResponse.headers['content-type'] || '').trim() ||
       String(attachment?.mimeType || '').trim() ||
       'application/octet-stream';
-    const contentLength = Number(upstreamResponse.headers.get('content-length') || buffer.length || 0);
+    const contentLength = Number(upstreamResponse.headers['content-length'] || buffer.length || 0);
     const fileName = resolveAttachmentDownloadFileName(message);
 
     res.setHeader('Content-Type', contentType);

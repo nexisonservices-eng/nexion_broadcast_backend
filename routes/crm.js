@@ -11,6 +11,8 @@ const Message = require('../models/Message');
 const LeadTask = require('../models/LeadTask');
 const LeadActivity = require('../models/LeadActivity');
 const CrmAutomationRun = require('../models/CrmAutomationRun');
+const CrmPipelineView = require('../models/CrmPipelineView');
+const CrmPipelineStage = require('../models/CrmPipelineStage');
 const WhatsAppConsentLog = require('../models/WhatsAppConsentLog');
 const {
   ContactDocument,
@@ -42,7 +44,7 @@ router.use(auth);
 router.use(requireCrmPolicy());
 
 const LEAD_STAGES = ['new', 'contacted', 'nurturing', 'qualified', 'proposal', 'won', 'lost'];
-const LEAD_STATUSES = ['new', 'nurturing', 'qualified', 'unqualified', 'won', 'lost'];
+const LEAD_STATUSES = ['new', 'contacted', 'nurturing', 'qualified', 'proposal', 'unqualified', 'won', 'lost'];
 const LEAD_TEMPERATURES = ['cold', 'warm', 'hot'];
 const DEAL_STAGES = ['discovery', 'qualified', 'proposal', 'negotiation', 'won', 'lost'];
 const DEAL_STATUSES = ['open', 'won', 'lost'];
@@ -110,6 +112,17 @@ const CRM_MESSAGE_FIELDS =
   '_id sender senderName text mediaType mediaCaption status timestamp broadcastId';
 const CRM_CONVERSATION_FIELDS =
   '_id status assignedTo lastMessage lastMessageTime lastMessageFrom unreadCount contactPhone contactName';
+const CRM_PIPELINE_VIEW_LIMIT = 12;
+const DEFAULT_LEAD_PIPELINE_STAGES = [
+  { key: 'new', label: 'New Lead', color: '#5f8fc3', order: 0 },
+  { key: 'contacted', label: 'Contacted', color: '#4a8bbd', order: 1 },
+  { key: 'nurturing', label: 'Nurturing', color: '#6f7bd0', order: 2 },
+  { key: 'qualified', label: 'Qualified', color: '#4f9d6c', order: 3 },
+  { key: 'proposal', label: 'Proposal Sent', color: '#d18a3a', order: 4 },
+  { key: 'won', label: 'Won', color: '#1d9b5e', order: 5 },
+  { key: 'lost', label: 'Lost', color: '#c45a5a', order: 6 }
+];
+const DEFAULT_LEAD_STAGE_KEY_SET = new Set(DEFAULT_LEAD_PIPELINE_STAGES.map((stage) => stage.key));
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -124,6 +137,140 @@ const toFiniteNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 };
+const slugifyPipelineStageKey = (value) =>
+  toCleanString(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'stage';
+
+const normalizePipelineStageResponse = (stage) => ({
+  id: String(stage?._id || stage?.id || '').trim(),
+  key: toCleanString(stage?.key).toLowerCase(),
+  label: toCleanString(stage?.label),
+  color: toCleanString(stage?.color) || '#5f8fc3',
+  order: Number.isFinite(Number(stage?.order)) ? Number(stage.order) : 0,
+  isArchived: Boolean(stage?.isArchived),
+  contactCount: Number.isFinite(Number(stage?.contactCount)) ? Number(stage.contactCount) : 0,
+  createdAt: stage?.createdAt || null,
+  updatedAt: stage?.updatedAt || null
+});
+
+const buildPipelineStageScope = (req) => ({
+  userId: String(req.user?.id || '').trim(),
+  ...(req.companyId ? { companyId: String(req.companyId).trim() } : {})
+});
+
+const getDefaultPipelineStages = () => DEFAULT_LEAD_PIPELINE_STAGES.map((stage) => ({
+  ...stage,
+  isArchived: false,
+  contactCount: 0
+}));
+
+const bootstrapDefaultPipelineStages = async (req) => {
+  const scope = buildPipelineStageScope(req);
+  const existingCount = await CrmPipelineStage.countDocuments(scope);
+  if (existingCount > 0) {
+    return CrmPipelineStage.find({ ...scope, isArchived: { $ne: true } })
+      .sort({ order: 1, createdAt: 1 })
+      .lean();
+  }
+
+  const stages = DEFAULT_LEAD_PIPELINE_STAGES.map((stage) => ({
+    ...scope,
+    key: stage.key,
+    label: stage.label,
+    color: stage.color,
+    order: stage.order,
+    isArchived: false
+  }));
+
+  try {
+    await CrmPipelineStage.insertMany(stages, { ordered: false });
+  } catch (error) {
+    if (String(error?.code || '') !== '11000') {
+      throw error;
+    }
+  }
+
+  return CrmPipelineStage.find({ ...scope, isArchived: { $ne: true } })
+    .sort({ order: 1, createdAt: 1 })
+    .lean();
+};
+
+const loadPipelineStages = async (req) => {
+  const scope = buildPipelineStageScope(req);
+  let stages = await CrmPipelineStage.find({ ...scope, isArchived: { $ne: true } })
+    .sort({ order: 1, createdAt: 1 })
+    .lean();
+
+  if (!stages.length) {
+    stages = await bootstrapDefaultPipelineStages(req);
+  }
+
+  const activeStages = stages.filter((stage) => !stage?.isArchived);
+  return activeStages.map((stage, index) => ({
+    ...normalizePipelineStageResponse(stage),
+    order: Number.isFinite(Number(stage?.order)) ? Number(stage.order) : index
+  }));
+};
+
+const loadPipelineStageMap = async (req) => {
+  const stages = await loadPipelineStages(req);
+  return {
+    stages,
+    keySet: new Set(stages.map((stage) => stage.key).filter(Boolean)),
+    stageMap: new Map(stages.map((stage) => [stage.key, stage]))
+  };
+};
+
+const getPipelineStageStatus = (stageKey) => {
+  const normalized = toCleanString(stageKey).toLowerCase();
+  if (DEFAULT_LEAD_STAGE_KEY_SET.has(normalized)) {
+    return normalized === 'proposal' ? 'proposal' : normalized;
+  }
+  return '';
+};
+
+const emitCrmRealtimeEvent = (req, payload = {}) => {
+  const sendToUser = req?.app?.locals?.sendToUser;
+  if (typeof sendToUser !== 'function') return;
+
+  const userId = toCleanString(req?.user?.id);
+  if (!userId) return;
+
+  sendToUser(userId, {
+    type: 'crm_changed',
+    scope: 'crm',
+    timestamp: new Date().toISOString(),
+    ...payload,
+    contactId: toCleanString(payload?.contactId),
+    dealId: toCleanString(payload?.dealId),
+    taskId: toCleanString(payload?.taskId),
+    pipelineViewId: toCleanString(payload?.pipelineViewId),
+    conversationId: toCleanString(payload?.conversationId)
+  });
+};
+
+const normalizePipelineViewFilters = (filters = {}) => ({
+  search: toCleanString(filters?.search),
+  queue: ['all', ...CONTACT_QUEUES].includes(toCleanString(filters?.queue).toLowerCase())
+    ? toCleanString(filters?.queue).toLowerCase()
+    : 'all',
+  status: ['all', ...LEAD_STATUSES].includes(toCleanString(filters?.status).toLowerCase())
+    ? toCleanString(filters?.status).toLowerCase()
+    : 'all',
+  owner: toCleanString(filters?.owner) || 'all',
+  viewMode: toCleanString(filters?.viewMode).toLowerCase() === 'board' ? 'board' : 'list'
+});
+
+const toPipelineViewResponse = (view) => ({
+  id: String(view?._id || view?.id || '').trim(),
+  label: String(view?.label || '').trim(),
+  filters: normalizePipelineViewFilters(view?.filters || {}),
+  isDefault: Boolean(view?.isDefault),
+  createdAt: view?.createdAt || null,
+  updatedAt: view?.updatedAt || null
+});
 
 const getDayRange = (value = new Date()) => {
   const baseDate = safeDate(value) || new Date();
@@ -938,6 +1085,495 @@ const getCrmRouteErrorStatus = (error) => {
   return error?.status || 500;
 };
 
+router.get('/pipeline-views', async (req, res) => {
+  try {
+    const views = await CrmPipelineView.find({
+      userId: String(req.user?.id || '').trim(),
+      ...(req.companyId ? { companyId: String(req.companyId).trim() } : {})
+    })
+      .sort({ isDefault: -1, updatedAt: -1, createdAt: -1 })
+      .lean();
+
+    const defaultView = views.find((view) => Boolean(view?.isDefault));
+    res.json({
+      success: true,
+      data: {
+        views: views.map(toPipelineViewResponse),
+        defaultViewId: defaultView ? String(defaultView._id || '').trim() : ''
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.post('/pipeline-views', async (req, res) => {
+  try {
+    const label = toCleanString(req.body?.label);
+    if (!label) {
+      return res.status(400).json({ success: false, error: 'View label is required' });
+    }
+
+    const viewCount = await CrmPipelineView.countDocuments({
+      userId: String(req.user?.id || '').trim(),
+      ...(req.companyId ? { companyId: String(req.companyId).trim() } : {})
+    });
+    if (viewCount >= CRM_PIPELINE_VIEW_LIMIT) {
+      return res.status(400).json({
+        success: false,
+        error: `You can save up to ${CRM_PIPELINE_VIEW_LIMIT} CRM views.`
+      });
+    }
+
+    const view = await CrmPipelineView.create({
+      userId: String(req.user?.id || '').trim(),
+      companyId: req.companyId ? String(req.companyId).trim() : '',
+      label,
+      filters: normalizePipelineViewFilters(req.body?.filters || {}),
+      isDefault: Boolean(req.body?.isDefault)
+    });
+
+    if (view.isDefault) {
+      await CrmPipelineView.updateMany(
+        {
+          userId: view.userId,
+          _id: { $ne: view._id }
+        },
+        { $set: { isDefault: false } }
+      );
+    }
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'pipeline_view',
+      action: 'created',
+      pipelineViewId: String(view._id || '').trim()
+    });
+
+    res.status(201).json({
+      success: true,
+      data: toPipelineViewResponse(view)
+    });
+  } catch (error) {
+    if (String(error?.code || '') === '11000') {
+      return res.status(409).json({ success: false, error: 'A saved view with that name already exists.' });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.patch('/pipeline-views/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!toObjectIdIfValid(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid view id' });
+    }
+
+    const view = await CrmPipelineView.findOne({
+      _id: id,
+      userId: String(req.user?.id || '').trim(),
+      ...(req.companyId ? { companyId: String(req.companyId).trim() } : {})
+    });
+
+    if (!view) {
+      return res.status(404).json({ success: false, error: 'Saved view not found' });
+    }
+
+    if (req.body?.label !== undefined) {
+      const label = toCleanString(req.body.label);
+      if (!label) {
+        return res.status(400).json({ success: false, error: 'View label is required' });
+      }
+      view.label = label;
+    }
+
+    if (req.body?.filters !== undefined) {
+      view.filters = normalizePipelineViewFilters(req.body.filters);
+    }
+
+    if (req.body?.isDefault !== undefined) {
+      view.isDefault = Boolean(req.body.isDefault);
+    }
+
+    await view.save();
+
+    if (view.isDefault) {
+      await CrmPipelineView.updateMany(
+        {
+          userId: view.userId,
+          _id: { $ne: view._id }
+        },
+        { $set: { isDefault: false } }
+      );
+    }
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'pipeline_view',
+      action: 'updated',
+      pipelineViewId: String(view._id || '').trim()
+    });
+
+    res.json({
+      success: true,
+      data: toPipelineViewResponse(view)
+    });
+  } catch (error) {
+    if (String(error?.code || '') === '11000') {
+      return res.status(409).json({ success: false, error: 'A saved view with that name already exists.' });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.delete('/pipeline-views/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!toObjectIdIfValid(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid view id' });
+    }
+
+    const view = await CrmPipelineView.findOneAndDelete({
+      _id: id,
+      userId: String(req.user?.id || '').trim(),
+      ...(req.companyId ? { companyId: String(req.companyId).trim() } : {})
+    });
+
+    if (!view) {
+      return res.status(404).json({ success: false, error: 'Saved view not found' });
+    }
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'pipeline_view',
+      action: 'deleted',
+      pipelineViewId: String(view._id || '').trim()
+    });
+
+    res.json({ success: true, data: { id: String(view._id || '').trim() } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.get('/pipeline-stages', async (req, res) => {
+  try {
+    const stages = await loadPipelineStages(req);
+    const stageCounts = await Contact.aggregate([
+      { $match: buildScopedFilter(req) },
+      {
+        $group: {
+          _id: { $toLower: { $ifNull: ['$stage', 'new'] } },
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    const countMap = (stageCounts || []).reduce((accumulator, item) => {
+      const key = toCleanString(item?._id).toLowerCase();
+      if (key) accumulator[key] = Number(item?.count || 0);
+      return accumulator;
+    }, {});
+
+    res.json({
+      success: true,
+      data: {
+        stages: stages.map((stage) => ({
+          ...stage,
+          contactCount: Number(countMap[stage.key] || 0)
+        })),
+        apiAvailable: true
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.post('/pipeline-stages', async (req, res) => {
+  try {
+    const label = toCleanString(req.body?.label);
+    const color = toCleanString(req.body?.color) || '#5f8fc3';
+    if (!label) {
+      return res.status(400).json({ success: false, error: 'Stage label is required' });
+    }
+
+    const scope = buildPipelineStageScope(req);
+    const stages = await loadPipelineStages(req);
+    const normalizedLabel = label.toLowerCase();
+    const labelExists = stages.some((stage) => String(stage.label || '').trim().toLowerCase() === normalizedLabel);
+    if (labelExists) {
+      return res.status(409).json({ success: false, error: 'A pipeline stage with that name already exists.' });
+    }
+
+    const existingKeys = new Set(stages.map((stage) => stage.key));
+    let key = slugifyPipelineStageKey(label);
+    if (existingKeys.has(key)) {
+      let suffix = 2;
+      while (existingKeys.has(`${key}_${suffix}`)) {
+        suffix += 1;
+      }
+      key = `${key}_${suffix}`;
+    }
+
+    const nextOrder = stages.length ? Math.max(...stages.map((stage) => Number(stage.order) || 0)) + 1 : 0;
+    const stage = await CrmPipelineStage.create({
+      ...scope,
+      key,
+      label,
+      color,
+      order: nextOrder,
+      isArchived: false
+    });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'pipeline_stage',
+      action: 'created',
+      pipelineStageId: String(stage._id || '').trim()
+    });
+
+    res.status(201).json({
+      success: true,
+      data: normalizePipelineStageResponse(stage)
+    });
+  } catch (error) {
+    if (String(error?.code || '') === '11000') {
+      return res.status(409).json({ success: false, error: 'A pipeline stage with that key already exists.' });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.patch('/pipeline-stages/reorder', async (req, res) => {
+  try {
+    const requestedStageIds = Array.isArray(req.body?.stageIds)
+      ? req.body.stageIds.map((value) => toCleanString(value)).filter(Boolean)
+      : [];
+
+    if (!requestedStageIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'Stage ids are required'
+      });
+    }
+
+    const uniqueStageIds = Array.from(new Set(requestedStageIds));
+    if (uniqueStageIds.length !== requestedStageIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'Stage ids must be unique'
+      });
+    }
+
+    const scope = buildPipelineStageScope(req);
+    const stages = await CrmPipelineStage.find({
+      ...scope,
+      isArchived: { $ne: true }
+    })
+      .sort({ order: 1, createdAt: 1 })
+      .lean();
+
+    if (stages.length !== uniqueStageIds.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'Stage order must include every active pipeline stage'
+      });
+    }
+
+    const stageMap = new Map(stages.map((stage) => [String(stage._id || '').trim(), stage]));
+    const unknownStageIds = uniqueStageIds.filter((stageId) => !stageMap.has(stageId));
+    if (unknownStageIds.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Stage order contains an unknown stage id'
+      });
+    }
+
+    const orderedStages = uniqueStageIds
+      .map((stageId) => stageMap.get(stageId))
+      .filter(Boolean);
+
+    const orderedStageIdSet = new Set(uniqueStageIds);
+    const remainingStages = stages.filter((stage) => !orderedStageIdSet.has(String(stage._id || '').trim()));
+    const nextOrderedStages = [...orderedStages, ...remainingStages];
+
+    await Promise.all(
+      nextOrderedStages.map((stage, index) =>
+        CrmPipelineStage.updateOne(
+          { _id: stage._id, ...scope },
+          { $set: { order: index } }
+        )
+      )
+    );
+
+    const nextStages = await CrmPipelineStage.find({
+      ...scope,
+      isArchived: { $ne: true }
+    })
+      .sort({ order: 1, createdAt: 1 })
+      .lean();
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'pipeline_stage',
+      action: 'reordered',
+      pipelineStageIds: uniqueStageIds
+    });
+
+    res.json({
+      success: true,
+      data: {
+        stageIds: nextOrderedStages.map((stage) => String(stage._id || '').trim()),
+        stages: nextStages.map(normalizePipelineStageResponse)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.patch('/pipeline-stages/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!toObjectIdIfValid(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid stage id' });
+    }
+
+    const stage = await CrmPipelineStage.findOne({
+      _id: id,
+      ...buildPipelineStageScope(req)
+    });
+
+    if (!stage) {
+      return res.status(404).json({ success: false, error: 'Pipeline stage not found' });
+    }
+
+    if (req.body?.label !== undefined) {
+      const label = toCleanString(req.body.label);
+      if (!label) {
+        return res.status(400).json({ success: false, error: 'Stage label is required' });
+      }
+      stage.label = label;
+    }
+
+    if (req.body?.color !== undefined) {
+      stage.color = toCleanString(req.body.color) || stage.color;
+    }
+
+    if (req.body?.order !== undefined) {
+      const normalizedOrder = Number(req.body.order);
+      if (!Number.isFinite(normalizedOrder) || normalizedOrder < 0) {
+        return res.status(400).json({ success: false, error: 'Stage order must be a non-negative number' });
+      }
+      stage.order = normalizedOrder;
+    }
+
+    if (req.body?.isArchived !== undefined) {
+      stage.isArchived = Boolean(req.body.isArchived);
+    }
+
+    await stage.save();
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'pipeline_stage',
+      action: 'updated',
+      pipelineStageId: String(stage._id || '').trim()
+    });
+
+    res.json({
+      success: true,
+      data: normalizePipelineStageResponse(stage)
+    });
+  } catch (error) {
+    if (String(error?.code || '') === '11000') {
+      return res.status(409).json({ success: false, error: 'A pipeline stage with that name already exists.' });
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.delete('/pipeline-stages/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!toObjectIdIfValid(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid stage id' });
+    }
+
+    const scope = buildPipelineStageScope(req);
+    const stage = await CrmPipelineStage.findOne({
+      _id: id,
+      ...scope
+    });
+
+    if (!stage) {
+      return res.status(404).json({ success: false, error: 'Pipeline stage not found' });
+    }
+
+    const stages = await CrmPipelineStage.find({
+      ...scope,
+      _id: { $ne: stage._id },
+      isArchived: { $ne: true }
+    })
+      .sort({ order: 1, createdAt: 1 })
+      .lean();
+
+    if (!stages.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one pipeline stage must remain active.'
+      });
+    }
+
+    const contactCount = await Contact.countDocuments(buildScopedFilter(req, { stage: stage.key }));
+    const fallbackStageKey = toCleanString(req.body?.fallbackStageKey).toLowerCase();
+    const fallbackStageId = toCleanString(req.body?.fallbackStageId);
+    const fallbackStage =
+      stages.find((item) => item.key === fallbackStageKey) ||
+      stages.find((item) => String(item._id || '') === fallbackStageId) ||
+      null;
+
+    if (contactCount > 0 && !fallbackStage) {
+      return res.status(409).json({
+        success: false,
+        error: 'This stage still has leads. Choose a fallback stage before deleting it.',
+        contactCount
+      });
+    }
+
+    if (contactCount > 0 && fallbackStage) {
+      const fallbackStatus = getPipelineStageStatus(fallbackStage.key);
+      const updatePayload = {
+        stage: fallbackStage.key,
+        lastStageChangedAt: new Date()
+      };
+      if (fallbackStatus) {
+        updatePayload.status = fallbackStatus;
+      }
+
+      await Contact.updateMany(buildScopedFilter(req, { stage: stage.key }), {
+        $set: updatePayload
+      });
+    }
+
+    await CrmPipelineStage.deleteOne({ _id: stage._id, ...scope });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'pipeline_stage',
+      action: 'deleted',
+      pipelineStageId: String(stage._id || '').trim(),
+      fallbackStageKey: fallbackStage ? fallbackStage.key : '',
+      movedContactCount: Number(contactCount || 0)
+    });
+
+    res.json({
+      success: true,
+      data: {
+        id: String(stage._id || '').trim(),
+        movedContactCount: Number(contactCount || 0),
+        fallbackStageKey: fallbackStage ? fallbackStage.key : ''
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 router.get('/contacts', async (req, res) => {
   try {
     const {
@@ -957,9 +1593,10 @@ router.get('/contacts', async (req, res) => {
     const normalizedStage = toCleanString(stage).toLowerCase();
     const normalizedStatus = toCleanString(status).toLowerCase();
     const normalizedOwnerId = toCleanString(ownerId);
+    const stageMap = await loadPipelineStageMap(req);
 
     if (normalizedStage) {
-      if (!LEAD_STAGES.includes(normalizedStage)) {
+      if (!stageMap.keySet.has(normalizedStage)) {
         return res.status(400).json({ success: false, error: 'Invalid stage filter' });
       }
       extraFilter.stage = normalizedStage;
@@ -1173,11 +1810,12 @@ router.patch('/contacts/:id/stage', async (req, res) => {
   try {
     const { id } = req.params;
     const stage = toCleanString(req.body?.stage).toLowerCase();
+    const stageMap = await loadPipelineStageMap(req);
 
     if (!toObjectIdIfValid(id)) {
       return res.status(400).json({ success: false, error: 'Invalid contact id' });
     }
-    if (!LEAD_STAGES.includes(stage)) {
+    if (!stageMap.keySet.has(stage)) {
       return res.status(400).json({ success: false, error: 'Invalid stage' });
     }
 
@@ -1191,15 +1829,9 @@ router.patch('/contacts/:id/stage', async (req, res) => {
     contact.stage = stage;
     contact.lastStageChangedAt = new Date();
 
-    const statusFromStage = {
-      qualified: 'qualified',
-      won: 'won',
-      lost: 'lost',
-      nurturing: 'nurturing',
-      new: 'new'
-    };
-    if (statusFromStage[stage]) {
-      contact.status = statusFromStage[stage];
+    const nextStatus = getPipelineStageStatus(stage);
+    if (nextStatus) {
+      contact.status = nextStatus;
     }
 
     await contact.save();
@@ -1215,6 +1847,12 @@ router.patch('/contacts/:id/stage', async (req, res) => {
         previousStatus,
         nextStatus: contact.status
       }
+    });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'contact',
+      action: 'stage_updated',
+      contactId: String(contact._id || '').trim()
     });
 
     res.json({ success: true, data: contact });
@@ -1320,6 +1958,12 @@ router.patch('/contacts/:id/profile', async (req, res) => {
       }
     });
 
+    emitCrmRealtimeEvent(req, {
+      entity: 'contact',
+      action: 'profile_updated',
+      contactId: String(contact._id || '').trim()
+    });
+
     res.json({ success: true, data: contact });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -1352,6 +1996,12 @@ router.patch('/contacts/:id/owner', async (req, res) => {
         previousOwner,
         nextOwner
       }
+    });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'contact',
+      action: 'owner_updated',
+      contactId: String(contact._id || '').trim()
     });
 
     res.json({ success: true, data: contact });
@@ -1397,6 +2047,12 @@ router.post('/contacts/:id/notes', async (req, res) => {
         nextNote,
         nextFollowUpAt: contact.nextFollowUpAt
       }
+    });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'contact',
+      action: 'notes_updated',
+      contactId: String(contact._id || '').trim()
     });
 
     res.json({ success: true, data: contact });
@@ -1491,6 +2147,13 @@ router.post('/contacts/:id/documents', async (req, res) => {
         fileName: attachment?.originalFileName || '',
         verificationStatus: document.verificationStatus
       }
+    });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'contact',
+      action: 'document_uploaded',
+      contactId: String(contact._id || '').trim(),
+      conversationId: String(conversationId || '').trim()
     });
 
     res.status(201).json({ success: true, data: document });
@@ -1724,6 +2387,13 @@ router.post('/deals', async (req, res) => {
       }
     });
 
+    emitCrmRealtimeEvent(req, {
+      entity: 'deal',
+      action: 'created',
+      contactId: String(deal.contactId || '').trim(),
+      dealId: String(deal._id || '').trim()
+    });
+
     res.status(201).json({ success: true, data: deal });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -1864,6 +2534,13 @@ router.patch('/deals/:id', async (req, res) => {
       }
     });
 
+    emitCrmRealtimeEvent(req, {
+      entity: 'deal',
+      action: 'updated',
+      contactId: String(deal.contactId || '').trim(),
+      dealId: String(deal._id || '').trim()
+    });
+
     res.json({ success: true, data: deal });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -1897,6 +2574,13 @@ router.delete('/deals/:id', async (req, res) => {
         status: deal.status,
         value: deal.value
       }
+    });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'deal',
+      action: 'deleted',
+      contactId: String(deal.contactId || '').trim(),
+      dealId: String(deal._id || '').trim()
     });
 
     res.json({
@@ -2016,6 +2700,13 @@ router.post('/tasks', async (req, res) => {
         recurrence: task.recurrence,
         commentCount: Array.isArray(task.comments) ? task.comments.length : 0
       }
+    });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'task',
+      action: 'created',
+      contactId: String(task.contactId || '').trim(),
+      taskId: String(task._id || '').trim()
     });
 
     res.status(201).json({ success: true, data: task });
@@ -2331,6 +3022,22 @@ router.patch('/tasks/:id', async (req, res) => {
       }
     });
 
+    emitCrmRealtimeEvent(req, {
+      entity: 'task',
+      action: task.status === 'completed' ? 'completed' : 'updated',
+      contactId: String(task.contactId || '').trim(),
+      taskId: String(task._id || '').trim()
+    });
+
+    if (nextRecurringTask) {
+      emitCrmRealtimeEvent(req, {
+        entity: 'task',
+        action: 'created',
+        contactId: String(nextRecurringTask.contactId || '').trim(),
+        taskId: String(nextRecurringTask._id || '').trim()
+      });
+    }
+
     res.json({
       success: true,
       data: {
@@ -2381,6 +3088,13 @@ router.post('/tasks/:id/comments', async (req, res) => {
         title: task.title,
         comment: text
       }
+    });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'task',
+      action: 'comment_added',
+      contactId: String(task.contactId || '').trim(),
+      taskId: String(task._id || '').trim()
     });
 
     res.status(201).json({ success: true, data: task });
@@ -2489,6 +3203,19 @@ router.post('/tasks/bulk', async (req, res) => {
         deletedTaskIds
       }
     });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'task',
+      action: 'bulk_updated',
+      contactIds: Array.from(
+        new Set(
+          tasks
+            .map((task) => String(task?.contactId || '').trim())
+            .filter(Boolean)
+        )
+      ),
+      taskIds: [...updatedTaskIds, ...deletedTaskIds]
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -2520,6 +3247,13 @@ router.delete('/tasks/:id', async (req, res) => {
         dueAt: task.dueAt,
         priority: task.priority
       }
+    });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'task',
+      action: 'deleted',
+      contactId: String(task.contactId || '').trim(),
+      taskId: String(task._id || '').trim()
     });
 
     res.json({
@@ -2777,6 +3511,12 @@ router.delete('/documents/:id', async (req, res) => {
       }
     });
 
+    emitCrmRealtimeEvent(req, {
+      entity: 'contact',
+      action: 'document_deleted',
+      contactId: String(document.contactId || '').trim()
+    });
+
     res.json({
       success: true,
       data: {
@@ -3032,6 +3772,11 @@ router.post('/ops/follow-up-automation', async (req, res) => {
       dryRun,
       limit,
       automationActor: req.user?.id || 'system:manual'
+    });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'automation',
+      action: dryRun ? 'preview_completed' : 'executed'
     });
 
     res.json({ success: true, data: result });

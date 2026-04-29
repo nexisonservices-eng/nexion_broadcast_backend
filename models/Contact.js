@@ -8,6 +8,12 @@ const ContactSchema = new mongoose.Schema({
 
   companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'company', index: true, default: null },
 
+  stage: { type: String, default: 'new', index: true },
+
+  status: { type: String, default: 'new', index: true },
+
+  lastStageChangedAt: { type: Date, default: null },
+
   name: { type: String, default: '' },
 
   phone: { type: String, unique: true, required: true, index: true },
@@ -28,6 +34,8 @@ const ContactSchema = new mongoose.Schema({
 
   isBlocked: { type: Boolean, default: false }
 
+}, {
+  strict: false
 });
 
 
