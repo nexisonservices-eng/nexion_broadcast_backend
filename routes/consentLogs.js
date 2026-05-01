@@ -94,6 +94,44 @@ const setExportCooldown = (req) => {
   exportCooldownMap.set(getExportCooldownKey(req), Date.now());
 };
 
+const buildMissingProofFilters = (req) => {
+  const filters = {
+    whatsappOptInStatus: 'opted_in',
+    $or: [
+      { whatsappOptInProofType: { $exists: false } },
+      { whatsappOptInProofType: null },
+      { whatsappOptInProofType: '' },
+      { whatsappOptInTextSnapshot: { $exists: false } },
+      { whatsappOptInTextSnapshot: null },
+      { whatsappOptInTextSnapshot: '' }
+    ]
+  };
+
+  const requestedSourceType = toCleanString(req.query?.sourceType);
+  const requestedUserId = toCleanString(req.query?.userId);
+  const requestedCompanyId = toCleanString(req.query?.companyId);
+  const includeImportedOnly = String(req.query?.importedOnly || 'true').toLowerCase() !== 'false';
+
+  if (includeImportedOnly) {
+    filters.sourceType = { $in: ['imported', 'manual', 'public_opt_in', 'meta_lead_ads'] };
+    filters.whatsappOptInSource = { $in: ['import', 'csv_import', 'manual', 'public_opt_in', 'meta_lead_ads'] };
+  }
+
+  if (requestedSourceType) {
+    filters.sourceType = requestedSourceType;
+  }
+
+  if (isSuperAdminRole(req.user?.role)) {
+    if (requestedUserId) filters.userId = requestedUserId;
+    if (requestedCompanyId) filters.companyId = requestedCompanyId;
+  } else {
+    filters.userId = req.user.id;
+    filters.companyId = req.companyId;
+  }
+
+  return filters;
+};
+
 // CSV building is handled in consentExportService.
 
 router.get('/', async (req, res) => {
@@ -298,6 +336,63 @@ router.get('/export-jobs/:id/download', async (req, res) => {
       `attachment; filename="whatsapp-consent-logs_${jobId}.csv"`
     );
     return res.status(200).send(csv);
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.get('/review/missing-proof', async (req, res) => {
+  try {
+    if (!ensureTenantCompanyId(req, res)) return;
+
+    const page = Math.max(1, Number(req.query?.page || 1));
+    const limit = Math.min(100, Math.max(10, Number(req.query?.limit || 25)));
+    const skip = (page - 1) * limit;
+    const filters = buildMissingProofFilters(req);
+
+    const projection = [
+      '_id',
+      'name',
+      'phone',
+      'email',
+      'sourceType',
+      'whatsappOptInStatus',
+      'whatsappOptInSource',
+      'whatsappOptInAt',
+      'whatsappOptInTextSnapshot',
+      'whatsappOptInProofType',
+      'whatsappOptInProofId',
+      'whatsappOptInCapturedBy',
+      'whatsappOptInPageUrl',
+      'createdAt',
+      'updatedAt'
+    ].join(' ');
+
+    const [items, total, prooflessCount, textlessCount] = await Promise.all([
+      Contact.find(filters).select(projection).sort({ updatedAt: -1, createdAt: -1 }).skip(skip).limit(limit).lean(),
+      Contact.countDocuments(filters),
+      Contact.countDocuments({
+        ...filters,
+        $or: [{ whatsappOptInProofType: { $in: [null, ''] } }, { whatsappOptInProofType: { $exists: false } }]
+      }),
+      Contact.countDocuments({
+        ...filters,
+        $or: [{ whatsappOptInTextSnapshot: { $in: [null, ''] } }, { whatsappOptInTextSnapshot: { $exists: false } }]
+      })
+    ]);
+
+    return res.json({
+      success: true,
+      data: items,
+      summary: {
+        total,
+        prooflessCount,
+        textlessCount
+      },
+      page,
+      limit,
+      totalPages: Math.max(1, Math.ceil(total / limit))
+    });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
   }

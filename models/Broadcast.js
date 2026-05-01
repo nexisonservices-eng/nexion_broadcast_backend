@@ -12,6 +12,18 @@ const BroadcastSchema = new mongoose.Schema({
   templateId: { type: mongoose.Schema.Types.ObjectId, ref: 'Template' },
   retryOfBroadcastId: { type: mongoose.Schema.Types.ObjectId, ref: 'Broadcast', index: true },
   retryAttempt: { type: Number, default: 0 },
+  audienceSource: {
+    mode: { type: String, default: 'contacts' },
+    label: { type: String, default: '' },
+    type: { type: String, default: '' },
+    segmentId: { type: String, default: '' },
+    sourceName: { type: String, default: '' },
+    uploadedFileName: { type: String, default: '' },
+    recipientCount: { type: Number, default: 0 },
+    selectedContactCount: { type: Number, default: 0 },
+    hasContactIds: { type: Boolean, default: false }
+  },
+  audienceSnapshot: mongoose.Schema.Types.Mixed,
   mediaUrl: String,
   mediaType: String,
   recipients: [{ 

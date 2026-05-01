@@ -304,10 +304,19 @@ router.post(
         return {
           phone: String(recipient?.phone || '').trim(),
           name: String(recipient?.name || '').trim(),
+          contactId: String(recipient?.contactId || '').trim() || null,
+          sourceType: String(recipient?.sourceType || fullData?.sourceType || '').trim() || null,
           variables: Array.isArray(recipient?.variables) ? recipient.variables : [],
           attributes: fullData && typeof fullData === 'object' ? fullData : {}
         };
       });
+      const hasContactsAudience = eligibleRecipients.some((recipient) => Boolean(String(recipient?.contactId || '').trim()));
+      const defaultAudienceMode = hasContactsAudience ? 'contacts' : 'csv';
+      const defaultAudienceLabel = hasContactsAudience ? 'Selected CRM contacts' : 'CSV upload';
+      const defaultAudienceType = hasContactsAudience ? 'contacts' : 'csv';
+      const selectedContactIds = eligibleRecipients
+        .map((recipient) => String(recipient?.contactId || '').trim())
+        .filter(Boolean);
 
       const created = await broadcastService.createBroadcast({
         name: broadcast_name || `Bulk Send - ${new Date().toISOString()}`,
@@ -319,6 +328,32 @@ router.post(
         templateContent: String(templateContent || '').trim(),
         language: language || 'en_US',
         recipients: eligibleRecipients,
+        audienceSource:
+          req.body?.audienceSource && typeof req.body.audienceSource === 'object'
+            ? req.body.audienceSource
+            : {
+                mode: defaultAudienceMode,
+                label: defaultAudienceLabel,
+                type: defaultAudienceType,
+                segmentId: '',
+                sourceName: hasContactsAudience ? 'crm_contacts' : 'csv_upload',
+                uploadedFileName: String(req.body?.audienceSource?.uploadedFileName || '').trim(),
+                recipientCount: eligibleRecipients.length,
+                selectedContactCount: selectedContactIds.length,
+                hasContactIds: selectedContactIds.length > 0
+              },
+        audienceSnapshot:
+          req.body?.audienceSnapshot && typeof req.body.audienceSnapshot === 'object'
+            ? req.body.audienceSnapshot
+            : {
+                mode: defaultAudienceMode,
+                label: defaultAudienceLabel,
+                sourceType: defaultAudienceType,
+                uploadedFileName: String(req.body?.audienceSnapshot?.uploadedFileName || '').trim(),
+                recipientCount: eligibleRecipients.length,
+                selectedContactCount: selectedContactIds.length,
+                contactIds: selectedContactIds
+              },
         createdBy: req.user.username || req.user.email || req.user.id,
         createdByEmail: req.user.email,
         createdById: req.user.id,

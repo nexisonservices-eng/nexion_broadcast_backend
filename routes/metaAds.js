@@ -255,11 +255,21 @@ const buildWalletState = async (userId) => {
   };
 };
 
+const buildMetaBillingState = async (userId) => {
+  try {
+    return await metaAdsService.getAdAccountBillingSummary({ userId });
+  } catch (error) {
+    console.warn('Failed to load Meta billing for overview:', error.message);
+    return null;
+  }
+};
+
 router.get('/overview', auth, async (req, res) => {
   try {
     const campaigns = await Campaign.find({ createdBy: req.user.id }).sort({ createdAt: -1 }).lean();
     const summary = buildSummary(campaigns);
     const setup = await metaAdsService.getSetupBundle({ userId: req.user.id });
+    const metaBilling = await buildMetaBillingState(req.user.id);
 
     res.json({
       success: true,
@@ -271,9 +281,10 @@ router.get('/overview', auth, async (req, res) => {
             ? Number(((summary.totalClicks / summary.totalImpressions) * 100).toFixed(2))
             : 0,
         averageCpl:
-          summary.totalLeads > 0 ? Number((summary.totalSpend / summary.totalLeads).toFixed(2)) : 0
+        summary.totalLeads > 0 ? Number((summary.totalSpend / summary.totalLeads).toFixed(2)) : 0
       },
       wallet: await buildWalletState(req.user.id),
+      metaBilling,
       campaigns
     });
   } catch (error) {
@@ -482,7 +493,8 @@ router.get('/wallet', auth, async (req, res) => {
   try {
     res.json({
       success: true,
-      wallet: await buildWalletState(req.user.id)
+      wallet: await buildWalletState(req.user.id),
+      metaBilling: await buildMetaBillingState(req.user.id)
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
