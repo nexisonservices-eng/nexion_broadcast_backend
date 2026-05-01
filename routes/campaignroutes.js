@@ -78,11 +78,11 @@ const campaignValidation = [
         .default('draft'),
     
     body('dailyBudget')
-        .optional()
+        .optional({ nullable: true, checkFalsy: true })
         .isFloat({ min: 1 }).withMessage('Daily budget must be at least $1'),
     
     body('lifetimeBudget')
-        .optional()
+        .optional({ nullable: true, checkFalsy: true })
         .isFloat({ min: 1 }).withMessage('Lifetime budget must be at least $1'),
     
     body('startDate')

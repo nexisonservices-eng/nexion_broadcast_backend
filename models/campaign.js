@@ -3,9 +3,9 @@ const mongoose = require('mongoose');
 
 const campaignSchema = new mongoose.Schema({
     companyId: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'company',
-        required: [true, 'companyId is required for campaign records'],
+        type: String,
+        trim: true,
+        default: '',
         index: true
     },
     name: {
@@ -357,13 +357,14 @@ const campaignSchema = new mongoose.Schema({
     },
     // User tracking
     createdBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User',
-        required: true
+        type: String,
+        trim: true,
+        default: ''
     },
     updatedBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User'
+        type: String,
+        trim: true,
+        default: ''
     }
 }, {
     timestamps: true,

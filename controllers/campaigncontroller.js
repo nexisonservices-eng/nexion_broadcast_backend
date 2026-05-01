@@ -534,7 +534,8 @@ exports.createCampaign = async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Error creating campaign',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+            error: error.message,
+            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
         });
     }
 };
@@ -1364,7 +1365,6 @@ exports.exportCampaigns = async (req, res) => {
 
         const campaigns = await features.query
             .select('-__v -metaResponse')
-            .populate('createdBy', 'name email')
             .lean();
 
         // Format data for export
@@ -1388,7 +1388,7 @@ exports.exportCampaigns = async (req, res) => {
             ROAS: campaign.roas,
             'ROI %': campaign.roi,
             Created: campaign.createdAt,
-            'Created By': campaign.createdBy?.name || 'Unknown'
+            'Created By': campaign.createdBy || 'Unknown'
         }));
 
         res.status(200).json({
