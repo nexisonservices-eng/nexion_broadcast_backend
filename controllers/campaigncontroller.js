@@ -102,6 +102,30 @@ const normalizeCreativeImageUrl = (value) => {
     return '';
 };
 
+const resolveCampaignCreativeImageUrl = (campaign = {}) => {
+    const candidates = [
+        campaign?.imageUrl,
+        campaign?.mediaUrl,
+        campaign?.creative?.mediaUrl,
+        campaign?.creative?.imageUrl,
+        campaign?.creativeUpload?.mediaUrl,
+        campaign?.creativeUpload?.secureUrl,
+        campaign?.metaResponse?.creative?.mediaUrl,
+        campaign?.metaResponse?.creative?.imageUrl,
+        campaign?.metaResponse?.creativeUpload?.mediaUrl,
+        campaign?.metaResponse?.creativeUpload?.secureUrl,
+        campaign?.metaResponse?.mediaUrl,
+        campaign?.metaResponse?.imageUrl
+    ];
+
+    for (const candidate of candidates) {
+        const normalized = normalizeCreativeImageUrl(candidate);
+        if (normalized) return normalized;
+    }
+
+    return '';
+};
+
 const serializeCampaignRecord = (campaign) => {
     const source =
         typeof campaign?.toObject === 'function'
@@ -121,7 +145,7 @@ const serializeCampaignRecord = (campaign) => {
 
     return {
         ...source,
-        imageUrl: normalizeCreativeImageUrl(source?.imageUrl),
+        imageUrl: resolveCampaignCreativeImageUrl(source),
         createdById: createdByValue ? String(createdByValue) : '',
         updatedById: updatedByValue ? String(updatedByValue) : '',
         createdBy:

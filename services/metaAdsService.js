@@ -887,6 +887,93 @@ const normalizeMetaDateValue = (value) => {
   return normalized;
 };
 
+const normalizeCreativeAssetUrl = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  if (/^(https?:)?\/\//i.test(raw) || raw.startsWith('/') || raw.startsWith('data:image/')) {
+    return raw;
+  }
+
+  return '';
+};
+
+const extractRemoteCreativeImageUrl = (creative = {}) => {
+  const candidates = [
+    creative?.image_url,
+    creative?.thumbnail_url,
+    creative?.picture,
+    creative?.image_hash,
+    creative?.object_story_spec?.link_data?.image_url,
+    creative?.object_story_spec?.link_data?.picture,
+    creative?.object_story_spec?.link_data?.image_hash,
+    creative?.object_story_spec?.photo_data?.url,
+    creative?.object_story_spec?.photo_data?.image_hash,
+    creative?.object_story_spec?.video_data?.image_url,
+    creative?.object_story_spec?.video_data?.thumbnail_url,
+    creative?.asset_feed_spec?.images?.[0]?.url,
+    creative?.asset_feed_spec?.images?.[0]?.image_url,
+    creative?.asset_feed_spec?.images?.[0]?.hash,
+    creative?.asset_feed_spec?.image_urls?.[0],
+    creative?.asset_feed_spec?.bodies?.[0]?.text
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeCreativeAssetUrl(candidate);
+    if (normalized) return normalized;
+  }
+
+  return '';
+};
+
+const extractRemoteCreativeImageHash = (creative = {}) => {
+  const candidates = [
+    creative?.image_hash,
+    creative?.object_story_spec?.link_data?.image_hash,
+    creative?.object_story_spec?.photo_data?.image_hash,
+    creative?.asset_feed_spec?.images?.[0]?.hash,
+    creative?.asset_feed_spec?.image_hash
+  ];
+
+  for (const candidate of candidates) {
+    const raw = String(candidate || '').trim();
+    if (raw) return raw;
+  }
+
+  return '';
+};
+
+const lookupMetaImageUrlByHash = async ({ adAccountId, accessToken, imageHash }) => {
+  const normalizedHash = String(imageHash || '').trim();
+  if (!normalizedHash) return '';
+
+  try {
+    const response = await graphRequest({
+      path: buildAdAccountPath(adAccountId, 'adimages'),
+      params: {
+        hashes: JSON.stringify([normalizedHash]),
+        fields: 'hash,url,permalink_url,original_width,original_height'
+      },
+      accessToken
+    });
+
+    const images = response?.images || {};
+    const imageRecord = images[normalizedHash] || Object.values(images)[0] || null;
+    const url = String(imageRecord?.url || imageRecord?.permalink_url || '').trim();
+    return normalizeCreativeAssetUrl(url);
+  } catch (error) {
+    console.warn(
+      '[Meta Ads] Unable to resolve image hash',
+      JSON.stringify({
+        adAccountId,
+        imageHash: normalizedHash,
+        message: extractApiErrorMessage(error)
+      })
+    );
+    return '';
+  }
+};
+
 const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
   if (shouldUseMockMode()) {
     return [];
@@ -931,12 +1018,37 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
   }
 
   const remoteCampaignMap = new Map();
+  const remoteCampaignImageMap = new Map();
+  const creativeCampaignMap = new Map();
   const accountIds = [...adAccountCandidates.keys()];
 
   for (const adAccountId of accountIds) {
+    let adsResponse = null;
     let response = null;
 
     for (const accessToken of tokenCandidates) {
+      if (!adsResponse) {
+        try {
+          adsResponse = await graphRequest({
+            path: buildAdAccountPath(adAccountId, 'ads'),
+            params: {
+              fields: 'id,name,campaign{id},creative{image_url,thumbnail_url,object_story_spec}',
+              limit: 100
+            },
+            accessToken
+          });
+        } catch (error) {
+          console.warn(
+            '[Meta Ads] Unable to load ads for remote campaign images',
+            JSON.stringify({
+              adAccountId,
+              source: accessContext.source,
+              message: extractApiErrorMessage(error)
+            })
+          );
+        }
+      }
+
       try {
         response = await graphRequest({
           path: buildAdAccountPath(adAccountId, 'campaigns'),
@@ -957,6 +1069,94 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
             message: extractApiErrorMessage(error)
           })
         );
+      }
+    }
+
+    const ads = Array.isArray(adsResponse?.data) ? adsResponse.data : [];
+    const unresolvedCreativeIds = new Set();
+    const creativeHashMap = new Map();
+    for (const ad of ads) {
+      const campaignId = String(ad?.campaign?.id || ad?.campaign_id || '').trim();
+      const creativeId = String(ad?.creative?.id || ad?.creative_id || '').trim();
+      const creativeHash =
+        extractRemoteCreativeImageHash(ad?.creative || {}) ||
+        String(ad?.creative?.image_hash || '').trim();
+
+      if (campaignId && creativeId) {
+        if (!creativeCampaignMap.has(creativeId)) {
+          creativeCampaignMap.set(creativeId, new Set());
+        }
+        creativeCampaignMap.get(creativeId).add(campaignId);
+      }
+
+      if (creativeId && creativeHash) {
+        creativeHashMap.set(creativeId, creativeHash);
+      }
+
+      if (!campaignId || remoteCampaignImageMap.has(campaignId)) continue;
+
+      const creativeUrl = extractRemoteCreativeImageUrl(ad?.creative || {});
+      if (creativeUrl) {
+        remoteCampaignImageMap.set(campaignId, creativeUrl);
+        continue;
+      }
+
+      if (creativeId) {
+        unresolvedCreativeIds.add(creativeId);
+      }
+    }
+
+    for (const creativeId of unresolvedCreativeIds) {
+      let creativeUrl = '';
+      try {
+        const creative = await graphRequest({
+          path: creativeId,
+          params: {
+            fields:
+              'id,image_url,thumbnail_url,picture,object_story_spec,asset_feed_spec,body,title'
+          },
+          accessToken: tokenCandidates[0]
+        });
+
+        creativeUrl = extractRemoteCreativeImageUrl(creative || {});
+
+        if (creativeUrl) {
+          const campaignIds = creativeCampaignMap.get(creativeId);
+          for (const campaignId of campaignIds || []) {
+            if (!remoteCampaignImageMap.has(campaignId)) {
+              remoteCampaignImageMap.set(campaignId, creativeUrl);
+            }
+          }
+          continue;
+        }
+      } catch (error) {
+        console.warn(
+          '[Meta Ads] Unable to load creative image for remote campaign',
+          JSON.stringify({
+            creativeId,
+            adAccountId,
+            source: accessContext.source,
+            message: extractApiErrorMessage(error)
+          })
+        );
+      }
+
+      const creativeHash = creativeHashMap.get(creativeId) || '';
+      if (!creativeHash) continue;
+
+      creativeUrl = await lookupMetaImageUrlByHash({
+        adAccountId,
+        accessToken: tokenCandidates[0],
+        imageHash: creativeHash
+      });
+
+      if (creativeUrl) {
+        const campaignIds = creativeCampaignMap.get(creativeId);
+        for (const campaignId of campaignIds || []) {
+          if (!remoteCampaignImageMap.has(campaignId)) {
+            remoteCampaignImageMap.set(campaignId, creativeUrl);
+          }
+        }
       }
     }
 
@@ -991,6 +1191,7 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
         revenue: 0,
         createdAt: campaign?.created_time || null,
         updatedAt: campaign?.updated_time || null,
+        imageUrl: remoteCampaignImageMap.get(remoteId) || '',
         metaResponse: campaign
       });
     }
