@@ -51,12 +51,25 @@ class TemplateController {
   async createTemplate(req, res) {
     try {
       const { name, category, language, content, type = 'custom', components } = req.body;
-      const normalizedName = String(name || '').trim();
+      const normalizedName = String(name || '')
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, '_')
+        .replace(/[^a-z0-9_]/g, '')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '');
 
       if (!normalizedName || (!content && !components)) {
         return res.status(400).json({
           success: false,
           error: 'Template name and content/components are required'
+        });
+      }
+
+      if (!/^[a-z0-9](?:[a-z0-9_]*[a-z0-9])?$/.test(normalizedName)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Template name must use lowercase letters, numbers, and underscores only, and cannot start or end with underscore.'
         });
       }
 
@@ -141,7 +154,8 @@ class TemplateController {
       if (!metaResult.success) {
         return res.status(400).json({
           success: false,
-          error: metaResult.error || 'Failed to submit template to Meta'
+          error: metaResult.error || 'Failed to submit template to Meta',
+          details: metaResult.details || null
         });
       }
 

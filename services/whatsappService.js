@@ -687,7 +687,8 @@ class WhatsAppService {
       console.error('âŒ Failed to create template:', error.response?.data || error.message);
       return { 
         success: false, 
-        error: error.response?.data?.error?.message || error.message 
+        error: (error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Failed to create template'),
+        details: error.response?.data || null
       };
     }
   }
