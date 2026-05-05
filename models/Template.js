@@ -4,7 +4,11 @@ const mongoose = require('mongoose');
 
 const TemplateSchema = new mongoose.Schema({
 
-  name: { type: String, required: true, unique: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+
+  companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'company', index: true, default: null },
+
+  name: { type: String, required: true },
 
   type: { 
 
@@ -74,6 +78,12 @@ const TemplateSchema = new mongoose.Schema({
 
   whatsappTemplateId: String,
 
+  businessAccountId: String,
+
+  phoneNumberId: String,
+
+  syncedAt: Date,
+
   isActive: { type: Boolean, default: true },
 
   usageCount: { type: Number, default: 0 },
@@ -101,6 +111,10 @@ TemplateSchema.pre('save', function(next) {
 
 
 TemplateSchema.index({ status: 1, isActive: 1 });
+
+TemplateSchema.index({ companyId: 1, userId: 1, name: 1 }, { unique: true });
+
+TemplateSchema.index({ companyId: 1, userId: 1, whatsappTemplateId: 1 }, { sparse: true });
 
 
 

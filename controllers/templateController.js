@@ -1,6 +1,55 @@
 const Template = require('../models/Template');
 const whatsappService = require('../services/whatsappService');
 
+const normalizeTemplateLookupValue = (value = '') => String(value || '').trim().toLowerCase();
+
+const isMetaDuplicateTemplateError = (result = {}) => {
+  const message = [
+    result.error,
+    result.details?.error?.message,
+    result.details?.error?.error_user_msg,
+    result.details?.message
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+
+  return /already exists|duplicate|name.*taken|template.*exist/.test(message);
+};
+
+const findExistingMetaTemplate = (templates = [], name = '', language = '') => {
+  const normalizedName = normalizeTemplateLookupValue(name);
+  const normalizedLanguage = normalizeTemplateLookupValue(language);
+
+  return (Array.isArray(templates) ? templates : []).find((template) => {
+    const templateName = normalizeTemplateLookupValue(template?.name);
+    const templateLanguage = normalizeTemplateLookupValue(template?.language);
+    return (
+      templateName === normalizedName &&
+      (!normalizedLanguage || templateLanguage === normalizedLanguage)
+    );
+  });
+};
+
+const buildLocalTemplateContentFromMeta = (components = []) => {
+  const safeComponents = Array.isArray(components) ? components : [];
+  const headerComponent = safeComponents.find((component) => component?.type === 'HEADER');
+  const bodyComponent = safeComponents.find((component) => component?.type === 'BODY');
+  const footerComponent = safeComponents.find((component) => component?.type === 'FOOTER');
+  const buttonsComponent = safeComponents.find((component) => component?.type === 'BUTTONS');
+
+  return {
+    header: {
+      type: headerComponent ? String(headerComponent.format || 'text').toLowerCase() : 'text',
+      text: headerComponent?.text || '',
+      mediaUrl: ''
+    },
+    body: bodyComponent?.text || '',
+    footer: footerComponent?.text || '',
+    buttons: buttonsComponent?.buttons || []
+  };
+};
+
 class TemplateController {
     // Helper function to extract variables from template text
     extractVariables(text) {
@@ -151,7 +200,24 @@ class TemplateController {
         components: componentsForMeta
       }, req.whatsappCredentials);
 
-      if (!metaResult.success) {
+      let metaTemplateId = metaResult.data?.id || null;
+      let existingMetaTemplate = null;
+
+      if (!metaResult.success && isMetaDuplicateTemplateError(metaResult)) {
+        const listResult = await whatsappService.getTemplateList(req.whatsappCredentials);
+        if (listResult.success) {
+          existingMetaTemplate = findExistingMetaTemplate(
+            listResult.data?.data || [],
+            templateData.name,
+            templateData.language
+          );
+          if (existingMetaTemplate) {
+            metaTemplateId = existingMetaTemplate.id || null;
+          }
+        }
+      }
+
+      if (!metaResult.success && !existingMetaTemplate) {
         return res.status(400).json({
           success: false,
           error: metaResult.error || 'Failed to submit template to Meta',
@@ -159,7 +225,14 @@ class TemplateController {
         });
       }
 
-      const metaTemplateId = metaResult.data?.id || null;
+      if (existingMetaTemplate) {
+        templateData.category = existingMetaTemplate.category || templateData.category;
+        templateData.language = existingMetaTemplate.language || templateData.language;
+        templateData.status = String(existingMetaTemplate.status || 'pending').toLowerCase();
+        templateData.isActive = templateData.status === 'approved';
+        templateData.content = buildLocalTemplateContentFromMeta(existingMetaTemplate.components) || templateData.content;
+        templateData.variables = this.extractVariables(templateData.content?.body || '');
+      }
 
       // Save locally only after Meta creation is successful.
       const template = await Template.findOneAndUpdate(
