@@ -25,6 +25,66 @@ const registerLegacyCoreRoutes = (app, deps) => {
   const isValidObjectId = (value = '') => /^[a-f\d]{24}$/i.test(String(value || '').trim());
   const buildCompanyScopeFilter = (companyId) => (companyId ? { companyId } : {});
 
+  const enrichConversationsWithLatestAgentStatus = async (conversations = [], req) => {
+    const safeConversations = Array.isArray(conversations) ? conversations : [];
+    const conversationObjectIds = safeConversations
+      .map((conversation) => String(conversation?._id || '').trim())
+      .filter((conversationId) => mongoose.Types.ObjectId.isValid(conversationId))
+      .map((conversationId) => new mongoose.Types.ObjectId(conversationId));
+
+    if (!conversationObjectIds.length) {
+      return safeConversations;
+    }
+
+    const latestAgentMessages = await Message.aggregate([
+      {
+        $match: {
+          userId: req.user.id,
+          ...(req.companyId ? { companyId: req.companyId } : {}),
+          conversationId: { $in: conversationObjectIds },
+          sender: 'agent'
+        }
+      },
+      {
+        $sort: {
+          conversationId: 1,
+          timestamp: -1,
+          createdAt: -1,
+          _id: -1
+        }
+      },
+      {
+        $group: {
+          _id: '$conversationId',
+          lastMessageStatus: { $first: '$status' },
+          lastMessageWhatsappMessageId: { $first: '$whatsappMessageId' },
+          lastMessageTime: { $first: '$timestamp' }
+        }
+      }
+    ]);
+
+    const latestByConversationId = new Map(
+      latestAgentMessages.map((message) => [String(message?._id || '').trim(), message])
+    );
+
+    return safeConversations.map((conversation) => {
+      const conversationId = String(conversation?._id || '').trim();
+      const latestMessage = latestByConversationId.get(conversationId);
+      if (!latestMessage) return conversation;
+
+      const derivedStatus = String(latestMessage?.lastMessageStatus || '').trim().toLowerCase();
+      return {
+        ...conversation,
+        lastMessageFrom: 'agent',
+        lastMessageStatus: derivedStatus || String(conversation?.lastMessageStatus || '').trim(),
+        lastMessageWhatsappMessageId:
+          String(latestMessage?.lastMessageWhatsappMessageId || '').trim() ||
+          String(conversation?.lastMessageWhatsappMessageId || '').trim(),
+        lastMessageTime: latestMessage?.lastMessageTime || conversation?.lastMessageTime
+      };
+    });
+  };
+
   const resolveReplyReferenceForOutboundSend = async ({
     userId,
     companyId,
@@ -361,7 +421,11 @@ const registerLegacyCoreRoutes = (app, deps) => {
         .sort({ lastMessageTime: -1 })
         .limit(100)
         .lean();
-      res.json(conversations);
+      const enrichedConversations = await enrichConversationsWithLatestAgentStatus(
+        conversations,
+        req
+      );
+      res.json(enrichedConversations);
     } catch (error) {
       res.status(500).json({ error: error.message });
     }
@@ -412,7 +476,11 @@ const registerLegacyCoreRoutes = (app, deps) => {
       if (!conversation) {
         return res.status(404).json({ error: 'Conversation not found' });
       }
-      return res.json(conversation);
+      const [enrichedConversation] = await enrichConversationsWithLatestAgentStatus(
+        [conversation],
+        req
+      );
+      return res.json(enrichedConversation || conversation);
     } catch (error) {
       return res.status(500).json({ error: error.message });
     }

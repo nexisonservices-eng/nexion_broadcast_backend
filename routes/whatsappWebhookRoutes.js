@@ -665,7 +665,9 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           await Conversation.updateOne(
             { _id: updatedMessage.conversationId },
             {
-              lastMessageStatus: status
+              lastMessageStatus: status,
+              lastMessageFrom: 'agent',
+              lastMessageWhatsappMessageId: updatedMessage.whatsappMessageId || messageId || ''
             }
           );
         } catch (conversationStatusError) {

@@ -322,7 +322,7 @@ class TemplateController {
       }
 
       // Save locally only after Meta creation is successful.
-      const template = await Template.findOneAndUpdate(
+      const savedTemplate = await Template.findOneAndUpdate(
         { userId: req.user.id, companyId: req.companyId, name: normalizedName },
         {
           ...templateData,
@@ -333,7 +333,7 @@ class TemplateController {
 
       res.status(201).json({
         success: true,
-        data: template,
+        data: savedTemplate,
         message: 'Template saved locally, but Meta submission failed',
         metaSubmission: {
           success: false,

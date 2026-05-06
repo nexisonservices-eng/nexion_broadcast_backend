@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
 const Message = require('../models/Message');
@@ -44,6 +45,75 @@ const TEAM_INBOX_CONVERSATION_FIELDS = [
   'resolvedAt'
 ].join(' ');
 
+const enrichConversationsWithLatestMessage = async (req, conversations) => {
+  const safeConversations = Array.isArray(conversations) ? conversations : [];
+  if (!safeConversations.length) {
+    return safeConversations;
+  }
+
+  const conversationIds = safeConversations
+    .map((conversation) => String(conversation?._id || '').trim())
+    .filter((conversationId) => Boolean(conversationId) && mongoose.Types.ObjectId.isValid(conversationId))
+    .map((conversationId) => new mongoose.Types.ObjectId(conversationId));
+
+  if (!conversationIds.length) {
+    return safeConversations;
+  }
+
+  const latestMessages = await Message.aggregate([
+    {
+      $match: {
+        ...buildScopedFilters(req, {
+          conversationId: { $in: conversationIds }
+        })
+      }
+    },
+    { $sort: { timestamp: -1, _id: -1 } },
+    {
+      $group: {
+        _id: '$conversationId',
+        latestMessage: { $first: '$$ROOT' }
+      }
+    }
+  ]);
+
+  const latestMessageByConversationId = new Map(
+    (Array.isArray(latestMessages) ? latestMessages : [])
+      .map((entry) => [String(entry?._id || '').trim(), entry?.latestMessage || null])
+      .filter(([conversationId, latestMessage]) => conversationId && latestMessage)
+  );
+
+  return safeConversations.map((conversation) => {
+    const conversationId = String(conversation?._id || '').trim();
+    const latestMessage = latestMessageByConversationId.get(conversationId);
+
+    if (!latestMessage) {
+      return conversation;
+    }
+
+    return {
+      ...conversation,
+      lastMessageFrom: String(latestMessage?.sender || conversation?.lastMessageFrom || '')
+        .trim()
+        .toLowerCase(),
+      lastMessageStatus:
+        String(latestMessage?.sender || '').trim().toLowerCase() === 'agent'
+          ? String(latestMessage?.status || conversation?.lastMessageStatus || 'sent')
+              .trim()
+              .toLowerCase()
+          : String(conversation?.lastMessageStatus || '').trim().toLowerCase(),
+      lastMessageWhatsappMessageId:
+        String(latestMessage?.whatsappMessageId || '').trim() ||
+        String(conversation?.lastMessageWhatsappMessageId || '').trim(),
+      lastMessageTime:
+        latestMessage?.timestamp ||
+        conversation?.lastMessageTime ||
+        latestMessage?.createdAt ||
+        conversation?.updatedAt
+    };
+  });
+};
+
 const buildScopedFilters = (req, extra = {}) => {
   const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
   const filters = {
@@ -72,6 +142,8 @@ class ConversationController {
         .populate('contactId', TEAM_INBOX_CONTACT_FIELDS)
         .sort({ lastMessageTime: -1 })
         .lean();
+
+      conversations = await enrichConversationsWithLatestMessage(req, conversations);
 
       conversations = conversations.map((conv) => {
         const fromConversation = Number(conv.unreadCount || 0);
