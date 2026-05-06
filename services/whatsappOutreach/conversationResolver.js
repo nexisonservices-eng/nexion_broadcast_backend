@@ -181,6 +181,7 @@ const resolveOrCreateConversationForTemplateSend = async ({
       lastMessageAttachmentName: '',
       lastMessageAttachmentPages: null,
       lastMessageFrom: 'agent',
+      lastMessageWhatsappMessageId: '',
       unreadCount: 0
     });
     createdConversation = true;

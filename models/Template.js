@@ -110,6 +110,16 @@ TemplateSchema.pre('save', function(next) {
 
 
 
+TemplateSchema.index(
+  { userId: 1, companyId: 1, name: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      userId: { $type: 'objectId' },
+      companyId: { $type: 'objectId' }
+    }
+  }
+);
 TemplateSchema.index({ status: 1, isActive: 1 });
 
 TemplateSchema.index({ companyId: 1, userId: 1, name: 1 }, { unique: true });

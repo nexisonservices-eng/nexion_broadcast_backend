@@ -4,9 +4,14 @@ const {
   downloadAndStoreIncomingWhatsAppMedia
 } = require('../services/inboxMediaService');
 const {
+  applyContactOptIn,
   applyContactOptOut,
   detectWhatsAppOptOutKeyword
 } = require('../services/whatsappOutreach/policy');
+const {
+  buildPhoneCandidates,
+  normalizePhoneDigits
+} = require('../services/whatsappOutreach/conversationResolver');
 const { logConsentEvent } = require('../services/whatsappConsentLogService');
 
 const registerWhatsAppWebhookRoutes = (app, deps) => {
@@ -15,6 +20,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
     ENABLE_DEBUG_LOGS,
     resolveUserIdByPhoneNumberId,
     getWhatsAppCredentialsByUserId,
+    getLeadScoringSettings,
     applyIncomingMessageScore,
     applyReadScoreForMessage,
     Contact,
@@ -70,6 +76,66 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       if (normalized) return normalized;
     }
     return '';
+  };
+
+  const normalizeKeywordText = (value = '') =>
+    String(value || '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, ' ');
+
+  const getExactKeywordMatches = ({ text = '', keywordRules = [] }) => {
+    const normalizedText = normalizeKeywordText(text);
+    if (!normalizedText) return [];
+
+    return (Array.isArray(keywordRules) ? keywordRules : []).filter((rule) => {
+      const keyword = normalizeKeywordText(rule?.keyword || '');
+      return Boolean(keyword) && keyword === normalizedText;
+    });
+  };
+
+  const applyKeywordOptInToContact = async ({
+    contact,
+    userId,
+    companyId,
+    messageText,
+    whatsappMessageId,
+    optInScope,
+    matchedKeyword
+  }) => {
+    if (!contact) return null;
+
+    applyContactOptIn(contact, { source: 'keyword_reply' });
+    contact.whatsappOptInScope = String(optInScope || 'marketing').trim().toLowerCase() || 'marketing';
+    contact.whatsappOptInTextSnapshot = String(messageText || '').trim();
+    contact.whatsappOptInProofType = 'keyword_reply';
+    contact.whatsappOptInProofId = String(whatsappMessageId || '').trim();
+    contact.whatsappOptInProofUrl = '';
+    contact.whatsappOptInCapturedBy = 'whatsapp_webhook';
+    contact.whatsappOptInPageUrl = '';
+    contact.whatsappOptInIp = '';
+    contact.whatsappOptInUserAgent = '';
+    contact.whatsappOptInMetadata = {
+      source: 'keyword_reply',
+      matchedKeyword: String(matchedKeyword || '').trim()
+    };
+    await contact.save();
+
+    await logConsentEvent({
+      contact,
+      action: 'opt_in',
+      payload: {
+        source: 'keyword_reply',
+        scope: contact.whatsappOptInScope,
+        consentText: contact.whatsappOptInTextSnapshot,
+        proofType: contact.whatsappOptInProofType,
+        proofId: contact.whatsappOptInProofId,
+        capturedBy: contact.whatsappOptInCapturedBy,
+        metadata: contact.whatsappOptInMetadata
+      }
+    });
+
+    return contact;
   };
 
   const summarizeNfmReply = (responseJson) => {
@@ -219,6 +285,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       console.log('Processing incoming message...');
 
       const from = messageData.from;
+      const normalizedFrom = normalizePhoneDigits(from);
+      const phoneCandidates = buildPhoneCandidates(from);
       const {
         text,
         scoringText,
@@ -292,12 +360,33 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       const inboundActivityAt = new Date();
       const serviceWindowClosesAt = new Date(inboundActivityAt.getTime() + 24 * 60 * 60 * 1000);
 
-      let contact = await Contact.findOne({ userId, companyId, phone: from });
+      let contact = await Contact.findOne({
+        userId,
+        companyId,
+        phone: { $in: phoneCandidates }
+      });
+      const leadScoringSettings =
+        typeof getLeadScoringSettings === 'function'
+          ? await getLeadScoringSettings({ userId, companyId })
+          : { optInKeywordRules: [], whatsappOptInScope: 'marketing' };
+      const optInKeywordRules = Array.isArray(leadScoringSettings?.whatsappOptInKeywordRules)
+        ? leadScoringSettings.whatsappOptInKeywordRules
+        : [];
+      const optInScope =
+        String(leadScoringSettings?.whatsappOptInScope || 'marketing').trim().toLowerCase() ||
+        'marketing';
+      const matchedOptInKeywords = getExactKeywordMatches({
+        text,
+        keywordRules: optInKeywordRules
+      });
+      const matchedOptInKeyword = matchedOptInKeywords[0]?.keyword || '';
+      const shouldApplyKeywordOptIn =
+        !detectWhatsAppOptOutKeyword(text) && Boolean(matchedOptInKeyword);
       if (!contact) {
         contact = await Contact.create({
           userId,
           companyId,
-          phone: from,
+          phone: normalizedFrom || from,
           name: value.contacts?.[0]?.profile?.name || from,
           sourceType: 'incoming_message',
           lastContact: inboundActivityAt,
@@ -316,7 +405,21 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
             }
           });
         }
+        if (shouldApplyKeywordOptIn) {
+          await applyKeywordOptInToContact({
+            contact,
+            userId,
+            companyId,
+            messageText: text,
+            whatsappMessageId: messageId,
+            optInScope,
+            matchedKeyword: matchedOptInKeyword
+          });
+        }
       } else {
+        if (normalizedFrom && contact.phone !== normalizedFrom) {
+          contact.phone = normalizedFrom;
+        }
         contact.lastContact = inboundActivityAt;
         contact.lastContactAt = inboundActivityAt;
         contact.lastInboundMessageAt = inboundActivityAt;
@@ -332,6 +435,17 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
             payload: {
               source: 'keyword'
             }
+          });
+        }
+        if (shouldApplyKeywordOptIn) {
+          await applyKeywordOptInToContact({
+            contact,
+            userId,
+            companyId,
+            messageText: text,
+            whatsappMessageId: messageId,
+            optInScope,
+            matchedKeyword: matchedOptInKeyword
           });
         }
       }
@@ -430,10 +544,19 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         });
       }
 
+      if (shouldApplyKeywordOptIn) {
+        emitRealtimeEvent(userId, {
+          type: 'crm_changed',
+          contactId: String(contact._id),
+          conversationId: String(conversation._id),
+          reason: 'whatsapp_keyword_opt_in'
+        });
+      }
+
       const broadcast = await Broadcast.findOne({
         companyId,
         createdById: userId,
-        'recipients.phone': from,
+        'recipients.phone': { $in: phoneCandidates },
         status: { $in: ['sending', 'completed'] },
         startedAt: { $exists: true }
       }).sort({ startedAt: -1 });
@@ -535,6 +658,19 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
 
       if (!updatedMessage) {
         return;
+      }
+
+      if (updatedMessage.sender === 'agent') {
+        try {
+          await Conversation.updateOne(
+            { _id: updatedMessage.conversationId },
+            {
+              lastMessageStatus: status
+            }
+          );
+        } catch (conversationStatusError) {
+          console.error('Error updating conversation lastMessageStatus:', conversationStatusError);
+        }
       }
 
       emitRealtimeEvent(effectiveUserId, {

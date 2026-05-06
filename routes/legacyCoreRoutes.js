@@ -121,6 +121,44 @@ const registerLegacyCoreRoutes = (app, deps) => {
     });
   };
 
+  const hydrateContactWithLatestInboundActivity = async ({
+    userId,
+    companyId,
+    conversation,
+    contact
+  }) => {
+    if (!contact || !conversation?._id || !userId) return contact;
+
+    const latestInboundMessage = await Message.findOne({
+      userId,
+      ...buildCompanyScopeFilter(companyId || conversation.companyId || null),
+      conversationId: conversation._id,
+      sender: 'contact'
+    })
+      .sort({ timestamp: -1, createdAt: -1, _id: -1 })
+      .select('timestamp whatsappTimestamp')
+      .lean();
+
+    const inboundActivityAt = latestInboundMessage?.whatsappTimestamp || latestInboundMessage?.timestamp;
+    if (!inboundActivityAt) return contact;
+
+    const inboundDate = new Date(inboundActivityAt);
+    if (Number.isNaN(inboundDate.getTime())) return contact;
+
+    const currentInboundAt = contact.lastInboundMessageAt
+      ? new Date(contact.lastInboundMessageAt)
+      : null;
+    const hasCurrentInbound = currentInboundAt && !Number.isNaN(currentInboundAt.getTime());
+    if (hasCurrentInbound && currentInboundAt.getTime() >= inboundDate.getTime()) {
+      return contact;
+    }
+
+    const hydratedContact = contact;
+    hydratedContact.lastInboundMessageAt = inboundDate;
+    hydratedContact.serviceWindowClosesAt = new Date(inboundDate.getTime() + 24 * 60 * 60 * 1000);
+    return hydratedContact;
+  };
+
   app.post(
     '/api/messages/send',
     auth,
@@ -165,8 +203,16 @@ const registerLegacyCoreRoutes = (app, deps) => {
           companyId: conversation.companyId || req.companyId || null,
           conversation
         });
+        const policyContact = outboundContact
+          ? await hydrateContactWithLatestInboundActivity({
+              userId: req.user.id,
+              companyId: conversation.companyId || req.companyId || null,
+              conversation,
+              contact: outboundContact
+            })
+          : null;
         const freeformValidation = outboundContact
-          ? validateFreeformOutboundSend(outboundContact)
+          ? validateFreeformOutboundSend(policyContact || outboundContact)
           : { ok: true, policy: null };
         if (!freeformValidation.ok) {
           return res.status(freeformValidation.statusCode || 403).json({
@@ -235,7 +281,9 @@ const registerLegacyCoreRoutes = (app, deps) => {
             lastMessageMediaType: String(mediaType || '').trim(),
             lastMessageAttachmentName: '',
             lastMessageAttachmentPages: null,
-            lastMessageFrom: 'agent'
+            lastMessageFrom: 'agent',
+            lastMessageWhatsappMessageId: whatsappMessageId || '',
+            lastMessageStatus: 'sent'
           }
         );
 
@@ -342,6 +390,7 @@ const registerLegacyCoreRoutes = (app, deps) => {
         contactName,
         status: status || 'active',
         lastMessageTime: new Date(),
+        lastMessageWhatsappMessageId: '',
         unreadCount: 0
       });
 
@@ -580,34 +629,56 @@ const registerLegacyCoreRoutes = (app, deps) => {
     try {
       const last7Days = new Date();
       last7Days.setDate(last7Days.getDate() - 7);
+      const analyticsScopeFilter = req.companyId
+        ? {
+            $or: [
+              { companyId: req.companyId },
+              { userId: req.user.id }
+            ]
+          }
+        : { userId: req.user.id };
+      const scopedConversations = await Conversation.find(analyticsScopeFilter).select('_id').lean();
+      const scopedConversationIds = scopedConversations
+        .map((conversation) => conversation?._id)
+        .filter(Boolean);
+      const analyticsMessageFilter = scopedConversationIds.length
+        ? {
+            conversationId: { $in: scopedConversationIds },
+            sender: 'agent'
+          }
+        : {
+            ...analyticsScopeFilter,
+            sender: 'agent'
+          };
+      const analyticsContactMessageFilter = scopedConversationIds.length
+        ? {
+            conversationId: { $in: scopedConversationIds },
+            sender: 'contact',
+            timestamp: { $gte: last7Days }
+          }
+        : {
+            ...analyticsScopeFilter,
+            sender: 'contact',
+            timestamp: { $gte: last7Days }
+          };
+
       const [totalConversations, activeConversations, allAgentMessages, userBroadcasts, messageTotals, messagesReceived] = await Promise.all([
-        Conversation.countDocuments({ userId: req.user.id, companyId: req.companyId }),
+        Conversation.countDocuments(analyticsScopeFilter),
         Conversation.countDocuments({
-          userId: req.user.id,
-          companyId: req.companyId,
+          ...analyticsScopeFilter,
           status: 'active'
         }),
         Message.find({
-          userId: req.user.id,
-          companyId: req.companyId,
-          sender: 'agent',
+          ...analyticsMessageFilter,
           timestamp: { $gte: last7Days }
         })
           .select('timestamp conversationId status mediaType')
           .lean(),
-        Broadcast.find({
-          companyId: req.companyId,
-          $or: [
-            { createdById: req.user.id },
-            { createdBy: req.user.username || req.user.email || req.user.id }
-          ]
-        }).select('stats').lean(),
+        Broadcast.find(analyticsScopeFilter).select('stats').lean(),
         Message.aggregate([
           {
             $match: {
-              userId: req.user.id,
-              companyId: req.companyId,
-              sender: 'agent'
+              ...analyticsMessageFilter
             }
           },
           {
@@ -632,12 +703,7 @@ const registerLegacyCoreRoutes = (app, deps) => {
             }
           }
         ]),
-        Message.countDocuments({
-          userId: req.user.id,
-          companyId: req.companyId,
-          sender: 'contact',
-          timestamp: { $gte: last7Days }
-        })
+        Message.countDocuments(analyticsContactMessageFilter)
       ]);
 
       const campaignTotals = userBroadcasts.reduce(

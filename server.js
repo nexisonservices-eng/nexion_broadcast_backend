@@ -4,6 +4,7 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const WebSocket = require('ws');
+const jwt = require('jsonwebtoken');
 
 // Database connection
 const connectDB = require('./config/database');
@@ -51,7 +52,7 @@ const {
   applyReadScoreForMessage,
   applyIncomingMessageScore
 } = require('./services/leadScoringService');
-const { isDebugLoggingEnabled, validateSecurityEnv } = require('./utils/securityConfig');
+const { isDebugLoggingEnabled, validateSecurityEnv, requireJwtSecret } = require('./utils/securityConfig');
 
 // Routes
 const bulkRoutes = require('./routes/bulk');
@@ -242,7 +243,24 @@ app.get('/api/version', (req, res) => {
 
 app.get('/api/lead-scoring/settings', auth, async (req, res) => {
   try {
-    const settings = await getLeadScoringSettings(req.user.id, req.companyId);
+    const token = String(req.headers.authorization || '').startsWith('Bearer ')
+      ? String(req.headers.authorization || '').split(' ')[1]
+      : '';
+    const decoded = token
+      ? (() => {
+          try {
+            return jwt.verify(token, requireJwtSecret('lead scoring settings lookup'));
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+    const resolvedUserId = req.user.id || decoded?.userId || decoded?.id || '';
+    const resolvedCompanyId = req.companyId || decoded?.companyId || null;
+    const settings = await getLeadScoringSettings({
+      userId: resolvedUserId,
+      companyId: resolvedCompanyId
+    });
     return res.json({
       success: true,
       data: settings
@@ -254,7 +272,32 @@ app.get('/api/lead-scoring/settings', auth, async (req, res) => {
 
 app.put('/api/lead-scoring/settings', auth, async (req, res) => {
   try {
-    const updated = await updateLeadScoringSettings(req.user.id, req.companyId, req.body || {});
+    const token = String(req.headers.authorization || '').startsWith('Bearer ')
+      ? String(req.headers.authorization || '').split(' ')[1]
+      : '';
+    const decoded = token
+      ? (() => {
+          try {
+            return jwt.verify(token, requireJwtSecret('lead scoring settings update'));
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+    const resolvedUserId = req.user.id || decoded?.userId || decoded?.id || '';
+    const resolvedCompanyId = req.companyId || decoded?.companyId || null;
+    if (!resolvedUserId) {
+      return res.status(401).json({
+        success: false,
+        error: 'Unable to resolve user identity for lead scoring settings update'
+      });
+    }
+    const updated = await updateLeadScoringSettings({
+      userId: resolvedUserId,
+      companyId: resolvedCompanyId,
+      updatedBy: resolvedUserId,
+      payload: req.body || {}
+    });
     return res.json({
       success: true,
       data: updated
@@ -340,6 +383,7 @@ registerWhatsAppWebhookRoutes(app, {
   ENABLE_DEBUG_LOGS,
   resolveUserIdByPhoneNumberId,
   getWhatsAppCredentialsByUserId,
+  getLeadScoringSettings,
   applyIncomingMessageScore,
   applyReadScoreForMessage,
   Contact,

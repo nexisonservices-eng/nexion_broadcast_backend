@@ -164,6 +164,7 @@ class BroadcastService {
     const endHour = Math.max(0, Math.min(23, Number(quietHours?.endHour ?? 8)));
     const timezone = String(quietHours?.timezone || 'UTC').trim() || 'UTC';
     const action = String(quietHours?.action || 'defer').toLowerCase() === 'skip' ? 'skip' : 'defer';
+    const batchSize = Math.max(1, Math.min(500, Number(policy?.batchSize || 50)));
 
     return {
       quietHours: {
@@ -172,7 +173,15 @@ class BroadcastService {
         endHour,
         timezone,
         action
-      }
+      },
+      batchSize: Number.isFinite(batchSize) ? Math.trunc(batchSize) : 50
+    };
+  }
+
+  normalizeBroadcastBatchPolicy(policy = {}) {
+    const batchSize = Math.max(1, Math.min(500, Number(policy?.batchSize || 50)));
+    return {
+      batchSize: Number.isFinite(batchSize) ? Math.trunc(batchSize) : 50
     };
   }
 
@@ -224,7 +233,8 @@ class BroadcastService {
       }),
       deliveryPolicy: this.normalizeDeliveryPolicy({
         ...(fallbackDeliveryPolicy || {}),
-        ...(broadcastData?.deliveryPolicy || {})
+        ...(broadcastData?.deliveryPolicy || {}),
+        batchSize: broadcastData?.deliveryPolicy?.batchSize ?? broadcastData?.batchSize
       }),
       compliancePolicy: this.normalizeCompliancePolicy({
         ...(fallbackCompliancePolicy || {}),
@@ -357,21 +367,22 @@ class BroadcastService {
       const rawPhone = recipient?.phone || recipient;
       const normalizedPhone = this.normalizePhoneNumber(rawPhone);
       if (!normalizedPhone) return;
-      detailsByPhone.set(normalizedPhone, {
-        phone: rawPhone,
-        name: recipient?.name || '',
-        sent: false,
-        delivered: false,
-        read: false,
-        failed: false,
-        replied: false,
-        replyCount: 0,
-        status: 'pending',
-        lastSentAt: null,
-        lastStatusAt: null,
-        lastReplyAt: null,
-        lastReplyText: ''
-      });
+        detailsByPhone.set(normalizedPhone, {
+          phone: rawPhone,
+          name: recipient?.name || '',
+          sent: false,
+          delivered: false,
+          read: false,
+          failed: false,
+          replied: false,
+          replyCount: 0,
+          status: 'pending',
+          lastSentAt: null,
+          lastStatusAt: null,
+          lastReplyAt: null,
+          lastReplyText: '',
+          lastFailureReason: ''
+        });
     });
 
     const startTime = new Date(broadcast.startedAt || broadcast.createdAt || Date.now());
@@ -458,7 +469,8 @@ class BroadcastService {
           lastSentAt: null,
           lastStatusAt: null,
           lastReplyAt: null,
-          lastReplyText: ''
+          lastReplyText: '',
+          lastFailureReason: ''
         });
       }
 
@@ -550,6 +562,51 @@ class BroadcastService {
       detail.replyCount += 1;
       detail.lastReplyAt = replyTime || detail.lastReplyAt;
       detail.lastReplyText = String(message.text || '').trim();
+    });
+
+    const deliveryResults = Array.isArray(broadcast?.deliveryResults) ? broadcast.deliveryResults : [];
+    deliveryResults.forEach((result) => {
+      const normalizedPhone = this.normalizePhoneNumber(result?.phone || '');
+      if (!normalizedPhone) return;
+
+      if (!detailsByPhone.has(normalizedPhone)) {
+        detailsByPhone.set(normalizedPhone, {
+          phone: result?.phone || normalizedPhone,
+          name: String(result?.name || '').trim(),
+          sent: false,
+          delivered: false,
+          read: false,
+          failed: false,
+          replied: false,
+          replyCount: 0,
+          status: 'pending',
+          lastSentAt: null,
+          lastStatusAt: null,
+          lastReplyAt: null,
+          lastReplyText: '',
+          lastFailureReason: ''
+        });
+      }
+
+      const detail = detailsByPhone.get(normalizedPhone);
+      const status = String(result?.status || '').toLowerCase();
+      const isFailed = result?.success === false && !result?.skipped;
+      const isSkipped = Boolean(result?.skipped);
+
+      if (isFailed) {
+        detail.failed = true;
+        detail.status = 'failed';
+        detail.lastFailureReason = String(result?.error || result?.reason || result?.policy?.error || '').trim();
+        detail.lastStatusAt = detail.lastStatusAt || new Date();
+      } else if (isSkipped) {
+        detail.status = 'pending';
+        detail.lastFailureReason = String(result?.reason || '').trim();
+      } else if (status === 'sent' || result?.success === true) {
+        detail.sent = true;
+        if (!detail.status || detail.status === 'pending') {
+          detail.status = 'sent';
+        }
+      }
     });
 
     // Final fallback: populate missing names from contacts table.
@@ -918,6 +975,7 @@ class BroadcastService {
       let usageBatchCount = 0;
       const usageBatchSize = Number(process.env.BROADCAST_USAGE_BATCH || 50);
       const sendDelayMs = Math.max(0, Number(process.env.BROADCAST_SEND_DELAY_MS || 1000));
+      const batchSize = Math.max(1, Math.min(500, Number(deliveryPolicy?.batchSize || 50)));
       const suppressionSet = new Set(
         (compliancePolicy?.suppressionListPhones || [])
           .map((phone) => this.normalizePhoneNumber(phone))
@@ -932,7 +990,29 @@ class BroadcastService {
           credentials: resolvedCredentials
         });
       }
-      const templateCategory = toCleanString(templateCategoryRaw).toLowerCase() || 'marketing';
+      const templateCategory = toCleanString(templateCategoryRaw).toLowerCase() || 'utility';
+      const templateHeaderMediaUrl = String(broadcast?.mediaUrl || '').trim();
+      const templateHeaderMediaType = String(broadcast?.mediaType || '').trim().toLowerCase();
+      if (broadcast.templateName && templateHeaderMediaType === 'image' && !templateHeaderMediaUrl) {
+        return {
+          success: false,
+          error: 'This broadcast template requires an image header. Add an image URL before sending.'
+        };
+      }
+      const templateComponents =
+        broadcast.templateName && templateHeaderMediaType === 'image' && templateHeaderMediaUrl
+          ? [
+              {
+                type: 'HEADER',
+                parameters: [
+                  {
+                    type: 'image',
+                    image: { link: templateHeaderMediaUrl }
+                  }
+                ]
+              }
+            ]
+          : null;
 
       // If templateContent is not stored, try to resolve from Meta
       if (!templatePreviewText && broadcast.templateName) {
@@ -943,7 +1023,10 @@ class BroadcastService {
         );
       }
 
-      for (const recipient of broadcast.recipients) {
+      const recipients = Array.isArray(broadcast.recipients) ? broadcast.recipients : [];
+      for (let batchStart = 0; batchStart < recipients.length; batchStart += batchSize) {
+        const batchRecipients = recipients.slice(batchStart, batchStart + batchSize);
+        for (const recipient of batchRecipients) {
         try {
           let result;
           const phoneNumber = recipient.phone || recipient;
@@ -1015,7 +1098,9 @@ class BroadcastService {
                   normalizedTemplateName,
                   broadcast.language || 'en_US',
                   recipient.variables || broadcast.variables || [],
-                  resolvedCredentials
+                  resolvedCredentials,
+                  true,
+                  templateComponents
                 ),
               retryPolicy
             );
@@ -1185,6 +1270,7 @@ class BroadcastService {
             retryable: errorMeta.retryable
           });
         }
+        }
       }
 
       broadcast.analytics = {
@@ -1194,6 +1280,7 @@ class BroadcastService {
         retried: Number(broadcast?.analytics?.retried || 0) + retried,
         failureCodeBreakdown
       };
+      broadcast.deliveryResults = results;
       broadcast.status = 'completed';
       broadcast.completedAt = new Date();
       await broadcast.save();
@@ -1275,7 +1362,8 @@ class BroadcastService {
           lastMessageMediaType: '',
           lastMessageAttachmentName: '',
           lastMessageAttachmentPages: null,
-          lastMessageFrom: 'agent'
+          lastMessageFrom: 'agent',
+          lastMessageWhatsappMessageId: whatsappMessageId || ''
         });
       } else {
         conversation.lastMessage = message;
@@ -1284,6 +1372,7 @@ class BroadcastService {
         conversation.lastMessageAttachmentName = '';
         conversation.lastMessageAttachmentPages = null;
         conversation.lastMessageFrom = 'agent';
+        conversation.lastMessageWhatsappMessageId = whatsappMessageId || '';
         await conversation.save();
       }
 
@@ -1590,6 +1679,10 @@ class BroadcastService {
         failed: messages.filter(msg => msg.status === 'failed').length,
         replied: 0 // Will be calculated below
       };
+      const deliveryFailedCount = Array.isArray(broadcast?.deliveryResults)
+        ? broadcast.deliveryResults.filter((item) => item?.success === false && !item?.skipped).length
+        : 0;
+      stats.failed = Math.max(stats.failed, deliveryFailedCount, Number(broadcast?.stats?.failed || 0));
 
       // Debug: Log message statuses to identify issues
       console.log('🔍 DEBUG: Message statuses found:', {

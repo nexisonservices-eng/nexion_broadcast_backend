@@ -22,6 +22,8 @@ const ConversationSchema = new mongoose.Schema({
   lastMessageAttachmentName: { type: String, default: '' },
   lastMessageAttachmentPages: { type: Number, default: null },
   lastMessageFrom: { type: String, enum: ['contact', 'agent'] },
+  lastMessageWhatsappMessageId: { type: String, default: '' },
+  lastMessageStatus: { type: String, default: '' },
   unreadCount: { type: Number, default: 0 },
   notes: String,
   createdAt: { type: Date, default: Date.now },

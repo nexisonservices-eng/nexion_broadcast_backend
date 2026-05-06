@@ -197,7 +197,7 @@ router.post(
     try {
       const recipients = Array.isArray(req.body?.recipients) ? req.body.recipients : [];
       const messageType = toCleanString(req.body?.messageType || req.body?.message_type || 'template');
-      const templateCategory = toCleanString(req.body?.templateCategory || '') || 'marketing';
+      const templateCategory = toCleanString(req.body?.templateCategory || '') || 'utility';
 
       if (!recipients.length) {
         return res.status(400).json({
@@ -218,7 +218,7 @@ router.post(
         success: true,
         data: {
           ...validation,
-          canProceed: validation.summary.eligible > 0
+          canProceed: recipients.length > 0
         }
       });
     } catch (error) {
@@ -248,13 +248,15 @@ router.post(
         templateName,
         templateContent,
         templateCategory = '',
+        mediaUrl = '',
+        mediaType = '',
         deliveryPolicy,
         retryPolicy,
         compliancePolicy
       } = req.body;
 
       const msgType = message_type || messageType || (templateName ? 'template' : 'text');
-      const normalizedTemplateCategory = toCleanString(templateCategory) || 'marketing';
+      const normalizedTemplateCategory = toCleanString(templateCategory) || 'utility';
       const rawTemplateName = template_name || templateName;
       const finalTemplateName = rawTemplateName ? String(rawTemplateName).trim().toLowerCase() : '';
       const customMsg = custom_message || customMessage || '';
@@ -291,15 +293,7 @@ router.post(
         templateCategory: normalizedTemplateCategory
       });
 
-      if (!audienceValidation.summary.eligible) {
-        return res.status(400).json({
-          success: false,
-          message: 'No eligible recipients found for this WhatsApp campaign',
-          audienceValidation
-        });
-      }
-
-      const eligibleRecipients = audienceValidation.eligibleRecipients.map((recipient) => {
+      const broadcastRecipients = parsedRecipients.map((recipient) => {
         const fullData = recipient?.data || recipient?.fullData || {};
         return {
           phone: String(recipient?.phone || '').trim(),
@@ -310,11 +304,11 @@ router.post(
           attributes: fullData && typeof fullData === 'object' ? fullData : {}
         };
       });
-      const hasContactsAudience = eligibleRecipients.some((recipient) => Boolean(String(recipient?.contactId || '').trim()));
+      const hasContactsAudience = broadcastRecipients.some((recipient) => Boolean(String(recipient?.contactId || '').trim()));
       const defaultAudienceMode = hasContactsAudience ? 'contacts' : 'csv';
       const defaultAudienceLabel = hasContactsAudience ? 'Selected CRM contacts' : 'CSV upload';
       const defaultAudienceType = hasContactsAudience ? 'contacts' : 'csv';
-      const selectedContactIds = eligibleRecipients
+      const selectedContactIds = broadcastRecipients
         .map((recipient) => String(recipient?.contactId || '').trim())
         .filter(Boolean);
 
@@ -326,8 +320,10 @@ router.post(
         templateName: finalTemplateName || null,
         templateCategory: normalizedTemplateCategory,
         templateContent: String(templateContent || '').trim(),
+        mediaUrl: String(mediaUrl || '').trim(),
+        mediaType: String(mediaType || '').trim(),
         language: language || 'en_US',
-        recipients: eligibleRecipients,
+        recipients: broadcastRecipients,
         audienceSource:
           req.body?.audienceSource && typeof req.body.audienceSource === 'object'
             ? req.body.audienceSource
@@ -338,7 +334,7 @@ router.post(
                 segmentId: '',
                 sourceName: hasContactsAudience ? 'crm_contacts' : 'csv_upload',
                 uploadedFileName: String(req.body?.audienceSource?.uploadedFileName || '').trim(),
-                recipientCount: eligibleRecipients.length,
+                recipientCount: broadcastRecipients.length,
                 selectedContactCount: selectedContactIds.length,
                 hasContactIds: selectedContactIds.length > 0
               },
@@ -350,7 +346,7 @@ router.post(
                 label: defaultAudienceLabel,
                 sourceType: defaultAudienceType,
                 uploadedFileName: String(req.body?.audienceSnapshot?.uploadedFileName || '').trim(),
-                recipientCount: eligibleRecipients.length,
+                recipientCount: broadcastRecipients.length,
                 selectedContactCount: selectedContactIds.length,
                 contactIds: selectedContactIds
               },
@@ -394,7 +390,7 @@ router.post(
         success: true,
         engine: 'bulk_broadcast_unified_v3',
         broadcastId: created.data._id,
-        total_sent: eligibleRecipients.length,
+        total_sent: broadcastRecipients.length,
         successful: Number(sent?.data?.stats?.successful || 0),
         failed: Number(sent?.data?.stats?.failed || 0),
         results: Array.isArray(sent?.data?.results) ? sent.data.results : [],

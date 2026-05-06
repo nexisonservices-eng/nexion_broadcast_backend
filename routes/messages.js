@@ -176,6 +176,12 @@ const resolveAttachmentUsername = (req) =>
     userId: req?.user?.id
   });
 
+const resolveBroadcastTemplateHeaderFolder = (req) => {
+  const storageUsername = resolveAttachmentUsername(req);
+  const safeUsername = String(storageUsername || 'user').trim().toLowerCase().replace(/[^a-z0-9._-]/g, '_');
+  return `meta-template-images/${safeUsername}/lead`;
+};
+
 const buildAttachmentLabel = (mediaType = '') => {
   const normalized = String(mediaType || '').trim().toLowerCase();
   if (normalized === 'image') return '[Image]';
@@ -369,6 +375,55 @@ const runAttachmentUpload = (req, res) =>
       return resolve();
     });
   });
+
+const runTemplateHeaderUpload = (req, res) =>
+  new Promise((resolve, reject) => {
+    upload.single('file')(req, res, (error) => {
+      if (error) return reject(error);
+      return resolve();
+    });
+  });
+
+router.post(
+  '/template-header-media',
+  requirePlanFeature('broadcastMessaging'),
+  async (req, res) => {
+    try {
+      await runTemplateHeaderUpload(req, res);
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          error: 'Image file is required'
+        });
+      }
+
+      const storageUsername = resolveAttachmentUsername(req);
+      const attachment = await uploadInboxAttachment({
+        file: req.file,
+        username: storageUsername,
+        direction: 'sent',
+        folderOverride: resolveBroadcastTemplateHeaderFolder(req),
+        userId: req.user.id,
+        sender: req.user.id,
+        recipient: 'broadcast-template-header'
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          mediaUrl: attachment.secureUrl,
+          attachment
+        }
+      });
+    } catch (error) {
+      return res.status(error?.status || 500).json({
+        success: false,
+        error: error?.message || 'Failed to upload template header image'
+      });
+    }
+  }
+);
 
 router.post(
   '/react',
@@ -629,6 +684,8 @@ router.post(
           lastMessageAttachmentName: '',
           lastMessageAttachmentPages: null,
           lastMessageFrom: 'agent',
+          lastMessageWhatsappMessageId: whatsappMessageId || '',
+          lastMessageStatus: 'sent',
           contactName:
             String(contact?.name || conversation.contactName || contactName || '').trim() ||
             conversation.contactName
@@ -823,7 +880,9 @@ router.post(
             mediaType === 'document' ? String(attachment?.originalFileName || '').trim() : '',
           lastMessageAttachmentPages:
             mediaType === 'document' ? Number(attachment?.pages || 0) || null : null,
-          lastMessageFrom: 'agent'
+          lastMessageFrom: 'agent',
+          lastMessageWhatsappMessageId: whatsappMessageId || '',
+          lastMessageStatus: 'sent'
         }
       );
 

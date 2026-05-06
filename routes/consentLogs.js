@@ -4,7 +4,11 @@ const Contact = require('../models/Contact');
 const WhatsAppConsentLog = require('../models/WhatsAppConsentLog');
 const ConsentExportJob = require('../models/ConsentExportJob');
 const { generateConsentExport } = require('../services/consentExportService');
-const { applyContactOptOut, toCleanString } = require('../services/whatsappOutreach/policy');
+const {
+  applyContactOptOut,
+  normalizeWhatsAppOptInStatus,
+  toCleanString
+} = require('../services/whatsappOutreach/policy');
 const { logConsentEvent } = require('../services/whatsappConsentLogService');
 
 const router = express.Router();
@@ -95,15 +99,51 @@ const setExportCooldown = (req) => {
 };
 
 const buildMissingProofFilters = (req) => {
-  const filters = {
-    whatsappOptInStatus: 'opted_in',
+  const hasOptInEvidence = {
     $or: [
-      { whatsappOptInProofType: { $exists: false } },
-      { whatsappOptInProofType: null },
-      { whatsappOptInProofType: '' },
-      { whatsappOptInTextSnapshot: { $exists: false } },
-      { whatsappOptInTextSnapshot: null },
-      { whatsappOptInTextSnapshot: '' }
+      { whatsappOptInAt: { $exists: true, $ne: null } },
+      { whatsappOptInTextSnapshot: { $exists: true, $ne: '' } },
+      { whatsappOptInProofType: { $exists: true, $ne: '' } },
+      { whatsappOptInProofId: { $exists: true, $ne: '' } },
+      { whatsappOptInProofUrl: { $exists: true, $ne: '' } },
+      { whatsappOptInPageUrl: { $exists: true, $ne: '' } },
+      { whatsappOptInCapturedBy: { $exists: true, $ne: '' } },
+      { whatsappOptInMetadata: { $exists: true, $ne: null } }
+    ]
+  };
+  const filters = {
+    $and: [
+      {
+        $or: [
+          { whatsappOptInStatus: 'opted_in' },
+          hasOptInEvidence
+        ]
+      },
+      {
+        $or: [
+          { whatsappOptInStatus: { $exists: false } },
+          { whatsappOptInStatus: null },
+          { whatsappOptInStatus: '' },
+          { whatsappOptInStatus: { $ne: 'opted_out' } }
+        ]
+      },
+      {
+        $or: [
+          { isBlocked: { $exists: false } },
+          { isBlocked: null },
+          { isBlocked: false }
+        ]
+      },
+      {
+        $or: [
+          { whatsappOptInProofType: { $exists: false } },
+          { whatsappOptInProofType: null },
+          { whatsappOptInProofType: '' },
+          { whatsappOptInTextSnapshot: { $exists: false } },
+          { whatsappOptInTextSnapshot: null },
+          { whatsappOptInTextSnapshot: '' }
+        ]
+      }
     ]
   };
 
@@ -131,6 +171,15 @@ const buildMissingProofFilters = (req) => {
 
   return filters;
 };
+
+const normalizeMissingProofContact = (contact = {}) => ({
+  ...contact,
+  whatsappOptInStatus: normalizeWhatsAppOptInStatus(
+    contact?.whatsappOptInStatus,
+    contact?.isBlocked,
+    contact
+  )
+});
 
 // CSV building is handled in consentExportService.
 
@@ -383,7 +432,7 @@ router.get('/review/missing-proof', async (req, res) => {
 
     return res.json({
       success: true,
-      data: items,
+      data: items.map(normalizeMissingProofContact),
       summary: {
         total,
         prooflessCount,

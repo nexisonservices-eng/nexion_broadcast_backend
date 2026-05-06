@@ -141,6 +141,137 @@ const parseTagList = (value) =>
     .map((tag) => tag.trim())
     .filter(Boolean);
 
+const normalizeImportFieldKey = (value = '') =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+
+const getImportedFieldValue = (contactData = {}, aliases = []) => {
+  if (!contactData || typeof contactData !== 'object') return '';
+
+  const normalizedLookup = new Map(
+    Object.entries(contactData).map(([key, value]) => [normalizeImportFieldKey(key), value])
+  );
+
+  for (const alias of Array.isArray(aliases) ? aliases : []) {
+    const rawValue = normalizedLookup.get(normalizeImportFieldKey(alias));
+    if (rawValue === undefined || rawValue === null) continue;
+    const cleanedValue = typeof rawValue === 'string' ? rawValue.trim() : rawValue;
+    if (cleanedValue === '') continue;
+    return cleanedValue;
+  }
+
+  return '';
+};
+
+const normalizeImportedContactData = (contactData = {}) => {
+  if (!contactData || typeof contactData !== 'object') return {};
+
+  const normalizedTags = (() => {
+    const rawTags = getImportedFieldValue(contactData, [
+      'tags',
+      'tag',
+      'Tag',
+      'contactTags',
+      'contact tags'
+    ]);
+    if (Array.isArray(rawTags)) {
+      return rawTags.map((tag) => String(tag || '').trim()).filter(Boolean);
+    }
+    return parseTagList(rawTags);
+  })();
+
+  return {
+    ...contactData,
+    name: toCleanString(
+      getImportedFieldValue(contactData, ['name', 'firstName', 'first name', 'fullName', 'full name'])
+    ),
+    phone: toCleanString(
+      getImportedFieldValue(contactData, [
+        'phone',
+        'whatsappNumber',
+        'whatsapp number',
+        'mobile',
+        'mobile number',
+        'contactNumber',
+        'contact number',
+        'phoneNumber',
+        'phone number'
+      ])
+    ),
+    email: toCleanString(getImportedFieldValue(contactData, ['email', 'emailAddress', 'email address'])),
+    status: toCleanString(
+      getImportedFieldValue(contactData, ['status', 'whatsappOptInStatus', 'optInStatus', 'opt in status'])
+    ),
+    source: toCleanString(getImportedFieldValue(contactData, ['source', 'importSource', 'import source'])),
+    sourceType: toCleanString(
+      getImportedFieldValue(contactData, ['sourceType', 'source type', 'contactSourceType'])
+    ),
+    consentText: toCleanString(
+      getImportedFieldValue(contactData, [
+        'consentText',
+        'consent text',
+        'textSnapshot',
+        'text snapshot',
+        'whatsappOptInTextSnapshot',
+        'optInText',
+        'opt in text',
+        'consentSnapshot',
+        'consent snapshot'
+      ])
+    ),
+    proofType: toCleanString(
+      getImportedFieldValue(contactData, [
+        'proofType',
+        'proof type',
+        'whatsappOptInProofType',
+        'consentProofType',
+        'consent proof type'
+      ])
+    ),
+    proofId: toCleanString(
+      getImportedFieldValue(contactData, [
+        'proofId',
+        'proof id',
+        'whatsappOptInProofId',
+        'consentProofId',
+        'consent proof id'
+      ])
+    ),
+    proofUrl: toCleanString(
+      getImportedFieldValue(contactData, [
+        'proofUrl',
+        'proof url',
+        'whatsappOptInProofUrl',
+        'consentProofUrl',
+        'consent proof url'
+      ])
+    ),
+    scope: toCleanString(
+      getImportedFieldValue(contactData, [
+        'scope',
+        'consentScope',
+        'consent scope',
+        'whatsappOptInScope',
+        'whatsapp opt in scope'
+      ])
+    ),
+    capturedBy: toCleanString(
+      getImportedFieldValue(contactData, ['capturedBy', 'captured by', 'whatsappOptInCapturedBy'])
+    ),
+    pageUrl: toCleanString(
+      getImportedFieldValue(contactData, ['pageUrl', 'page url', 'whatsappOptInPageUrl'])
+    ),
+    lineNumber: getImportedFieldValue(contactData, ['lineNumber', 'line number']) || contactData.lineNumber || null,
+    metadata:
+      contactData?.metadata && typeof contactData.metadata === 'object' && !Array.isArray(contactData.metadata)
+        ? contactData.metadata
+        : null,
+    tags: normalizedTags
+  };
+};
+
 const normalizeContactInput = (payload = {}, fallbackSourceType = 'manual') => {
   const next = { ...payload };
   if (payload.phone !== undefined) {
@@ -187,31 +318,32 @@ const normalizeImportStatus = (value = '') =>
   toCleanString(value).toLowerCase().replace(/_/g, '-');
 
 const buildImportConsentAuditPayload = (contactData = {}, req, lineNumber = null) => {
+  const normalizedContactData = normalizeImportedContactData(contactData);
   const consentText = toCleanString(
-    contactData.consentText ||
-      contactData.whatsappOptInTextSnapshot ||
-      contactData.optInText ||
-      contactData.consentSnapshot
+    normalizedContactData.consentText ||
+      normalizedContactData.whatsappOptInTextSnapshot ||
+      normalizedContactData.optInText ||
+      normalizedContactData.consentSnapshot
   );
   const proofType = toCleanString(
-    contactData.proofType ||
-      contactData.whatsappOptInProofType ||
-      contactData.consentProofType
+    normalizedContactData.proofType ||
+      normalizedContactData.whatsappOptInProofType ||
+      normalizedContactData.consentProofType
   );
   const proofId = toCleanString(
-    contactData.proofId ||
-      contactData.whatsappOptInProofId ||
-      contactData.consentProofId
+    normalizedContactData.proofId ||
+      normalizedContactData.whatsappOptInProofId ||
+      normalizedContactData.consentProofId
   );
   const proofUrl = toCleanString(
-    contactData.proofUrl ||
-      contactData.whatsappOptInProofUrl ||
-      contactData.consentProofUrl
+    normalizedContactData.proofUrl ||
+      normalizedContactData.whatsappOptInProofUrl ||
+      normalizedContactData.consentProofUrl
   );
   const scope = normalizeOptInScope(
-    contactData.scope ||
-      contactData.whatsappOptInScope ||
-      contactData.consentScope ||
+    normalizedContactData.scope ||
+      normalizedContactData.whatsappOptInScope ||
+      normalizedContactData.consentScope ||
       'marketing'
   );
 
@@ -221,26 +353,60 @@ const buildImportConsentAuditPayload = (contactData = {}, req, lineNumber = null
 
   return buildOptInAuditPayload(
     {
-      source: toCleanString(contactData.source) || 'import',
+      source: toCleanString(normalizedContactData.source) || 'import',
       scope,
       consentText,
       proofType,
       proofId,
       proofUrl,
-      capturedBy: toCleanString(contactData.capturedBy || contactData.whatsappOptInCapturedBy),
-      pageUrl: toCleanString(contactData.pageUrl || contactData.whatsappOptInPageUrl),
+      capturedBy: toCleanString(
+        normalizedContactData.capturedBy || normalizedContactData.whatsappOptInCapturedBy
+      ),
+      pageUrl: toCleanString(
+        normalizedContactData.pageUrl || normalizedContactData.whatsappOptInPageUrl
+      ),
       metadata: {
-        importLineNumber: lineNumber || contactData.lineNumber || null,
+        importLineNumber: lineNumber || normalizedContactData.lineNumber || null,
         importSource: 'csv_import',
         ...(
-          contactData.metadata && typeof contactData.metadata === 'object' && !Array.isArray(contactData.metadata)
-            ? contactData.metadata
+          normalizedContactData.metadata &&
+          typeof normalizedContactData.metadata === 'object' &&
+          !Array.isArray(normalizedContactData.metadata)
+            ? normalizedContactData.metadata
             : {}
         )
       }
     },
     req
   );
+};
+
+const isStrictOptInImportRow = (contactData = {}) => {
+  const normalizedContactData = normalizeImportedContactData(contactData);
+  const status = normalizeImportStatus(normalizedContactData.status);
+  if (status !== 'opted-in') return { strictOptIn: false };
+
+  const consentText = toCleanString(
+    normalizedContactData.consentText ||
+      normalizedContactData.whatsappOptInTextSnapshot ||
+      normalizedContactData.optInText ||
+      normalizedContactData.consentSnapshot
+  );
+  const proofType = toCleanString(
+    normalizedContactData.proofType ||
+      normalizedContactData.whatsappOptInProofType ||
+      normalizedContactData.consentProofType
+  );
+
+  return {
+    strictOptIn: true,
+    consentText,
+    proofType,
+    missingFields: [
+      !consentText ? 'consentText' : null,
+      !proofType ? 'proofType' : null
+    ].filter(Boolean)
+  };
 };
 
 const applyOptInAuditPayload = (contact, auditPayload) => {
@@ -723,24 +889,26 @@ router.post('/import', async (req, res) => {
       
       for (const contactData of batch) {
         try {
+          const normalizedContactData = normalizeImportedContactData(contactData);
+
           // Validate required fields
-          if (!contactData.phone) {
+          if (!normalizedContactData.phone) {
             results.failed++;
             results.errors.push({
-              line: contactData.lineNumber || 'Unknown',
+              line: normalizedContactData.lineNumber || 'Unknown',
               error: 'Phone number is required',
-              data: contactData
+              data: normalizedContactData
             });
             continue;
           }
 
-          const normalizedPhone = getPreferredPhoneValue(contactData);
+          const normalizedPhone = getPreferredPhoneValue(normalizedContactData);
           if (!normalizedPhone) {
             results.failed++;
             results.errors.push({
-              line: contactData.lineNumber || 'Unknown',
+              line: normalizedContactData.lineNumber || 'Unknown',
               error: 'Phone number is required',
-              data: contactData
+              data: normalizedContactData
             });
             continue;
           }
@@ -749,17 +917,29 @@ router.post('/import', async (req, res) => {
           const existingContact = await Contact.findOne(
             buildScopedContactFilter(req, buildPhoneMatchFilter(normalizedPhone) || {})
           );
-          const normalizedStatus = normalizeImportStatus(contactData.status);
+          const normalizedStatus = normalizeImportStatus(normalizedContactData.status);
+          const strictOptInRule = isStrictOptInImportRow(normalizedContactData);
           const importConsentAudit = buildImportConsentAuditPayload(
-            contactData,
+            normalizedContactData,
             req,
-            contactData.lineNumber || null
+            normalizedContactData.lineNumber || null
           );
 
+          if (strictOptInRule.strictOptIn && strictOptInRule.missingFields.length > 0) {
+            results.failed++;
+            results.errors.push({
+              line: normalizedContactData.lineNumber || 'Unknown',
+              error:
+                `Opted-in rows must include ${strictOptInRule.missingFields.join(' and ')}.`,
+              data: normalizedContactData
+            });
+            continue;
+          }
+
           if (existingContact) {
-            existingContact.name = toCleanString(contactData.name) || existingContact.name;
-            existingContact.email = toCleanString(contactData.email) || existingContact.email;
-            existingContact.tags = getMergedTags(existingContact.tags, contactData.tags);
+            existingContact.name = toCleanString(normalizedContactData.name) || existingContact.name;
+            existingContact.email = toCleanString(normalizedContactData.email) || existingContact.email;
+            existingContact.tags = getMergedTags(existingContact.tags, normalizedContactData.tags);
             existingContact.phone = normalizedPhone;
             existingContact.sourceType = existingContact.sourceType || 'imported';
             if (normalizedStatus === 'opted-out') {
@@ -768,13 +948,6 @@ router.post('/import', async (req, res) => {
               if (importConsentAudit) {
                 applyContactOptIn(existingContact, { source: 'import' });
                 applyOptInAuditPayload(existingContact, importConsentAudit);
-              } else {
-                results.warnings.push({
-                  line: contactData.lineNumber || 'Unknown',
-                  warning:
-                    'Opted-in rows must include consentText and proofType. Contact imported as unknown instead.',
-                  data: contactData
-                });
               }
             }
             await existingContact.save();
@@ -783,13 +956,13 @@ router.post('/import', async (req, res) => {
           }
 
           // Create contact
-          const contact = new Contact({
+          const contact = await Contact.create({
             userId: req.user.id,
             companyId: req.companyId || null,
-            name: contactData.name || '',
+            name: normalizedContactData.name || '',
             phone: normalizedPhone,
-            email: contactData.email || '',
-            tags: Array.isArray(contactData.tags) ? contactData.tags : [],
+            email: normalizedContactData.email || '',
+            tags: Array.isArray(normalizedContactData.tags) ? normalizedContactData.tags : [],
             isBlocked: normalizedStatus === 'opted-out',
             sourceType: 'imported',
             lastContact: new Date(),
@@ -803,13 +976,6 @@ router.post('/import', async (req, res) => {
             if (importConsentAudit) {
               applyContactOptIn(contact, { source: 'import' });
               applyOptInAuditPayload(contact, importConsentAudit);
-            } else {
-              results.warnings.push({
-                line: contactData.lineNumber || 'Unknown',
-                warning:
-                  'Opted-in rows must include consentText and proofType. Contact imported as unknown instead.',
-                data: contactData
-              });
             }
           }
 

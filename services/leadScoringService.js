@@ -7,6 +7,8 @@ const DEFAULT_LEAD_SCORING_SETTINGS = Object.freeze({
   readScore: 2,
   replyScore: 5,
   keywordRules: [],
+  whatsappOptInScope: 'marketing',
+  whatsappOptInKeywordRules: [],
   isEnabled: true,
   automation: {
     isEnabled: false,
@@ -81,6 +83,20 @@ const normalizeLeadScoringPayload = (payload = {}) => {
     updates.keywordRules = normalizeKeywordRules(payload.keywords);
   }
 
+  if (Object.prototype.hasOwnProperty.call(payload, 'whatsappOptInScope')) {
+    const normalizedScope = String(payload.whatsappOptInScope || '').trim().toLowerCase();
+    updates.whatsappOptInScope =
+      ['marketing', 'service', 'both'].includes(normalizedScope)
+        ? normalizedScope
+        : DEFAULT_LEAD_SCORING_SETTINGS.whatsappOptInScope;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, 'whatsappOptInKeywordRules')) {
+    updates.whatsappOptInKeywordRules = normalizeKeywordRules(payload.whatsappOptInKeywordRules);
+  } else if (Object.prototype.hasOwnProperty.call(payload, 'whatsappOptInKeywords')) {
+    updates.whatsappOptInKeywordRules = normalizeKeywordRules(payload.whatsappOptInKeywords);
+  }
+
   const automationPayload =
     payload?.automation && typeof payload.automation === 'object' ? payload.automation : null;
   if (automationPayload) {
@@ -117,6 +133,17 @@ const toPlainConfig = (config) => ({
   readScore: toNonNegativeNumber(config?.readScore, DEFAULT_LEAD_SCORING_SETTINGS.readScore),
   replyScore: toNonNegativeNumber(config?.replyScore, DEFAULT_LEAD_SCORING_SETTINGS.replyScore),
   keywordRules: normalizeKeywordRules(config?.keywordRules || []),
+  whatsappOptInScope:
+    ['marketing', 'service', 'both'].includes(
+      String(config?.whatsappOptInScope || DEFAULT_LEAD_SCORING_SETTINGS.whatsappOptInScope)
+        .trim()
+        .toLowerCase()
+    )
+      ? String(config?.whatsappOptInScope || DEFAULT_LEAD_SCORING_SETTINGS.whatsappOptInScope)
+          .trim()
+          .toLowerCase()
+      : DEFAULT_LEAD_SCORING_SETTINGS.whatsappOptInScope,
+  whatsappOptInKeywordRules: normalizeKeywordRules(config?.whatsappOptInKeywordRules || []),
   isEnabled: config?.isEnabled !== false,
   automation: {
     isEnabled: config?.automation?.isEnabled === true,

@@ -32,6 +32,7 @@ const BroadcastSchema = new mongoose.Schema({
     variables: [String],
     attributes: mongoose.Schema.Types.Mixed
   }],
+  deliveryResults: mongoose.Schema.Types.Mixed,
   recipientCount: { type: Number, default: 0 },
   status: { 
     type: String, 
@@ -71,7 +72,8 @@ const BroadcastSchema = new mongoose.Schema({
       endHour: { type: Number, min: 0, max: 23, default: 8 },
       timezone: { type: String, default: 'UTC' },
       action: { type: String, enum: ['defer', 'skip'], default: 'defer' }
-    }
+    },
+    batchSize: { type: Number, min: 1, max: 500, default: 50 }
   },
   retryPolicy: {
     enabled: { type: Boolean, default: true },

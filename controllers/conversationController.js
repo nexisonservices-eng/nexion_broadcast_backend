@@ -5,6 +5,12 @@ const {
   normalizeRole,
   isTenantWideRole
 } = require('../utils/accessControl');
+const {
+  getWhatsAppMessagingPolicy,
+  applyContactOptIn,
+  applyContactOptOut,
+  toCleanString
+} = require('../services/whatsappOutreach/policy');
 
 const TEAM_INBOX_CONTACT_FIELDS =
   '_id name phone email notes tags status stage customFields nextFollowUpAt leadScore leadScoreBreakdown isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata whatsappMarketingWindowStartedAt whatsappMarketingSendCount whatsappMarketingLastSentAt whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt';
@@ -29,6 +35,8 @@ const TEAM_INBOX_CONVERSATION_FIELDS = [
   'lastMessageAttachmentName',
   'lastMessageAttachmentPages',
   'lastMessageFrom',
+  'lastMessageWhatsappMessageId',
+  'lastMessageStatus',
   'unreadCount',
   'notes',
   'createdAt',
@@ -90,6 +98,17 @@ class ConversationController {
   async getContacts(req, res) {
     try {
       const { search, tags } = req.query;
+      const wantsMarketingEligible =
+        String(req.query?.marketingEligible || '').trim().toLowerCase() === 'true';
+      const wantsRecentlyInteracted =
+        String(req.query?.recentlyInteractedOnly || req.query?.repliedOnly || '')
+          .trim()
+          .toLowerCase() === 'true';
+      const requestedOptInStatus = toCleanString(req.query?.whatsappOptInStatus || '').toLowerCase();
+      const requestedSourceType = toCleanString(req.query?.sourceType || '').toLowerCase();
+      const limit = Math.max(1, Math.min(500, Number(req.query?.limit || 100)));
+      const page = Math.max(1, Number(req.query?.page || 1));
+      const skip = (page - 1) * limit;
       const filters = buildScopedFilters(req);
       
       if (search) {
@@ -104,13 +123,36 @@ class ConversationController {
         const tagArray = Array.isArray(tags) ? tags : tags.split(',');
         filters.tags = { $in: tagArray };
       }
+
+      if (requestedOptInStatus) {
+        filters.whatsappOptInStatus = requestedOptInStatus;
+      }
+
+      if (requestedSourceType) {
+        filters.sourceType = requestedSourceType;
+      }
       
+      const totalCount = await Contact.countDocuments(filters);
       const contacts = await Contact.find(filters)
         .select(CONTACT_LIST_FIELDS)
-        .sort({ lastContact: -1, createdAt: -1 })
+        .sort({ lastContact: -1, lastInboundMessageAt: -1, createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
         .lean();
+
+      const filteredContacts = (Array.isArray(contacts) ? contacts : []).filter((contact) => {
+        const policy = getWhatsAppMessagingPolicy(contact);
+        if (wantsMarketingEligible && !policy.marketingTemplateAllowed) {
+          return false;
+        }
+        if (wantsRecentlyInteracted && !policy.serviceWindowOpen) {
+          return false;
+        }
+        return true;
+      });
       
-      res.json({ success: true, data: contacts });
+      res.setHeader('x-total-count', String(totalCount));
+      res.json({ success: true, data: filteredContacts });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }

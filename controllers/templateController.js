@@ -69,6 +69,23 @@ class TemplateController {
         
         return variables;
     }
+
+  hasStandaloneVariableLine(text) {
+    if (!text) return false;
+    return String(text)
+      .split(/\r?\n/)
+      .some((line) => /^\s*\{\{\d+\}\}\s*$/.test(line));
+  }
+
+  buildMetaSafeText(text) {
+    const lines = String(text || '')
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    return lines.join(' ').replace(/\s+/g, ' ').trim();
+  }
   async getAllTemplates(req, res) {
     try {
       const { status, isActive, category } = req.query;
@@ -152,8 +169,16 @@ class TemplateController {
         });
       }
 
+      if (this.hasStandaloneVariableLine(templateContent?.body || bodyText)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Variables cannot be alone on a line. Put text before or after the variable.'
+        });
+      }
+
       const bodyForVariables = templateContent?.body || bodyText;
       const variables = this.extractVariables(bodyForVariables);
+      const metaSafeBody = this.buildMetaSafeText(bodyForVariables);
 
       const templateData = {
         userId: req.user.id,
@@ -170,28 +195,90 @@ class TemplateController {
         createdById: req.user.id
       };
 
-      // Strict rule: template must be created in Meta first. Only then save in DB.
       const componentsForMeta = Array.isArray(components) && components.length > 0
         ? components
+            .map((component) => {
+              const componentType = String(component?.type || '').trim().toUpperCase();
+              if (!componentType) return null;
+
+              if (componentType === 'BODY') {
+                const bodyTextForMeta = this.buildMetaSafeText(component?.text || bodyForVariables);
+                if (!bodyTextForMeta) return null;
+
+                return {
+                  ...component,
+                  type: 'BODY',
+                  text: bodyTextForMeta
+                };
+              }
+
+              if (componentType === 'HEADER') {
+                const headerFormat = String(component?.format || '').trim().toUpperCase();
+                return {
+                  ...component,
+                  type: 'HEADER',
+                  ...(headerFormat ? { format: headerFormat } : {}),
+                  ...(headerFormat === 'TEXT'
+                    ? { text: String(component?.text || '').trim() }
+                    : {})
+                };
+              }
+
+              if (componentType === 'FOOTER') {
+                return {
+                  ...component,
+                  type: 'FOOTER',
+                  text: String(component?.text || '').trim()
+                };
+              }
+
+              return {
+                ...component,
+                type: componentType
+              };
+            })
+            .filter(Boolean)
         : [
             ...(templateContent?.header?.text
               ? [{
                   type: 'HEADER',
                   format: 'TEXT',
-                  text: templateContent.header.text
+                  text: String(templateContent.header.text || '').trim()
                 }]
               : []),
             {
               type: 'BODY',
-              text: templateContent?.body || ''
+              text: metaSafeBody
             },
             ...(templateContent?.footer
               ? [{
                   type: 'FOOTER',
-                  text: templateContent.footer
+                  text: String(templateContent.footer || '').trim()
                 }]
               : [])
           ];
+
+      const templateScopeFilter = {
+        userId: req.user.id,
+        companyId: req.companyId,
+        name: normalizedName
+      };
+
+      const existingTemplate = await Template.findOne(templateScopeFilter);
+      let template;
+
+      if (existingTemplate) {
+        existingTemplate.set({
+          ...templateData,
+          whatsappTemplateId: null
+        });
+        template = await existingTemplate.save();
+      } else {
+        template = await Template.create({
+          ...templateData,
+          whatsappTemplateId: null
+        });
+      }
 
       const metaResult = await whatsappService.createTemplate({
         name: templateData.name,
@@ -247,9 +334,21 @@ class TemplateController {
       res.status(201).json({
         success: true,
         data: template,
-        message: 'Template created successfully and submitted for approval'
+        message: 'Template saved locally, but Meta submission failed',
+        metaSubmission: {
+          success: false,
+          error: metaResult.error || 'Failed to submit template to Meta',
+          details: metaResult.details || null
+        }
       });
     } catch (error) {
+      if (error?.name === 'StrictModeError' && /companyId/.test(String(error?.message || ''))) {
+        return res.status(500).json({
+          success: false,
+          error: 'Template schema mismatch detected. Restart backend to load latest schema.',
+          details: error.message
+        });
+      }
       if (error.code === 11000) {
         return res.status(400).json({ success: false, error: 'Template name already exists' });
       }

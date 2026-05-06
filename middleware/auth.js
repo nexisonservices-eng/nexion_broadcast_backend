@@ -3,6 +3,14 @@ const { fetchUserContext } = require('../services/adminAuthService');
 const { requireJwtSecret } = require('../utils/securityConfig');
 const { normalizeRole } = require('../utils/accessControl');
 
+const normalizeIdLike = (value) => {
+  const normalized = String(value || '').trim();
+  if (!normalized || ['undefined', 'null', 'none'].includes(normalized.toLowerCase())) {
+    return '';
+  }
+  return normalized;
+};
+
 module.exports = (req, res, next) => {
   const run = async () => {
     try {
@@ -11,43 +19,67 @@ module.exports = (req, res, next) => {
         return res.status(401).json({ success: false, error: 'Unauthorized: token missing' });
       }
 
+      const token = authHeader.split(' ')[1];
+      let decodedFallback = null;
+      try {
+        decodedFallback = jwt.verify(token, requireJwtSecret('auth token verification'));
+      } catch (error) {
+        decodedFallback = null;
+      }
+
       // Preferred: resolve from admin backend
       try {
         const context = await fetchUserContext(authHeader);
         if (context?.userId || context?.email) {
+          const fallback = decodedFallback || {};
+          const contextUserId = normalizeIdLike(context.userId || context.id);
+          const fallbackUserId = normalizeIdLike(fallback.userId || fallback.id);
+          const contextCompanyId = normalizeIdLike(context.companyId);
+          const fallbackCompanyId = normalizeIdLike(fallback.companyId);
           req.user = {
-            id: context.userId || context.id,
-            email: context.email,
-            role: context.role,
-            username: context.username,
-            companyId: context.companyId,
-            companyRole: context.companyRole,
-            planCode: context.planCode,
-            featureFlags: context.featureFlags,
-            subscriptionStatus: context.subscriptionStatus,
-            trialUsage: context.trialUsage || {},
-            trialLimits: context.trialLimits || {},
-            documentStatus: context.documentStatus || "not_required",
-            workspaceAccessState: context.workspaceAccessState || "",
-            canPerformActions: typeof context.canPerformActions === "boolean" ? context.canPerformActions : true,
-            canViewAnalytics: typeof context.canViewAnalytics === "boolean" ? context.canViewAnalytics : true
+            id: contextUserId || fallbackUserId || '',
+            email: String(context.email || fallback.email || '').trim(),
+            role: context.role || fallback.role,
+            username: context.username || fallback.username,
+            companyId: contextCompanyId || fallbackCompanyId || null,
+            companyRole: context.companyRole || fallback.companyRole,
+            planCode: context.planCode || fallback.planCode,
+            featureFlags: context.featureFlags || fallback.featureFlags,
+            subscriptionStatus: context.subscriptionStatus || fallback.subscriptionStatus,
+            trialUsage: context.trialUsage || fallback.trialUsage || {},
+            trialLimits: context.trialLimits || fallback.trialLimits || {},
+            documentStatus: context.documentStatus || fallback.documentStatus || 'not_required',
+            workspaceAccessState: context.workspaceAccessState || fallback.workspaceAccessState || '',
+            canPerformActions:
+              typeof context.canPerformActions === 'boolean'
+                ? context.canPerformActions
+                : typeof fallback.canPerformActions === 'boolean'
+                  ? fallback.canPerformActions
+                  : true,
+            canViewAnalytics:
+              typeof context.canViewAnalytics === 'boolean'
+                ? context.canViewAnalytics
+                : typeof fallback.canViewAnalytics === 'boolean'
+                ? fallback.canViewAnalytics
+                : true
           };
-          req.companyId = context.companyId || null;
-          req.planFeatures = context.featureFlags || {};
+          req.companyId = contextCompanyId || fallbackCompanyId || null;
+          req.planFeatures = context.featureFlags || fallback.featureFlags || {};
           req.user.normalizedRole = normalizeRole(req.user.companyRole || req.user.role);
           req.authContext = {
             tenant: req.companyId || null,
             role: req.user.normalizedRole,
             feature: req.planFeatures || {}
           };
-          return next();
+          if (req.user.id || req.user.email) {
+            return next();
+          }
         }
       } catch (error) {
         // fallback to local JWT parsing
       }
 
-      const token = authHeader.split(' ')[1];
-      const decoded = jwt.verify(token, requireJwtSecret('auth token verification'));
+      const decoded = decodedFallback || jwt.verify(token, requireJwtSecret('auth token verification'));
       req.user = {
         id: decoded.userId || decoded.id,
         email: decoded.email,

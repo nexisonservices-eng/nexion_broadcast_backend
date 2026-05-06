@@ -330,7 +330,8 @@ async function updateConversationForMissedCallAutomation({
       lastMessageMediaType: '',
       lastMessageAttachmentName: '',
       lastMessageAttachmentPages: null,
-      lastMessageFrom: 'agent'
+      lastMessageFrom: 'agent',
+      lastMessageWhatsappMessageId: String(whatsappMessageId || '').trim() || ''
     });
   } else {
     conversation.contactName = conversation.contactName || contact.name;
@@ -340,6 +341,7 @@ async function updateConversationForMissedCallAutomation({
     conversation.lastMessageAttachmentName = '';
     conversation.lastMessageAttachmentPages = null;
     conversation.lastMessageFrom = 'agent';
+    conversation.lastMessageWhatsappMessageId = String(whatsappMessageId || '').trim() || '';
     await conversation.save();
   }
 

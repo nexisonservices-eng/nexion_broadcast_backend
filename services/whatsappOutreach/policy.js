@@ -6,10 +6,23 @@ const toSafeDate = (value) => {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 };
 
-const normalizeWhatsAppOptInStatus = (value, isBlocked = false) => {
+const hasOptInEvidence = (contact = {}) =>
+  Boolean(
+    toCleanString(contact?.whatsappOptInAt) ||
+      toCleanString(contact?.whatsappOptInTextSnapshot) ||
+      toCleanString(contact?.whatsappOptInProofType) ||
+      toCleanString(contact?.whatsappOptInProofId) ||
+      toCleanString(contact?.whatsappOptInProofUrl) ||
+      toCleanString(contact?.whatsappOptInPageUrl) ||
+      toCleanString(contact?.whatsappOptInCapturedBy) ||
+      toCleanString(contact?.whatsappOptInMetadata)
+  );
+
+const normalizeWhatsAppOptInStatus = (value, isBlocked = false, contact = {}) => {
   const normalized = toCleanString(value).toLowerCase();
   if (normalized === 'opted_in') return 'opted_in';
   if (normalized === 'opted_out') return 'opted_out';
+  if (hasOptInEvidence(contact)) return 'opted_in';
   return isBlocked ? 'opted_out' : 'unknown';
 };
 
@@ -122,19 +135,34 @@ const getWhatsAppMessagingPolicy = (contact = {}, options = {}) => {
   const now = options.now instanceof Date ? options.now : new Date();
   const normalizedOptInStatus = normalizeWhatsAppOptInStatus(
     contact?.whatsappOptInStatus,
-    contact?.isBlocked
+    contact?.isBlocked,
+    contact
   );
   const normalizedOptInScope = normalizeOptInScope(contact?.whatsappOptInScope);
   const serviceWindowClosesAt = toSafeDate(contact?.serviceWindowClosesAt);
+  const lastInboundMessageAt = toSafeDate(contact?.lastInboundMessageAt);
+  const inferredServiceWindowClosesAt = lastInboundMessageAt
+    ? new Date(lastInboundMessageAt.getTime() + 24 * 60 * 60 * 1000)
+    : null;
+  const effectiveServiceWindowClosesAt =
+    serviceWindowClosesAt && inferredServiceWindowClosesAt
+      ? new Date(
+          Math.max(
+            serviceWindowClosesAt.getTime(),
+            inferredServiceWindowClosesAt.getTime()
+          )
+        )
+      : serviceWindowClosesAt || inferredServiceWindowClosesAt;
   const serviceWindowOpen = Boolean(
-    serviceWindowClosesAt && serviceWindowClosesAt.getTime() > now.getTime()
+    effectiveServiceWindowClosesAt && effectiveServiceWindowClosesAt.getTime() > now.getTime()
   );
   const optedOut = normalizedOptInStatus === 'opted_out';
   const freeformAllowed = serviceWindowOpen && !optedOut;
   const templateOnly = !optedOut && !freeformAllowed;
   const templateCategory = toCleanString(options?.templateCategory).toLowerCase();
+  const recentlyInteracted = serviceWindowOpen;
   const marketingTemplateAllowed =
-    !optedOut && normalizedOptInStatus === 'opted_in' && marketingScopeAllowed(normalizedOptInScope);
+    !optedOut && (normalizedOptInStatus === 'opted_in' || hasOptInEvidence(contact) || recentlyInteracted);
   const marketingRateState = getMarketingRateLimitState(contact, {
     now,
     max: options?.marketingLimit,
@@ -154,13 +182,14 @@ const getWhatsAppMessagingPolicy = (contact = {}, options = {}) => {
   return {
     normalizedOptInStatus,
     normalizedOptInScope,
-    serviceWindowClosesAt,
+    serviceWindowClosesAt: effectiveServiceWindowClosesAt,
     serviceWindowOpen,
     freeformAllowed,
     templateOnly,
     optedOut,
     templateAllowed,
     marketingTemplateAllowed,
+    recentlyInteracted,
     marketingRateLimited: marketingRateState.limited,
     marketingRateRemaining: marketingRateState.remaining,
     marketingNextAllowedAt: marketingRateState.nextAllowedAt,
@@ -234,7 +263,7 @@ const validateTemplateOutboundSend = (contact = {}, { templateCategory = '' } = 
       policy,
       statusCode: 403,
       error:
-        'Marketing template messages require a valid WhatsApp opt-in for this contact.'
+        'Marketing template messages require a WhatsApp opt-in or a recent customer interaction.'
     };
   }
 
@@ -268,6 +297,7 @@ const buildBroadcastAudienceValidation = ({
     optedOut: 0,
     freeformWindowClosed: 0,
     missingMarketingOptIn: 0,
+    recentlyInteracted: 0,
     marketingRateLimited: 0,
     invalidPhone: 0
   };
@@ -313,6 +343,8 @@ const buildBroadcastAudienceValidation = ({
       } else if (normalizedMessageType === 'template') {
         if (validation.policy?.marketingRateLimited) {
           summary.marketingRateLimited += 1;
+        } else if (validation.policy?.recentlyInteracted) {
+          summary.recentlyInteracted += 1;
         } else {
           summary.missingMarketingOptIn += 1;
         }

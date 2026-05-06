@@ -32,6 +32,8 @@ const LeadScoringConfigSchema = new mongoose.Schema(
     readScore: { type: Number, default: 2 },
     replyScore: { type: Number, default: 5 },
     keywordRules: { type: [KeywordRuleSchema], default: [] },
+    whatsappOptInScope: { type: String, default: 'marketing', trim: true },
+    whatsappOptInKeywordRules: { type: [KeywordRuleSchema], default: [] },
     isEnabled: { type: Boolean, default: true },
     automation: { type: LeadScoringAutomationSchema, default: () => ({}) },
     updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
