@@ -3,11 +3,16 @@ const {
   resolveInboxStorageUsername,
   uploadInboxAttachment
 } = require('./inboxMediaService');
+const { resolveCrmContactDocumentsFolder } = require('./cloudinaryCompanyFolders');
 
 const resolveContactDocumentStorageUsername = ({ username, email, userId }) =>
   resolveInboxStorageUsername({ username, email, userId });
 
-const resolveContactDocumentFolder = ({ username, contact }) => {
+const resolveContactDocumentFolder = ({ username, contact, companyContext = null }) => {
+  if (companyContext) {
+    return resolveCrmContactDocumentsFolder({ companyContext, contact });
+  }
+
   const safeUsername = sanitizeStorageSegment(username, 'user');
   const contactPhone = String(contact?.phone || '').replace(/\D/g, '');
   const contactName = String(contact?.name || '').trim();
@@ -24,6 +29,7 @@ const uploadContactDocumentAttachment = async ({
   file,
   user,
   contact,
+  companyContext = null,
   sender = '',
   recipient = ''
 }) => {
@@ -32,12 +38,13 @@ const uploadContactDocumentAttachment = async ({
     email: user?.email,
     userId: user?.id
   });
-  const folder = resolveContactDocumentFolder({ username, contact });
+  const folder = resolveContactDocumentFolder({ username, contact, companyContext });
 
   return uploadInboxAttachment({
     file,
     username,
     folderOverride: folder,
+    companyContext,
     direction: 'sent',
     userId: user?.id,
     sender,

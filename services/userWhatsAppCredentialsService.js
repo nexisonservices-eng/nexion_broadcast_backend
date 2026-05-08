@@ -53,6 +53,9 @@ const normalizeCredentials = (data) => {
   const phoneNumber = trimOrNull(data.phoneNumber);
   const missedCallWebhook = trimOrNull(data.missedCallWebhook);
   const companyId = trimOrNull(data.companyId);
+  const companyName = trimOrNull(data.companyName);
+  const companySlug = trimOrNull(data.companySlug);
+  const cloudinaryFolderRoot = trimOrNull(data.cloudinaryFolderRoot);
 
   const missedCallTemplateName = trimOrNull(
     data.missedCallTemplateName || data.missedcalltemplatename
@@ -128,6 +131,9 @@ const normalizeCredentials = (data) => {
     twilioId,
     phoneNumber,
     companyId,
+    companyName,
+    companySlug,
+    cloudinaryFolderRoot,
     missedCallWebhook,
     missedCallTemplateName,
     missedCallTemplateLanguage,

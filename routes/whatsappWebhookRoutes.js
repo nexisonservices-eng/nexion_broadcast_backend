@@ -321,6 +321,12 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
             mediaId: incomingMediaId,
             credentials: userCredentials,
             username: storageUsername,
+            companyContext: {
+              companyId,
+              companyName: userCredentials?.companyName || '',
+              companySlug: userCredentials?.companySlug || '',
+              cloudinaryFolderRoot: userCredentials?.cloudinaryFolderRoot || ''
+            },
             userId,
             sender: from,
             recipient: userId,

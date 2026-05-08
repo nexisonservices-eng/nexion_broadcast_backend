@@ -15,6 +15,13 @@ const {
 } = require('../utils/accessControl');
 const { emitAuthAuditLog } = require('../utils/authAuditLogger');
 
+const resolveCompanyStorageContext = (req) => ({
+    companyId: req.companyId || req.user?.companyId || null,
+    companyName: req.user?.companyName || '',
+    companySlug: req.user?.companySlug || '',
+    cloudinaryFolderRoot: req.user?.cloudinaryFolderRoot || ''
+});
+
 const buildMetaCreateErrorMessage = (metaError) => {
     const details = metaError?.details?.error || {};
     const title = String(details.error_user_title || '').trim();
@@ -467,24 +474,24 @@ exports.createCampaign = async (req, res) => {
 
         if (requestedMediaType === 'video' && videoFile?.buffer) {
             req.body.videoUrl = await uploadCampaignCreative(videoFile, {
-                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                companyContext: resolveCompanyStorageContext(req),
                 resourceType: 'video'
             });
         } else if (requestedMediaType === 'image' && imageFile?.buffer) {
             req.body.imageUrl = await uploadCampaignCreative(imageFile, {
-                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                companyContext: resolveCompanyStorageContext(req),
                 resourceType: 'image'
             });
         } else if (videoFile?.buffer && !imageFile?.buffer) {
             req.body.mediaType = 'video';
             req.body.videoUrl = await uploadCampaignCreative(videoFile, {
-                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                companyContext: resolveCompanyStorageContext(req),
                 resourceType: 'video'
             });
         } else if (imageFile?.buffer && !videoFile?.buffer) {
             req.body.mediaType = 'image';
             req.body.imageUrl = await uploadCampaignCreative(imageFile, {
-                folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                companyContext: resolveCompanyStorageContext(req),
                 resourceType: 'image'
             });
         }
@@ -621,14 +628,14 @@ exports.updateCampaign = async (req, res) => {
 
             if (videoFile?.buffer) {
                 req.body.videoUrl = await uploadCampaignCreative(videoFile, {
-                    folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                    companyContext: resolveCompanyStorageContext(req),
                     resourceType: 'video'
                 });
                 req.body.mediaType = 'video';
                 req.body.imageUrl = '';
             } else if (imageFile?.buffer) {
                 req.body.imageUrl = await uploadCampaignCreative(imageFile, {
-                    folder: process.env.CLOUDINARY_FOLDER || 'meta-ads',
+                    companyContext: resolveCompanyStorageContext(req),
                     resourceType: 'image'
                 });
                 req.body.mediaType = 'image';

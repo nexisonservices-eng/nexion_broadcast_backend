@@ -1,4 +1,5 @@
 const { v2: cloudinary } = require('cloudinary');
+const { resolveCompanyFolders } = require('../services/cloudinaryCompanyFolders');
 
 let configured = false;
 
@@ -46,7 +47,7 @@ const uploadCampaignCreative = async (file, options = {}) => {
 
   ensureCloudinaryConfig();
 
-  const folder = options.folder || process.env.CLOUDINARY_FOLDER || 'meta-ads';
+  const folder = options.folder || (options.companyContext ? resolveCompanyFolders(options.companyContext).metaAdsFolder : '') || process.env.CLOUDINARY_FOLDER || 'meta-ads';
   const resourceType = resolveResourceType(file, options.resourceType);
   const dataUri = `data:${file.mimetype || 'image/jpeg'};base64,${file.buffer.toString('base64')}`;
 

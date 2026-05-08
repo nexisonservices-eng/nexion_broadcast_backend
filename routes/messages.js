@@ -32,6 +32,8 @@ const {
   applyMarketingTemplateSent,
   toCleanString
 } = require('../services/whatsappOutreach/policy');
+const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
+const { resolveCompanyFolders } = require('../services/cloudinaryCompanyFolders');
 
 router.use(auth);
 router.use(
@@ -176,11 +178,12 @@ const resolveAttachmentUsername = (req) =>
     userId: req?.user?.id
   });
 
-const resolveBroadcastTemplateHeaderFolder = (req) => {
-  const storageUsername = resolveAttachmentUsername(req);
-  const safeUsername = String(storageUsername || 'user').trim().toLowerCase().replace(/[^a-z0-9._-]/g, '_');
-  return `meta-template-images/${safeUsername}/lead`;
-};
+const resolveCompanyStorageContext = (req) => ({
+  companyId: req.companyId || req.user?.companyId || null,
+  companyName: req.user?.companyName || '',
+  companySlug: req.user?.companySlug || '',
+  cloudinaryFolderRoot: req.user?.cloudinaryFolderRoot || ''
+});
 
 const buildAttachmentLabel = (mediaType = '') => {
   const normalized = String(mediaType || '').trim().toLowerCase();
@@ -245,7 +248,11 @@ const loadAuthorizedAttachmentMessage = async ({ req, messageId }) => {
   const attachmentOwnerSegment = String(attachment?.username || storageUsername || '').trim();
   if (
     attachment?.publicId &&
-    !isAttachmentPathOwned({ publicId: attachment.publicId, username: attachmentOwnerSegment })
+    !isAttachmentPathOwned({
+      publicId: attachment.publicId,
+      username: attachmentOwnerSegment,
+      companyContext: resolveCompanyStorageContext(req)
+    })
   ) {
     const error = new Error('Attachment does not belong to current user storage path');
     error.status = 403;
@@ -551,6 +558,42 @@ router.post(
 );
 
 router.post(
+  '/template-header-media',
+  requirePlanFeature('templates'),
+  requireWhatsAppCredentials,
+  async (req, res) => {
+    try {
+      await runAttachmentUpload(req, res);
+      if (!req.file) {
+        return res.status(400).json({ success: false, error: 'Template header media file is required' });
+      }
+
+      const companyContext = resolveCompanyStorageContext(req);
+      const folder = resolveCompanyFolders(companyContext).metaTemplateImagesFolder;
+      const mediaUrl = await uploadCampaignCreative(req.file, {
+        folder,
+        resourceType: 'auto'
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          mediaUrl,
+          url: mediaUrl,
+          folder
+        }
+      });
+    } catch (error) {
+      const statusCode = Number(error?.status || 500);
+      return res.status(statusCode).json({
+        success: false,
+        error: error?.message || 'Failed to upload template header media'
+      });
+    }
+  }
+);
+
+router.post(
   '/send-template',
   requirePlanFeature('broadcastMessaging'),
   requireWhatsAppCredentials,
@@ -789,6 +832,7 @@ router.post(
         file: req.file,
         username: storageUsername,
         direction: 'sent',
+        companyContext: resolveCompanyStorageContext(req),
         userId: req.user.id,
         sender: req.user.id,
         recipient: to
@@ -1103,7 +1147,11 @@ router.delete('/attachments/:messageId', async (req, res) => {
     const attachmentOwnerSegment = String(attachment?.username || storageUsername || '').trim();
     if (
       attachment?.publicId &&
-      !isAttachmentPathOwned({ publicId: attachment.publicId, username: attachmentOwnerSegment })
+      !isAttachmentPathOwned({
+        publicId: attachment.publicId,
+        username: attachmentOwnerSegment,
+        companyContext: resolveCompanyStorageContext(req)
+      })
     ) {
       return res.status(403).json({
         success: false,

@@ -2,6 +2,11 @@ const axios = require('axios');
 const path = require('path');
 const crypto = require('crypto');
 const { v2: cloudinary } = require('cloudinary');
+const {
+  sanitizeStorageSegment,
+  resolveCompanyRoot,
+  resolveInboxFolderPath: resolveCompanyInboxFolderPath
+} = require('./cloudinaryCompanyFolders');
 
 const GRAPH_API_BASE_URL = 'https://graph.facebook.com/v20.0';
 const DEFAULT_FOLDER_ROOT = 'inbox';
@@ -80,13 +85,6 @@ const hasCloudinaryCredentials = () =>
       process.env.CLOUDINARY_API_SECRET
   );
 
-const sanitizeStorageSegment = (value, fallback = 'user') => {
-  const raw = String(value || '').trim().toLowerCase();
-  const normalized = raw.replace(/[^a-z0-9._-]/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
-  const trimmed = normalized.slice(0, 64);
-  return trimmed || fallback;
-};
-
 const resolveInboxStorageUsername = ({ username, email, userId }) => {
   const preferred = String(username || '').trim();
   if (preferred) return sanitizeStorageSegment(preferred, sanitizeStorageSegment(userId, 'user'));
@@ -113,11 +111,14 @@ const resolveInboxFolderPath = ({ username, direction = 'sent' }) => {
   return `${root}/${safeUsername}/${safeDirection}`;
 };
 
-const ensureInboxFolders = async ({ username }) => {
+const ensureFolderPath = async (folderPath) => {
   ensureCloudinaryConfig();
-  const root = resolveFolderRoot();
-  const safeUsername = sanitizeStorageSegment(username, 'user');
-  const folders = [`${root}`, `${root}/${safeUsername}`, `${root}/${safeUsername}/sent`, `${root}/${safeUsername}/received`];
+  const normalized = String(folderPath || '').trim().replace(/\\/g, '/').replace(/\/+/g, '/');
+  const folders = [];
+  const segments = normalized.split('/').filter(Boolean);
+  for (let index = 0; index < segments.length; index += 1) {
+    folders.push(segments.slice(0, index + 1).join('/'));
+  }
 
   for (const folder of folders) {
     try {
@@ -135,6 +136,13 @@ const ensureInboxFolders = async ({ username }) => {
       }
     }
   }
+};
+
+const ensureInboxFolders = async ({ username }) => {
+  const root = resolveFolderRoot();
+  const safeUsername = sanitizeStorageSegment(username, 'user');
+  await ensureFolderPath(`${root}/${safeUsername}/sent`);
+  await ensureFolderPath(`${root}/${safeUsername}/received`);
 };
 
 const allowedImageMimeTypes = () =>
@@ -241,6 +249,7 @@ const uploadInboxAttachment = async ({
   username,
   direction = 'sent',
   folderOverride = '',
+  companyContext = null,
   userId,
   sender,
   recipient
@@ -258,11 +267,12 @@ const uploadInboxAttachment = async ({
   const { fileSize, originalName, mimeType, fileCategory, extension } = validateAttachmentFile(file);
   const safeUsername = sanitizeStorageSegment(username, sanitizeStorageSegment(userId, 'user'));
   const normalizedFolderOverride = String(folderOverride || '').trim().replace(/\\/g, '/').replace(/\/+/g, '/');
-  if (!normalizedFolderOverride) {
-    await ensureInboxFolders({ username: safeUsername });
-  }
-
-  const folder = normalizedFolderOverride || resolveInboxFolderPath({ username: safeUsername, direction });
+  const folder =
+    normalizedFolderOverride ||
+    (companyContext
+      ? resolveCompanyInboxFolderPath({ companyContext, direction })
+      : resolveInboxFolderPath({ username: safeUsername, direction }));
+  await ensureFolderPath(folder);
   const resourceType = fileCategory === 'image' ? 'image' : 'raw';
   const publicIdBase = buildPublicIdBase({ originalName, extension, userId });
   const dataUri = `data:${mimeType || 'application/octet-stream'};base64,${file.buffer.toString('base64')}`;
@@ -300,8 +310,17 @@ const uploadInboxAttachment = async ({
   };
 };
 
-const isAttachmentPathOwned = ({ publicId, username }) => {
+const isAttachmentPathOwned = ({ publicId, username, companyContext = null }) => {
   const normalizedPublicId = String(publicId || '').trim();
+  if (companyContext) {
+    try {
+      const expectedCompanyPrefix = `${resolveCompanyRoot(companyContext)}/`;
+      if (normalizedPublicId.startsWith(expectedCompanyPrefix)) return true;
+    } catch (_error) {
+      // Fall through to legacy username-based path validation.
+    }
+  }
+
   const safeUsername = sanitizeStorageSegment(username, 'user');
   const root = resolveFolderRoot();
   const expectedPrefix = `${root}/${safeUsername}/`;
@@ -473,6 +492,7 @@ const downloadAndStoreIncomingWhatsAppMedia = async ({
   mediaId,
   credentials,
   username,
+  companyContext = null,
   userId,
   sender,
   recipient,
@@ -497,6 +517,7 @@ const downloadAndStoreIncomingWhatsAppMedia = async ({
       size: Number(binary.fileSize || binary.buffer.length || 0)
     },
     username,
+    companyContext,
     direction: 'received',
     userId,
     sender,
