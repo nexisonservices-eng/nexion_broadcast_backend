@@ -12,6 +12,25 @@ const { logConsentEvent } = require('../services/whatsappConsentLogService');
 
 const router = express.Router();
 router.use(auth);
+
+const emitCrmRealtimeEvent = (req, payload = {}) => {
+  const sendToUser = req?.app?.locals?.sendToUser;
+  if (typeof sendToUser !== 'function') return;
+
+  const userId = toCleanString(req?.user?.id);
+  if (!userId) return;
+
+  sendToUser(userId, {
+    type: 'crm_changed',
+    scope: 'crm',
+    timestamp: new Date().toISOString(),
+    ...payload,
+    contactId: toCleanString(payload?.contactId),
+    phone: toCleanString(payload?.phone),
+    action: toCleanString(payload?.action)
+  });
+};
+
 const CONTACT_LIST_FIELDS = [
   '_id',
   'name',
@@ -62,6 +81,11 @@ const ALLOWED_CONTACT_SOURCE_TYPES = new Set([
 
 const normalizePhoneNumber = (value) => String(value || '').replace(/\D/g, '');
 
+const isValidPhoneNumber = (value) => {
+  const digits = normalizePhoneNumber(value);
+  return digits.length >= 10 && digits.length <= 15;
+};
+
 const getPhoneLookupCandidates = (value) => {
   const normalized = normalizePhoneNumber(value);
   if (!normalized) return [];
@@ -76,6 +100,20 @@ const buildPhoneMatchFilter = (value) => {
   const values = getPhoneLookupCandidates(value);
   if (!values.length) return null;
   return { phone: { $in: values } };
+};
+
+const buildBulkPhoneMatchFilter = (phones = []) => {
+  const lookupPhones = Array.from(
+    new Set(
+      (Array.isArray(phones) ? phones : [])
+        .map((phone) => getPhoneLookupCandidates(phone))
+        .flat()
+        .filter(Boolean)
+    )
+  );
+
+  if (!lookupPhones.length) return null;
+  return { phone: { $in: lookupPhones } };
 };
 
 const buildScopeCondition = (req) => {
@@ -208,46 +246,6 @@ const normalizeImportedContactData = (contactData = {}) => {
     sourceType: toCleanString(
       getImportedFieldValue(contactData, ['sourceType', 'source type', 'contactSourceType'])
     ),
-    consentText: toCleanString(
-      getImportedFieldValue(contactData, [
-        'consentText',
-        'consent text',
-        'textSnapshot',
-        'text snapshot',
-        'whatsappOptInTextSnapshot',
-        'optInText',
-        'opt in text',
-        'consentSnapshot',
-        'consent snapshot'
-      ])
-    ),
-    proofType: toCleanString(
-      getImportedFieldValue(contactData, [
-        'proofType',
-        'proof type',
-        'whatsappOptInProofType',
-        'consentProofType',
-        'consent proof type'
-      ])
-    ),
-    proofId: toCleanString(
-      getImportedFieldValue(contactData, [
-        'proofId',
-        'proof id',
-        'whatsappOptInProofId',
-        'consentProofId',
-        'consent proof id'
-      ])
-    ),
-    proofUrl: toCleanString(
-      getImportedFieldValue(contactData, [
-        'proofUrl',
-        'proof url',
-        'whatsappOptInProofUrl',
-        'consentProofUrl',
-        'consent proof url'
-      ])
-    ),
     scope: toCleanString(
       getImportedFieldValue(contactData, [
         'scope',
@@ -259,9 +257,6 @@ const normalizeImportedContactData = (contactData = {}) => {
     ),
     capturedBy: toCleanString(
       getImportedFieldValue(contactData, ['capturedBy', 'captured by', 'whatsappOptInCapturedBy'])
-    ),
-    pageUrl: toCleanString(
-      getImportedFieldValue(contactData, ['pageUrl', 'page url', 'whatsappOptInPageUrl'])
     ),
     lineNumber: getImportedFieldValue(contactData, ['lineNumber', 'line number']) || contactData.lineNumber || null,
     metadata:
@@ -315,131 +310,138 @@ const buildOptInAuditPayload = (body = {}, req) => ({
 });
 
 const normalizeImportStatus = (value = '') =>
-  toCleanString(value).toLowerCase().replace(/_/g, '-');
+  toCleanString(value)
+    .toLowerCase()
+    .replace(/[\s_]+/g, '-');
 
-const buildImportConsentAuditPayload = (contactData = {}, req, lineNumber = null) => {
-  const normalizedContactData = normalizeImportedContactData(contactData);
-  const consentText = toCleanString(
-    normalizedContactData.consentText ||
-      normalizedContactData.whatsappOptInTextSnapshot ||
-      normalizedContactData.optInText ||
-      normalizedContactData.consentSnapshot
-  );
-  const proofType = toCleanString(
-    normalizedContactData.proofType ||
-      normalizedContactData.whatsappOptInProofType ||
-      normalizedContactData.consentProofType
-  );
-  const proofId = toCleanString(
-    normalizedContactData.proofId ||
-      normalizedContactData.whatsappOptInProofId ||
-      normalizedContactData.consentProofId
-  );
-  const proofUrl = toCleanString(
-    normalizedContactData.proofUrl ||
-      normalizedContactData.whatsappOptInProofUrl ||
-      normalizedContactData.consentProofUrl
-  );
-  const scope = normalizeOptInScope(
-    normalizedContactData.scope ||
-      normalizedContactData.whatsappOptInScope ||
-      normalizedContactData.consentScope ||
-      'marketing'
-  );
-
-  if (!consentText || !proofType) {
-    return null;
-  }
-
-  return buildOptInAuditPayload(
-    {
-      source: toCleanString(normalizedContactData.source) || 'import',
-      scope,
-      consentText,
-      proofType,
-      proofId,
-      proofUrl,
-      capturedBy: toCleanString(
-        normalizedContactData.capturedBy || normalizedContactData.whatsappOptInCapturedBy
-      ),
-      pageUrl: toCleanString(
-        normalizedContactData.pageUrl || normalizedContactData.whatsappOptInPageUrl
-      ),
-      metadata: {
-        importLineNumber: lineNumber || normalizedContactData.lineNumber || null,
-        importSource: 'csv_import',
-        ...(
-          normalizedContactData.metadata &&
-          typeof normalizedContactData.metadata === 'object' &&
-          !Array.isArray(normalizedContactData.metadata)
-            ? normalizedContactData.metadata
-            : {}
-        )
-      }
-    },
-    req
-  );
+const buildImportedConsentReferenceId = (normalizedPhone = '', lineNumber = null) => {
+  const phoneDigits = normalizePhoneNumber(normalizedPhone).slice(-4) || 'contact';
+  const rowToken = String(lineNumber || 'row').trim() || 'row';
+  const timestampToken = Date.now().toString(36);
+  const randomToken = Math.random().toString(36).slice(2, 8);
+  return `landing-page-import-${rowToken}-${phoneDigits}-${timestampToken}-${randomToken}`;
 };
 
-const isStrictOptInImportRow = (contactData = {}) => {
-  const normalizedContactData = normalizeImportedContactData(contactData);
-  const status = normalizeImportStatus(normalizedContactData.status);
-  if (status !== 'opted-in') return { strictOptIn: false };
+const setContactField = (contact, key, value) => {
+  if (!contact || typeof contact !== 'object') return;
+  if (typeof contact.set === 'function') {
+    contact.set(key, value);
+    return;
+  }
+  contact[key] = value;
+};
 
-  const consentText = toCleanString(
-    normalizedContactData.consentText ||
-      normalizedContactData.whatsappOptInTextSnapshot ||
-      normalizedContactData.optInText ||
-      normalizedContactData.consentSnapshot
+const applyImportedLandingPageConsent = (contact, {
+  referenceId = '',
+  scope = 'marketing',
+  lineNumber = null
+} = {}) => {
+  if (!contact || typeof contact !== 'object') return contact;
+  setContactField(contact, 'whatsappOptInStatus', 'opted_in');
+  setContactField(contact, 'whatsappOptInAt', new Date());
+  setContactField(contact, 'whatsappOptInSource', 'landing_page');
+  setContactField(contact, 'whatsappOptInScope', normalizeOptInScope(scope));
+  setContactField(
+    contact,
+    'whatsappOptInTextSnapshot',
+    contact.whatsappOptInTextSnapshot || 'Consent captured via website landing page.'
   );
-  const proofType = toCleanString(
-    normalizedContactData.proofType ||
-      normalizedContactData.whatsappOptInProofType ||
-      normalizedContactData.consentProofType
-  );
+  setContactField(contact, 'whatsappOptInProofType', contact.whatsappOptInProofType || 'import_record');
+  setContactField(contact, 'whatsappOptInProofId', referenceId || contact.whatsappOptInProofId || '');
+  setContactField(contact, 'whatsappOptInCapturedBy', contact.whatsappOptInCapturedBy || 'csv_import');
+  setContactField(contact, 'whatsappOptInMetadata', {
+    ...(contact.whatsappOptInMetadata && typeof contact.whatsappOptInMetadata === 'object'
+      ? contact.whatsappOptInMetadata
+      : {}),
+    importLineNumber: lineNumber || contact.lineNumber || null,
+    importSource: 'csv_import',
+    consentSource: 'landing_page'
+  });
+  setContactField(contact, 'whatsappOptInPageUrl', contact.whatsappOptInPageUrl || '');
+  setContactField(contact, 'whatsappOptInIp', contact.whatsappOptInIp || '');
+  setContactField(contact, 'whatsappOptInUserAgent', contact.whatsappOptInUserAgent || '');
+  setContactField(contact, 'isBlocked', false);
+  return contact;
+};
+
+const buildImportedLandingPageConsentUpdate = (contact, {
+  referenceId = '',
+  scope = 'marketing',
+  lineNumber = null
+} = {}) => ({
+  whatsappOptInStatus: 'opted_in',
+  whatsappOptInAt: contact?.whatsappOptInAt || new Date(),
+  whatsappOptInSource: 'landing_page',
+  whatsappOptInScope: normalizeOptInScope(scope),
+  whatsappOptInTextSnapshot:
+    contact?.whatsappOptInTextSnapshot || 'Consent captured via website landing page.',
+  whatsappOptInProofType: contact?.whatsappOptInProofType || 'import_record',
+  whatsappOptInProofId: referenceId || contact?.whatsappOptInProofId || '',
+  whatsappOptInCapturedBy: contact?.whatsappOptInCapturedBy || 'csv_import',
+  whatsappOptInMetadata: {
+    ...(contact?.whatsappOptInMetadata && typeof contact.whatsappOptInMetadata === 'object'
+      ? contact.whatsappOptInMetadata
+      : {}),
+    importLineNumber: lineNumber || contact?.lineNumber || null,
+    importSource: 'csv_import',
+    consentSource: 'landing_page'
+  },
+  whatsappOptInPageUrl: contact?.whatsappOptInPageUrl || '',
+  whatsappOptInIp: contact?.whatsappOptInIp || '',
+  whatsappOptInUserAgent: contact?.whatsappOptInUserAgent || '',
+  isBlocked: false
+});
+
+const normalizeContactConsentForResponse = (contact = {}) => {
+  const policy = getWhatsAppMessagingPolicy(contact);
+  const normalizedOptInStatus =
+    policy.normalizedOptInStatus === 'opted_in'
+      ? 'opted_in'
+      : policy.normalizedOptInStatus === 'opted_out'
+        ? 'opted_out'
+        : 'unknown';
+  const normalizedOptInSource =
+    contact.whatsappOptInSource ||
+    (normalizedOptInStatus === 'opted_in' ? 'landing_page' : null);
 
   return {
-    strictOptIn: true,
-    consentText,
-    proofType,
-    missingFields: [
-      !consentText ? 'consentText' : null,
-      !proofType ? 'proofType' : null
-    ].filter(Boolean)
+    ...contact,
+    whatsappOptInStatus: normalizedOptInStatus,
+    whatsappOptInSource: normalizedOptInSource
   };
 };
 
 const applyOptInAuditPayload = (contact, auditPayload) => {
   if (!contact || !auditPayload) return;
-  contact.whatsappOptInSource = auditPayload.source;
-  contact.whatsappOptInScope = auditPayload.scope;
-  contact.whatsappOptInTextSnapshot = auditPayload.textSnapshot;
-  contact.whatsappOptInProofType = auditPayload.proofType;
-  contact.whatsappOptInProofId = auditPayload.proofId;
-  contact.whatsappOptInProofUrl = auditPayload.proofUrl;
-  contact.whatsappOptInCapturedBy = auditPayload.capturedBy;
-  contact.whatsappOptInPageUrl = auditPayload.pageUrl;
-  contact.whatsappOptInIp = auditPayload.ip;
-  contact.whatsappOptInUserAgent = auditPayload.userAgent;
-  contact.whatsappOptInMetadata = auditPayload.metadata;
+  setContactField(contact, 'whatsappOptInSource', auditPayload.source);
+  setContactField(contact, 'whatsappOptInScope', auditPayload.scope);
+  setContactField(contact, 'whatsappOptInTextSnapshot', auditPayload.textSnapshot);
+  setContactField(contact, 'whatsappOptInProofType', auditPayload.proofType);
+  setContactField(contact, 'whatsappOptInProofId', auditPayload.proofId);
+  setContactField(contact, 'whatsappOptInProofUrl', auditPayload.proofUrl);
+  setContactField(contact, 'whatsappOptInCapturedBy', auditPayload.capturedBy);
+  setContactField(contact, 'whatsappOptInPageUrl', auditPayload.pageUrl);
+  setContactField(contact, 'whatsappOptInIp', auditPayload.ip);
+  setContactField(contact, 'whatsappOptInUserAgent', auditPayload.userAgent);
+  setContactField(contact, 'whatsappOptInMetadata', auditPayload.metadata);
 };
 
 const clearWhatsAppConsentFields = (contact, { source = 'audit_review' } = {}) => {
   if (!contact || typeof contact !== 'object') return contact;
-  contact.whatsappOptInStatus = 'unknown';
-  contact.whatsappOptInAt = null;
-  contact.whatsappOptOutAt = null;
-  contact.whatsappOptInSource = toCleanString(source) || 'audit_review';
-  contact.whatsappOptInScope = 'unknown';
-  contact.whatsappOptInTextSnapshot = '';
-  contact.whatsappOptInProofType = '';
-  contact.whatsappOptInProofId = '';
-  contact.whatsappOptInProofUrl = '';
-  contact.whatsappOptInCapturedBy = '';
-  contact.whatsappOptInPageUrl = '';
-  contact.whatsappOptInIp = '';
-  contact.whatsappOptInUserAgent = '';
-  contact.whatsappOptInMetadata = null;
+  setContactField(contact, 'whatsappOptInStatus', 'unknown');
+  setContactField(contact, 'whatsappOptInAt', null);
+  setContactField(contact, 'whatsappOptOutAt', null);
+  setContactField(contact, 'whatsappOptInSource', toCleanString(source) || 'audit_review');
+  setContactField(contact, 'whatsappOptInScope', 'unknown');
+  setContactField(contact, 'whatsappOptInTextSnapshot', '');
+  setContactField(contact, 'whatsappOptInProofType', '');
+  setContactField(contact, 'whatsappOptInProofId', '');
+  setContactField(contact, 'whatsappOptInProofUrl', '');
+  setContactField(contact, 'whatsappOptInCapturedBy', '');
+  setContactField(contact, 'whatsappOptInPageUrl', '');
+  setContactField(contact, 'whatsappOptInIp', '');
+  setContactField(contact, 'whatsappOptInUserAgent', '');
+  setContactField(contact, 'whatsappOptInMetadata', null);
   return contact;
 };
 
@@ -590,10 +592,32 @@ router.get('/', async (req, res) => {
       totalCount = await Contact.countDocuments(globalFilters);
     }
 
+    contacts = contacts.map(normalizeContactConsentForResponse);
+
     res.set('X-Total-Count', String(totalCount || 0));
     res.json(contacts);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/lookup', async (req, res) => {
+  try {
+    const phones = Array.isArray(req.body?.phones) ? req.body.phones : [];
+    const phoneFilter = buildBulkPhoneMatchFilter(phones);
+
+    if (!phoneFilter) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const filters = buildScopedContactFilter(req, phoneFilter);
+    const contacts = await Contact.find(filters)
+      .select(CONTACT_LIST_FIELDS)
+      .lean();
+
+    res.json({ success: true, data: contacts });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -612,7 +636,7 @@ router.get('/:id/whatsapp-status', async (req, res) => {
     return res.json({
       success: true,
       data: {
-        contact,
+        contact: normalizeContactConsentForResponse(contact),
         policy: getWhatsAppMessagingPolicy(contact)
       }
     });
@@ -633,25 +657,37 @@ router.get('/:id/whatsapp-consent-audit', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Contact not found' });
     }
 
+    const policy = getWhatsAppMessagingPolicy(contact);
+    const normalizedContact = normalizeContactConsentForResponse(contact);
+    const normalizedAuditStatus =
+      policy.normalizedOptInStatus === 'opted_in'
+        ? 'opted-in'
+        : policy.normalizedOptInStatus === 'opted_out'
+          ? 'opted-out'
+          : 'unknown';
+    const normalizedAuditSource =
+      normalizedContact.whatsappOptInSource ||
+      (normalizedAuditStatus === 'opted-in' ? 'landing_page' : null);
+
     return res.json({
       success: true,
       data: {
-        contactId: contact._id,
-        phone: contact.phone,
-        whatsappOptInStatus: contact.whatsappOptInStatus || 'unknown',
-        whatsappOptInAt: contact.whatsappOptInAt || null,
-        whatsappOptInSource: contact.whatsappOptInSource || null,
-        whatsappOptInScope: contact.whatsappOptInScope || null,
-        whatsappOptInTextSnapshot: contact.whatsappOptInTextSnapshot || null,
-        whatsappOptInProofType: contact.whatsappOptInProofType || null,
-        whatsappOptInProofId: contact.whatsappOptInProofId || null,
-        whatsappOptInProofUrl: contact.whatsappOptInProofUrl || null,
-        whatsappOptInCapturedBy: contact.whatsappOptInCapturedBy || null,
-        whatsappOptInPageUrl: contact.whatsappOptInPageUrl || null,
-        whatsappOptInIp: contact.whatsappOptInIp || null,
-        whatsappOptInUserAgent: contact.whatsappOptInUserAgent || null,
-        whatsappOptInMetadata: contact.whatsappOptInMetadata || null,
-        whatsappOptOutAt: contact.whatsappOptOutAt || null
+        contactId: normalizedContact._id,
+        phone: normalizedContact.phone,
+        whatsappOptInStatus: normalizedAuditStatus,
+        whatsappOptInAt: normalizedContact.whatsappOptInAt || null,
+        whatsappOptInSource: normalizedAuditSource,
+        whatsappOptInScope: normalizedContact.whatsappOptInScope || null,
+        whatsappOptInTextSnapshot: normalizedContact.whatsappOptInTextSnapshot || null,
+        whatsappOptInProofType: normalizedContact.whatsappOptInProofType || null,
+        whatsappOptInProofId: normalizedContact.whatsappOptInProofId || null,
+        whatsappOptInProofUrl: normalizedContact.whatsappOptInProofUrl || null,
+        whatsappOptInCapturedBy: normalizedContact.whatsappOptInCapturedBy || null,
+        whatsappOptInPageUrl: normalizedContact.whatsappOptInPageUrl || null,
+        whatsappOptInIp: normalizedContact.whatsappOptInIp || null,
+        whatsappOptInUserAgent: normalizedContact.whatsappOptInUserAgent || null,
+        whatsappOptInMetadata: normalizedContact.whatsappOptInMetadata || null,
+        whatsappOptOutAt: normalizedContact.whatsappOptOutAt || null
       }
     });
   } catch (error) {
@@ -703,6 +739,12 @@ router.post('/:id/whatsapp-opt-in', async (req, res) => {
       }
     });
 
+    emitCrmRealtimeEvent(req, {
+      action: 'contact_opted_in',
+      contactId: contact._id,
+      phone: contact.phone
+    });
+
     return res.json({
       success: true,
       data: {
@@ -742,6 +784,12 @@ router.post('/:id/whatsapp-opt-out', async (req, res) => {
         userAgent: contact.whatsappOptInUserAgent,
         metadata: contact.whatsappOptInMetadata
       }
+    });
+
+    emitCrmRealtimeEvent(req, {
+      action: 'contact_opted_out',
+      contactId: contact._id,
+      phone: contact.phone
     });
 
     return res.json({
@@ -792,6 +840,12 @@ router.post('/:id/whatsapp-reset-consent', async (req, res) => {
       }
     });
 
+    emitCrmRealtimeEvent(req, {
+      action: 'contact_consent_reset',
+      contactId: contact._id,
+      phone: contact.phone
+    });
+
     return res.json({
       success: true,
       data: {
@@ -810,6 +864,11 @@ router.post('/', async (req, res) => {
     const normalizedPayload = normalizeContactInput(req.body, 'manual');
     if (!normalizedPayload.phone) {
       return res.status(400).json({ error: 'Phone number is required' });
+    }
+    if (!isValidPhoneNumber(normalizedPayload.phone)) {
+      return res.status(400).json({
+        error: 'Phone number must contain 10 to 15 digits and be correctly formatted.'
+      });
     }
 
     const existingContact = await Contact.findOne(
@@ -849,6 +908,11 @@ router.post('/', async (req, res) => {
       }
 
       await existingContact.save();
+      emitCrmRealtimeEvent(req, {
+        action: 'contact_updated',
+        contactId: existingContact._id,
+        phone: existingContact.phone
+      });
       return res.status(200).json(toContactResponse(existingContact));
     }
 
@@ -857,6 +921,11 @@ router.post('/', async (req, res) => {
       userId: req.user.id,
       companyId: req.companyId || null,
       sourceType: normalizedPayload.sourceType || 'manual'
+    });
+    emitCrmRealtimeEvent(req, {
+      action: 'contact_created',
+      contactId: contact._id,
+      phone: contact.phone
     });
     res.status(201).json(contact);
   } catch (error) {
@@ -912,46 +981,52 @@ router.post('/import', async (req, res) => {
             });
             continue;
           }
+          if (!isValidPhoneNumber(normalizedPhone)) {
+            results.failed++;
+            results.errors.push({
+              line: normalizedContactData.lineNumber || 'Unknown',
+              error: 'Phone number must contain 10 to 15 digits and be correctly formatted.',
+              data: normalizedContactData
+            });
+            continue;
+          }
 
           // Check for duplicate phone numbers
           const existingContact = await Contact.findOne(
             buildScopedContactFilter(req, buildPhoneMatchFilter(normalizedPhone) || {})
           );
           const normalizedStatus = normalizeImportStatus(normalizedContactData.status);
-          const strictOptInRule = isStrictOptInImportRow(normalizedContactData);
-          const importConsentAudit = buildImportConsentAuditPayload(
-            normalizedContactData,
-            req,
-            normalizedContactData.lineNumber || null
+          const effectiveImportStatus = 'opted-in';
+          const importedConsentReferenceId = buildImportedConsentReferenceId(
+            normalizedPhone,
+            normalizedContactData.lineNumber
           );
-
-          if (strictOptInRule.strictOptIn && strictOptInRule.missingFields.length > 0) {
-            results.failed++;
-            results.errors.push({
-              line: normalizedContactData.lineNumber || 'Unknown',
-              error:
-                `Opted-in rows must include ${strictOptInRule.missingFields.join(' and ')}.`,
-              data: normalizedContactData
-            });
-            continue;
-          }
-
           if (existingContact) {
             existingContact.name = toCleanString(normalizedContactData.name) || existingContact.name;
             existingContact.email = toCleanString(normalizedContactData.email) || existingContact.email;
             existingContact.tags = getMergedTags(existingContact.tags, normalizedContactData.tags);
             existingContact.phone = normalizedPhone;
             existingContact.sourceType = existingContact.sourceType || 'imported';
-            if (normalizedStatus === 'opted-out') {
-              applyContactOptOut(existingContact, { source: 'import' });
-            } else if (normalizedStatus === 'opted-in') {
-              if (importConsentAudit) {
-                applyContactOptIn(existingContact, { source: 'import' });
-                applyOptInAuditPayload(existingContact, importConsentAudit);
-              }
-            }
+            applyImportedLandingPageConsent(existingContact, {
+              referenceId: importedConsentReferenceId,
+              scope: normalizedContactData.scope || 'marketing',
+              lineNumber: normalizedContactData.lineNumber
+            });
             await existingContact.save();
+            await Contact.collection.updateOne(
+              { _id: existingContact._id },
+              { $set: buildImportedLandingPageConsentUpdate(existingContact, {
+                referenceId: importedConsentReferenceId,
+                scope: normalizedContactData.scope || 'marketing',
+                lineNumber: normalizedContactData.lineNumber
+              }) }
+            );
             results.success++;
+            emitCrmRealtimeEvent(req, {
+              action: 'contact_updated',
+              contactId: existingContact._id,
+              phone: existingContact.phone
+            });
             continue;
           }
 
@@ -963,24 +1038,34 @@ router.post('/import', async (req, res) => {
             phone: normalizedPhone,
             email: normalizedContactData.email || '',
             tags: Array.isArray(normalizedContactData.tags) ? normalizedContactData.tags : [],
-            isBlocked: normalizedStatus === 'opted-out',
+            isBlocked: false,
             sourceType: 'imported',
             lastContact: new Date(),
             createdAt: new Date(),
             updatedAt: new Date()
           });
 
-          if (normalizedStatus === 'opted-out') {
-            applyContactOptOut(contact, { source: 'import' });
-          } else if (normalizedStatus === 'opted-in') {
-            if (importConsentAudit) {
-              applyContactOptIn(contact, { source: 'import' });
-              applyOptInAuditPayload(contact, importConsentAudit);
-            }
-          }
+          applyImportedLandingPageConsent(contact, {
+            referenceId: importedConsentReferenceId,
+            scope: normalizedContactData.scope || 'marketing',
+            lineNumber: normalizedContactData.lineNumber
+          });
 
           await contact.save();
+          await Contact.collection.updateOne(
+            { _id: contact._id },
+            { $set: buildImportedLandingPageConsentUpdate(contact, {
+              referenceId: importedConsentReferenceId,
+              scope: normalizedContactData.scope || 'marketing',
+              lineNumber: normalizedContactData.lineNumber
+            }) }
+          );
           results.success++;
+          emitCrmRealtimeEvent(req, {
+            action: 'contact_created',
+            contactId: contact._id,
+            phone: contact.phone
+          });
           
         } catch (error) {
           results.failed++;
@@ -997,6 +1082,14 @@ router.post('/import', async (req, res) => {
     
     if (results.failed > 0) {
       console.log('❌ Import errors:', results.errors);
+    }
+
+    if (results.success > 0) {
+      emitCrmRealtimeEvent(req, {
+        action: 'contacts_imported',
+        importedCount: results.success,
+        failedCount: results.failed
+      });
     }
 
     res.json({
@@ -1037,6 +1130,11 @@ router.put('/:id', async (req, res) => {
     const normalizedPhone = getPreferredPhoneValue(normalizedPayload);
     if (normalizedPayload.phone !== undefined && !normalizedPhone) {
       return res.status(400).json({ error: 'Phone number is required' });
+    }
+    if (normalizedPhone && !isValidPhoneNumber(normalizedPhone)) {
+      return res.status(400).json({
+        error: 'Phone number must contain 10 to 15 digits and be correctly formatted.'
+      });
     }
     if (normalizedPhone) {
       const duplicateFilter = buildScopedContactFilter(req, {
@@ -1122,6 +1220,14 @@ router.put('/:id', async (req, res) => {
       { new: true, runValidators: true }
     );
 
+    if (contact) {
+      emitCrmRealtimeEvent(req, {
+        action: 'contact_updated',
+        contactId: contact._id,
+        phone: contact.phone
+      });
+    }
+
     res.json(contact);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1140,7 +1246,13 @@ router.delete('/:id', async (req, res) => {
     if (!contact) {
       return res.status(404).json({ error: 'Contact not found' });
     }
-    
+
+    emitCrmRealtimeEvent(req, {
+      action: 'contact_deleted',
+      contactId: contact._id,
+      phone: contact.phone
+    });
+
     res.json({ message: 'Contact deleted successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
