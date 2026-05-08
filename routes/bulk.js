@@ -42,7 +42,7 @@ const buildContactsByPhoneMap = async (req, recipients = []) => {
     buildScopedContactFilter(req, { phone: { $in: allPhoneCandidates } })
   )
     .select(
-      '_id phone isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptOutAt serviceWindowClosesAt'
+      '_id phone isBlocked sourceType whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata whatsappOptOutAt serviceWindowClosesAt lastInboundMessageAt'
     )
     .lean();
 
@@ -90,6 +90,36 @@ const parseCsvLine = (line = '') => {
   return values;
 };
 
+const normalizeHeaderKey = (value = '') =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ');
+
+const findPhoneColumnIndex = (headers = []) => {
+  if (!Array.isArray(headers) || headers.length === 0) return 0;
+
+  const preferredPatterns = [
+    /whatsapp\s*number/,
+    /\bphone\s*number\b/,
+    /\bmobile\s*number\b/,
+    /\bwhatsapp\b/,
+    /\bphone\b/,
+    /\bmobile\b/,
+    /\bmsisdn\b/,
+    /\bnumber\b/
+  ];
+
+  for (const pattern of preferredPatterns) {
+    const matchIndex = headers.findIndex((header) => pattern.test(normalizeHeaderKey(header)));
+    if (matchIndex >= 0) return matchIndex;
+  }
+
+  return 0;
+};
+
+const isTemplateVariableHeader = (header = '') => /^var\d+$/i.test(String(header || '').trim());
+
 const parseCSV = async (csvData, hasHeaders) => {
   const results = [];
   const lines = String(csvData || '')
@@ -103,7 +133,8 @@ const parseCSV = async (csvData, hasHeaders) => {
 
   if (hasHeaders) {
     const headers = parseCsvLine(lines[0]);
-    const phoneColumn = headers[0];
+    const phoneColumnIndex = findPhoneColumnIndex(headers);
+    const phoneColumn = headers[phoneColumnIndex] || headers[0];
     const dataLines = lines.slice(1);
 
     dataLines.forEach((line) => {
@@ -117,7 +148,9 @@ const parseCSV = async (csvData, hasHeaders) => {
       if (!phone) return;
 
       const variables = [];
-      headers.slice(1).forEach((header) => {
+      headers.forEach((header, headerIndex) => {
+        if (headerIndex === phoneColumnIndex) return;
+        if (!isTemplateVariableHeader(header)) return;
         const value = row[header];
         if (value !== undefined && value !== null && String(value).trim()) {
           variables.push(String(value));
@@ -372,29 +405,27 @@ router.post(
         }
       };
 
-      const sent = await broadcastService.sendBroadcast(
-        created.data._id,
-        broadcaster,
-        req.whatsappCredentials || null
-      );
-
-      if (!sent?.success) {
-        return res.status(400).json({
-          success: false,
-          message: sent?.error || 'Bulk send failed',
-          broadcastId: created.data._id
+      setImmediate(() => {
+        broadcastService.sendBroadcast(
+          created.data._id,
+          broadcaster,
+          req.whatsappCredentials || null
+        ).catch((error) => {
+          console.error(`Background bulk send failed for ${created.data._id}:`, error);
         });
-      }
+      });
 
-      return res.json({
+      return res.status(202).json({
         success: true,
+        queued: true,
         engine: 'bulk_broadcast_unified_v3',
         broadcastId: created.data._id,
         total_sent: broadcastRecipients.length,
-        successful: Number(sent?.data?.stats?.successful || 0),
-        failed: Number(sent?.data?.stats?.failed || 0),
-        results: Array.isArray(sent?.data?.results) ? sent.data.results : [],
-        audienceValidation
+        successful: 0,
+        failed: 0,
+        results: [],
+        audienceValidation,
+        message: 'Broadcast queued. Sending will continue in the background.'
       });
     } catch (error) {
       return res.status(500).json({

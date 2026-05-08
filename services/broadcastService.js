@@ -164,7 +164,8 @@ class BroadcastService {
     const endHour = Math.max(0, Math.min(23, Number(quietHours?.endHour ?? 8)));
     const timezone = String(quietHours?.timezone || 'UTC').trim() || 'UTC';
     const action = String(quietHours?.action || 'defer').toLowerCase() === 'skip' ? 'skip' : 'defer';
-    const batchSize = Math.max(1, Math.min(500, Number(policy?.batchSize || 50)));
+    const batchSize = Math.max(1, Math.min(50, Number(policy?.batchSize || 50)));
+    const batchDelaySeconds = Math.max(0, Math.min(3600, Number(policy?.batchDelaySeconds ?? 5)));
 
     return {
       quietHours: {
@@ -174,15 +175,54 @@ class BroadcastService {
         timezone,
         action
       },
-      batchSize: Number.isFinite(batchSize) ? Math.trunc(batchSize) : 50
+      batchSize: Number.isFinite(batchSize) ? Math.trunc(batchSize) : 50,
+      batchDelaySeconds: Number.isFinite(batchDelaySeconds) ? Math.trunc(batchDelaySeconds) : 5
     };
   }
 
   normalizeBroadcastBatchPolicy(policy = {}) {
-    const batchSize = Math.max(1, Math.min(500, Number(policy?.batchSize || 50)));
+    const batchSize = Math.max(1, Math.min(50, Number(policy?.batchSize || 50)));
+    const batchDelaySeconds = Math.max(0, Math.min(3600, Number(policy?.batchDelaySeconds ?? 5)));
     return {
-      batchSize: Number.isFinite(batchSize) ? Math.trunc(batchSize) : 50
+      batchSize: Number.isFinite(batchSize) ? Math.trunc(batchSize) : 50,
+      batchDelaySeconds: Number.isFinite(batchDelaySeconds) ? Math.trunc(batchDelaySeconds) : 5
     };
+  }
+
+  normalizeTemplateVariables(variables = []) {
+    if (!Array.isArray(variables)) return [];
+
+    return variables
+      .map((value) => {
+        if (typeof value === 'string') {
+          return value.trim();
+        }
+
+        if (value && typeof value === 'object') {
+          return String(
+            value.text ??
+              value.value ??
+              value.body ??
+              value.content ??
+              value.parameter ??
+              value.name ??
+              ''
+          ).trim();
+        }
+
+        return String(value ?? '').trim();
+      })
+      .filter(Boolean);
+  }
+
+  extractTemplateVariableCount(templateText = '') {
+    const matches = [...String(templateText || '').matchAll(/\{\{(\d+)\}\}/g)];
+    if (matches.length === 0) return 0;
+
+    return matches.reduce((maxValue, match) => {
+      const numericValue = Number(match?.[1] || 0);
+      return Number.isFinite(numericValue) ? Math.max(maxValue, numericValue) : maxValue;
+    }, 0);
   }
 
   normalizeCompliancePolicy(policy = {}) {
@@ -234,7 +274,9 @@ class BroadcastService {
       deliveryPolicy: this.normalizeDeliveryPolicy({
         ...(fallbackDeliveryPolicy || {}),
         ...(broadcastData?.deliveryPolicy || {}),
-        batchSize: broadcastData?.deliveryPolicy?.batchSize ?? broadcastData?.batchSize
+        batchSize: broadcastData?.deliveryPolicy?.batchSize ?? broadcastData?.batchSize,
+        batchDelaySeconds:
+          broadcastData?.deliveryPolicy?.batchDelaySeconds ?? broadcastData?.batchDelaySeconds
       }),
       compliancePolicy: this.normalizeCompliancePolicy({
         ...(fallbackCompliancePolicy || {}),
@@ -832,6 +874,13 @@ class BroadcastService {
   async createBroadcast(broadcastData, broadcaster = null) {
     try {
       broadcastData = this.normalizeBroadcastPolicies(broadcastData || {});
+      const templateVariables = this.normalizeTemplateVariables(
+        broadcastData.variables || broadcastData.templateParameters || []
+      );
+      if (templateVariables.length > 0) {
+        broadcastData.variables = templateVariables;
+      }
+      delete broadcastData.templateParameters;
       // If scheduledAt is provided, set status to 'scheduled'
       if (broadcastData.scheduledAt) {
         broadcastData.status = 'scheduled';
@@ -974,14 +1023,18 @@ class BroadcastService {
           : {};
       let usageBatchCount = 0;
       const usageBatchSize = Number(process.env.BROADCAST_USAGE_BATCH || 50);
-      const sendDelayMs = Math.max(0, Number(process.env.BROADCAST_SEND_DELAY_MS || 1000));
-      const batchSize = Math.max(1, Math.min(500, Number(deliveryPolicy?.batchSize || 50)));
+      const sendDelayMs = Math.max(0, Number(process.env.BROADCAST_SEND_DELAY_MS || 100));
+      const batchSize = Math.max(1, Math.min(50, Number(deliveryPolicy?.batchSize || 50)));
+      const batchDelayMs = Math.max(0, Number(deliveryPolicy?.batchDelaySeconds || 5)) * 1000;
       const suppressionSet = new Set(
         (compliancePolicy?.suppressionListPhones || [])
           .map((phone) => this.normalizePhoneNumber(phone))
           .filter(Boolean)
       );
       let templatePreviewText = broadcast.templateContent || null;
+      const broadcastTemplateVariables = this.normalizeTemplateVariables(
+        broadcast?.variables || broadcast?.templateParameters || []
+      );
       const explicitTemplateCategory = toCleanString(broadcast?.templateCategory || '').toLowerCase();
       let templateCategoryRaw = explicitTemplateCategory;
       if (!templateCategoryRaw && broadcast.messageType === 'template') {
@@ -1023,11 +1076,33 @@ class BroadcastService {
         );
       }
 
+      const requiredTemplateVariableCount = this.extractTemplateVariableCount(
+        broadcast?.templateContent || templatePreviewText || ''
+      );
+      const hasAnyRecipientVariables = Array.isArray(broadcast?.recipients)
+        ? broadcast.recipients.some((recipient) => Array.isArray(recipient?.variables) && recipient.variables.length > 0)
+        : false;
+      const hasBroadcastVariables = broadcastTemplateVariables.length > 0;
+      if (
+        broadcast.templateName &&
+        requiredTemplateVariableCount > 0 &&
+        !hasAnyRecipientVariables &&
+        !hasBroadcastVariables
+      ) {
+        return {
+          success: false,
+          error: `Template "${broadcast.templateName}" needs ${requiredTemplateVariableCount} variable column(s) in the CSV file, but none were provided. Add var1, var2, etc. and try again.`
+        };
+      }
+
       const recipients = Array.isArray(broadcast.recipients) ? broadcast.recipients : [];
       for (let batchStart = 0; batchStart < recipients.length; batchStart += batchSize) {
         const batchRecipients = recipients.slice(batchStart, batchStart + batchSize);
         for (const recipient of batchRecipients) {
         try {
+          const recipientVariables = Array.isArray(recipient?.variables) && recipient.variables.length > 0
+            ? recipient.variables
+            : broadcastTemplateVariables;
           let result;
           const phoneNumber = recipient.phone || recipient;
           const normalizedPhone = this.normalizePhoneNumber(phoneNumber);
@@ -1051,7 +1126,10 @@ class BroadcastService {
             phone: phoneNumber
           });
 
-          if (!contact) {
+          const requiresContactRecord =
+            !broadcast.templateName || templateCategory === 'marketing';
+
+          if (!contact && requiresContactRecord) {
             failed++;
             broadcast.stats.failed++;
             results.push({
@@ -1097,7 +1175,7 @@ class BroadcastService {
                   phoneNumber,
                   normalizedTemplateName,
                   broadcast.language || 'en_US',
-                  recipient.variables || broadcast.variables || [],
+                  this.normalizeTemplateVariables(recipientVariables),
                   resolvedCredentials,
                   true,
                   templateComponents
@@ -1129,14 +1207,14 @@ class BroadcastService {
               success: result.success,
               templateName: normalizedTemplateName,
               language: broadcast.language || 'en_US',
-              variables: recipient.variables || broadcast.variables || [],
+              variables: this.normalizeTemplateVariables(recipientVariables),
               error: result.error
             });
             
             messageTextForInbox = templatePreviewText
               ? this.processTemplateVariables(
                   templatePreviewText,
-                  recipient.variables || broadcast.variables || [],
+                  this.normalizeTemplateVariables(recipientVariables),
                   rowData
                 )
               : `Template: ${normalizedTemplateName}`;
@@ -1157,7 +1235,7 @@ class BroadcastService {
             // Process custom message with variable replacement
             const processedMessage = this.processTemplateVariables(
               broadcast.message,
-              recipient.variables || broadcast.variables || [],
+              recipientVariables,
               rowData
             );
             const sendTextOutcome = await this.sendWithRetry(
@@ -1210,18 +1288,20 @@ class BroadcastService {
               broadcast.companyId
             );
 
-            if (broadcast.templateName && templateCategory === 'marketing') {
+            if (broadcast.templateName && templateCategory === 'marketing' && contact) {
               applyMarketingTemplateSent(contact, { now: new Date() });
               await contact.save();
             }
 
-            await this.logBroadcastContactActivity({
-              broadcast,
-              contact,
-              conversation,
-              messageText: messageTextForInbox,
-              templateCategory
-            });
+            if (contact) {
+              await this.logBroadcastContactActivity({
+                broadcast,
+                contact,
+                conversation,
+                messageText: messageTextForInbox,
+                templateCategory
+              });
+            }
 
             if (typeof broadcaster === 'function' && conversation && message) {
               broadcaster({
@@ -1256,8 +1336,10 @@ class BroadcastService {
             response: result.data
           });
 
-          // Rate limiting between recipients
-          await new Promise(resolve => setTimeout(resolve, sendDelayMs));
+          // Rate limiting within the batch
+          if (sendDelayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, sendDelayMs));
+          }
         } catch (error) {
           failed++;
           broadcast.stats.failed++;
@@ -1270,6 +1352,11 @@ class BroadcastService {
             retryable: errorMeta.retryable
           });
         }
+        }
+
+        const hasMoreBatches = batchStart + batchSize < recipients.length;
+        if (hasMoreBatches && batchDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, batchDelayMs));
         }
       }
 
@@ -1329,6 +1416,7 @@ class BroadcastService {
 
   async updateConversation(phone, message, whatsappResponse, broadcastId, userId, companyId) {
     try {
+      const whatsappMessageId = whatsappResponse?.messages?.[0]?.id;
       let contact = await Contact.findOne({ userId, companyId, phone });
       if (!contact) {
         contact = await Contact.create({
@@ -1376,7 +1464,6 @@ class BroadcastService {
         await conversation.save();
       }
 
-      const whatsappMessageId = whatsappResponse?.messages?.[0]?.id;
       const savedMessage = await Message.create({
         userId,
         companyId,

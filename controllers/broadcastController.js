@@ -111,12 +111,20 @@ class BroadcastController {
           sendToUser(String(req.user.id), payload);
         }
       };
-      const result = await broadcastService.sendBroadcast(req.params.id, broadcaster, req.whatsappCredentials);
-      if (result.success) {
-        res.json(result);
-      } else {
-        res.status(400).json(result);
-      }
+      setImmediate(() => {
+        broadcastService
+          .sendBroadcast(req.params.id, broadcaster, req.whatsappCredentials)
+          .catch((error) => {
+            console.error(`Background broadcast send failed for ${req.params.id}:`, error);
+          });
+      });
+
+      res.status(202).json({
+        success: true,
+        queued: true,
+        broadcastId: req.params.id,
+        message: 'Broadcast queued. Sending will continue in the background.'
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }

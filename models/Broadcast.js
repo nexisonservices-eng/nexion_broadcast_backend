@@ -73,7 +73,8 @@ const BroadcastSchema = new mongoose.Schema({
       timezone: { type: String, default: 'UTC' },
       action: { type: String, enum: ['defer', 'skip'], default: 'defer' }
     },
-    batchSize: { type: Number, min: 1, max: 500, default: 50 }
+    batchSize: { type: Number, min: 1, max: 50, default: 50 },
+    batchDelaySeconds: { type: Number, min: 0, max: 3600, default: 5 }
   },
   retryPolicy: {
     enabled: { type: Boolean, default: true },

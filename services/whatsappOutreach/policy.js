@@ -15,14 +15,26 @@ const hasOptInEvidence = (contact = {}) =>
       toCleanString(contact?.whatsappOptInProofUrl) ||
       toCleanString(contact?.whatsappOptInPageUrl) ||
       toCleanString(contact?.whatsappOptInCapturedBy) ||
-      toCleanString(contact?.whatsappOptInMetadata)
+      toCleanString(contact?.whatsappOptInMetadata) ||
+      ['landing_page', 'public_opt_in', 'website_form'].includes(
+        toCleanString(contact?.whatsappOptInSource || contact?.source).toLowerCase()
+      )
   );
 
 const normalizeWhatsAppOptInStatus = (value, isBlocked = false, contact = {}) => {
-  const normalized = toCleanString(value).toLowerCase();
+  const normalized = toCleanString(value)
+    .toLowerCase()
+    .replace(/[-\s]+/g, '_');
   if (normalized === 'opted_in') return 'opted_in';
   if (normalized === 'opted_out') return 'opted_out';
   if (hasOptInEvidence(contact)) return 'opted_in';
+  if (
+    ['imported', 'csv_import'].includes(toCleanString(contact?.sourceType || contact?.source).toLowerCase()) &&
+    !contact?.isBlocked &&
+    !contact?.whatsappOptOutAt
+  ) {
+    return 'opted_in';
+  }
   return isBlocked ? 'opted_out' : 'unknown';
 };
 
@@ -37,6 +49,15 @@ const normalizeOptInScope = (value = '') => {
 const marketingScopeAllowed = (scope = '') => {
   const normalized = normalizeOptInScope(scope);
   return normalized === 'marketing' || normalized === 'both';
+};
+
+const setContactField = (contact, key, value) => {
+  if (!contact || typeof contact !== 'object') return;
+  if (typeof contact.set === 'function') {
+    contact.set(key, value);
+    return;
+  }
+  contact[key] = value;
 };
 
 const getMarketingRateLimitConfig = () => {
@@ -199,22 +220,22 @@ const getWhatsAppMessagingPolicy = (contact = {}, options = {}) => {
 
 const applyContactOptIn = (contact, { source = 'manual' } = {}) => {
   if (!contact || typeof contact !== 'object') return contact;
-  contact.whatsappOptInStatus = 'opted_in';
-  contact.whatsappOptInAt = new Date();
-  contact.whatsappOptInSource = toCleanString(source) || 'manual';
-  contact.whatsappOptOutAt = null;
-  contact.isBlocked = false;
+  setContactField(contact, 'whatsappOptInStatus', 'opted_in');
+  setContactField(contact, 'whatsappOptInAt', new Date());
+  setContactField(contact, 'whatsappOptInSource', toCleanString(source) || 'manual');
+  setContactField(contact, 'whatsappOptOutAt', null);
+  setContactField(contact, 'isBlocked', false);
   return contact;
 };
 
 const applyContactOptOut = (contact, { source = 'manual' } = {}) => {
   if (!contact || typeof contact !== 'object') return contact;
-  contact.whatsappOptInStatus = 'opted_out';
-  contact.whatsappOptOutAt = new Date();
+  setContactField(contact, 'whatsappOptInStatus', 'opted_out');
+  setContactField(contact, 'whatsappOptOutAt', new Date());
   if (!toCleanString(contact.whatsappOptInSource)) {
-    contact.whatsappOptInSource = toCleanString(source) || 'manual';
+    setContactField(contact, 'whatsappOptInSource', toCleanString(source) || 'manual');
   }
-  contact.isBlocked = true;
+  setContactField(contact, 'isBlocked', true);
   return contact;
 };
 
@@ -288,6 +309,8 @@ const buildBroadcastAudienceValidation = ({
 } = {}) => {
   const normalizedMessageType = toCleanString(messageType).toLowerCase();
   const normalizedTemplateCategory = toCleanString(templateCategory).toLowerCase();
+  const allowMissingContactForTemplate =
+    normalizedMessageType === 'template' && normalizedTemplateCategory !== 'marketing';
   const eligibleRecipients = [];
   const invalidRecipients = [];
   const summary = {
@@ -317,14 +340,38 @@ const buildBroadcastAudienceValidation = ({
     }
 
     const matchedContact = contactsByPhone.get(phone) || null;
+    const recipientPolicy = getWhatsAppMessagingPolicy(recipient, {
+      templateCategory: normalizedTemplateCategory
+    });
     if (!matchedContact) {
+      if (allowMissingContactForTemplate || recipientPolicy.marketingTemplateAllowed) {
+        summary.eligible += 1;
+        eligibleRecipients.push({
+          ...recipient,
+          phone,
+          contactId: null,
+          policy: recipientPolicy
+        });
+        continue;
+      }
+
       summary.invalid += 1;
-      summary.missingContact += 1;
+      if (normalizedMessageType === 'template' && normalizedTemplateCategory === 'marketing') {
+        summary.missingMarketingOptIn += 1;
+      } else {
+        summary.missingContact += 1;
+      }
       invalidRecipients.push({
         recipient,
         phone,
-        reason: 'missing_contact',
-        error: 'Contact record not found for this phone number.'
+        reason:
+          normalizedMessageType === 'template' && normalizedTemplateCategory === 'marketing'
+            ? 'missing_marketing_opt_in'
+            : 'missing_contact',
+        error:
+          normalizedMessageType === 'template' && normalizedTemplateCategory === 'marketing'
+            ? 'Marketing template messages require a WhatsApp opt-in or a recent customer interaction.'
+            : 'Contact record not found for this phone number.'
       });
       continue;
     }
