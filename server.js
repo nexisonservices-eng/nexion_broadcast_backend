@@ -72,6 +72,7 @@ const crmRoutes = require('./routes/crm');
 const googleCalendarRoutes = require('./routes/googleCalendar');
 const campaignRoutes = require('./routes/campaignroutes');
 const usageRoutes = require('./routes/usage');
+const internalCleanupRoutes = require('./routes/internalCleanup');
 const { registerWhatsAppWebhookRoutes } = require('./routes/whatsappWebhookRoutes');
 const { registerLegacyCoreRoutes } = require('./routes/legacyCoreRoutes');
 const { createWebSocketHub } = require('./realtime/websocketHub');
@@ -230,6 +231,7 @@ app.use('/api/crm', crmRoutes);
 app.use('/api/google-calendar', googleCalendarRoutes);
 app.use('/api/campaigns', campaignRoutes);
 app.use('/api/usage', usageRoutes);
+app.use('/internal/cleanup', internalCleanupRoutes);
 
 // Compatibility endpoints used by older frontend modules when legacy core routes are disabled.
 app.get('/api/version', (req, res) => {
