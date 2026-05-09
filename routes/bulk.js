@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -12,7 +12,10 @@ const { enqueueCsvImport } = require('../queues/csvImportQueue');
 const { processCsvImport } = require('../services/csvImportProcessor');
 const CsvImportJob = require('../models/CsvImportJob');
 const Contact = require('../models/Contact');
-const { buildPhoneLookupFilters } = require('../services/whatsappOutreach/conversationResolver');
+const {
+  buildPhoneCandidates,
+  buildPhoneLookupFilters
+} = require('../services/whatsappOutreach/conversationResolver');
 const {
   buildBroadcastAudienceValidation,
   toCleanString

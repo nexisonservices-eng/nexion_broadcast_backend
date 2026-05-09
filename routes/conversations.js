@@ -14,7 +14,8 @@ const {
 const {
   CACHE_TTL_SECONDS,
   getInboxScopeVariants,
-  getOrSetCachedJson
+  getOrSetCachedJson,
+  invalidateInboxConversation
 } = require('../utils/teamInboxCache');
 const {
   normalizeRole,
@@ -25,8 +26,9 @@ const buildScopedMessageFilters = (req, extra = {}) => {
   const normalizedRole = normalizeRole(
     req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role
   );
+  const normalizedCompanyId = String(req?.companyId || req?.user?.companyId || '').trim();
   const filters = {
-    ...(req.companyId ? { companyId: req.companyId } : {}),
+    ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
     ...extra
   };
 
@@ -85,8 +87,9 @@ router.get('/:id/messages', async (req, res) => {
 
     const limit = normalizePageLimit(req.query?.limit);
     const cursor = decodeMessageCursor(req.query?.cursor);
+    const normalizedCompanyId = String(req.companyId || req.user?.companyId || '').trim();
     const scopeVariants = getInboxScopeVariants({
-      companyId: req.companyId || '',
+      companyId: normalizedCompanyId,
       userId: req.user?.id || ''
     });
     const scope = scopeVariants[scopeVariants.length - 1] || scopeVariants[0] || '';
@@ -97,6 +100,58 @@ router.get('/:id/messages', async (req, res) => {
       ...queryCursor
     });
 
+    const loadMessages = async (filters) =>
+      Message.find(filters)
+        .select(
+          '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
+        )
+        .populate(
+          'replyTo',
+          '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
+        )
+        .sort({ timestamp: -1, _id: -1 })
+        .limit(limit + 1)
+        .lean();
+
+    const loadScopedMessages = async () => {
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[conversations] thread filters', {
+          conversationId,
+          reqCompanyId: req.companyId || null,
+          reqUserCompanyId: req.user?.companyId || null,
+          normalizedCompanyId,
+          queryFilters
+        });
+      }
+      const scopedMessages = await loadMessages({
+        ...queryFilters,
+        ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {})
+      });
+
+      if (scopedMessages.length > 0 || !normalizedCompanyId) {
+        return scopedMessages;
+      }
+
+      const companyWideMessages = await loadMessages({
+        conversationId,
+        ...queryCursor,
+        companyId: normalizedCompanyId
+      });
+
+      if (companyWideMessages.length > 0) {
+        return companyWideMessages;
+      }
+
+      return loadMessages({
+        conversationId,
+        ...queryCursor,
+        $or: [
+          { companyId: { $exists: false } },
+          { companyId: null }
+        ]
+      });
+    };
+
     const cachedResponse = threadScope
       ? await getOrSetCachedJson({
           namespace: 'messages',
@@ -105,17 +160,7 @@ router.get('/:id/messages', async (req, res) => {
           keyParts: [String(limit), String(req.query?.cursor || '').trim()],
           ttlSeconds: CACHE_TTL_SECONDS.messages,
           loader: async () => {
-            const messages = await Message.find(queryFilters)
-              .select(
-                '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
-              )
-              .populate(
-                'replyTo',
-                '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
-              )
-              .sort({ timestamp: -1, _id: -1 })
-              .limit(limit + 1)
-              .lean();
+            const messages = await loadScopedMessages();
 
             const page = buildChronologicalPage({
               documents: messages,
@@ -136,20 +181,24 @@ router.get('/:id/messages', async (req, res) => {
       : null;
 
     if (cachedResponse) {
-      return res.json(cachedResponse);
+      const cachedItems = Array.isArray(cachedResponse?.data) ? cachedResponse.data : [];
+      if (cachedItems.length > 0) {
+        return res.json(cachedResponse);
+      }
+
+      const totalMessagesForConversation = await Message.countDocuments({ conversationId });
+      if (totalMessagesForConversation > 0) {
+        await invalidateInboxConversation({
+          companyId: req.companyId || '',
+          userId: req.user?.id || '',
+          conversationId
+        });
+      } else {
+        return res.json(cachedResponse);
+      }
     }
 
-    const messages = await Message.find(queryFilters)
-      .select(
-        '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
-      )
-      .populate(
-        'replyTo',
-        '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
-      )
-      .sort({ timestamp: -1, _id: -1 })
-      .limit(limit + 1)
-      .lean();
+    const messages = await loadScopedMessages();
 
     const page = buildChronologicalPage({
       documents: messages,

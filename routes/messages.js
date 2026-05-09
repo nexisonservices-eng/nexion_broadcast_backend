@@ -79,8 +79,9 @@ router.get('/conversation/:id', async (req, res) => {
 
     const limit = normalizePageLimit(req.query?.limit);
     const cursor = decodeMessageCursor(req.query?.cursor);
+    const normalizedCompanyId = String(req.companyId || req.user?.companyId || '').trim();
     const scopeVariants = getInboxScopeVariants({
-      companyId: req.companyId || '',
+      companyId: normalizedCompanyId,
       userId: req.user?.id || ''
     });
     const scope = scopeVariants[scopeVariants.length - 1] || scopeVariants[0] || '';
@@ -106,19 +107,29 @@ router.get('/conversation/:id', async (req, res) => {
     const loadScopedMessages = async () => {
       const scopedMessages = await loadMessages({
         ...baseFilters,
-        ...(req.companyId ? { companyId: req.companyId } : {})
+        ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {})
       });
 
-      if (scopedMessages.length > 0 || !req.companyId) {
+      if (scopedMessages.length > 0 || !normalizedCompanyId) {
         return scopedMessages;
       }
 
+      const companyWideMessages = await loadMessages({
+        conversationId,
+        ...(cursor ? buildMessageCursorFilter(cursor) : {}),
+        companyId: normalizedCompanyId
+      });
+
+      if (companyWideMessages.length > 0) {
+        return companyWideMessages;
+      }
+
       return loadMessages({
-        ...baseFilters,
+        conversationId,
+        ...(cursor ? buildMessageCursorFilter(cursor) : {}),
         $or: [
           { companyId: { $exists: false } },
-          { companyId: null },
-          { companyId: '' }
+          { companyId: null }
         ]
       });
     };
@@ -151,13 +162,27 @@ router.get('/conversation/:id', async (req, res) => {
       : null;
 
     if (cachedResponse) {
-      return res.json(cachedResponse);
+      const cachedItems = Array.isArray(cachedResponse?.data) ? cachedResponse.data : [];
+      if (cachedItems.length > 0) {
+        return res.json(cachedResponse);
       }
 
-      const messages = await loadScopedMessages();
-      const page = buildChronologicalPage({
-        documents: messages,
-        limit,
+      const totalMessagesForConversation = await Message.countDocuments({ conversationId });
+      if (totalMessagesForConversation > 0) {
+        await invalidateInboxConversation({
+          companyId: normalizedCompanyId,
+          userId: req.user?.id || '',
+          conversationId
+        });
+      } else {
+        return res.json(cachedResponse);
+      }
+    }
+
+    const messages = await loadScopedMessages();
+    const page = buildChronologicalPage({
+      documents: messages,
+      limit,
       encodeCursor: encodeMessageCursor
     });
 
@@ -504,8 +529,9 @@ const buildScopedMessageFilters = (req, extra = {}) => {
   const normalizedRole = normalizeRole(
     req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role
   );
+  const normalizedCompanyId = String(req?.companyId || req?.user?.companyId || '').trim();
   const filters = {
-    ...(req.companyId ? { companyId: req.companyId } : {}),
+    ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
     ...extra
   };
 

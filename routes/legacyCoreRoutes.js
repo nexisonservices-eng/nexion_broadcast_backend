@@ -37,8 +37,9 @@ const buildScopedMessageFilters = (req, extra = {}) => {
   const normalizedRole = normalizeRole(
     req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role
   );
+  const normalizedCompanyId = String(req?.companyId || req?.user?.companyId || '').trim();
   const filters = {
-    ...(req.companyId ? { companyId: req.companyId } : {}),
+    ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
     ...extra
   };
 
@@ -47,6 +48,14 @@ const buildScopedMessageFilters = (req, extra = {}) => {
   }
 
   return filters;
+};
+
+const buildCompanyWideMessageFilters = (req, extra = {}) => {
+  const normalizedCompanyId = String(req?.companyId || req?.user?.companyId || '').trim();
+  return {
+    ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
+    ...extra
+  };
 };
 
 const registerLegacyCoreRoutes = (app, deps) => {
@@ -759,8 +768,9 @@ const registerLegacyCoreRoutes = (app, deps) => {
 
       const limit = normalizePageLimit(req.query?.limit);
       const cursor = decodeMessageCursor(req.query?.cursor);
+      const normalizedCompanyId = String(req.companyId || req.user?.companyId || '').trim();
       const scopeVariants = getInboxScopeVariants({
-        companyId: req.companyId || '',
+        companyId: normalizedCompanyId,
         userId: req.user?.id || ''
       });
       const scope = scopeVariants[scopeVariants.length - 1] || scopeVariants[0] || '';
@@ -784,21 +794,39 @@ const registerLegacyCoreRoutes = (app, deps) => {
           .lean();
 
       const loadScopedMessages = async () => {
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[legacyCoreRoutes] thread filters', {
+            conversationId,
+            reqCompanyId: req.companyId || null,
+            reqUserCompanyId: req.user?.companyId || null,
+            normalizedCompanyId,
+            baseFilters
+          });
+        }
         const scopedMessages = await loadMessages({
           ...baseFilters,
-          ...(req.companyId ? { companyId: req.companyId } : {})
+          ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {})
         });
 
-        if (scopedMessages.length > 0 || !req.companyId) {
+        if (scopedMessages.length > 0 || !normalizedCompanyId) {
           return scopedMessages;
+        }
+
+        const companyWideMessages = await loadMessages({
+          conversationId,
+          ...(cursor ? buildMessageCursorFilter(cursor) : {}),
+          ...buildCompanyWideMessageFilters(req)
+        });
+
+        if (companyWideMessages.length > 0) {
+          return companyWideMessages;
         }
 
         return loadMessages({
           ...baseFilters,
           $or: [
             { companyId: { $exists: false } },
-            { companyId: null },
-            { companyId: '' }
+            { companyId: null }
           ]
         });
       };
