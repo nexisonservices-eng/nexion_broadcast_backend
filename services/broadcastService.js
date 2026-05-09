@@ -6,7 +6,11 @@ const BroadcastDispatch = require('../models/BroadcastDispatch');
 const LeadActivity = require('../models/LeadActivity');
 const Template = require('../models/Template');
 const whatsappService = require('./whatsappService');
+const {
+  syncConversationSummaryFromConversation
+} = require('./conversationSummaryService');
 const { enqueueBroadcastSend } = require('../queues/broadcastQueue');
+const { enqueueBroadcastInboxWrite } = require('../queues/broadcastInboxQueue');
 const { getWhatsAppCredentialsForUser } = require('./userWhatsAppCredentialsService');
 const {
   buildPhoneCandidates
@@ -18,6 +22,18 @@ const {
   applyMarketingTemplateSent
 } = require('./whatsappOutreach/policy');
 const axios = require('axios');
+const { createRedisConnection, isRedisDisabled } = require('../config/redis');
+
+const broadcastRateLimiterRedis = createRedisConnection({
+  maxRetriesPerRequest: 1,
+  enableOfflineQueue: true
+});
+
+const BROADCAST_RATE_LIMIT_MAX = Math.max(1, Number(process.env.BROADCAST_RATE_LIMIT_MAX || 25));
+const BROADCAST_RATE_LIMIT_WINDOW_MS = Math.max(
+  1000,
+  Number(process.env.BROADCAST_RATE_LIMIT_WINDOW_MS || 60000)
+);
 
 const ADMIN_USAGE_ENDPOINT =
   process.env.ADMIN_USAGE_ENDPOINT || '/internal/usage/record';
@@ -83,6 +99,72 @@ class BroadcastService {
       ...(companyId ? { companyId } : {}),
       phone: { $in: phoneCandidates }
     });
+  }
+
+  async resolveBroadcastAudienceRecipients({
+    broadcast,
+    userId = null,
+    companyId = null,
+    recipientSubset = null
+  } = {}) {
+    if (Array.isArray(recipientSubset) && recipientSubset.length > 0) {
+      return recipientSubset;
+    }
+
+    const existingRecipients = Array.isArray(broadcast?.recipients) ? broadcast.recipients : [];
+    if (existingRecipients.length > 0) {
+      return existingRecipients;
+    }
+
+    const audienceSource = broadcast?.audienceSource && typeof broadcast.audienceSource === 'object'
+      ? broadcast.audienceSource
+      : {};
+    const audienceSnapshot = broadcast?.audienceSnapshot && typeof broadcast.audienceSnapshot === 'object'
+      ? broadcast.audienceSnapshot
+      : {};
+    const importJobId = String(
+      audienceSource?.importJobId ||
+        audienceSnapshot?.importJobId ||
+        ''
+    ).trim();
+    const contactIds = Array.from(
+      new Set(
+        [
+          ...(Array.isArray(audienceSource?.contactIds) ? audienceSource.contactIds : []),
+          ...(Array.isArray(audienceSnapshot?.contactIds) ? audienceSnapshot.contactIds : [])
+        ]
+          .map((id) => String(id || '').trim())
+          .filter(Boolean)
+      )
+    );
+
+    const query = {
+      userId: userId || broadcast?.createdById || null,
+      ...(companyId || broadcast?.companyId ? { companyId: companyId || broadcast?.companyId } : {})
+    };
+
+    if (importJobId) {
+      query.importJobId = importJobId;
+    } else if (contactIds.length > 0) {
+      query._id = { $in: contactIds };
+    } else {
+      return [];
+    }
+
+    const contacts = await Contact.find(query)
+      .select(
+        '_id name phone phoneDigits sourceType tags importJobId whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata'
+      )
+      .lean();
+
+    return contacts.map((contact) => ({
+      phone: String(contact?.phone || '').trim(),
+      name: String(contact?.name || '').trim(),
+      contactId: String(contact?._id || '').trim(),
+      sourceType: String(contact?.sourceType || 'imported').trim() || 'imported',
+      variables: [],
+      attributes: contact
+    })).filter((recipient) => Boolean(recipient.phone));
   }
 
   async resolveTemplateCategoryForBroadcast({ broadcast, credentials }) {
@@ -873,6 +955,122 @@ class BroadcastService {
       errorMessage: raw
     };
   }
+
+  getBroadcastRateLimitScopeKey({ broadcast = null, credentials = null } = {}) {
+    const phoneNumberId = String(
+      credentials?.phoneNumberId ||
+        credentials?.whatsappId ||
+        broadcast?.credentialsSnapshot?.phoneNumberId ||
+        broadcast?.credentialsSnapshot?.whatsappId ||
+        ''
+    ).trim();
+    if (phoneNumberId) {
+      return `phone:${phoneNumberId}`;
+    }
+
+    const businessAccountId = String(
+      credentials?.businessAccountId ||
+        credentials?.whatsappBusiness ||
+        broadcast?.credentialsSnapshot?.businessAccountId ||
+        broadcast?.credentialsSnapshot?.whatsappBusiness ||
+        ''
+    ).trim();
+    if (businessAccountId) {
+      return `waba:${businessAccountId}`;
+    }
+
+    return `broadcast:${String(broadcast?._id || broadcast?.id || 'unknown').trim()}`;
+  }
+
+  async enforceBroadcastRateLimit({ broadcast = null, credentials = null, weight = 1 } = {}) {
+    if (isRedisDisabled) {
+      return { limited: false };
+    }
+
+    const scopeKey = this.getBroadcastRateLimitScopeKey({ broadcast, credentials });
+    const redisKey = `broadcast:rate:${scopeKey}`;
+    const increment = Math.max(1, Number(weight) || 1);
+
+    const count = await broadcastRateLimiterRedis.incrby(redisKey, increment);
+    if (count === increment) {
+      await broadcastRateLimiterRedis.expire(redisKey, Math.ceil(BROADCAST_RATE_LIMIT_WINDOW_MS / 1000));
+    }
+
+    if (count > BROADCAST_RATE_LIMIT_MAX) {
+      const ttlSeconds = await broadcastRateLimiterRedis.ttl(redisKey);
+      const retryAfterMs = Math.max(
+        BROADCAST_RATE_LIMIT_WINDOW_MS,
+        (Number(ttlSeconds) > 0 ? Number(ttlSeconds) * 1000 : BROADCAST_RATE_LIMIT_WINDOW_MS)
+      );
+      const error = new Error('Broadcast rate limited');
+      error.rateLimited = true;
+      error.retryAfterMs = retryAfterMs;
+      error.scopeKey = scopeKey;
+      error.rateLimitKey = redisKey;
+      throw error;
+    }
+
+    return {
+      limited: false,
+      count,
+      scopeKey,
+      rateLimitKey: redisKey
+    };
+  }
+
+  async getBroadcastRateLimitSnapshot({ broadcastId = null, credentials = null } = {}) {
+    if (isRedisDisabled) {
+      return {
+        enabled: false,
+        count: 0,
+        ttlMs: 0,
+        max: BROADCAST_RATE_LIMIT_MAX,
+        windowMs: BROADCAST_RATE_LIMIT_WINDOW_MS,
+        scopeKey: null,
+        rateLimitKey: null
+      };
+    }
+
+    let broadcast = null;
+    if (broadcastId) {
+      broadcast = await Broadcast.findById(broadcastId)
+        .select('_id credentialsSnapshot createdById companyId')
+        .lean();
+    }
+
+    const snapshotCredentials =
+      credentials ||
+      (broadcast?.credentialsSnapshot
+        ? {
+            phoneNumberId: broadcast.credentialsSnapshot.phoneNumberId,
+            whatsappId: broadcast.credentialsSnapshot.whatsappId,
+            businessAccountId: broadcast.credentialsSnapshot.businessAccountId,
+            whatsappBusiness: broadcast.credentialsSnapshot.whatsappBusiness
+          }
+        : null);
+
+    const scopeKey = this.getBroadcastRateLimitScopeKey({
+      broadcast,
+      credentials: snapshotCredentials
+    });
+    const rateLimitKey = `broadcast:rate:${scopeKey}`;
+
+    const [countRaw, ttlSeconds] = await Promise.all([
+      broadcastRateLimiterRedis.get(rateLimitKey),
+      broadcastRateLimiterRedis.ttl(rateLimitKey)
+    ]);
+
+    return {
+      enabled: true,
+      count: Math.max(0, Number(countRaw || 0) || 0),
+      ttlMs: Math.max(0, Number(ttlSeconds || 0) || 0) * 1000,
+      max: BROADCAST_RATE_LIMIT_MAX,
+      windowMs: BROADCAST_RATE_LIMIT_WINDOW_MS,
+      scopeKey,
+      rateLimitKey
+    };
+  }
+
   async createBroadcast(broadcastData, broadcaster = null) {
     try {
       broadcastData = this.normalizeBroadcastPolicies(broadcastData || {});
@@ -1024,6 +1222,7 @@ class BroadcastService {
       }
 
       const results = [];
+      const recordResult = skipFinalize ? () => {} : (entry) => results.push(entry);
       let successful = 0;
       let failed = 0;
       let suppressed = 0;
@@ -1107,7 +1306,12 @@ class BroadcastService {
         };
       }
 
-      const recipients = recipientSubset || (Array.isArray(broadcast.recipients) ? broadcast.recipients : []);
+      const recipients = await this.resolveBroadcastAudienceRecipients({
+        broadcast,
+        userId: broadcast.createdById,
+        companyId: broadcast.companyId,
+        recipientSubset
+      });
       for (let batchStart = 0; batchStart < recipients.length; batchStart += batchSize) {
         const batchRecipients = recipients.slice(batchStart, batchStart + batchSize);
         for (const recipient of batchRecipients) {
@@ -1130,7 +1334,7 @@ class BroadcastService {
             recipientIndex: Number(batchStart + batchRecipients.indexOf(recipient) || 0)
           });
           if (dispatchClaim?.alreadyFinal || dispatchClaim?.locked) {
-            results.push({
+            recordResult({
               phone: phoneNumber,
               success: true,
               skipped: true,
@@ -1145,7 +1349,7 @@ class BroadcastService {
               status: 'suppressed',
               errorMessage: 'suppressed_by_compliance_policy'
             });
-            results.push({
+            recordResult({
               phone: phoneNumber,
               success: false,
               skipped: true,
@@ -1174,7 +1378,7 @@ class BroadcastService {
               status: 'skipped',
               errorMessage: 'contact_record_missing'
             });
-            results.push({
+            recordResult({
               phone: phoneNumber,
               success: false,
               error: 'Contact record not found for compliance checks.'
@@ -1191,7 +1395,7 @@ class BroadcastService {
                 status: 'failed',
                 errorMessage: 'template_name_missing'
               });
-              results.push({
+              recordResult({
                 phone: phoneNumber,
                 success: false,
                 error: 'Template name is required'
@@ -1212,7 +1416,7 @@ class BroadcastService {
                 status: 'skipped',
                 errorMessage: templateValidation.error
               });
-              results.push({
+              recordResult({
                 phone: phoneNumber,
                 success: false,
                 error: templateValidation.error,
@@ -1228,6 +1432,11 @@ class BroadcastService {
                   rowData
                 )
               : `Template: ${normalizedTemplateName}`;
+            await this.enforceBroadcastRateLimit({
+              broadcast,
+              credentials: resolvedCredentials,
+              weight: 1
+            });
             await this.noteBroadcastDispatchPayload({
               broadcastDispatchKey,
               messageText: messageTextForInbox,
@@ -1263,7 +1472,7 @@ class BroadcastService {
                 failureCodeBreakdown[errorMeta.errorCode] =
                   Number(failureCodeBreakdown[errorMeta.errorCode] || 0) + 1;
               }
-              results.push({
+              recordResult({
                 phone: phoneNumber,
                 success: false,
                 error: errorMeta.errorMessage || 'Template send failed',
@@ -1297,7 +1506,7 @@ class BroadcastService {
                 status: 'skipped',
                 errorMessage: freeformValidation.error
               });
-              results.push({
+              recordResult({
                 phone: phoneNumber,
                 success: false,
                 error: freeformValidation.error,
@@ -1313,6 +1522,11 @@ class BroadcastService {
               rowData
             );
             messageTextForInbox = processedMessage;
+            await this.enforceBroadcastRateLimit({
+              broadcast,
+              credentials: resolvedCredentials,
+              weight: 1
+            });
             await this.noteBroadcastDispatchPayload({
               broadcastDispatchKey,
               messageText: messageTextForInbox,
@@ -1336,7 +1550,7 @@ class BroadcastService {
                 failureCodeBreakdown[errorMeta.errorCode] =
                   Number(failureCodeBreakdown[errorMeta.errorCode] || 0) + 1;
               }
-              results.push({
+              recordResult({
                 phone: phoneNumber,
                 success: false,
                 error: errorMeta.errorMessage || 'Message send failed',
@@ -1358,7 +1572,7 @@ class BroadcastService {
               status: 'failed',
               errorMessage: 'No message or template specified'
             });
-            results.push({
+            recordResult({
               phone: phoneNumber,
               success: false,
               error: 'No message or template specified'
@@ -1371,39 +1585,52 @@ class BroadcastService {
           if (result.success) {
             successful++;
             broadcast.stats.sent++;
-            
-            // Create or update conversation + create message so Team Inbox shows it
-            const { conversation, message } = await this.updateConversation(
-              phoneNumber,
-              messageTextForInbox,
-              result.data,
-              broadcast._id,
-              broadcast.createdById,
-              broadcast.companyId,
-              broadcastDispatchKey
-            );
-
-            if (broadcast.templateName && templateCategory === 'marketing' && contact) {
-              applyMarketingTemplateSent(contact, { now: new Date() });
-              await contact.save();
-            }
-
-            if (contact) {
-              await this.logBroadcastContactActivity({
-                broadcast,
-                contact,
-                conversation,
-                messageText: messageTextForInbox,
-                templateCategory
+            if (skipFinalize) {
+              await this.enqueueBroadcastInboxWrite({
+                broadcastId: broadcast._id,
+                userId: broadcast.createdById,
+                companyId: broadcast.companyId,
+                phoneNumber,
+                message: messageTextForInbox,
+                whatsappResponse: result.data,
+                broadcastDispatchKey,
+                templateCategory,
+                contactId: contact?._id || ''
               });
-            }
+            } else {
+              // Keep the legacy synchronous path for direct/manual sends.
+              const { conversation, message } = await this.updateConversation(
+                phoneNumber,
+                messageTextForInbox,
+                result.data,
+                broadcast._id,
+                broadcast.createdById,
+                broadcast.companyId,
+                broadcastDispatchKey
+              );
 
-            if (typeof broadcaster === 'function' && conversation && message) {
-              broadcaster({
-                type: 'message_sent',
-                conversation: conversation.toObject(),
-                message: message.toObject()
-              });
+              if (broadcast.templateName && templateCategory === 'marketing' && contact) {
+                applyMarketingTemplateSent(contact, { now: new Date() });
+                await contact.save();
+              }
+
+              if (contact) {
+                await this.logBroadcastContactActivity({
+                  broadcast,
+                  contact,
+                  conversation,
+                  messageText: messageTextForInbox,
+                  templateCategory
+                });
+              }
+
+              if (typeof broadcaster === 'function' && conversation && message) {
+                broadcaster({
+                  type: 'message_sent',
+                  conversation: conversation.toObject(),
+                  message: message.toObject()
+                });
+              }
             }
             usageBatchCount += 1;
             if (usageBatchCount >= usageBatchSize) {
@@ -1420,7 +1647,7 @@ class BroadcastService {
               errorMessage: errorMeta.errorMessage
             });
             console.error(`❌ Failed to send to ${phoneNumber}:`, errorMeta.errorMessage);
-            results.push({
+            recordResult({
               phone: phoneNumber,
               success: false,
               error: errorMeta.errorMessage,
@@ -1430,7 +1657,7 @@ class BroadcastService {
             continue;
           }
 
-          results.push({
+          recordResult({
             phone: phoneNumber,
             success: true,
             response: result.data
@@ -1441,6 +1668,9 @@ class BroadcastService {
             await new Promise((resolve) => setTimeout(resolve, sendDelayMs));
           }
         } catch (error) {
+          if (error?.rateLimited) {
+            throw error;
+          }
           failed++;
           broadcast.stats.failed++;
           const errorMeta = this.classifySendError(error);
@@ -1453,7 +1683,7 @@ class BroadcastService {
           } catch (_dispatchFinalizeError) {
             // best effort only
           }
-          results.push({
+          recordResult({
             phone: recipient.phone || recipient,
             success: false,
             error: errorMeta.errorMessage || error.message,
@@ -1527,6 +1757,14 @@ class BroadcastService {
         }
       };
     } catch (error) {
+      if (error?.rateLimited) {
+        return {
+          success: false,
+          rateLimited: true,
+          retryAfterMs: Number(error.retryAfterMs || BROADCAST_RATE_LIMIT_WINDOW_MS),
+          error: error.message || 'Broadcast rate limited'
+        };
+      }
       try {
         await Broadcast.findByIdAndUpdate(
           broadcastId,
@@ -1589,6 +1827,7 @@ class BroadcastService {
         conversation.lastMessageWhatsappMessageId = whatsappMessageId || '';
         await conversation.save();
       }
+      await syncConversationSummaryFromConversation(conversation);
 
       const savedMessage = await Message.create({
         userId,
@@ -1607,6 +1846,32 @@ class BroadcastService {
       console.error('Error updating conversation:', error);
       return { conversation: null, message: null };
     }
+  }
+
+  async enqueueBroadcastInboxWrite({
+    broadcastId,
+    userId,
+    companyId,
+    phoneNumber,
+    message,
+    whatsappResponse,
+    broadcastDispatchKey = '',
+    templateCategory = '',
+    contactId = '',
+    skipActivityLog = false
+  }) {
+    return enqueueBroadcastInboxWrite({
+      broadcastId,
+      userId,
+      companyId,
+      phoneNumber,
+      message,
+      whatsappResponse,
+      broadcastDispatchKey,
+      templateCategory,
+      contactId,
+      skipActivityLog
+    });
   }
 
   async claimBroadcastDispatch({
@@ -2438,3 +2703,4 @@ class BroadcastService {
 }
 
 module.exports = new BroadcastService();
+

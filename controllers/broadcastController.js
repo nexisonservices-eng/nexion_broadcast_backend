@@ -1,6 +1,11 @@
 const broadcastService = require('../services/broadcastService');
 const { enqueueBroadcastSend, getBroadcastQueueCounts } = require('../queues/broadcastQueue');
 const {
+  getBroadcastInboxQueueCounts,
+  getBroadcastInboxQueueLagSnapshot
+} = require('../queues/broadcastInboxQueue');
+const { getQueueLagSnapshot } = require('../queues/broadcastQueue');
+const {
   normalizeRole,
   isTenantWideRole
 } = require('../utils/accessControl');
@@ -422,12 +427,35 @@ class BroadcastController {
 
   async getQueueMetrics(req, res) {
     try {
-      const counts = await getBroadcastQueueCounts();
+      const [sendCounts, inboxCounts, sendLag, inboxLag, rateLimitSnapshot] = await Promise.all([
+        getBroadcastQueueCounts(),
+        getBroadcastInboxQueueCounts(),
+        getQueueLagSnapshot(),
+        getBroadcastInboxQueueLagSnapshot(),
+        req.query?.broadcastId || req.query?.phoneNumberId || req.query?.businessAccountId
+          ? broadcastService.getBroadcastRateLimitSnapshot({
+              broadcastId: req.query?.broadcastId || null,
+              credentials: {
+                phoneNumberId: req.query?.phoneNumberId || '',
+                businessAccountId: req.query?.businessAccountId || '',
+                whatsappId: req.query?.phoneNumberId || '',
+                whatsappBusiness: req.query?.businessAccountId || ''
+              }
+            })
+          : Promise.resolve(null)
+      ]);
       return res.json({
         success: true,
         data: {
-          queue: 'broadcast-send',
-          counts
+          queues: {
+            'broadcast-send': sendCounts,
+            'broadcast-inbox-write': inboxCounts
+          },
+          lag: {
+            'broadcast-send': sendLag,
+            'broadcast-inbox-write': inboxLag
+          },
+          rateLimit: rateLimitSnapshot || null
         }
       });
     } catch (error) {

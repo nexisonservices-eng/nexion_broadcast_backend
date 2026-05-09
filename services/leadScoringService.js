@@ -2,6 +2,7 @@ const Contact = require('../models/Contact');
 const Conversation = require('../models/Conversation');
 const Message = require('../models/Message');
 const LeadScoringConfig = require('../models/LeadScoringConfig');
+const { invalidateInboxScope } = require('../utils/teamInboxCache');
 
 const DEFAULT_LEAD_SCORING_SETTINGS = Object.freeze({
   readScore: 2,
@@ -247,7 +248,7 @@ const applyScoreToContact = async ({
 
   if (!contactId || !userId || safeTotal === 0) return null;
 
-  return Contact.findOneAndUpdate(
+  const updatedContact = await Contact.findOneAndUpdate(
     {
       _id: contactId,
       userId,
@@ -268,6 +269,12 @@ const applyScoreToContact = async ({
       new: true
     }
   ).lean();
+
+  if (updatedContact) {
+    void invalidateInboxScope({ companyId, userId });
+  }
+
+  return updatedContact;
 };
 
 const getKeywordMatches = ({ text = '', keywordRules = [] }) => {

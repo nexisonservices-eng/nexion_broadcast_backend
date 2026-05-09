@@ -1,5 +1,8 @@
 const Contact = require('../../models/Contact');
 const Conversation = require('../../models/Conversation');
+const {
+  syncConversationSummaryFromConversation
+} = require('../../services/conversationSummaryService');
 
 const normalizePhoneDigits = (value = '') => String(value || '').replace(/\D/g, '');
 
@@ -185,6 +188,7 @@ const resolveOrCreateConversationForTemplateSend = async ({
       unreadCount: 0
     });
     createdConversation = true;
+    await syncConversationSummaryFromConversation(conversation);
   }
 
   return {

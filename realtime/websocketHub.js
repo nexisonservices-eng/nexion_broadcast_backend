@@ -4,6 +4,9 @@ const {
   subscribeRealtimeEvents
 } = require('./realtimeBus');
 const {
+  subscribeBroadcastEvents
+} = require('./broadcastEventBus');
+const {
   setUserPresence,
   clearUserPresence,
   setTypingState,
@@ -12,6 +15,25 @@ const {
 
 const createWebSocketHub = ({ wss }) => {
   const clients = new Map();
+  const roomMembers = new Map();
+
+  const getRoomKey = (kind, value) => `${kind}:${String(value || '').trim()}`;
+  const resolveDataCompanyId = (data = {}) =>
+    String(
+      data?.companyId ||
+        data?.conversation?.companyId ||
+        data?.message?.companyId ||
+        data?.payload?.companyId ||
+        ''
+    ).trim();
+  const resolveDataConversationId = (data = {}) =>
+    String(
+      data?.conversationId ||
+        data?.conversation?._id ||
+        data?.message?.conversationId ||
+        data?.payload?.conversationId ||
+        ''
+    ).trim();
 
   const getSocketSet = (userId) => {
     const normalizedUserId = String(userId || '').trim();
@@ -36,10 +58,67 @@ const createWebSocketHub = ({ wss }) => {
     if (socketSet.size === 0) {
       clients.delete(normalizedUserId);
     }
+
+    const joinedRooms = ws.joinedRooms instanceof Set ? Array.from(ws.joinedRooms) : [];
+    joinedRooms.forEach((roomId) => {
+      const roomSet = roomMembers.get(roomId);
+      if (!roomSet) return;
+      roomSet.delete(ws);
+      if (roomSet.size === 0) {
+        roomMembers.delete(roomId);
+      }
+    });
+    if (ws.joinedRooms instanceof Set) {
+      ws.joinedRooms.clear();
+    }
   };
 
-  const sendToLocalUser = (userId, data) => {
-    const socketSet = clients.get(String(userId || '').trim());
+  const getRoomSet = (roomId) => {
+    const normalizedRoomId = String(roomId || '').trim();
+    if (!normalizedRoomId) return null;
+
+    let socketSet = roomMembers.get(normalizedRoomId);
+    if (!socketSet) {
+      socketSet = new Set();
+      roomMembers.set(normalizedRoomId, socketSet);
+    }
+    return socketSet;
+  };
+
+  const joinRoom = (roomId, ws) => {
+    const normalizedRoomId = String(roomId || '').trim();
+    if (!normalizedRoomId || !ws) return false;
+
+    const socketSet = getRoomSet(normalizedRoomId);
+    if (!socketSet) return false;
+
+    socketSet.add(ws);
+    if (!(ws.joinedRooms instanceof Set)) {
+      ws.joinedRooms = new Set();
+    }
+    ws.joinedRooms.add(normalizedRoomId);
+    return true;
+  };
+
+  const leaveRoom = (roomId, ws) => {
+    const normalizedRoomId = String(roomId || '').trim();
+    if (!normalizedRoomId || !ws) return false;
+
+    const socketSet = roomMembers.get(normalizedRoomId);
+    if (!socketSet) return false;
+
+    socketSet.delete(ws);
+    if (ws.joinedRooms instanceof Set) {
+      ws.joinedRooms.delete(normalizedRoomId);
+    }
+    if (socketSet.size === 0) {
+      roomMembers.delete(normalizedRoomId);
+    }
+    return true;
+  };
+
+  const sendToLocalRoom = (roomId, data) => {
+    const socketSet = roomMembers.get(String(roomId || '').trim());
     if (!socketSet || socketSet.size === 0) return;
 
     const message = JSON.stringify(data);
@@ -48,6 +127,12 @@ const createWebSocketHub = ({ wss }) => {
         client.send(message);
       }
     });
+  };
+
+  const sendToLocalUser = (userId, data) => {
+    const normalizedUserId = String(userId || '').trim();
+    if (!normalizedUserId) return;
+    sendToLocalRoom(getRoomKey('user', normalizedUserId), data);
   };
 
   const broadcastLocal = (data) => {
@@ -59,6 +144,40 @@ const createWebSocketHub = ({ wss }) => {
         }
       });
     });
+  };
+
+  const syncConversationRoom = (ws, nextConversationId = '') => {
+    if (!(ws.joinedRooms instanceof Set)) {
+      ws.joinedRooms = new Set();
+    }
+
+    const normalizedNextConversationId = String(nextConversationId || '').trim();
+    const currentConversationId = String(ws.activeConversationId || '').trim();
+    if (currentConversationId && currentConversationId !== normalizedNextConversationId) {
+      leaveRoom(getRoomKey('conversation', currentConversationId), ws);
+    }
+
+    ws.activeConversationId = normalizedNextConversationId;
+    if (normalizedNextConversationId) {
+      joinRoom(getRoomKey('conversation', normalizedNextConversationId), ws);
+    }
+  };
+
+  const syncCompanyRoom = (ws, companyId = '') => {
+    if (!(ws.joinedRooms instanceof Set)) {
+      ws.joinedRooms = new Set();
+    }
+
+    const normalizedCompanyId = String(companyId || '').trim();
+    const currentCompanyId = String(ws.companyId || '').trim();
+    if (currentCompanyId && currentCompanyId !== normalizedCompanyId) {
+      leaveRoom(getRoomKey('company', currentCompanyId), ws);
+    }
+
+    ws.companyId = normalizedCompanyId;
+    if (normalizedCompanyId) {
+      joinRoom(getRoomKey('company', normalizedCompanyId), ws);
+    }
   };
 
   const deliverEvent = (event = {}) => {
@@ -73,11 +192,59 @@ const createWebSocketHub = ({ wss }) => {
       if (targetUserId) {
         sendToLocalUser(targetUserId, event.data || {});
       }
+      const targetCompanyId = resolveDataCompanyId(event?.data || {});
+      if (targetCompanyId) {
+        sendToLocalRoom(getRoomKey('company', targetCompanyId), event.data || {});
+      }
+      const targetConversationId = resolveDataConversationId(event?.data || {});
+      if (targetConversationId) {
+        sendToLocalRoom(getRoomKey('conversation', targetConversationId), event.data || {});
+      }
+      return;
+    }
+
+    if (scope === 'company') {
+      const targetCompanyId = String(event?.companyId || resolveDataCompanyId(event?.data || {})).trim();
+      if (targetCompanyId) {
+        sendToLocalRoom(getRoomKey('company', targetCompanyId), event.data || {});
+      }
+      return;
+    }
+
+    if (scope === 'conversation') {
+      const targetConversationId = String(event?.conversationId || resolveDataConversationId(event?.data || {})).trim();
+      if (targetConversationId) {
+        sendToLocalRoom(getRoomKey('conversation', targetConversationId), event.data || {});
+      }
+      return;
+    }
+
+    if (scope === 'room') {
+      const targetRoom = String(event?.room || '').trim();
+      if (targetRoom) {
+        sendToLocalRoom(targetRoom, event.data || {});
+      }
     }
   };
 
   subscribeRealtimeEvents((event) => {
     deliverEvent(event);
+  });
+
+  subscribeBroadcastEvents((event) => {
+    const targetUserId = String(event?.userId || '').trim();
+    const payload = event?.payload || {};
+
+    if (targetUserId) {
+      void sendToUser(targetUserId, payload).catch((error) => {
+        console.error('Failed to deliver broadcast event to user:', error?.message || error);
+      });
+      return;
+    }
+
+    void broadcast(payload).catch((error) => {
+      console.error('Failed to broadcast global broadcast-event payload:', error?.message || error);
+    });
   });
 
   const broadcast = async (data) => {
@@ -92,6 +259,18 @@ const createWebSocketHub = ({ wss }) => {
   const sendToUser = async (userId, data) => {
     const normalizedUserId = String(userId || '').trim();
     if (!normalizedUserId) return;
+
+    const companyId = resolveDataCompanyId(data || {});
+    if (companyId) {
+      const payload = {
+        scope: 'company',
+        companyId,
+        data
+      };
+      sendToLocalRoom(getRoomKey('company', companyId), data);
+      await publishRealtimeEvent(payload);
+      return;
+    }
 
     const payload = {
       scope: 'user',
@@ -115,12 +294,20 @@ const createWebSocketHub = ({ wss }) => {
     broadcastLocal({ type: 'user_list', users: userList });
   };
 
-  const publishPresenceUpdate = async ({ userId, online, socketCount, lastSeen, activeConversationId }) => {
+  const publishPresenceUpdate = async ({
+    userId,
+    companyId,
+    online,
+    socketCount,
+    lastSeen,
+    activeConversationId
+  }) => {
     const normalizedUserId = String(userId || '').trim();
     if (!normalizedUserId) return;
 
     const payload = {
-      scope: 'broadcast',
+      scope: companyId ? 'company' : 'broadcast',
+      companyId: String(companyId || '').trim() || null,
       data: {
         type: 'presence:update',
         userId: normalizedUserId,
@@ -130,13 +317,18 @@ const createWebSocketHub = ({ wss }) => {
         activeConversationId: String(activeConversationId || '').trim() || null
       }
     };
-    broadcastLocal(payload.data);
+    if (payload.companyId) {
+      sendToLocalRoom(getRoomKey('company', payload.companyId), payload.data);
+    } else {
+      broadcastLocal(payload.data);
+    }
     await publishRealtimeEvent(payload);
   };
 
   const publishTypingUpdate = async ({
     userId,
     conversationId,
+    companyId,
     isTyping,
     displayName
   }) => {
@@ -145,7 +337,9 @@ const createWebSocketHub = ({ wss }) => {
     if (!normalizedUserId || !normalizedConversationId) return;
 
     const payload = {
-      scope: 'broadcast',
+      scope: companyId ? 'conversation' : 'broadcast',
+      companyId: String(companyId || '').trim() || null,
+      conversationId: normalizedConversationId,
       data: {
         type: 'typing:update',
         userId: normalizedUserId,
@@ -154,7 +348,9 @@ const createWebSocketHub = ({ wss }) => {
         displayName: String(displayName || '').trim() || null
       }
     };
-    broadcastLocal(payload.data);
+    if (payload.conversationId) {
+      sendToLocalRoom(getRoomKey('conversation', payload.conversationId), payload.data);
+    }
     await publishRealtimeEvent(payload);
   };
 
@@ -169,6 +365,9 @@ const createWebSocketHub = ({ wss }) => {
 
         nextSocketSet.add(ws);
         ws.userId = nextUserId;
+        joinRoom(getRoomKey('user', nextUserId), ws);
+        syncCompanyRoom(ws, data.companyId || ws.companyId || '');
+        syncConversationRoom(ws, data.activeConversationId || ws.activeConversationId || '');
         ws.lastSeenAt = new Date();
         console.log(`Client identified: ${nextUserId}`);
 
@@ -178,10 +377,12 @@ const createWebSocketHub = ({ wss }) => {
           online: true,
           socketCount,
           lastSeen: ws.lastSeenAt,
-          activeConversationId: ws.activeConversationId || ''
+          activeConversationId: ws.activeConversationId || '',
+          companyId: ws.companyId || ''
         });
         await publishPresenceUpdate({
           userId: nextUserId,
+          companyId: ws.companyId || '',
           online: true,
           socketCount,
           lastSeen: ws.lastSeenAt.toISOString(),
@@ -192,9 +393,13 @@ const createWebSocketHub = ({ wss }) => {
       }
       case 'presence:ping': {
         const activeConversationId = String(data.conversationId || data.activeConversationId || '').trim();
+        const companyId = String(data.companyId || ws.companyId || '').trim();
         ws.lastSeenAt = new Date();
+        if (companyId) {
+          syncCompanyRoom(ws, companyId);
+        }
         if (activeConversationId) {
-          ws.activeConversationId = activeConversationId;
+          syncConversationRoom(ws, activeConversationId);
         }
 
         const socketSet = clients.get(String(userId || '').trim());
@@ -208,15 +413,42 @@ const createWebSocketHub = ({ wss }) => {
         });
         await publishPresenceUpdate({
           userId,
+          companyId: ws.companyId || '',
           online: true,
           socketCount,
           lastSeen: ws.lastSeenAt.toISOString(),
           activeConversationId: ws.activeConversationId || ''
         });
+        try {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'pong',
+              timestamp: Date.now(),
+              userId: String(userId || '').trim() || null
+            }));
+          }
+        } catch (error) {
+          console.error('Failed to send pong response:', error.message);
+        }
         break;
       }
       case 'ping': {
         await handleWebSocketMessage({ ...data, type: 'presence:ping' }, userId, ws);
+        break;
+      }
+      case 'conversation:subscribe': {
+        const conversationId = String(data.conversationId || '').trim();
+        if (conversationId) {
+          syncConversationRoom(ws, conversationId);
+        }
+        break;
+      }
+      case 'conversation:unsubscribe': {
+        const conversationId = String(data.conversationId || '').trim();
+        if (conversationId && String(ws.activeConversationId || '').trim() === conversationId) {
+          leaveRoom(getRoomKey('conversation', conversationId), ws);
+          ws.activeConversationId = '';
+        }
         break;
       }
       case 'typing':
@@ -226,10 +458,11 @@ const createWebSocketHub = ({ wss }) => {
         const isTyping =
           data.type === 'typing:start' ? true : data.type === 'typing:stop' ? false : Boolean(data.isTyping);
         const displayName = String(data.displayName || data.userName || '').trim();
+        const companyId = String(data.companyId || ws.companyId || '').trim();
 
         ws.lastSeenAt = new Date();
         if (conversationId) {
-          ws.activeConversationId = conversationId;
+          syncConversationRoom(ws, conversationId);
         }
 
         await setTypingState({
@@ -241,6 +474,7 @@ const createWebSocketHub = ({ wss }) => {
         await publishTypingUpdate({
           userId,
           conversationId,
+          companyId,
           isTyping,
           displayName
         });
@@ -260,20 +494,23 @@ const createWebSocketHub = ({ wss }) => {
 
     console.log('User ID:', userId);
     getSocketSet(userId)?.add(ws);
+    ws.joinedRooms = ws.joinedRooms instanceof Set ? ws.joinedRooms : new Set();
+    joinRoom(getRoomKey('user', userId), ws);
 
     console.log('Total connected users:', clients.size);
 
     broadcastUserList();
 
     setUserPresence({
-      userId,
-      online: true,
-      socketCount: clients.get(userId)?.size || 1,
-      lastSeen: ws.lastSeenAt,
-      activeConversationId: ''
-    }).catch((error) => {
-      console.error('Failed to mark presence online:', error.message);
-    });
+        userId,
+        online: true,
+        socketCount: clients.get(userId)?.size || 1,
+        lastSeen: ws.lastSeenAt,
+        activeConversationId: '',
+        companyId: ws.companyId || ''
+      }).catch((error) => {
+        console.error('Failed to mark presence online:', error.message);
+      });
 
     ws.on('message', (message) => {
       try {
@@ -291,19 +528,19 @@ const createWebSocketHub = ({ wss }) => {
     });
 
     ws.on('close', () => {
-      removeSocket(userId, ws);
-      const socketCount = clients.get(userId)?.size || 0;
-      const lastSeenAt = ws.lastSeenAt || new Date();
+        removeSocket(userId, ws);
+        const socketCount = clients.get(userId)?.size || 0;
+        const lastSeenAt = ws.lastSeenAt || new Date();
 
-      setUserPresence({
-        userId,
-        online: socketCount > 0,
-        socketCount,
-        lastSeen: lastSeenAt,
-        activeConversationId: ws.activeConversationId || ''
-      }).catch((error) => {
-        console.error('Failed to update presence on close:', error.message);
-      });
+        setUserPresence({
+          userId,
+          online: socketCount > 0,
+          socketCount,
+          lastSeen: lastSeenAt,
+          activeConversationId: ws.activeConversationId || ''
+        }).catch((error) => {
+          console.error('Failed to update presence on close:', error.message);
+        });
 
       if (socketCount === 0) {
         clearTypingState({

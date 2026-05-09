@@ -38,6 +38,20 @@ const {
   getCrmOwnerPerformanceReport
 } = require('../services/crmReportsService');
 const { getLeadScoringSettings } = require('../services/leadScoringService');
+const { buildCrmContactSearchPlan } = require('../utils/crmContactSearchPlan');
+const { buildCrmContactListHint } = require('../utils/crmContactQueryPlan');
+const {
+  CONTACT_CURSOR_SORT,
+  buildCrmContactCursorFilter,
+  decodeCrmContactCursor,
+  encodeCrmContactCursor
+} = require('../utils/crmContactPagination');
+const { buildDealSearchPlan } = require('../utils/dealSearchPlan');
+const {
+  buildDealCursorFilter,
+  decodeDealCursor,
+  encodeDealCursor
+} = require('../utils/dealPagination');
 
 const router = express.Router();
 router.use(auth);
@@ -105,6 +119,7 @@ const CRM_CONTACT_LIST_FIELDS = [
   'createdAt',
   'updatedAt'
 ].join(' ');
+const CRM_CONTACT_LIST_SORT = CONTACT_CURSOR_SORT;
 const CRM_TASK_CONTACT_FIELDS = 'name phone stage status leadScore temperature ownerId nextFollowUpAt';
 const CRM_DEAL_CONTACT_FIELDS =
   'name phone stage status temperature ownerId leadScore nextFollowUpAt dealValue';
@@ -1585,6 +1600,7 @@ router.get('/contacts', async (req, res) => {
       minScore,
       maxScore,
       hasFollowUp,
+      cursor: cursorParam = '',
       page = 1,
       limit = 50
     } = req.query;
@@ -1634,22 +1650,21 @@ router.get('/contacts', async (req, res) => {
     }
 
     const normalizedSearch = toCleanString(search);
-    const searchFilter = normalizedSearch
-      ? {
-          $or: [
-        { name: { $regex: normalizedSearch, $options: 'i' } },
-        { phone: { $regex: normalizedSearch, $options: 'i' } },
-        { email: { $regex: normalizedSearch, $options: 'i' } },
-        { notes: { $regex: normalizedSearch, $options: 'i' } },
-        { tags: { $in: [new RegExp(normalizedSearch, 'i')] } }
-          ]
-        }
-      : {};
+    const searchPlan = buildCrmContactSearchPlan(normalizedSearch);
+    const searchFilter = searchPlan.summaryClause || {};
+    const normalizedCursor = toCleanString(cursorParam);
+    const hasCursor = Boolean(normalizedCursor);
+    const cursor = hasCursor ? decodeCrmContactCursor(normalizedCursor) : null;
+    if (hasCursor && !cursor) {
+      return res.status(400).json({ success: false, error: 'Invalid cursor' });
+    }
 
     const pageNumber = Math.max(Number(page) || 1, 1);
     const pageSize = Math.min(Math.max(Number(limit) || 50, 1), 200);
     const skip = (pageNumber - 1) * pageSize;
     const queueFilter = buildContactQueueFilter(req, normalizedQueue);
+    const ownerScopeId = normalizedOwnerId || (normalizedQueue === 'my_leads' ? toCleanString(req?.user?.id) : '');
+    const listHint = buildCrmContactListHint({ ownerScopeId, searchPlan });
     if (normalizedQueue === 'today_calls') {
       const { startOfDay, endOfDay } = getDayRange(new Date());
       const todayCallTasks = await LeadTask.find(
@@ -1670,17 +1685,98 @@ router.get('/contacts', async (req, res) => {
         $in: contactIds.map((contactId) => new mongoose.Types.ObjectId(contactId))
       };
     }
-    const scopedFilter = buildScopedFilter(req, mergeFiltersWithAnd(extraFilter, searchFilter, queueFilter || {}));
+    const baseScopedFilter = mergeFiltersWithAnd(extraFilter, searchFilter, queueFilter || {});
+    const cursorFilter = hasCursor ? buildCrmContactCursorFilter(cursor) : {};
+    const scopedFilter = buildScopedFilter(req, mergeFiltersWithAnd(baseScopedFilter, cursorFilter));
 
-    const [contacts, total] = await Promise.all([
-      Contact.find(scopedFilter)
+    if (hasCursor) {
+      let contactQuery = Contact.find(scopedFilter)
         .select(CRM_CONTACT_LIST_FIELDS)
-        .sort({ nextFollowUpAt: 1, leadScore: -1, lastContact: -1, createdAt: -1 })
-        .skip(skip)
-        .limit(pageSize)
-        .lean(),
+        .sort(CRM_CONTACT_LIST_SORT)
+        .limit(pageSize + 1)
+        .lean();
+
+      if (listHint) {
+        contactQuery = contactQuery.hint(listHint);
+      }
+
+      let contacts = await contactQuery;
+      let hasMore = contacts.length > pageSize;
+      if (hasMore) {
+        contacts = contacts.slice(0, pageSize);
+      }
+
+      if (!contacts.length && searchPlan.fallbackClause) {
+        const fallbackScopedFilter = buildScopedFilter(
+          req,
+          mergeFiltersWithAnd(extraFilter, searchPlan.fallbackClause, queueFilter || {}, cursorFilter)
+        );
+        let fallbackQuery = Contact.find(fallbackScopedFilter)
+          .select(CRM_CONTACT_LIST_FIELDS)
+          .sort(CRM_CONTACT_LIST_SORT)
+          .limit(pageSize + 1)
+          .lean();
+
+        if (listHint) {
+          fallbackQuery = fallbackQuery.hint(listHint);
+        }
+
+        contacts = await fallbackQuery;
+        hasMore = contacts.length > pageSize;
+        if (hasMore) {
+          contacts = contacts.slice(0, pageSize);
+        }
+      }
+
+      return res.json({
+        success: true,
+        data: contacts,
+        pagination: {
+          limit: pageSize,
+          hasMore,
+          nextCursor: hasMore ? encodeCrmContactCursor(contacts[contacts.length - 1]) : null,
+          cursor: normalizedCursor || null
+        }
+      });
+    }
+
+    let contactQuery = Contact.find(scopedFilter)
+      .select(CRM_CONTACT_LIST_FIELDS)
+      .sort(CRM_CONTACT_LIST_SORT)
+      .skip(skip)
+      .limit(pageSize)
+      .lean();
+
+    if (listHint) {
+      contactQuery = contactQuery.hint(listHint);
+    }
+
+    let [contacts, total] = await Promise.all([
+      contactQuery,
       Contact.countDocuments(scopedFilter)
     ]);
+
+    if (!contacts.length && searchPlan.fallbackClause) {
+      const fallbackScopedFilter = buildScopedFilter(
+        req,
+        mergeFiltersWithAnd(extraFilter, searchPlan.fallbackClause, queueFilter || {})
+      );
+      let fallbackQuery = Contact.find(fallbackScopedFilter)
+        .select(CRM_CONTACT_LIST_FIELDS)
+        .sort(CRM_CONTACT_LIST_SORT)
+        .skip(skip)
+        .limit(pageSize)
+        .lean();
+
+      if (listHint) {
+        fallbackQuery = fallbackQuery.hint(listHint);
+      }
+
+      [contacts, total] = await Promise.all([
+        fallbackQuery,
+        Contact.countDocuments(fallbackScopedFilter)
+      ]);
+    }
 
     res.json({
       success: true,
@@ -2222,32 +2318,117 @@ router.get('/deals', async (req, res) => {
     }
 
     const normalizedSearch = toCleanString(search);
-    const searchFilter = normalizedSearch
-      ? {
-          $or: [
-            { title: { $regex: normalizedSearch, $options: 'i' } },
-            { productName: { $regex: normalizedSearch, $options: 'i' } },
-            { source: { $regex: normalizedSearch, $options: 'i' } },
-            { notes: { $regex: normalizedSearch, $options: 'i' } },
-            { lostReason: { $regex: normalizedSearch, $options: 'i' } }
-          ]
-        }
-      : {};
+    const searchPlan = buildDealSearchPlan(normalizedSearch);
+    const searchFilter = searchPlan.summaryClause || {};
+
+    const cursorParam = String(req.query?.cursor || '').trim();
+    const hasCursor = Boolean(cursorParam);
+    const cursor = hasCursor ? decodeDealCursor(cursorParam) : null;
+    if (hasCursor && !cursor) {
+      return res.status(400).json({ success: false, error: 'Invalid cursor' });
+    }
 
     const pageNumber = Math.max(Number(page) || 1, 1);
     const pageSize = Math.min(Math.max(Number(limit) || 50, 1), 200);
     const skip = (pageNumber - 1) * pageSize;
-    const scopedFilter = buildScopedFilter(req, mergeFiltersWithAnd(extraFilter, searchFilter));
+    const sortClause = { expectedCloseAtSort: 1, updatedAt: -1, createdAt: -1, _id: -1 };
+    const cursorFilter = hasCursor ? buildDealCursorFilter(cursor) : {};
 
-    const [deals, total] = await Promise.all([
-      Deal.find(scopedFilter)
+    const scopedFilter = buildScopedFilter(
+      req,
+      mergeFiltersWithAnd(extraFilter, searchFilter, cursorFilter)
+    );
+
+    if (hasCursor) {
+      let dealQuery = Deal.find(scopedFilter)
         .populate('contactId', CRM_DEAL_CONTACT_FIELDS)
-        .sort({ expectedCloseAt: 1, updatedAt: -1, createdAt: -1 })
+        .sort(sortClause)
+        .limit(pageSize + 1)
+        .lean();
+
+      if (searchPlan.hint) {
+        dealQuery = dealQuery.hint(searchPlan.hint);
+      }
+
+      let deals = await dealQuery;
+      let hasMore = deals.length > pageSize;
+      if (hasMore) {
+        deals = deals.slice(0, pageSize);
+      }
+
+      if (!deals.length && searchPlan.fallbackClause) {
+        const fallbackScopedFilter = buildScopedFilter(
+          req,
+          mergeFiltersWithAnd(extraFilter, searchPlan.fallbackClause, cursorFilter)
+        );
+        let fallbackQuery = Deal.find(fallbackScopedFilter)
+          .populate('contactId', CRM_DEAL_CONTACT_FIELDS)
+          .sort(sortClause)
+          .limit(pageSize + 1)
+          .lean();
+
+        if (searchPlan.hint) {
+          fallbackQuery = fallbackQuery.hint(searchPlan.hint);
+        }
+
+        deals = await fallbackQuery;
+        hasMore = deals.length > pageSize;
+        if (hasMore) {
+          deals = deals.slice(0, pageSize);
+        }
+      }
+
+      return res.json({
+        success: true,
+        data: deals,
+        pagination: {
+          limit: pageSize,
+          hasMore,
+          nextCursor: hasMore ? encodeDealCursor(deals[deals.length - 1]) : null,
+          cursor: cursorParam || null
+        }
+      });
+    }
+
+    const scopedPageFilter = buildScopedFilter(req, mergeFiltersWithAnd(extraFilter, searchFilter));
+
+    let dealQuery = Deal.find(scopedPageFilter)
+      .populate('contactId', CRM_DEAL_CONTACT_FIELDS)
+      .sort(sortClause)
+      .skip(skip)
+      .limit(pageSize)
+      .lean();
+
+    if (searchPlan.hint) {
+      dealQuery = dealQuery.hint(searchPlan.hint);
+    }
+
+    let [deals, total] = await Promise.all([
+      dealQuery,
+      Deal.countDocuments(scopedPageFilter)
+    ]);
+
+    if (!deals.length && searchPlan.fallbackClause) {
+      const fallbackScopedFilter = buildScopedFilter(
+        req,
+        mergeFiltersWithAnd(extraFilter, searchPlan.fallbackClause)
+      );
+      let fallbackQuery = Deal.find(fallbackScopedFilter)
+        .populate('contactId', CRM_DEAL_CONTACT_FIELDS)
+        .sort(sortClause)
         .skip(skip)
         .limit(pageSize)
-        .lean(),
-      Deal.countDocuments(scopedFilter)
-    ]);
+        .lean();
+
+      if (searchPlan.hint) {
+        fallbackQuery = fallbackQuery.hint(searchPlan.hint);
+      }
+
+      [deals, total] = await Promise.all([
+        fallbackQuery,
+        Deal.countDocuments(fallbackScopedFilter)
+      ]);
+    }
 
     res.json({
       success: true,

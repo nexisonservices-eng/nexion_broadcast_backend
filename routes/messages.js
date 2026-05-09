@@ -9,6 +9,28 @@ const Contact = require('../models/Contact');
 const Template = require('../models/Template');
 const whatsappService = require('../services/whatsappService');
 const {
+  buildChronologicalPage,
+  buildMessageCursorFilter,
+  decodeMessageCursor,
+  encodeAttachmentCursor,
+  encodeMessageCursor,
+  normalizePageLimit
+} = require('../utils/threadPagination');
+const {
+  CACHE_TTL_SECONDS,
+  getInboxScopeVariants,
+  getOrSetCachedJson,
+  invalidateInboxConversation,
+  invalidateInboxScope
+} = require('../utils/teamInboxCache');
+const {
+  normalizeRole,
+  isTenantWideRole
+} = require('../utils/accessControl');
+const {
+  upsertConversationSummary
+} = require('../services/conversationSummaryService');
+const {
   resolveInboxStorageUsername,
   uploadInboxAttachment,
   generateSignedAttachmentUrl,
@@ -55,41 +77,96 @@ router.get('/conversation/:id', async (req, res) => {
       });
     }
 
-    const parsedLimit = Number(req.query?.limit);
-    const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 80)) : 30;
-    const cursor = String(req.query?.cursor || '').trim();
-
-    const filters = {
+    const limit = normalizePageLimit(req.query?.limit);
+    const cursor = decodeMessageCursor(req.query?.cursor);
+    const scopeVariants = getInboxScopeVariants({
+      companyId: req.companyId || '',
+      userId: req.user?.id || ''
+    });
+    const scope = scopeVariants[scopeVariants.length - 1] || scopeVariants[0] || '';
+    const threadScope = scope ? `${scope}:${conversationId}` : '';
+    const baseFilters = buildScopedMessageFilters(req, {
       conversationId,
-      userId: req.user.id,
-      ...(req.companyId ? { companyId: req.companyId } : {})
+      ...(cursor ? buildMessageCursorFilter(cursor) : {})
+    });
+
+    const loadMessages = async (filters) =>
+      Message.find(filters)
+        .select(
+          '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
+        )
+        .populate(
+          'replyTo',
+          '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
+        )
+        .sort({ timestamp: -1, _id: -1 })
+        .limit(limit + 1)
+        .lean();
+
+    const loadScopedMessages = async () => {
+      const scopedMessages = await loadMessages({
+        ...baseFilters,
+        ...(req.companyId ? { companyId: req.companyId } : {})
+      });
+
+      if (scopedMessages.length > 0 || !req.companyId) {
+        return scopedMessages;
+      }
+
+      return loadMessages({
+        ...baseFilters,
+        $or: [
+          { companyId: { $exists: false } },
+          { companyId: null },
+          { companyId: '' }
+        ]
+      });
     };
 
-    if (cursor) {
-      const cursorDate = new Date(cursor);
-      if (!Number.isNaN(cursorDate.valueOf())) {
-        filters.timestamp = { $lt: cursorDate };
-      }
-    }
+    const cachedResponse = threadScope
+      ? await getOrSetCachedJson({
+          namespace: 'messages',
+          scope: threadScope,
+          versionGroup: 'thread',
+          keyParts: [String(limit), String(req.query?.cursor || '').trim()],
+          ttlSeconds: CACHE_TTL_SECONDS.messages,
+          loader: async () => {
+            const messages = await loadScopedMessages();
+            const page = buildChronologicalPage({
+              documents: messages,
+              limit,
+              encodeCursor: encodeMessageCursor
+            });
 
-    const messages = await Message.find(filters)
-      .sort({ timestamp: -1, _id: -1 })
-      .limit(limit + 1)
-      .lean();
-
-    const hasMore = messages.length > limit;
-    const trimmed = hasMore ? messages.slice(0, limit) : messages;
-    const chronologicalMessages = [...trimmed].reverse();
-    const nextCursor = hasMore
-      ? new Date(trimmed[trimmed.length - 1]?.timestamp || Date.now()).toISOString()
+            return {
+              data: page.items,
+              meta: {
+                limit,
+                hasMore: page.hasMore,
+                nextCursor: page.nextCursor
+              }
+            };
+          }
+        })
       : null;
 
+    if (cachedResponse) {
+      return res.json(cachedResponse);
+      }
+
+      const messages = await loadScopedMessages();
+      const page = buildChronologicalPage({
+        documents: messages,
+        limit,
+      encodeCursor: encodeMessageCursor
+    });
+
     return res.json({
-      data: chronologicalMessages,
+      data: page.items,
       meta: {
         limit,
-        hasMore,
-        nextCursor
+        hasMore: page.hasMore,
+        nextCursor: page.nextCursor
       }
     });
   } catch (error) {
@@ -193,6 +270,37 @@ const buildAttachmentLabel = (mediaType = '') => {
   if (normalized === 'document') return '[Document]';
   if (normalized) return `[${normalized.charAt(0).toUpperCase()}${normalized.slice(1)}]`;
   return '[Attachment]';
+};
+
+const syncConversationSummary = async (conversation = {}, updates = {}) => {
+  const base = typeof conversation.toObject === 'function' ? conversation.toObject() : conversation;
+  if (!base?._id) return null;
+
+  return upsertConversationSummary({
+    conversationId: base._id,
+    userId: base.userId,
+    companyId: base.companyId,
+    contactId: base.contactId,
+    contactPhone: base.contactPhone,
+    contactName: base.contactName,
+    status: base.status,
+    assignedTo: base.assignedTo,
+    assignedToId: base.assignedToId,
+    tags: base.tags,
+    priority: base.priority,
+    lastMessageTime: base.lastMessageTime,
+    lastMessage: base.lastMessage,
+    lastMessageMediaType: base.lastMessageMediaType,
+    lastMessageAttachmentName: base.lastMessageAttachmentName,
+    lastMessageAttachmentPages: base.lastMessageAttachmentPages,
+    lastMessageFrom: base.lastMessageFrom,
+    lastMessageWhatsappMessageId: base.lastMessageWhatsappMessageId,
+    lastMessageStatus: base.lastMessageStatus,
+    unreadCount: base.unreadCount,
+    notes: base.notes,
+    resolvedAt: base.resolvedAt,
+    ...updates
+  });
 };
 
 const resolveContactForConversation = async ({ userId, companyId, conversation }) => {
@@ -392,6 +500,22 @@ const runTemplateHeaderUpload = (req, res) =>
     });
   });
 
+const buildScopedMessageFilters = (req, extra = {}) => {
+  const normalizedRole = normalizeRole(
+    req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role
+  );
+  const filters = {
+    ...(req.companyId ? { companyId: req.companyId } : {}),
+    ...extra
+  };
+
+  if (!isTenantWideRole(normalizedRole)) {
+    filters.userId = req.user.id;
+  }
+
+  return filters;
+};
+
 router.post(
   '/template-header-media',
   requirePlanFeature('broadcastMessaging'),
@@ -439,6 +563,9 @@ router.post(
   requireWhatsAppCredentials,
   async (req, res) => {
     try {
+      const mediaPipelineRequestId =
+        String(req.headers?.['x-request-id'] || '').trim() ||
+        `reaction-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
       const {
         to,
         conversationId,
@@ -538,6 +665,36 @@ router.post(
         whatsappMessageId,
         status: 'sent',
         timestamp: new Date()
+      });
+
+      await Conversation.updateOne(
+        { _id: conversation._id },
+        {
+          lastMessageTime: new Date(),
+          lastMessage: reactionText,
+          lastMessageMediaType: '',
+          lastMessageAttachmentName: '',
+          lastMessageAttachmentPages: null,
+          lastMessageFrom: 'agent',
+          lastMessageWhatsappMessageId: whatsappMessageId || '',
+          lastMessageStatus: 'sent'
+        }
+      );
+      await syncConversationSummary(conversation, {
+        lastMessageTime: new Date(),
+        lastMessage: reactionText,
+        lastMessageMediaType: '',
+        lastMessageAttachmentName: '',
+        lastMessageAttachmentPages: null,
+        lastMessageFrom: 'agent',
+        lastMessageWhatsappMessageId: whatsappMessageId || '',
+        lastMessageStatus: 'sent'
+      });
+
+      await invalidateInboxConversation({
+        companyId: messageCompanyId || '',
+        userId: req.user.id || '',
+        conversationId: conversation._id
       });
 
       const sendToUser = req.app?.locals?.sendToUser;
@@ -736,6 +893,25 @@ router.post(
             conversation.contactName
         }
       );
+      await syncConversationSummary(conversation, {
+        contactName:
+          String(contact?.name || conversation.contactName || contactName || '').trim() ||
+          conversation.contactName,
+        lastMessageTime: messageTimestamp,
+        lastMessage: previewText,
+        lastMessageMediaType: '',
+        lastMessageAttachmentName: '',
+        lastMessageAttachmentPages: null,
+        lastMessageFrom: 'agent',
+        lastMessageWhatsappMessageId: whatsappMessageId || '',
+        lastMessageStatus: 'sent'
+      });
+
+      await invalidateInboxConversation({
+        companyId: messageCompanyId || '',
+        userId: req.user.id || '',
+        conversationId: conversation._id
+      });
 
       const sendToUser = req.app?.locals?.sendToUser;
       if (typeof sendToUser === 'function') {
@@ -940,6 +1116,24 @@ router.post(
           lastMessageStatus: 'sent'
         }
       );
+      await syncConversationSummary(conversation, {
+        lastMessageTime: new Date(),
+        lastMessage: messageText,
+        lastMessageMediaType: mediaType,
+        lastMessageAttachmentName:
+          mediaType === 'document' ? String(attachment?.originalFileName || '').trim() : '',
+        lastMessageAttachmentPages:
+          mediaType === 'document' ? Number(attachment?.pages || 0) || null : null,
+        lastMessageFrom: 'agent',
+        lastMessageWhatsappMessageId: whatsappMessageId || '',
+        lastMessageStatus: 'sent'
+      });
+
+      await invalidateInboxConversation({
+        companyId: messageCompanyId || '',
+        userId: req.user.id || '',
+        conversationId: conversation._id
+      });
 
       const sendToUser = req.app?.locals?.sendToUser;
       if (typeof sendToUser === 'function') {
@@ -986,17 +1180,11 @@ router.get('/attachments', async (req, res) => {
       type = ''
     } = req.query || {};
 
-    const parsedLimit = Number(rawLimit);
-    const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 50)) : 30;
+    const limit = Math.max(1, Math.min(normalizePageLimit(rawLimit), 50));
 
-    const filters = {
-      userId: req.user.id,
-      $or: [{ 'attachment.publicId': { $exists: true, $ne: '' } }, { mediaUrl: { $exists: true, $ne: '' } }]
-    };
-
-    if (req.companyId) {
-      filters.companyId = req.companyId;
-    }
+      const filters = buildScopedMessageFilters(req, {
+        $or: [{ 'attachment.publicId': { $exists: true, $ne: '' } }, { mediaUrl: { $exists: true, $ne: '' } }]
+      });
 
     const normalizedConversationId = String(conversationId || '').trim();
     if (normalizedConversationId) {
@@ -1008,12 +1196,9 @@ router.get('/attachments', async (req, res) => {
       filters.mediaType = normalizedType;
     }
 
-    const normalizedCursor = String(cursor || '').trim();
-    if (normalizedCursor) {
-      const cursorDate = new Date(normalizedCursor);
-      if (!Number.isNaN(cursorDate.valueOf())) {
-        filters.timestamp = { $lt: cursorDate };
-      }
+    const cursorFilter = decodeMessageCursor(cursor);
+    if (cursorFilter) {
+      Object.assign(filters, buildMessageCursorFilter(cursorFilter));
     }
 
     const messages = await Message.find(filters)
@@ -1024,19 +1209,19 @@ router.get('/attachments', async (req, res) => {
       )
       .lean();
 
-    const hasMore = messages.length > limit;
-    const trimmed = hasMore ? messages.slice(0, limit) : messages;
-    const nextCursor = hasMore
-      ? new Date(trimmed[trimmed.length - 1]?.timestamp || Date.now()).toISOString()
-      : null;
+    const page = buildChronologicalPage({
+      documents: messages,
+      limit,
+      encodeCursor: encodeAttachmentCursor
+    });
 
     return res.json({
       success: true,
-      data: trimmed.map(mapAttachmentSummary),
+      data: page.items.map(mapAttachmentSummary),
       meta: {
         limit,
-        hasMore,
-        nextCursor
+        hasMore: page.hasMore,
+        nextCursor: page.nextCursor
       }
     });
   } catch (error) {
@@ -1193,6 +1378,12 @@ router.delete('/attachments/:messageId', async (req, res) => {
     message.text = message.text || '[Attachment deleted]';
     await message.save();
 
+    await invalidateInboxConversation({
+      companyId: req.companyId || message.companyId || '',
+      userId: req.user.id || '',
+      conversationId: message.conversationId
+    });
+
     const sendToUser = req.app?.locals?.sendToUser;
     if (typeof sendToUser === 'function') {
       sendToUser(String(req.user.id), {
@@ -1235,7 +1426,25 @@ router.delete('/delete-selected', async (req, res) => {
       deleteFilter.companyId = req.companyId;
     }
 
+    const affectedConversationIds = await Message.distinct('conversationId', deleteFilter);
     const deleteResult = await Message.deleteMany(deleteFilter);
+
+    if (Array.isArray(affectedConversationIds) && affectedConversationIds.length > 0) {
+      await Promise.all(
+        affectedConversationIds.map((conversationId) =>
+          invalidateInboxConversation({
+            companyId: req.companyId || '',
+            userId: req.user.id || '',
+            conversationId
+          })
+        )
+      );
+    } else {
+      await invalidateInboxScope({
+        companyId: req.companyId || '',
+        userId: req.user.id || ''
+      });
+    }
     
     res.json({ 
       success: true, 

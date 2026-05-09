@@ -3,6 +3,9 @@ const Template = require('../models/Template');
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
+const {
+  syncConversationSummaryFromConversation
+} = require('./conversationSummaryService');
 const whatsappService = require('./whatsappService');
 const { getWhatsAppCredentialsByUserId } = require('./userWhatsAppCredentialsService');
 const {
@@ -322,6 +325,7 @@ async function updateConversationForMissedCallAutomation({
   if (!conversation) {
     conversation = await Conversation.create({
       userId,
+      companyId: missedCall.companyId || null,
       contactId: contact._id,
       contactPhone: phone,
       contactName: contact.name,
@@ -344,9 +348,11 @@ async function updateConversationForMissedCallAutomation({
     conversation.lastMessageWhatsappMessageId = String(whatsappMessageId || '').trim() || '';
     await conversation.save();
   }
+  await syncConversationSummaryFromConversation(conversation);
 
   const message = await Message.create({
     userId,
+    companyId: missedCall.companyId || null,
     conversationId: conversation._id,
     sender: 'agent',
     text: messageText,

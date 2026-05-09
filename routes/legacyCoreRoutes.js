@@ -6,6 +6,48 @@ const {
   recordConversationRead,
   shouldSkipConversationReadUpdate
 } = require('../utils/conversationReadStateCache');
+const {
+  buildChronologicalPage,
+  buildMessageCursorFilter,
+  decodeMessageCursor,
+  encodeMessageCursor,
+  normalizePageLimit
+} = require('../utils/threadPagination');
+const {
+  CACHE_TTL_SECONDS,
+  getInboxScopeVariants,
+  getOrSetCachedJson,
+  invalidateInboxConversation,
+  invalidateInboxScope
+} = require('../utils/teamInboxCache');
+const {
+  normalizeRole,
+  isTenantWideRole
+} = require('../utils/accessControl');
+const { buildContactSearchPlan } = require('../utils/contactSearchPlan');
+const {
+  syncConversationSummaryFromConversation,
+  upsertConversationSummaries,
+  upsertConversationSummary
+} = require('../services/conversationSummaryService');
+const ConversationSummary = require('../models/ConversationSummary');
+const { buildInboxSearchPlan } = require('../utils/inboxSearchPlan');
+
+const buildScopedMessageFilters = (req, extra = {}) => {
+  const normalizedRole = normalizeRole(
+    req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role
+  );
+  const filters = {
+    ...(req.companyId ? { companyId: req.companyId } : {}),
+    ...extra
+  };
+
+  if (!isTenantWideRole(normalizedRole)) {
+    filters.userId = req.user.id;
+  }
+
+  return filters;
+};
 
 const registerLegacyCoreRoutes = (app, deps) => {
   const {
@@ -352,6 +394,35 @@ const registerLegacyCoreRoutes = (app, deps) => {
             lastMessageStatus: 'sent'
           }
         );
+        await upsertConversationSummary({
+          conversationId: conversation._id,
+          userId: req.user.id,
+          companyId: messageCompanyId,
+          contactId: conversation.contactId,
+          contactPhone: conversation.contactPhone,
+          contactName: conversation.contactName,
+          status: conversation.status,
+          assignedTo: conversation.assignedTo,
+          assignedToId: conversation.assignedToId,
+          tags: conversation.tags,
+          priority: conversation.priority,
+          lastMessageTime: new Date(),
+          lastMessage: text,
+          lastMessageMediaType: String(mediaType || '').trim(),
+          lastMessageAttachmentName: '',
+          lastMessageAttachmentPages: null,
+          lastMessageFrom: 'agent',
+          lastMessageWhatsappMessageId: whatsappMessageId || '',
+          lastMessageStatus: 'sent',
+          unreadCount: conversation.unreadCount,
+          notes: conversation.notes,
+          resolvedAt: conversation.resolvedAt
+        });
+        await invalidateInboxConversation({
+          companyId: messageCompanyId || '',
+          userId: req.user.id || '',
+          conversationId: conversation._id
+        });
 
         emitRealtimeEvent(req.user.id, {
           type: 'message_sent',
@@ -411,18 +482,102 @@ const registerLegacyCoreRoutes = (app, deps) => {
   app.get('/api/conversations', auth, async (req, res) => {
     try {
       const { status, assignedTo, search } = req.query;
-      const filters = { userId: req.user.id, companyId: req.companyId };
+      const baseFilters = { userId: req.user.id, companyId: req.companyId };
+      const searchPlan = buildInboxSearchPlan(search);
 
-      if (status) filters.status = status;
-      if (assignedTo) filters.assignedTo = assignedTo;
-      if (search) {
-        filters.$or = [
-          { contactName: { $regex: search, $options: 'i' } },
-          { contactPhone: { $regex: search, $options: 'i' } }
-        ];
+      if (status) baseFilters.status = status;
+      if (assignedTo) baseFilters.assignedTo = assignedTo;
+
+      if (searchPlan.summaryClause) {
+        const summaryFilters = { ...baseFilters, ...searchPlan.summaryClause };
+        let summaryQuery = ConversationSummary.find(summaryFilters)
+          .select('conversationId lastMessageTime')
+          .sort({ lastMessageTime: -1, _id: -1 })
+          .limit(100)
+          .lean();
+
+        if (searchPlan.hint) {
+          summaryQuery = summaryQuery.hint(searchPlan.hint);
+        }
+
+        const summaryRows = await summaryQuery;
+        const summaryConversationIds = summaryRows
+          .map((row) => String(row?.conversationId || '').trim())
+          .filter(Boolean);
+
+        if (summaryConversationIds.length) {
+          const conversationFilters = {
+            ...baseFilters,
+            _id: { $in: summaryConversationIds }
+          };
+          const conversations = await Conversation.find(conversationFilters)
+            .populate('contactId', 'name phone email tags')
+            .lean();
+
+          const conversationById = new Map(
+            conversations.map((conversation) => [String(conversation?._id || '').trim(), conversation])
+          );
+
+          const orderedFromSummary = summaryConversationIds
+            .map((conversationId) => conversationById.get(conversationId))
+            .filter(Boolean);
+
+          const enrichedFromSummary = await enrichConversationsWithLatestAgentStatus(
+            orderedFromSummary,
+            req
+          );
+
+          if (enrichedFromSummary.length >= 100 || !searchPlan.fallbackClause) {
+            return res.json(enrichedFromSummary);
+          }
+
+          const remainingLimit = 100 - enrichedFromSummary.length;
+          if (remainingLimit > 0) {
+            const fallbackFilters = {
+              ...baseFilters,
+              ...(searchPlan.fallbackClause || {}),
+              _id: { $nin: summaryConversationIds }
+            };
+            const fallbackConversations = await Conversation.find(fallbackFilters)
+              .populate('contactId', 'name phone email tags')
+              .sort({ lastMessageTime: -1 })
+              .limit(remainingLimit)
+              .lean();
+            const enrichedFallback = await enrichConversationsWithLatestAgentStatus(
+              fallbackConversations,
+              req
+            );
+            const combined = [...enrichedFromSummary, ...enrichedFallback].sort((a, b) => {
+              const aTime = new Date(a?.lastMessageTime || 0).getTime();
+              const bTime = new Date(b?.lastMessageTime || 0).getTime();
+              if (Number.isNaN(aTime) && Number.isNaN(bTime)) return 0;
+              if (Number.isNaN(aTime)) return 1;
+              if (Number.isNaN(bTime)) return -1;
+              return bTime - aTime;
+            });
+            return res.json(combined.slice(0, 100));
+          }
+        }
+
+        if (searchPlan.fallbackClause) {
+          const fallbackFilters = {
+            ...baseFilters,
+            ...searchPlan.fallbackClause
+          };
+          const fallbackConversations = await Conversation.find(fallbackFilters)
+            .populate('contactId', 'name phone email tags')
+            .sort({ lastMessageTime: -1 })
+            .limit(100)
+            .lean();
+          const enrichedFallback = await enrichConversationsWithLatestAgentStatus(
+            fallbackConversations,
+            req
+          );
+          return res.json(enrichedFallback);
+        }
       }
 
-      const conversations = await Conversation.find(filters)
+      const conversations = await Conversation.find(baseFilters)
         .populate('contactId', 'name phone email tags')
         .sort({ lastMessageTime: -1 })
         .limit(100)
@@ -463,6 +618,11 @@ const registerLegacyCoreRoutes = (app, deps) => {
         lastMessageWhatsappMessageId: '',
         unreadCount: 0
       });
+      await syncConversationSummaryFromConversation(conversation);
+      await invalidateInboxScope({
+        companyId: req.companyId || '',
+        userId: req.user.id || ''
+      });
 
       return res.status(201).json(conversation);
     } catch (error) {
@@ -502,6 +662,12 @@ const registerLegacyCoreRoutes = (app, deps) => {
       if (!conversation) {
         return res.status(404).json({ error: 'Conversation not found' });
       }
+      await syncConversationSummaryFromConversation(conversation);
+      await invalidateInboxConversation({
+        companyId: req.companyId || '',
+        userId: req.user.id || '',
+        conversationId: conversation._id
+      });
       return res.json(conversation);
     } catch (error) {
       return res.status(500).json({ error: error.message });
@@ -552,6 +718,15 @@ const registerLegacyCoreRoutes = (app, deps) => {
           { _id: conversationId, userId: req.user.id, companyId: req.companyId },
           { unreadCount: 0 }
         );
+        await upsertConversationSummary({
+          ...conversation,
+          unreadCount: 0
+        });
+        await invalidateInboxConversation({
+          companyId: req.companyId || '',
+          userId: req.user.id || '',
+          conversationId
+        });
 
         await recordConversationRead({
           ...scope,
@@ -577,58 +752,101 @@ const registerLegacyCoreRoutes = (app, deps) => {
 
   app.get('/api/conversations/:id/messages', auth, async (req, res) => {
     try {
-      const parsedLimit = Number(req.query?.limit);
-      const hasPagination = Number.isFinite(parsedLimit) && parsedLimit > 0;
-      const limit = hasPagination ? Math.max(1, Math.min(parsedLimit, 80)) : 0;
-      const cursor = String(req.query?.cursor || '').trim();
-      const filters = {
-        conversationId: req.params.id,
-        userId: req.user.id
+      const conversationId = String(req.params.id || '').trim();
+      if (!conversationId) {
+        return res.status(400).json({ error: 'conversationId is required' });
+      }
+
+      const limit = normalizePageLimit(req.query?.limit);
+      const cursor = decodeMessageCursor(req.query?.cursor);
+      const scopeVariants = getInboxScopeVariants({
+        companyId: req.companyId || '',
+        userId: req.user?.id || ''
+      });
+      const scope = scopeVariants[scopeVariants.length - 1] || scopeVariants[0] || '';
+      const threadScope = scope ? `${scope}:${conversationId}` : '';
+      const baseFilters = buildScopedMessageFilters(req, {
+        conversationId,
+        ...(cursor ? buildMessageCursorFilter(cursor) : {})
+      });
+
+      const loadMessages = async (filters) =>
+        Message.find(filters)
+          .select(
+            '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
+          )
+          .populate(
+            'replyTo',
+            '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
+          )
+          .sort({ timestamp: -1, _id: -1 })
+          .limit(limit + 1)
+          .lean();
+
+      const loadScopedMessages = async () => {
+        const scopedMessages = await loadMessages({
+          ...baseFilters,
+          ...(req.companyId ? { companyId: req.companyId } : {})
+        });
+
+        if (scopedMessages.length > 0 || !req.companyId) {
+          return scopedMessages;
+        }
+
+        return loadMessages({
+          ...baseFilters,
+          $or: [
+            { companyId: { $exists: false } },
+            { companyId: null },
+            { companyId: '' }
+          ]
+        });
       };
 
-      if (req.companyId) {
-        filters.companyId = req.companyId;
-      }
+      const cachedResponse = threadScope
+        ? await getOrSetCachedJson({
+          namespace: 'messages',
+          scope: threadScope,
+            versionGroup: 'thread',
+            keyParts: [String(limit), String(req.query?.cursor || '').trim()],
+          ttlSeconds: CACHE_TTL_SECONDS.messages,
+          loader: async () => {
+              const messages = await loadScopedMessages();
+              const page = buildChronologicalPage({
+                documents: messages,
+                limit,
+                encodeCursor: encodeMessageCursor
+              });
 
-      if (hasPagination && cursor) {
-        const cursorDate = new Date(cursor);
-        if (!Number.isNaN(cursorDate.valueOf())) {
-          filters.timestamp = { $lt: cursorDate };
-        }
-      }
-
-      const baseQuery = Message.find(filters)
-        .select(
-          '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
-        )
-        .populate(
-          'replyTo',
-          '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
-        )
-        .sort(hasPagination ? { timestamp: -1 } : { timestamp: 1 })
-        .lean();
-
-      const messages = hasPagination
-        ? await baseQuery.limit(limit + 1)
-        : await baseQuery;
-
-      if (!hasPagination) {
-        return res.json(messages);
-      }
-
-      const hasMore = messages.length > limit;
-      const trimmedMessages = hasMore ? messages.slice(0, limit) : messages;
-      const chronologicalMessages = [...trimmedMessages].reverse();
-      const nextCursor = hasMore
-        ? new Date(trimmedMessages[trimmedMessages.length - 1]?.timestamp || Date.now()).toISOString()
+              return {
+                data: page.items,
+                meta: {
+                  limit,
+                  hasMore: page.hasMore,
+                  nextCursor: page.nextCursor
+                }
+              };
+            }
+          })
         : null;
 
+      if (cachedResponse) {
+        return res.json(cachedResponse);
+      }
+
+      const messages = await loadScopedMessages();
+      const page = buildChronologicalPage({
+        documents: messages,
+        limit,
+        encodeCursor: encodeMessageCursor
+      });
+
       return res.json({
-        data: chronologicalMessages,
+        data: page.items,
         meta: {
           limit,
-          hasMore,
-          nextCursor
+          hasMore: page.hasMore,
+          nextCursor: page.nextCursor
         }
       });
     } catch (error) {
@@ -639,20 +857,41 @@ const registerLegacyCoreRoutes = (app, deps) => {
   app.get('/api/contacts', auth, async (req, res) => {
     try {
       const { search, tags } = req.query;
-      const filters = { userId: req.user.id, companyId: req.companyId };
+      const searchPlan = buildContactSearchPlan(search);
+      const baseFilters = { userId: req.user.id, companyId: req.companyId };
+      const filters = { ...baseFilters };
 
-      if (search) {
-        filters.$or = [
-          { name: { $regex: search, $options: 'i' } },
-          { phone: { $regex: search, $options: 'i' } },
-          { email: { $regex: search, $options: 'i' } }
-        ];
+      if (searchPlan.summaryClause) {
+        filters.$and = filters.$and ? [...filters.$and, searchPlan.summaryClause] : [searchPlan.summaryClause];
       }
       if (tags) {
         filters.tags = { $in: tags.split(',') };
       }
 
-      const contacts = await Contact.find(filters).sort({ lastContact: -1 }).lean();
+      let contactQuery = Contact.find(filters).sort({ lastContact: -1, createdAt: -1, _id: -1 }).lean();
+      if (searchPlan.hint) {
+        contactQuery = contactQuery.hint(searchPlan.hint);
+      }
+
+      let contacts = await contactQuery;
+
+      if (!contacts.length && searchPlan.fallbackClause) {
+        const fallbackFilters = {
+          ...baseFilters,
+          ...(tags ? { tags: { $in: tags.split(',') } } : {}),
+          ...searchPlan.fallbackClause
+        };
+        let fallbackQuery = Contact.find(fallbackFilters)
+          .sort({ lastContact: -1, createdAt: -1, _id: -1 })
+          .lean();
+
+        if (searchPlan.hint) {
+          fallbackQuery = fallbackQuery.hint(searchPlan.hint);
+        }
+
+        contacts = await fallbackQuery;
+      }
+
       res.json(contacts);
     } catch (error) {
       res.status(500).json({ error: error.message });
@@ -709,11 +948,33 @@ const registerLegacyCoreRoutes = (app, deps) => {
         { new: true, runValidators: true }
       );
 
+      const conversationUpdate = {};
       if (name !== undefined && name !== currentContact.name) {
+        conversationUpdate.contactName = name;
+      }
+      if (phone !== undefined && phone !== currentContact.phone) {
+        conversationUpdate.contactPhone = phone;
+      }
+
+      if (Object.keys(conversationUpdate).length > 0) {
         await Conversation.updateMany(
           { contactId: id, userId: req.user.id, companyId: req.companyId },
-          { contactName: name }
+          conversationUpdate
         );
+        const updatedConversations = await Conversation.find({
+          contactId: id,
+          userId: req.user.id,
+          companyId: req.companyId
+        })
+          .select(
+            '_id userId companyId contactId contactPhone contactName status assignedTo assignedToId tags priority lastMessageTime lastMessage lastMessageMediaType lastMessageAttachmentName lastMessageAttachmentPages lastMessageFrom lastMessageWhatsappMessageId lastMessageStatus unreadCount notes resolvedAt'
+          )
+          .lean();
+        await upsertConversationSummaries(updatedConversations);
+        await invalidateInboxScope({
+          companyId: req.companyId || '',
+          userId: req.user.id || ''
+        });
       }
 
       return res.json(contact);

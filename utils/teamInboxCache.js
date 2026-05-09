@@ -4,9 +4,11 @@ const { createRedisConnection } = require('../config/redis');
 const CACHE_NAMESPACE = 'team-inbox';
 const CACHE_TTL_SECONDS = {
   conversations: 30,
+  summaryPages: 20,
   messages: 45
 };
 const VERSION_TTL_SECONDS = 60 * 60 * 24 * 30;
+const CONVERSATION_CACHE_VERSION_GROUPS = ['list', 'summaryPages'];
 
 let redisClient = null;
 
@@ -92,6 +94,31 @@ const bumpVersion = async (namespace, scope, versionGroup) => {
   }
 };
 
+const bumpConversationCacheGroups = async ({
+  companyId = '',
+  userId = '',
+  versionGroups = CONVERSATION_CACHE_VERSION_GROUPS
+} = {}) => {
+  const scopes = getInboxScopeVariants({ companyId, userId });
+  const normalizedGroups = Array.from(
+    new Set(
+      (Array.isArray(versionGroups) ? versionGroups : [versionGroups])
+        .map((versionGroup) => toCleanString(versionGroup))
+        .filter(Boolean)
+    )
+  );
+
+  if (!scopes.length || !normalizedGroups.length) {
+    return;
+  }
+
+  await Promise.all(
+    scopes.flatMap((scope) =>
+      normalizedGroups.map((versionGroup) => bumpVersion('conversations', scope, versionGroup))
+    )
+  );
+};
+
 const getCachedJson = async (key) => {
   if (!key) return null;
   try {
@@ -146,10 +173,17 @@ const getOrSetCachedJson = async ({
 };
 
 const invalidateInboxScope = async ({ companyId = '', userId = '', versionGroup = 'list' } = {}) => {
-  const scopes = getInboxScopeVariants({ companyId, userId });
-  await Promise.all(
-    scopes.map((scope) => bumpVersion('conversations', scope, versionGroup))
-  );
+  const normalizedVersionGroup = toCleanString(versionGroup) || 'list';
+  const versionGroups =
+    normalizedVersionGroup === 'list'
+      ? CONVERSATION_CACHE_VERSION_GROUPS
+      : [normalizedVersionGroup];
+
+  await bumpConversationCacheGroups({
+    companyId,
+    userId,
+    versionGroups
+  });
 };
 
 const invalidateInboxConversation = async ({
@@ -160,13 +194,17 @@ const invalidateInboxConversation = async ({
   const scopes = getInboxScopeVariants({ companyId, userId });
   const normalizedConversationId = toCleanString(conversationId);
   if (!normalizedConversationId) {
-    await Promise.all(scopes.map((scope) => bumpVersion('conversations', scope, 'list')));
+    await bumpConversationCacheGroups({
+      companyId,
+      userId
+    });
     return;
   }
 
   await Promise.all(
     scopes.flatMap((scope) => [
       bumpVersion('conversations', scope, 'list'),
+      bumpVersion('conversations', scope, 'summaryPages'),
       bumpVersion('messages', `${scope}:${normalizedConversationId}`, 'thread')
     ])
   );

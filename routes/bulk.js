@@ -1,9 +1,16 @@
 const express = require('express');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const multer = require('multer');
 const auth = require('../middleware/auth');
 const requireWhatsAppCredentials = require('../middleware/requireWhatsAppCredentials');
 const requirePlanFeature = require('../middleware/planGuard');
 const broadcastService = require('../services/broadcastService');
 const { enqueueBroadcastSend } = require('../queues/broadcastQueue');
+const { enqueueCsvImport } = require('../queues/csvImportQueue');
+const { processCsvImport } = require('../services/csvImportProcessor');
+const CsvImportJob = require('../models/CsvImportJob');
 const Contact = require('../models/Contact');
 const { buildPhoneCandidates } = require('../services/whatsappOutreach/conversationResolver');
 const {
@@ -13,6 +20,23 @@ const {
 
 const router = express.Router();
 router.use(auth);
+
+const csvImportUploadDir = path.join(os.tmpdir(), 'nexion-csv-imports');
+fs.mkdirSync(csvImportUploadDir, { recursive: true });
+const csvImportUpload = multer({
+  storage: multer.diskStorage({
+    destination: csvImportUploadDir,
+    filename: (_req, file, cb) => {
+      const safeName = String(file.originalname || 'csv-import.csv')
+        .replace(/[^a-zA-Z0-9_.-]+/g, '_')
+        .slice(0, 80);
+      cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${safeName}`);
+    }
+  }),
+  limits: {
+    fileSize: Math.max(5 * 1024 * 1024, Number(process.env.CSV_IMPORT_FILE_SIZE_LIMIT || 50 * 1024 * 1024))
+  }
+});
 
 const buildScopedContactFilter = (req, extra = {}) => {
   const scopedConditions = [{ userId: req.user.id }];
@@ -224,6 +248,167 @@ router.post('/upload', async (req, res) => {
   }
 });
 
+router.post('/imports', csvImportUpload.single('csv_file'), async (req, res) => {
+  const uploadedFile = req.file || null;
+  const originalFileName = String(uploadedFile?.originalname || '').trim();
+  const storedFileName = String(uploadedFile?.filename || '').trim();
+  const filePath = String(uploadedFile?.path || '').trim();
+
+  if (!uploadedFile || !filePath) {
+    return res.status(400).json({
+      success: false,
+      message: 'CSV file is required'
+    });
+  }
+
+  try {
+    const job = await CsvImportJob.create({
+      userId: req.user.id,
+      companyId: req.companyId || null,
+      originalFileName,
+      storedFileName,
+      filePath,
+      status: 'queued',
+      currentStage: 'queued',
+      queueJobId: ''
+    });
+
+    const queueResult = await enqueueCsvImport({
+      importJobId: job._id,
+      userId: req.user.id,
+      companyId: req.companyId || null,
+      filePath,
+      originalFileName
+    });
+
+    if (!queueResult.success) {
+      await CsvImportJob.findByIdAndUpdate(job._id, {
+        status: 'failed',
+        currentStage: 'failed',
+        errorMessage: queueResult.error || 'Failed to queue CSV import',
+        completedAt: new Date()
+      });
+      return res.status(400).json(queueResult);
+    }
+
+    await CsvImportJob.findByIdAndUpdate(job._id, {
+      queueJobId: queueResult.data.jobId,
+      updatedAt: new Date()
+    });
+
+    if (String(process.env.DISABLE_REDIS || process.env.REDIS_DISABLED || '').trim().toLowerCase() === 'true') {
+      void processCsvImport({
+        id: queueResult.data.jobId,
+        data: {
+          importJobId: String(job._id),
+          userId: String(req.user.id),
+          companyId: String(req.companyId || ''),
+          filePath,
+          originalFileName
+        }
+      }).catch(async (error) => {
+        await CsvImportJob.findByIdAndUpdate(job._id, {
+          status: 'failed',
+          currentStage: 'failed',
+          errorMessage: String(error?.message || error || 'CSV import failed'),
+          completedAt: new Date()
+        });
+      });
+    }
+
+    return res.status(202).json({
+      success: true,
+      queued: true,
+      importJob: {
+        id: String(job._id),
+        status: 'queued',
+        currentStage: 'queued',
+        originalFileName,
+        totalRows: 0,
+        processedRows: 0,
+        successCount: 0,
+        failedCount: 0,
+        duplicateCount: 0,
+        skippedCount: 0,
+        percentComplete: 0
+      },
+      message: 'CSV import queued. Processing will continue in the background.'
+    });
+  } catch (error) {
+    if (filePath) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        // ignore cleanup errors
+      }
+    }
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to queue CSV import'
+    });
+  }
+});
+
+router.get('/imports', async (req, res) => {
+  try {
+    const limit = Math.min(20, Math.max(1, Number(req.query.limit || 8)));
+    const status = String(req.query.status || '').trim();
+    const query = {
+      userId: req.user.id,
+      ...(req.companyId ? { companyId: req.companyId } : {})
+    };
+    if (status) {
+      query.status = status;
+    }
+
+    const jobs = await CsvImportJob.find(query)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    return res.json({
+      success: true,
+      data: {
+        jobs
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to load CSV import history'
+    });
+  }
+});
+
+router.get('/imports/:id', async (req, res) => {
+  try {
+    const job = await CsvImportJob.findOne({
+      _id: req.params.id,
+      userId: req.user.id,
+      ...(req.companyId ? { companyId: req.companyId } : {})
+    }).lean();
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: 'CSV import job not found'
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        job
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to load CSV import job'
+    });
+  }
+});
+
 router.post(
   '/validate-audience',
   requirePlanFeature('broadcastMessaging'),
@@ -295,6 +480,28 @@ router.post(
       const finalTemplateName = rawTemplateName ? String(rawTemplateName).trim().toLowerCase() : '';
       const customMsg = custom_message || customMessage || '';
 
+      const reqAudienceSource = req.body?.audienceSource && typeof req.body.audienceSource === 'object'
+        ? req.body.audienceSource
+        : {};
+      const reqAudienceSnapshot = req.body?.audienceSnapshot && typeof req.body.audienceSnapshot === 'object'
+        ? req.body.audienceSnapshot
+        : {};
+      const compactImportJobId = String(
+        reqAudienceSource.importJobId ||
+        reqAudienceSnapshot.importJobId ||
+        req.body?.importJobId ||
+        ''
+      ).trim();
+      const compactContactIds = Array.from(
+        new Set(
+          [
+            ...(Array.isArray(reqAudienceSource.contactIds) ? reqAudienceSource.contactIds : []),
+            ...(Array.isArray(reqAudienceSnapshot.contactIds) ? reqAudienceSnapshot.contactIds : [])
+          ].map((contactId) => String(contactId || '').trim()).filter(Boolean)
+        )
+      );
+      const useCompactAudience = Boolean(compactImportJobId || compactContactIds.length);
+
       let parsedRecipients = [];
       if (Array.isArray(recipients) && recipients.length > 0) {
         parsedRecipients = recipients;
@@ -305,27 +512,19 @@ router.post(
         const firstRow = lines[0] || '';
         const hasHeaders = /[a-zA-Z]/.test(firstRow) && !/^[\d+\-\s()]+$/.test(firstRow);
         parsedRecipients = await parseCSV(csvData, hasHeaders);
-      } else {
+      } else if (!useCompactAudience) {
         return res.status(400).json({
           success: false,
           message: 'Recipients data or CSV file is required'
         });
       }
 
-      if (!parsedRecipients.length) {
+      if (!parsedRecipients.length && !useCompactAudience) {
         return res.status(400).json({
           success: false,
           message: 'No valid recipients found'
         });
       }
-
-      const contactsByPhone = await buildContactsByPhoneMap(req, parsedRecipients);
-      const audienceValidation = buildBroadcastAudienceValidation({
-        recipients: parsedRecipients,
-        contactsByPhone,
-        messageType: msgType,
-        templateCategory: normalizedTemplateCategory
-      });
 
       const broadcastRecipients = parsedRecipients.map((recipient) => {
         const fullData = recipient?.data || recipient?.fullData || {};
@@ -339,12 +538,65 @@ router.post(
         };
       });
       const hasContactsAudience = broadcastRecipients.some((recipient) => Boolean(String(recipient?.contactId || '').trim()));
-      const defaultAudienceMode = hasContactsAudience ? 'contacts' : 'csv';
-      const defaultAudienceLabel = hasContactsAudience ? 'Selected CRM contacts' : 'CSV upload';
-      const defaultAudienceType = hasContactsAudience ? 'contacts' : 'csv';
       const selectedContactIds = broadcastRecipients
         .map((recipient) => String(recipient?.contactId || '').trim())
         .filter(Boolean);
+      const compactRecipientCount = useCompactAudience
+        ? compactImportJobId
+          ? await Contact.countDocuments(
+              buildScopedContactFilter(req, { importJobId: compactImportJobId })
+            )
+          : compactContactIds.length
+        : broadcastRecipients.length;
+      const compactSelectedContactCount = useCompactAudience
+        ? compactContactIds.length
+        : selectedContactIds.length;
+      const compactSourceName = compactImportJobId
+        ? 'csv_import_job'
+        : hasContactsAudience || compactContactIds.length
+          ? 'crm_contacts'
+          : 'csv_upload';
+      const compactAudienceMode = compactImportJobId
+        ? 'csv_import_job'
+        : compactContactIds.length
+          ? 'contacts'
+          : hasContactsAudience
+            ? 'contacts'
+            : 'csv';
+      const compactAudienceLabel = compactImportJobId
+        ? 'CSV import job'
+        : compactContactIds.length
+          ? 'Selected CRM contacts'
+          : hasContactsAudience
+            ? 'Selected CRM contacts'
+            : 'CSV upload';
+      const compactAudienceType = compactImportJobId
+        ? 'csv_import_job'
+        : compactContactIds.length
+          ? 'contacts'
+          : hasContactsAudience
+            ? 'contacts'
+            : 'csv';
+
+      const audienceValidation = useCompactAudience
+        ? {
+            valid: true,
+            mode: compactAudienceMode,
+            summary: {
+              recipientCount: compactRecipientCount,
+              selectedContactCount: compactSelectedContactCount,
+              importJobId: compactImportJobId
+            },
+            eligibleRecipients: [],
+            invalidRecipients: [],
+            duplicateRecipients: []
+          }
+        : buildBroadcastAudienceValidation({
+            recipients: parsedRecipients,
+            contactsByPhone: await buildContactsByPhoneMap(req, parsedRecipients),
+            messageType: msgType,
+            templateCategory: normalizedTemplateCategory
+          });
 
       const created = await broadcastService.createBroadcast({
         name: broadcast_name || `Bulk Send - ${new Date().toISOString()}`,
@@ -357,33 +609,39 @@ router.post(
         mediaUrl: String(mediaUrl || '').trim(),
         mediaType: String(mediaType || '').trim(),
         language: language || 'en_US',
-        recipients: broadcastRecipients,
+        recipients: useCompactAudience ? [] : broadcastRecipients,
+        recipientCount: compactRecipientCount,
         audienceSource:
-          req.body?.audienceSource && typeof req.body.audienceSource === 'object'
-            ? req.body.audienceSource
-            : {
-                mode: defaultAudienceMode,
-                label: defaultAudienceLabel,
-                type: defaultAudienceType,
-                segmentId: '',
-                sourceName: hasContactsAudience ? 'crm_contacts' : 'csv_upload',
-                uploadedFileName: String(req.body?.audienceSource?.uploadedFileName || '').trim(),
-                recipientCount: broadcastRecipients.length,
-                selectedContactCount: selectedContactIds.length,
-                hasContactIds: selectedContactIds.length > 0
-              },
+          useCompactAudience
+            ? {
+                ...reqAudienceSource,
+                mode: compactAudienceMode,
+                label: compactAudienceLabel,
+                type: compactAudienceType,
+                segmentId: String(reqAudienceSource.segmentId || '').trim(),
+                sourceName: compactSourceName,
+                uploadedFileName: String(reqAudienceSource.uploadedFileName || '').trim(),
+                recipientCount: compactRecipientCount,
+                selectedContactCount: compactSelectedContactCount,
+                hasContactIds: compactContactIds.length > 0 || Boolean(compactImportJobId),
+                importJobId: compactImportJobId,
+                contactIds: compactContactIds
+              }
+            : reqAudienceSource,
         audienceSnapshot:
-          req.body?.audienceSnapshot && typeof req.body.audienceSnapshot === 'object'
-            ? req.body.audienceSnapshot
-            : {
-                mode: defaultAudienceMode,
-                label: defaultAudienceLabel,
-                sourceType: defaultAudienceType,
-                uploadedFileName: String(req.body?.audienceSnapshot?.uploadedFileName || '').trim(),
-                recipientCount: broadcastRecipients.length,
-                selectedContactCount: selectedContactIds.length,
-                contactIds: selectedContactIds
-              },
+          useCompactAudience
+            ? {
+                ...reqAudienceSnapshot,
+                mode: compactAudienceMode,
+                label: compactAudienceLabel,
+                sourceType: compactAudienceType,
+                uploadedFileName: String(reqAudienceSnapshot.uploadedFileName || '').trim(),
+                recipientCount: compactRecipientCount,
+                selectedContactCount: compactSelectedContactCount,
+                contactIds: compactContactIds,
+                importJobId: compactImportJobId
+              }
+            : reqAudienceSnapshot,
         createdBy: req.user.username || req.user.email || req.user.id,
         createdByEmail: req.user.email,
         createdById: req.user.id,
@@ -417,7 +675,7 @@ router.post(
         engine: 'bulk_broadcast_unified_v3',
         broadcastId: created.data._id,
         jobId: queueResult.data.jobId,
-        total_sent: broadcastRecipients.length,
+        total_sent: useCompactAudience ? compactRecipientCount : broadcastRecipients.length,
         successful: 0,
         failed: 0,
         results: [],

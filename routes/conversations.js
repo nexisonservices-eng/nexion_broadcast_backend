@@ -4,6 +4,38 @@ const conversationController = require('../controllers/conversationController');
 const Message = require('../models/Message');
 const auth = require('../middleware/auth');
 const { requireTenantPolicy } = require('../middleware/tenantPolicy');
+const {
+  buildChronologicalPage,
+  buildMessageCursorFilter,
+  decodeMessageCursor,
+  encodeMessageCursor,
+  normalizePageLimit
+} = require('../utils/threadPagination');
+const {
+  CACHE_TTL_SECONDS,
+  getInboxScopeVariants,
+  getOrSetCachedJson
+} = require('../utils/teamInboxCache');
+const {
+  normalizeRole,
+  isTenantWideRole
+} = require('../utils/accessControl');
+
+const buildScopedMessageFilters = (req, extra = {}) => {
+  const normalizedRole = normalizeRole(
+    req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role
+  );
+  const filters = {
+    ...(req.companyId ? { companyId: req.companyId } : {}),
+    ...extra
+  };
+
+  if (!isTenantWideRole(normalizedRole)) {
+    filters.userId = req.user.id;
+  }
+
+  return filters;
+};
 
 router.use(auth);
 router.use(
@@ -51,43 +83,86 @@ router.get('/:id/messages', async (req, res) => {
       });
     }
 
-    const parsedLimit = Number(req.query?.limit);
-    const limit = Number.isFinite(parsedLimit)
-      ? Math.max(1, Math.min(parsedLimit, 80))
-      : 30;
-    const cursor = String(req.query?.cursor || '').trim();
-
-    const filters = {
+    const limit = normalizePageLimit(req.query?.limit);
+    const cursor = decodeMessageCursor(req.query?.cursor);
+    const scopeVariants = getInboxScopeVariants({
+      companyId: req.companyId || '',
+      userId: req.user?.id || ''
+    });
+    const scope = scopeVariants[scopeVariants.length - 1] || scopeVariants[0] || '';
+    const threadScope = scope ? `${scope}:${conversationId}` : '';
+    const queryCursor = cursor ? buildMessageCursorFilter(cursor) : {};
+    const queryFilters = buildScopedMessageFilters(req, {
       conversationId,
-      companyId: req.companyId
-    };
+      ...queryCursor
+    });
 
-    const normalizedCursor = String(cursor || '').trim();
-    if (normalizedCursor) {
-      const cursorDate = new Date(normalizedCursor);
-      if (!Number.isNaN(cursorDate.valueOf())) {
-        filters.timestamp = { $lt: cursorDate };
-      }
+    const cachedResponse = threadScope
+      ? await getOrSetCachedJson({
+          namespace: 'messages',
+          scope: threadScope,
+          versionGroup: 'thread',
+          keyParts: [String(limit), String(req.query?.cursor || '').trim()],
+          ttlSeconds: CACHE_TTL_SECONDS.messages,
+          loader: async () => {
+            const messages = await Message.find(queryFilters)
+              .select(
+                '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
+              )
+              .populate(
+                'replyTo',
+                '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
+              )
+              .sort({ timestamp: -1, _id: -1 })
+              .limit(limit + 1)
+              .lean();
+
+            const page = buildChronologicalPage({
+              documents: messages,
+              limit,
+              encodeCursor: encodeMessageCursor
+            });
+
+            return {
+              data: page.items,
+              meta: {
+                limit,
+                hasMore: page.hasMore,
+                nextCursor: page.nextCursor
+              }
+            };
+          }
+        })
+      : null;
+
+    if (cachedResponse) {
+      return res.json(cachedResponse);
     }
 
-    const messages = await Message.find(filters)
+    const messages = await Message.find(queryFilters)
+      .select(
+        '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
+      )
+      .populate(
+        'replyTo',
+        '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
+      )
       .sort({ timestamp: -1, _id: -1 })
       .limit(limit + 1)
       .lean();
 
-    const hasMore = messages.length > limit;
-    const trimmed = hasMore ? messages.slice(0, limit) : messages;
-    const chronologicalMessages = [...trimmed].reverse();
-    const nextCursor = hasMore
-      ? new Date(trimmed[trimmed.length - 1]?.timestamp || Date.now()).toISOString()
-      : null;
+    const page = buildChronologicalPage({
+      documents: messages,
+      limit,
+      encodeCursor: encodeMessageCursor
+    });
 
     return res.json({
-      data: chronologicalMessages,
+      data: page.items,
       meta: {
         limit,
-        hasMore,
-        nextCursor
+        hasMore: page.hasMore,
+        nextCursor: page.nextCursor
       }
     });
   } catch (error) {

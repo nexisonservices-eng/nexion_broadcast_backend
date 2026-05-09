@@ -229,6 +229,33 @@ const enqueueBroadcastSend = async ({
 const getBroadcastQueueCounts = async () =>
   broadcastQueue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed', 'paused');
 
+const getQueueLagSnapshot = async () => {
+  if (isRedisDisabled) {
+    return {
+      oldestWaitingAgeMs: 0,
+      oldestDelayedAgeMs: 0,
+      oldestWaitingJobId: null,
+      oldestDelayedJobId: null
+    };
+  }
+
+  const [waitingJobs, delayedJobs] = await Promise.all([
+    broadcastQueue.getJobs(['waiting'], 0, 0, true),
+    broadcastQueue.getJobs(['delayed'], 0, 0, true)
+  ]);
+
+  const now = Date.now();
+  const oldestWaiting = waitingJobs?.[0] || null;
+  const oldestDelayed = delayedJobs?.[0] || null;
+
+  return {
+    oldestWaitingAgeMs: oldestWaiting?.timestamp ? Math.max(0, now - oldestWaiting.timestamp) : 0,
+    oldestDelayedAgeMs: oldestDelayed?.timestamp ? Math.max(0, now - oldestDelayed.timestamp) : 0,
+    oldestWaitingJobId: oldestWaiting?.id || null,
+    oldestDelayedJobId: oldestDelayed?.id || null
+  };
+};
+
 module.exports = {
   queueName,
   connection,
@@ -236,6 +263,7 @@ module.exports = {
   broadcastQueueEvents,
   enqueueBroadcastSend,
   getBroadcastQueueCounts,
+  getQueueLagSnapshot,
   initializeBroadcastChunkProgress,
   markBroadcastChunkState,
   getBroadcastChunkProgressSummary,

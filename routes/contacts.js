@@ -1,5 +1,7 @@
 const express = require('express');
 const Contact = require('../models/Contact');
+const Conversation = require('../models/Conversation');
+const ConversationSummary = require('../models/ConversationSummary');
 const auth = require('../middleware/auth');
 const { normalizeRole, isTenantWideRole } = require('../utils/accessControl');
 const {
@@ -9,25 +11,33 @@ const {
   toCleanString
 } = require('../services/whatsappOutreach/policy');
 const { logConsentEvent } = require('../services/whatsappConsentLogService');
+const { invalidateInboxScope } = require('../utils/teamInboxCache');
+const { buildContactSearchPlan } = require('../utils/contactSearchPlan');
+const { buildPhoneCandidates } = require('../services/whatsappOutreach/conversationResolver');
 
 const router = express.Router();
 router.use(auth);
 
 const emitCrmRealtimeEvent = (req, payload = {}) => {
   const sendToUser = req?.app?.locals?.sendToUser;
-  if (typeof sendToUser !== 'function') return;
-
   const userId = toCleanString(req?.user?.id);
-  if (!userId) return;
+  const companyId = toCleanString(req?.companyId);
 
-  sendToUser(userId, {
-    type: 'crm_changed',
-    scope: 'crm',
-    timestamp: new Date().toISOString(),
-    ...payload,
-    contactId: toCleanString(payload?.contactId),
-    phone: toCleanString(payload?.phone),
-    action: toCleanString(payload?.action)
+  if (typeof sendToUser === 'function' && userId) {
+    sendToUser(userId, {
+      type: 'crm_changed',
+      scope: 'crm',
+      timestamp: new Date().toISOString(),
+      ...payload,
+      contactId: toCleanString(payload?.contactId),
+      phone: toCleanString(payload?.phone),
+      action: toCleanString(payload?.action)
+    });
+  }
+
+  void invalidateInboxScope({
+    companyId,
+    userId
   });
 };
 
@@ -183,6 +193,45 @@ const buildContactCursorFilter = (cursor) => {
             lastContact: cursorLastContact,
             _id: cursorId ? { $lt: cursorId } : { $exists: true }
           }
+    ]
+  };
+};
+
+const buildContactListSortClause = (sortOption = '') => {
+  const normalizedSort = String(sortOption || '').trim().toLowerCase();
+  switch (normalizedSort) {
+    case 'name-desc':
+      return { nameLower: -1, lastContact: 1, createdAt: 1, _id: 1 };
+    case 'last-active-asc':
+      return { lastContact: 1, createdAt: 1, _id: 1 };
+    case 'last-active-desc':
+      return { lastContact: -1, createdAt: -1, _id: -1 };
+    case 'name-asc':
+    default:
+      return { nameLower: 1, lastContact: -1, createdAt: -1, _id: -1 };
+  }
+};
+
+const buildLastActiveFilterClause = (value = '') => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized || normalized === 'all') return null;
+
+  const dayMap = {
+    '1day': 1,
+    '2days': 2,
+    '1week': 7,
+    '1month': 30
+  };
+
+  const days = dayMap[normalized];
+  if (!days) return null;
+
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  return {
+    $or: [
+      { lastContact: { $gte: since } },
+      { lastContactAt: { $gte: since } },
+      { lastInboundMessageAt: { $gte: since } }
     ]
   };
 };
@@ -524,26 +573,43 @@ router.get('/', async (req, res) => {
       req.query.whatsappOptInStatus || req.query.optInStatus || ''
     ).trim().toLowerCase();
     const requestedSourceType = String(req.query.sourceType || '').trim().toLowerCase();
+    const requestedRecentlyInteracted =
+      String(req.query.recentlyInteractedOnly || req.query.repliedOnly || '')
+        .trim()
+        .toLowerCase() === 'true';
+    const requestedLastActiveFilter = String(
+      req.query.activeFilter || req.query.lastActiveFilter || ''
+    ).trim().toLowerCase();
+    const requestedSortOption = String(req.query.sort || req.query.sortOption || '')
+      .trim()
+      .toLowerCase();
     const marketingEligibleOnly =
       String(req.query.marketingEligible || req.query.marketingEligibleOnly || '').trim().toLowerCase() ===
       'true';
     const hasWhatsApp =
       String(req.query.hasWhatsApp || '').trim().toLowerCase() === 'true';
-    const parsedLimit = Number(req.query.limit);
-    const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(Math.floor(parsedLimit), 200) : null;
     const cursor = decodeContactCursor(req.query.cursor);
+    const parsedPage = Number(req.query.page);
+    const parsedPageSize = Number(req.query.pageSize || req.query.limit);
+    const page = Number.isFinite(parsedPage) && parsedPage > 0 ? Math.floor(parsedPage) : 1;
+    const pageSize = Number.isFinite(parsedPageSize) && parsedPage > 0
+      ? Math.min(Math.floor(parsedPageSize), 200)
+      : 10;
+    const isPageMode = !cursor && (
+      req.query.page !== undefined ||
+      req.query.pageSize !== undefined ||
+      req.query.sort !== undefined ||
+      req.query.sortOption !== undefined ||
+      req.query.activeFilter !== undefined ||
+      req.query.lastActiveFilter !== undefined
+    );
     const queryConditions = [];
+    const searchPlan = buildContactSearchPlan(search);
 
-    if (search) {
-      queryConditions.push({
-        $or: [
-          { name: { $regex: search, $options: 'i' } },
-          { phone: { $regex: search, $options: 'i' } },
-          { email: { $regex: search, $options: 'i' } }
-        ]
-      });
+    if (searchPlan.summaryClause) {
+      queryConditions.push(searchPlan.summaryClause);
     }
-    
+
     if (tags) {
       queryConditions.push({ tags: { $in: parseTagList(tags) } });
     }
@@ -554,6 +620,13 @@ router.get('/', async (req, res) => {
 
     if (requestedSourceType && requestedSourceType !== 'all') {
       queryConditions.push({ sourceType: requestedSourceType });
+    }
+
+    if (requestedLastActiveFilter && requestedLastActiveFilter !== 'all') {
+      const lastActiveClause = buildLastActiveFilterClause(requestedLastActiveFilter);
+      if (lastActiveClause) {
+        queryConditions.push(lastActiveClause);
+      }
     }
 
     if (marketingEligibleOnly) {
@@ -570,25 +643,264 @@ router.get('/', async (req, res) => {
       });
     }
 
+    if (requestedRecentlyInteracted) {
+      const now = new Date();
+      const serviceWindowFallback = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+      queryConditions.push({
+        $or: [
+          { serviceWindowClosesAt: { $gt: now } },
+          { lastInboundMessageAt: { $gte: serviceWindowFallback } }
+        ]
+      });
+    }
+
     const extraFilters =
       queryConditions.length === 0 ? {} : queryConditions.length === 1 ? queryConditions[0] : { $and: queryConditions };
     const filters = buildScopedContactFilter(req, extraFilters);
-    const cursorFilters = cursor ? { ...filters, ...buildContactCursorFilter(cursor) } : filters;
-    let contactQuery = Contact.find(cursorFilters)
-      .select(CONTACT_LIST_FIELDS)
-      .sort({ lastContact: -1, createdAt: -1, _id: -1 });
+    const defaultSortClause = { lastContact: -1, createdAt: -1, _id: -1 };
 
-    if (limit) {
-      contactQuery = contactQuery.limit(limit + 1);
+    const fetchContactsPage = async ({
+      queryFilters,
+      countFilters = queryFilters,
+      sortClause,
+      requestedPage = 1,
+      requestedPageSize = 10
+    }) => {
+      const totalCount = await Contact.countDocuments(countFilters);
+      const totalPages = Math.max(1, Math.ceil(totalCount / requestedPageSize));
+      const safePage = Math.min(Math.max(requestedPage, 1), totalPages);
+      let contactQuery = Contact.find(queryFilters)
+        .select(CONTACT_LIST_FIELDS)
+        .sort(sortClause)
+        .skip((safePage - 1) * requestedPageSize)
+        .limit(requestedPageSize);
+
+      if (searchPlan.hint) {
+        contactQuery = contactQuery.hint(searchPlan.hint);
+      }
+
+      const pageContacts = await contactQuery.lean();
+      return {
+        contacts: pageContacts,
+        totalCount,
+        totalPages,
+        page: safePage
+      };
+    };
+
+    if (isPageMode) {
+      const sortClause = buildContactListSortClause(requestedSortOption);
+      let pageResult = await fetchContactsPage({
+        queryFilters: filters,
+        sortClause,
+        requestedPage: page,
+        requestedPageSize: pageSize
+      });
+
+      if (!pageResult.contacts.length) {
+        const legacyConditions = [
+          {
+            $or: [
+              { userId: { $exists: false } },
+              { userId: null },
+              { userId: '' }
+            ]
+          }
+        ];
+
+        if (req.companyId) {
+          legacyConditions.push({
+            $or: [
+              { companyId: req.companyId },
+              { companyId: { $exists: false } },
+              { companyId: null },
+              { companyId: '' }
+            ]
+          });
+        }
+
+        if (searchPlan.fallbackClause) {
+          legacyConditions.push(searchPlan.fallbackClause);
+        }
+
+        if (tags) {
+          legacyConditions.push({ tags: { $in: parseTagList(tags) } });
+        }
+
+        const legacyFilters =
+          legacyConditions.length === 1 ? legacyConditions[0] : { $and: legacyConditions };
+
+        pageResult = await fetchContactsPage({
+          queryFilters: legacyFilters,
+          countFilters: legacyFilters,
+          sortClause,
+          requestedPage: page,
+          requestedPageSize: pageSize
+        });
+      }
+
+      if (!pageResult.contacts.length) {
+        const globalConditions = [];
+        if (searchPlan.fallbackClause) {
+          globalConditions.push(searchPlan.fallbackClause);
+        }
+        if (tags) {
+          globalConditions.push({ tags: { $in: parseTagList(tags) } });
+        }
+        const globalFilters =
+          globalConditions.length === 0
+            ? {}
+            : globalConditions.length === 1
+              ? globalConditions[0]
+              : { $and: globalConditions };
+
+        pageResult = await fetchContactsPage({
+          queryFilters: globalFilters,
+          countFilters: globalFilters,
+          sortClause,
+          requestedPage: page,
+          requestedPageSize: pageSize
+        });
+      }
+
+      const contacts = pageResult.contacts.map(normalizeContactConsentForResponse);
+      const hasMore = pageResult.page < pageResult.totalPages;
+
+      res.set('X-Total-Count', String(pageResult.totalCount || 0));
+      return res.json({
+        success: true,
+        data: contacts,
+        meta: {
+          limit: pageSize,
+          page: pageResult.page,
+          pageSize,
+          totalCount: pageResult.totalCount || 0,
+          totalPages: pageResult.totalPages,
+          hasMore,
+          nextCursor: null
+        }
+      });
+    }
+
+    if (cursor) {
+      const cursorFilters = { ...filters, ...buildContactCursorFilter(cursor) };
+      let contactQuery = Contact.find(cursorFilters)
+        .select(CONTACT_LIST_FIELDS)
+        .sort(defaultSortClause);
+
+      if (searchPlan.hint) {
+        contactQuery = contactQuery.hint(searchPlan.hint);
+      }
+
+      contactQuery = contactQuery.limit(pageSize + 1);
+
+      let contacts = await contactQuery.lean();
+      let totalCount = await Contact.countDocuments(filters);
+      let hasMore = false;
+      if (contacts.length > pageSize) {
+        hasMore = true;
+        contacts = contacts.slice(0, pageSize);
+      }
+
+      // Backward compatibility: older contacts were saved without user/company scope.
+      // If scoped query returns nothing, surface legacy contacts so existing data doesn't disappear.
+      if (!contacts.length) {
+        const legacyConditions = [
+          {
+            $or: [
+              { userId: { $exists: false } },
+              { userId: null },
+              { userId: '' }
+            ]
+          }
+        ];
+
+        if (req.companyId) {
+          legacyConditions.push({
+            $or: [
+              { companyId: req.companyId },
+              { companyId: { $exists: false } },
+              { companyId: null },
+              { companyId: '' }
+            ]
+          });
+        }
+
+        if (searchPlan.fallbackClause) {
+          legacyConditions.push(searchPlan.fallbackClause);
+        }
+
+        if (tags) {
+          legacyConditions.push({ tags: { $in: parseTagList(tags) } });
+        }
+
+        const legacyFilters =
+          legacyConditions.length === 1 ? legacyConditions[0] : { $and: legacyConditions };
+
+        contacts = await Contact.find(legacyFilters)
+          .select(CONTACT_LIST_FIELDS)
+          .sort(defaultSortClause)
+          .limit(pageSize + 1)
+          .lean();
+        totalCount = await Contact.countDocuments(legacyFilters);
+        if (contacts.length > pageSize) {
+          hasMore = true;
+          contacts = contacts.slice(0, pageSize);
+        }
+      }
+
+      // Final recovery fallback for legacy datasets with inconsistent scope metadata.
+      // Keeps search/tags behavior but removes scope constraints so contacts don't vanish.
+      if (!contacts.length) {
+        const globalConditions = [];
+        if (searchPlan.fallbackClause) {
+          globalConditions.push(searchPlan.fallbackClause);
+        }
+        if (tags) {
+          globalConditions.push({ tags: { $in: parseTagList(tags) } });
+        }
+        const globalFilters =
+          globalConditions.length === 0
+            ? {}
+            : globalConditions.length === 1
+              ? globalConditions[0]
+              : { $and: globalConditions };
+        contacts = await Contact.find(globalFilters)
+          .select(CONTACT_LIST_FIELDS)
+          .sort(defaultSortClause)
+          .limit(pageSize + 1)
+          .lean();
+        totalCount = await Contact.countDocuments(globalFilters);
+        if (contacts.length > pageSize) {
+          hasMore = true;
+          contacts = contacts.slice(0, pageSize);
+        }
+      }
+
+      contacts = contacts.map(normalizeContactConsentForResponse);
+
+      res.set('X-Total-Count', String(totalCount || 0));
+      return res.json({
+        success: true,
+        data: contacts,
+        meta: {
+          limit: pageSize,
+          hasMore,
+          nextCursor: hasMore ? encodeContactCursor(contacts[contacts.length - 1]) : null
+        }
+      });
+    }
+
+    let contactQuery = Contact.find(filters)
+      .select(CONTACT_LIST_FIELDS)
+      .sort(defaultSortClause);
+
+    if (searchPlan.hint) {
+      contactQuery = contactQuery.hint(searchPlan.hint);
     }
 
     let contacts = await contactQuery.lean();
     let totalCount = await Contact.countDocuments(filters);
-    let hasMore = false;
-    if (limit && contacts.length > limit) {
-      hasMore = true;
-      contacts = contacts.slice(0, limit);
-    }
 
     // Backward compatibility: older contacts were saved without user/company scope.
     // If scoped query returns nothing, surface legacy contacts so existing data doesn't disappear.
@@ -614,14 +926,8 @@ router.get('/', async (req, res) => {
         });
       }
 
-      if (search) {
-        legacyConditions.push({
-          $or: [
-            { name: { $regex: search, $options: 'i' } },
-            { phone: { $regex: search, $options: 'i' } },
-            { email: { $regex: search, $options: 'i' } }
-          ]
-        });
+      if (searchPlan.fallbackClause) {
+        legacyConditions.push(searchPlan.fallbackClause);
       }
 
       if (tags) {
@@ -633,7 +939,7 @@ router.get('/', async (req, res) => {
 
       contacts = await Contact.find(legacyFilters)
         .select(CONTACT_LIST_FIELDS)
-        .sort({ lastContact: -1, createdAt: -1, _id: -1 })
+        .sort(defaultSortClause)
         .lean();
       totalCount = await Contact.countDocuments(legacyFilters);
     }
@@ -642,14 +948,8 @@ router.get('/', async (req, res) => {
     // Keeps search/tags behavior but removes scope constraints so contacts don't vanish.
     if (!contacts.length) {
       const globalConditions = [];
-      if (search) {
-        globalConditions.push({
-          $or: [
-            { name: { $regex: search, $options: 'i' } },
-            { phone: { $regex: search, $options: 'i' } },
-            { email: { $regex: search, $options: 'i' } }
-          ]
-        });
+      if (searchPlan.fallbackClause) {
+        globalConditions.push(searchPlan.fallbackClause);
       }
       if (tags) {
         globalConditions.push({ tags: { $in: parseTagList(tags) } });
@@ -662,7 +962,7 @@ router.get('/', async (req, res) => {
             : { $and: globalConditions };
       contacts = await Contact.find(globalFilters)
         .select(CONTACT_LIST_FIELDS)
-        .sort({ lastContact: -1, createdAt: -1, _id: -1 })
+        .sort(defaultSortClause)
         .lean();
       totalCount = await Contact.countDocuments(globalFilters);
     }
@@ -674,9 +974,13 @@ router.get('/', async (req, res) => {
       success: true,
       data: contacts,
       meta: {
-        limit: limit || null,
-        hasMore,
-        nextCursor: hasMore ? encodeContactCursor(contacts[contacts.length - 1]) : null
+        limit: null,
+        hasMore: false,
+        nextCursor: null,
+        totalCount: totalCount || 0,
+        totalPages: 1,
+        page: 1,
+        pageSize: contacts.length || 0
       }
     });
   } catch (error) {
@@ -1034,130 +1338,185 @@ router.post('/import', async (req, res) => {
       errors: []
     };
 
-    // Process contacts in batches to avoid overwhelming the database
-    const batchSize = 50;
+    const batchSize = 250;
     for (let i = 0; i < contacts.length; i += batchSize) {
       const batch = contacts.slice(i, i + batchSize);
-      
-      for (const contactData of batch) {
+      const normalizedBatch = batch
+        .map((contactData, index) => ({
+          source: contactData,
+          normalized: normalizeImportedContactData(contactData),
+          lineNumber: contactData?.lineNumber || i + index + 1
+        }))
+        .filter((entry) => entry.normalized);
+
+      const validRows = [];
+      for (const entry of normalizedBatch) {
+        const normalizedPhone = getPreferredPhoneValue(entry.normalized);
+        if (!normalizedPhone) {
+          results.failed++;
+          results.errors.push({
+            line: entry.lineNumber || 'Unknown',
+            error: 'Phone number is required',
+            data: entry.normalized
+          });
+          continue;
+        }
+
+        if (!isValidPhoneNumber(normalizedPhone)) {
+          results.failed++;
+          results.errors.push({
+            line: entry.lineNumber || 'Unknown',
+            error: 'Phone number must contain 10 to 15 digits and be correctly formatted.',
+            data: entry.normalized
+          });
+          continue;
+        }
+
+        validRows.push({
+          ...entry,
+          normalizedPhone,
+          phoneDigits: normalizePhoneNumber(normalizedPhone)
+        });
+      }
+
+      if (!validRows.length) {
+        continue;
+      }
+
+      const lookupPhones = Array.from(
+        new Set(validRows.flatMap((entry) => buildPhoneCandidates(entry.normalizedPhone)).filter(Boolean))
+      );
+      const lookupPhoneDigits = Array.from(
+        new Set(validRows.map((entry) => entry.phoneDigits).filter(Boolean))
+      );
+
+      const existingContacts = lookupPhones.length || lookupPhoneDigits.length
+        ? await Contact.find(
+            buildScopedContactFilter(req, {
+              $or: [
+                lookupPhones.length ? { phone: { $in: lookupPhones } } : null,
+                lookupPhoneDigits.length ? { phoneDigits: { $in: lookupPhoneDigits } } : null
+              ].filter(Boolean)
+            })
+          )
+            .select('_id phone phoneDigits tags name email sourceType lastContact whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata isBlocked')
+            .lean()
+        : [];
+
+      const existingMap = new Map();
+      for (const contact of existingContacts) {
+        const contactCandidates = buildPhoneCandidates(contact?.phone || '');
+        contactCandidates.forEach((candidate) => {
+          if (!existingMap.has(candidate)) {
+            existingMap.set(candidate, contact);
+          }
+        });
+        if (contact?.phoneDigits && !existingMap.has(contact.phoneDigits)) {
+          existingMap.set(contact.phoneDigits, contact);
+        }
+      }
+
+      const operations = [];
+      for (const entry of validRows) {
         try {
-          const normalizedContactData = normalizeImportedContactData(contactData);
-
-          // Validate required fields
-          if (!normalizedContactData.phone) {
-            results.failed++;
-            results.errors.push({
-              line: normalizedContactData.lineNumber || 'Unknown',
-              error: 'Phone number is required',
-              data: normalizedContactData
-            });
-            continue;
-          }
-
-          const normalizedPhone = getPreferredPhoneValue(normalizedContactData);
-          if (!normalizedPhone) {
-            results.failed++;
-            results.errors.push({
-              line: normalizedContactData.lineNumber || 'Unknown',
-              error: 'Phone number is required',
-              data: normalizedContactData
-            });
-            continue;
-          }
-          if (!isValidPhoneNumber(normalizedPhone)) {
-            results.failed++;
-            results.errors.push({
-              line: normalizedContactData.lineNumber || 'Unknown',
-              error: 'Phone number must contain 10 to 15 digits and be correctly formatted.',
-              data: normalizedContactData
-            });
-            continue;
-          }
-
-          // Check for duplicate phone numbers
-          const existingContact = await Contact.findOne(
-            buildScopedContactFilter(req, buildPhoneMatchFilter(normalizedPhone) || {})
-          );
-          const normalizedStatus = normalizeImportStatus(normalizedContactData.status);
-          const effectiveImportStatus = 'opted-in';
           const importedConsentReferenceId = buildImportedConsentReferenceId(
-            normalizedPhone,
-            normalizedContactData.lineNumber
+            entry.normalizedPhone,
+            entry.lineNumber
           );
+          const existingContact =
+            existingMap.get(entry.phoneDigits) ||
+            buildPhoneCandidates(entry.normalizedPhone).map((candidate) => existingMap.get(candidate)).find(Boolean) ||
+            null;
+
           if (existingContact) {
-            existingContact.name = toCleanString(normalizedContactData.name) || existingContact.name;
-            existingContact.email = toCleanString(normalizedContactData.email) || existingContact.email;
-            existingContact.tags = getMergedTags(existingContact.tags, normalizedContactData.tags);
-            existingContact.phone = normalizedPhone;
-            existingContact.sourceType = existingContact.sourceType || 'imported';
-            applyImportedLandingPageConsent(existingContact, {
-              referenceId: importedConsentReferenceId,
-              scope: normalizedContactData.scope || 'marketing',
-              lineNumber: normalizedContactData.lineNumber
+            const mergedTags = getMergedTags(existingContact.tags, entry.normalized.tags);
+            const updatedName = toCleanString(entry.normalized.name) || toCleanString(existingContact.name);
+
+            operations.push({
+              updateOne: {
+                filter: { _id: existingContact._id },
+                update: {
+                  $set: {
+                    userId: req.user.id,
+                    companyId: req.companyId || null,
+                    name: updatedName,
+                    nameLower: updatedName.toLowerCase(),
+                    phone: entry.normalizedPhone,
+                    phoneDigits: entry.phoneDigits,
+                    email: toCleanString(entry.normalized.email) || toCleanString(existingContact.email),
+                    tags: mergedTags,
+                    sourceType: existingContact.sourceType || 'imported',
+                    isBlocked: false,
+                    lastContact: existingContact.lastContact || new Date(),
+                    updatedAt: new Date(),
+                    ...buildImportedLandingPageConsentUpdate(existingContact, {
+                      referenceId: importedConsentReferenceId,
+                      scope: entry.normalized.scope || 'marketing',
+                      lineNumber: entry.lineNumber
+                    })
+                  }
+                },
+                upsert: false
+              }
             });
-            await existingContact.save();
-            await Contact.collection.updateOne(
-              { _id: existingContact._id },
-              { $set: buildImportedLandingPageConsentUpdate(existingContact, {
+          } else {
+            const newContactDoc = {
+              userId: req.user.id,
+              companyId: req.companyId || null,
+              name: toCleanString(entry.normalized.name) || '',
+              nameLower: toCleanString(entry.normalized.name).toLowerCase(),
+              phone: entry.normalizedPhone,
+              phoneDigits: entry.phoneDigits,
+              email: toCleanString(entry.normalized.email) || '',
+              tags: Array.isArray(entry.normalized.tags) ? entry.normalized.tags : [],
+              isBlocked: false,
+              sourceType: 'imported',
+              lastContact: new Date(),
+              createdAt: new Date(),
+              updatedAt: new Date(),
+              ...buildImportedLandingPageConsentUpdate(null, {
                 referenceId: importedConsentReferenceId,
-                scope: normalizedContactData.scope || 'marketing',
-                lineNumber: normalizedContactData.lineNumber
-              }) }
-            );
-            results.success++;
-            emitCrmRealtimeEvent(req, {
-              action: 'contact_updated',
-              contactId: existingContact._id,
-              phone: existingContact.phone
+                scope: entry.normalized.scope || 'marketing',
+                lineNumber: entry.lineNumber
+              })
+            };
+
+            operations.push({
+              insertOne: {
+                document: newContactDoc
+              }
             });
-            continue;
           }
-
-          // Create contact
-          const contact = await Contact.create({
-            userId: req.user.id,
-            companyId: req.companyId || null,
-            name: normalizedContactData.name || '',
-            phone: normalizedPhone,
-            email: normalizedContactData.email || '',
-            tags: Array.isArray(normalizedContactData.tags) ? normalizedContactData.tags : [],
-            isBlocked: false,
-            sourceType: 'imported',
-            lastContact: new Date(),
-            createdAt: new Date(),
-            updatedAt: new Date()
-          });
-
-          applyImportedLandingPageConsent(contact, {
-            referenceId: importedConsentReferenceId,
-            scope: normalizedContactData.scope || 'marketing',
-            lineNumber: normalizedContactData.lineNumber
-          });
-
-          await contact.save();
-          await Contact.collection.updateOne(
-            { _id: contact._id },
-            { $set: buildImportedLandingPageConsentUpdate(contact, {
-              referenceId: importedConsentReferenceId,
-              scope: normalizedContactData.scope || 'marketing',
-              lineNumber: normalizedContactData.lineNumber
-            }) }
-          );
-          results.success++;
-          emitCrmRealtimeEvent(req, {
-            action: 'contact_created',
-            contactId: contact._id,
-            phone: contact.phone
-          });
-          
         } catch (error) {
           results.failed++;
           results.errors.push({
-            line: contactData.lineNumber || 'Unknown',
+            line: entry.lineNumber || 'Unknown',
             error: error.message,
-            data: contactData
+            data: entry.normalized
           });
         }
+      }
+
+      if (!operations.length) {
+        continue;
+      }
+
+      try {
+        const bulkResult = await Contact.bulkWrite(operations, { ordered: false });
+        results.success += Number(bulkResult?.matchedCount || 0) + Number(bulkResult?.upsertedCount || 0);
+      } catch (error) {
+        const bulkResult = error?.result?.result || error?.result || null;
+        results.success += Number(bulkResult?.nMatched || bulkResult?.matchedCount || 0) +
+          Number(bulkResult?.nUpserted || bulkResult?.upsertedCount || 0);
+        results.failed += Number(bulkResult?.writeErrors?.length || 1);
+        results.errors.push({
+          line: 'batch',
+          error: error.message,
+          data: {
+            batchStart: i,
+            batchSize: batch.length
+          }
+        });
       }
     }
 
@@ -1171,7 +1530,8 @@ router.post('/import', async (req, res) => {
       emitCrmRealtimeEvent(req, {
         action: 'contacts_imported',
         importedCount: results.success,
-        failedCount: results.failed
+        failedCount: results.failed,
+        batchSize
       });
     }
 
@@ -1304,6 +1664,23 @@ router.put('/:id', async (req, res) => {
     );
 
     if (contact) {
+      const conversationUpdate = {};
+      if (name !== undefined) {
+        conversationUpdate.contactName = contact.name || '';
+      }
+      if (phone !== undefined) {
+        conversationUpdate.contactPhone = contact.phone || '';
+      }
+      if (Object.keys(conversationUpdate).length > 0) {
+        await Conversation.updateMany(
+          buildScopedContactFilter(req, { contactId: contact._id }),
+          conversationUpdate
+        );
+        await ConversationSummary.updateMany(
+          buildScopedContactFilter(req, { contactId: contact._id }),
+          conversationUpdate
+        );
+      }
       emitCrmRealtimeEvent(req, {
         action: 'contact_updated',
         contactId: contact._id,

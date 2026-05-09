@@ -17,6 +17,7 @@ const missedCallAutomationService = require('./services/missedCallAutomationServ
 const templateController = require('./controllers/templateController');
 const metaAdsService = require('./services/metaAdsService');
 const whatsappService = require('./services/whatsappService');
+const { upsertConversationSummary } = require('./services/conversationSummaryService');
 
 // Models
 const Contact = require('./models/Contact');
@@ -34,6 +35,7 @@ const Campaign = require('./models/campaign');
 const { ContactDocument } = require('./models/ContactDocument');
 const WhatsAppConsentLog = require('./models/WhatsAppConsentLog');
 const ConsentExportJob = require('./models/ConsentExportJob');
+const CsvImportJob = require('./models/CsvImportJob');
 
 // Middleware / config / helpers
 const auth = require('./middleware/auth');
@@ -53,6 +55,7 @@ const {
   applyIncomingMessageScore
 } = require('./services/leadScoringService');
 const { isDebugLoggingEnabled, validateSecurityEnv, requireJwtSecret } = require('./utils/securityConfig');
+const { invalidateInboxConversation } = require('./utils/teamInboxCache');
 
 // Routes
 const bulkRoutes = require('./routes/bulk');
@@ -81,10 +84,14 @@ const { startAppScheduler } = require('./jobs/appScheduler');
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
+const HEARTBEAT_INTERVAL_MS = Number(process.env.WS_HEARTBEAT_INTERVAL_MS || 30000);
+const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS || 10000);
 const ENABLE_LEGACY_CORE_ROUTES =
   String(process.env.ENABLE_LEGACY_CORE_ROUTES || 'false').trim().toLowerCase() === 'true';
 const ENABLE_DEBUG_LOGS = isDebugLoggingEnabled();
 const securityEnvValidation = validateSecurityEnv();
+let heartbeatInterval = null;
+let isShuttingDown = false;
 
 if (securityEnvValidation.warnings.length) {
   console.warn('Security configuration warnings:', securityEnvValidation.warnings.join(' '));
@@ -201,6 +208,25 @@ app.use(
   })
 );
 app.use(express.urlencoded({ extended: true }));
+
+app.get('/healthz', (req, res) => {
+  const dbReady = mongoose.connection.readyState === 1;
+  res.status(dbReady ? 200 : 503).json({
+    ok: dbReady,
+    service: 'whatsapp-backend',
+    uptimeSeconds: Math.round(process.uptime()),
+    dbReady,
+    websocketReady: wss.readyState === WebSocket.OPEN || wss.readyState === WebSocket.CONNECTING
+  });
+});
+
+app.get('/readyz', (req, res) => {
+  const dbReady = mongoose.connection.readyState === 1;
+  res.status(dbReady ? 200 : 503).json({
+    ok: dbReady,
+    dbReady
+  });
+});
 
 // Backward-compatible redirect for older Meta OAuth callback URLs.
 app.get('/auth/meta/callback', (req, res) => {
@@ -332,6 +358,16 @@ app.put('/api/conversations/:id/read', auth, async (req, res) => {
       return res.status(404).json({ success: false, error: 'Conversation not found' });
     }
 
+    await upsertConversationSummary({
+      ...conversation,
+      unreadCount: 0
+    });
+    await invalidateInboxConversation({
+      companyId: req.companyId || '',
+      userId: req.user.id || '',
+      conversationId: conversation._id
+    });
+
     return res.json({ success: true, data: conversation });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
@@ -379,6 +415,37 @@ const websocketHub = createWebSocketHub({ wss });
 app.locals.broadcast = websocketHub.broadcast;
 app.locals.sendToUser = websocketHub.sendToUser;
 
+wss.on('connection', (ws) => {
+  ws.isAlive = true;
+
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+});
+
+heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      try {
+        ws.terminate();
+      } catch (error) {
+        console.error('Failed to terminate stale WebSocket client:', error.message);
+      }
+      return;
+    }
+
+    ws.isAlive = false;
+    try {
+      ws.ping();
+    } catch (error) {
+      console.error('Failed to ping WebSocket client:', error.message);
+    }
+  });
+}, HEARTBEAT_INTERVAL_MS);
+if (typeof heartbeatInterval.unref === 'function') {
+  heartbeatInterval.unref();
+}
+
 // WhatsApp webhook endpoints
 registerWhatsAppWebhookRoutes(app, {
   whatsappConfig,
@@ -417,6 +484,86 @@ if (ENABLE_LEGACY_CORE_ROUTES) {
 }
 
 const PORT = process.env.PORT || 3001;
+const shutdown = async (signal, error) => {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  if (error) {
+    console.error(`Shutdown triggered by ${signal}:`, error);
+  } else {
+    console.log(`Shutdown triggered by ${signal}`);
+  }
+
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+
+  try {
+    wss.clients.forEach((ws) => {
+      try {
+        ws.close(1001, 'Server shutting down');
+      } catch (closeError) {
+        console.error('Failed to close WebSocket client:', closeError.message);
+      }
+    });
+    wss.close();
+  } catch (closeError) {
+    console.error('Failed to close WebSocket server:', closeError.message);
+  }
+
+  const exitTimer = setTimeout(() => {
+    console.error('Forced shutdown after timeout.');
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  if (typeof exitTimer.unref === 'function') {
+    exitTimer.unref();
+  }
+
+  try {
+    await new Promise((resolve) => {
+      server.close(() => resolve());
+    });
+  } catch (closeError) {
+    console.error('Failed to close HTTP server cleanly:', closeError.message);
+  }
+
+  try {
+    if (mongoose.connection.readyState !== 0) {
+      await mongoose.connection.close(false);
+    }
+  } catch (dbError) {
+    console.error('Failed to close MongoDB connection cleanly:', dbError.message);
+  }
+
+  clearTimeout(exitTimer);
+  process.exit(error ? 1 : 0);
+};
+
+server.on('error', (error) => {
+  console.error('HTTP server error:', error);
+  if (error?.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use. Stop the duplicate process before restarting the backend.`);
+  }
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+  void shutdown('uncaughtException', error);
+});
+
+process.on('SIGTERM', () => {
+  void shutdown('SIGTERM');
+});
+
+process.on('SIGINT', () => {
+  void shutdown('SIGINT');
+});
+
 server.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   console.log('WebSocket server ready');
@@ -439,7 +586,8 @@ server.listen(PORT, async () => {
       Campaign.syncIndexes(),
       ContactDocument.syncIndexes(),
       WhatsAppConsentLog.syncIndexes(),
-      ConsentExportJob.syncIndexes()
+      ConsentExportJob.syncIndexes(),
+      CsvImportJob.syncIndexes()
     ]);
     console.log('MongoDB indexes synced for all models including Campaigns.');
   } catch (indexError) {

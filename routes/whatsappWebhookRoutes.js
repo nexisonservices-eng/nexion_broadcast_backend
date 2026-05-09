@@ -16,6 +16,9 @@ const { logConsentEvent } = require('../services/whatsappConsentLogService');
 const broadcastService = require('../services/broadcastService');
 const { invalidateInboxConversation } = require('../utils/teamInboxCache');
 const {
+  syncConversationSummaryFromConversation
+} = require('../services/conversationSummaryService');
+const {
   recordConversationInboundUnread
 } = require('../utils/conversationReadStateCache');
 
@@ -635,6 +638,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         }
         await conversation.save();
       }
+      await syncConversationSummaryFromConversation(conversation);
 
       const message = await Message.create({
         userId,
@@ -851,6 +855,15 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
               lastMessageWhatsappMessageId: updatedMessage.whatsappMessageId || messageId || ''
             }
           );
+          await syncConversationSummaryFromConversation({
+            _id: updatedMessage.conversationId,
+            userId: updatedMessage.userId,
+            companyId: updatedMessage.companyId,
+            lastMessageStatus: status,
+            lastMessageFrom: 'agent',
+            lastMessageWhatsappMessageId:
+              updatedMessage.whatsappMessageId || messageId || ''
+          });
         } catch (conversationStatusError) {
           console.error('Error updating conversation lastMessageStatus:', conversationStatusError);
         }

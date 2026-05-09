@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Conversation = require('../models/Conversation');
+const ConversationSummary = require('../models/ConversationSummary');
 const Contact = require('../models/Contact');
 const Message = require('../models/Message');
 const {
@@ -19,9 +20,15 @@ const {
   applyContactOptOut,
   toCleanString
 } = require('../services/whatsappOutreach/policy');
+const {
+  deleteConversationSummary,
+  upsertConversationSummaries
+} = require('../services/conversationSummaryService');
+const { buildInboxSearchPlan } = require('../utils/inboxSearchPlan');
+const { buildContactSearchPlan } = require('../utils/contactSearchPlan');
 
-const TEAM_INBOX_CONTACT_FIELDS =
-  '_id name phone email notes tags status stage customFields nextFollowUpAt leadScore leadScoreBreakdown isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata whatsappMarketingWindowStartedAt whatsappMarketingSendCount whatsappMarketingLastSentAt whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt';
+const TEAM_INBOX_CONTACT_SUMMARY_FIELDS =
+  '_id name phone tags status stage leadScore leadScoreBreakdown isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt';
 const CONTACT_LIST_FIELDS =
   '_id name phone email tags stage status source ownerId sourceType lastContact lastContactAt nextFollowUpAt isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata whatsappMarketingWindowStartedAt whatsappMarketingSendCount whatsappMarketingLastSentAt whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt leadScore createdAt updatedAt';
 
@@ -202,10 +209,221 @@ const buildScopedFilters = (req, extra = {}) => {
   return filters;
 };
 
+const attachContactSnapshotsToConversations = async (conversations = [], req) => {
+  const safeConversations = Array.isArray(conversations) ? conversations : [];
+  const contactIds = safeConversations
+    .map((conversation) => String(conversation?.contactId || '').trim())
+    .filter((contactId) => mongoose.Types.ObjectId.isValid(contactId));
+
+  if (!contactIds.length) {
+    return safeConversations.map((conversation) => ({
+      ...conversation,
+      unreadCount: Math.max(0, Number(conversation?.unreadCount || 0) || 0)
+    }));
+  }
+
+  const uniqueContactIds = Array.from(new Set(contactIds));
+  const contacts = await Contact.find({
+    _id: { $in: uniqueContactIds },
+    ...buildScopedFilters(req)
+  })
+    .select(TEAM_INBOX_CONTACT_SUMMARY_FIELDS)
+    .lean();
+
+  const contactById = new Map(
+    contacts.map((contact) => [String(contact?._id || '').trim(), contact])
+  );
+
+  return safeConversations.map((conversation) => {
+    const contactId = String(conversation?.contactId || '').trim();
+    const contact = contactById.get(contactId);
+    return {
+      ...conversation,
+      contactId: contact || conversation?.contactId || null,
+      unreadCount: Math.max(0, Number(conversation?.unreadCount || 0) || 0)
+    };
+  });
+};
+
+const loadConversationSummaryRows = async ({ finalFilters, limit, queryHint = null }) => {
+  let query = ConversationSummary.find(finalFilters)
+    .select(TEAM_INBOX_CONVERSATION_FIELDS)
+    .sort({ lastMessageTime: -1, _id: -1 })
+    .lean();
+
+  if (queryHint) {
+    query = query.hint(queryHint);
+  }
+
+  if (limit > 0) {
+    query = query.limit(limit + 1);
+  }
+
+  let conversations;
+  try {
+    conversations = await query;
+  } catch (error) {
+    const errorMessage = String(error?.message || '').toLowerCase();
+    const isHintError =
+      Boolean(queryHint) &&
+      (error?.code === 2 ||
+        error?.codeName === 'BadValue' ||
+        errorMessage.includes('hint') ||
+        errorMessage.includes('bad value'));
+
+    if (!isHintError) {
+      throw error;
+    }
+
+    let fallbackQuery = ConversationSummary.find(finalFilters)
+      .select(TEAM_INBOX_CONVERSATION_FIELDS)
+      .sort({ lastMessageTime: -1, _id: -1 })
+      .lean();
+
+    if (limit > 0) {
+      fallbackQuery = fallbackQuery.limit(limit + 1);
+    }
+
+    conversations = await fallbackQuery;
+  }
+
+  let hasMore = false;
+  if (limit > 0 && conversations.length > limit) {
+    hasMore = true;
+    return {
+      conversations: conversations.slice(0, limit),
+      hasMore,
+      nextCursor: encodeConversationCursor(conversations[limit - 1])
+    };
+  }
+
+  return {
+    conversations,
+    hasMore,
+    nextCursor: conversations.length
+      ? encodeConversationCursor(conversations[conversations.length - 1])
+      : null
+  };
+};
+
+const normalizeConversationFilter = (value = '') => {
+  const normalizedValue = String(value || '').trim().toLowerCase();
+  if (normalizedValue === 'unread' || normalizedValue === 'read') {
+    return normalizedValue;
+  }
+  return 'all';
+};
+
+const buildConversationUnreadFilterClause = (conversationFilter = 'all') => {
+  const normalizedFilter = normalizeConversationFilter(conversationFilter);
+  if (normalizedFilter === 'unread') {
+    return { unreadCount: { $gt: 0 } };
+  }
+  if (normalizedFilter === 'read') {
+    return {
+      $or: [
+        { unreadCount: { $lte: 0 } },
+        { unreadCount: { $exists: false } }
+      ]
+    };
+  }
+  return null;
+};
+
+const encodeConversationCursorCacheKey = (cursor = null) => {
+  if (!cursor?.lastMessageTime) return '';
+
+  const lastMessageTime = new Date(cursor.lastMessageTime);
+  if (Number.isNaN(lastMessageTime.getTime())) return '';
+
+  return `${lastMessageTime.toISOString()}::${String(cursor.id || '').trim()}`;
+};
+
+const loadConversationFallbackRows = async ({ finalFilters, limit }) => {
+  let query = Conversation.find(finalFilters)
+    .select(TEAM_INBOX_CONVERSATION_FIELDS)
+    .sort({ lastMessageTime: -1, _id: -1 })
+    .lean();
+
+  if (limit > 0) {
+    query = query.limit(limit + 1);
+  }
+
+  const rawConversations = await query;
+  const hasMore = limit > 0 && rawConversations.length > limit;
+  const rawItems = hasMore ? rawConversations.slice(0, limit) : rawConversations;
+
+  if (rawItems.length) {
+    // Keep the response path fast; summary backfill is important but not required
+    // before the client can render the current page of conversations.
+    void upsertConversationSummaries(rawItems).catch((error) => {
+      console.error('Failed to backfill conversation summaries:', error);
+    });
+  }
+
+  return {
+    conversations: rawItems,
+    hasMore,
+    nextCursor: hasMore ? encodeConversationCursor(rawItems[rawItems.length - 1]) : null
+  };
+};
+
+const loadConversationSummaryPage = async ({
+  summaryFilters,
+  fallbackFilters,
+  limit,
+  req,
+  scope,
+  cacheKeyParts,
+  queryHint = null
+}) => {
+  const loadSummaryRows = async () => {
+    const summaryRows = await loadConversationSummaryRows({
+      finalFilters: summaryFilters,
+      limit,
+      queryHint
+    });
+
+    if (summaryRows.conversations.length) {
+      return summaryRows;
+    }
+
+    return loadConversationFallbackRows({
+      finalFilters: fallbackFilters,
+      limit
+    });
+  };
+
+  const cachedSummaryRows = scope
+    ? await getOrSetCachedJson({
+        namespace: 'conversations',
+        scope,
+        versionGroup: 'summaryPages',
+        keyParts: cacheKeyParts,
+        ttlSeconds: CACHE_TTL_SECONDS.summaryPages,
+        loader: loadSummaryRows
+      })
+    : await loadSummaryRows();
+
+  const conversations = await attachContactSnapshotsToConversations(
+    cachedSummaryRows?.conversations || [],
+    req
+  );
+
+  return {
+    conversations,
+    hasMore: Boolean(cachedSummaryRows?.hasMore),
+    nextCursor: cachedSummaryRows?.nextCursor || null
+  };
+};
+
 class ConversationController {
   async getConversations(req, res) {
     try {
       const { status, assignedTo, search } = req.query;
+      const conversationFilter = normalizeConversationFilter(
+        req.query?.filter || req.query?.conversationFilter || ''
+      );
       const filters = buildScopedFilters(req);
       const scopeVariants = getInboxScopeVariants({
         companyId: filters.companyId,
@@ -221,65 +439,72 @@ class ConversationController {
       const parsedLimit = Number(req.query?.limit);
       const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 200)) : 0;
       const cursor = decodeConversationCursor(req.query?.cursor);
-      const finalFilters = cursor
-        ? { ...filters, ...buildConversationCursorFilter(cursor) }
-        : filters;
+      const normalizedSearch = String(search || '').trim();
+      const normalizedSearchLower = normalizedSearch.toLowerCase();
+      const searchPlan = buildInboxSearchPlan(normalizedSearch);
+      const cacheKeyParts = [
+        String(status || '').trim(),
+        String(assignedTo || '').trim(),
+        conversationFilter,
+        normalizedSearchLower,
+        String(limit || 0),
+        encodeConversationCursorCacheKey(cursor)
+      ];
+      const summaryFilters = { ...filters };
+      const fallbackFilters = { ...filters };
+      const summaryFilterClauses = [];
+      const fallbackFilterClauses = [];
+      const queryHint = searchPlan.hint;
+      const unreadFilterClause = buildConversationUnreadFilterClause(conversationFilter);
+      if (cursor) {
+        const cursorFilter = buildConversationCursorFilter(cursor);
+        summaryFilterClauses.push(cursorFilter);
+        fallbackFilterClauses.push(cursorFilter);
+      }
+      if (unreadFilterClause) {
+        summaryFilterClauses.push(unreadFilterClause);
+        fallbackFilterClauses.push(unreadFilterClause);
+      }
+      if (normalizedSearch) {
+        summaryFilterClauses.push(searchPlan.summaryClause);
+        fallbackFilterClauses.push(searchPlan.fallbackClause);
+      }
+      if (summaryFilterClauses.length === 1) {
+        Object.assign(summaryFilters, summaryFilterClauses[0]);
+      } else if (summaryFilterClauses.length > 1) {
+        summaryFilters.$and = summaryFilterClauses;
+      }
+      if (fallbackFilterClauses.length === 1) {
+        Object.assign(fallbackFilters, fallbackFilterClauses[0]);
+      } else if (fallbackFilterClauses.length > 1) {
+        fallbackFilters.$and = fallbackFilterClauses;
+      }
 
       const cachedResponse = scope
         ? await getOrSetCachedJson({
             namespace: 'conversations',
             scope,
             versionGroup: 'list',
-            keyParts: [
-              String(status || '').trim(),
-              String(assignedTo || '').trim(),
-              String(search || '').trim().toLowerCase(),
-              String(limit || 0),
-              String(cursor || '').trim()
-            ],
+            keyParts: cacheKeyParts,
             ttlSeconds: CACHE_TTL_SECONDS.conversations,
             loader: async () => {
-              let query = Conversation.find(finalFilters)
-                .select(TEAM_INBOX_CONVERSATION_FIELDS)
-                .populate('contactId', TEAM_INBOX_CONTACT_FIELDS)
-                .sort({ lastMessageTime: -1, _id: -1 })
-                .lean();
-
-              if (limit > 0) {
-                query = query.limit(limit + 1);
-              }
-
-              let conversations = await query;
-
-              conversations = (Array.isArray(conversations) ? conversations : []).map((conv) => {
-                const fromConversation = Number(conv.unreadCount || 0);
-                conv.unreadCount = Number.isFinite(fromConversation) ? Math.max(0, fromConversation) : 0;
-                return conv;
+              const summaryPage = await loadConversationSummaryPage({
+                summaryFilters,
+                fallbackFilters,
+                limit,
+                req,
+                scope,
+                cacheKeyParts,
+                queryHint
               });
-
-              if (search) {
-                const searchLower = String(search || '').toLowerCase();
-                conversations = conversations.filter(
-                  (conv) =>
-                    conv.contactName?.toLowerCase().includes(searchLower) ||
-                    conv.contactPhone?.includes(search) ||
-                    conv.lastMessage?.toLowerCase().includes(searchLower)
-                );
-              }
-
-              let hasMore = false;
-              if (limit > 0 && conversations.length > limit) {
-                hasMore = true;
-                conversations = conversations.slice(0, limit);
-              }
 
               return {
                 success: true,
-                data: conversations,
+                data: summaryPage.conversations,
                 meta: {
                   limit: limit || null,
-                  hasMore,
-                  nextCursor: hasMore ? encodeConversationCursor(conversations[conversations.length - 1]) : null
+                  hasMore: summaryPage.hasMore,
+                  nextCursor: summaryPage.nextCursor
                 }
               };
             }
@@ -318,15 +543,12 @@ class ConversationController {
       const limit = Math.max(1, Math.min(500, Number(req.query?.limit || 100)));
       const cursor = decodeContactCursor(req.query?.cursor);
       const filters = buildScopedFilters(req);
-      
-      if (search) {
-        filters.$or = [
-          { name: { $regex: search, $options: 'i' } },
-          { phone: { $regex: search, $options: 'i' } },
-          { email: { $regex: search, $options: 'i' } }
-        ];
+      const searchPlan = buildContactSearchPlan(search);
+
+      if (searchPlan.summaryClause) {
+        filters.$and = filters.$and ? [...filters.$and, searchPlan.summaryClause] : [searchPlan.summaryClause];
       }
-      
+
       if (tags) {
         const tagArray = Array.isArray(tags) ? tags : tags.split(',');
         filters.tags = { $in: tagArray };
@@ -339,14 +561,18 @@ class ConversationController {
       if (requestedSourceType) {
         filters.sourceType = requestedSourceType;
       }
-      
+
       const totalCount = await Contact.countDocuments(filters);
       const cursorFilters = cursor ? { ...filters, ...buildContactCursorFilter(cursor) } : filters;
-      let contacts = await Contact.find(cursorFilters)
+      let contactQuery = Contact.find(cursorFilters)
         .select(CONTACT_LIST_FIELDS)
-        .sort({ lastContact: -1, createdAt: -1, _id: -1 })
-        .limit(limit + 1)
-        .lean();
+        .sort({ lastContact: -1, createdAt: -1, _id: -1 });
+
+      if (searchPlan.hint) {
+        contactQuery = contactQuery.hint(searchPlan.hint);
+      }
+
+      let contacts = await contactQuery.limit(limit + 1).lean();
 
       const hasMore = contacts.length > limit;
       if (hasMore) {
@@ -534,12 +760,26 @@ class ConversationController {
         { new: true, runValidators: true }
       );
       
-      // If name was updated, also update all conversations for this contact
+      const conversationUpdate = {};
       if (name !== undefined && name !== contact.name) {
+        conversationUpdate.contactName = name;
+      }
+      if (phone !== undefined && phone !== contact.phone) {
+        conversationUpdate.contactPhone = phone;
+      }
+
+      // Keep conversation documents and the read model aligned with the contact record.
+      if (Object.keys(conversationUpdate).length > 0) {
         await Conversation.updateMany(
           buildScopedFilters(req, { contactId: id }),
-          { contactName: name }
+          conversationUpdate
         );
+        const updatedConversations = await Conversation.find(
+          buildScopedFilters(req, { contactId: id })
+        )
+          .select(TEAM_INBOX_CONVERSATION_FIELDS)
+          .lean();
+        await upsertConversationSummaries(updatedConversations);
         await invalidateInboxScope({
           companyId: req.companyId || '',
           userId: req.user.id || ''
@@ -585,6 +825,7 @@ class ConversationController {
       }
       
       await Conversation.deleteOne(buildScopedFilters(req, { _id: id }));
+      await deleteConversationSummary(id);
       await Message.deleteMany(buildScopedFilters(req, { conversationId: id }));
       await invalidateInboxConversation({
         companyId: req.companyId || '',

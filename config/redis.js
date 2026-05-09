@@ -1,8 +1,16 @@
 const IORedis = require('ioredis');
 
+const hasExplicitRedisConfig = Boolean(
+  String(process.env.REDIS_URL || '').trim() ||
+    String(process.env.REDIS_HOST || '').trim() ||
+    String(process.env.REDIS_PORT || '').trim() ||
+    String(process.env.DISABLE_REDIS || '').trim() ||
+    String(process.env.REDIS_DISABLED || '').trim()
+);
+
 const isRedisDisabled =
   String(process.env.DISABLE_REDIS || process.env.REDIS_DISABLED || '').trim().toLowerCase() ===
-  'true';
+    'true' || !hasExplicitRedisConfig;
 
 const redisUrl =
   String(process.env.REDIS_URL || '').trim() ||
@@ -92,6 +100,7 @@ const createRedisConnection = (overrides = {}) => {
 module.exports = {
   redisUrl,
   redisOptions,
+  hasExplicitRedisConfig,
   isRedisDisabled,
   createRedisConnection,
   createNoopRedisConnection
