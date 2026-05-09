@@ -88,6 +88,13 @@ class BroadcastController {
 
   async sendBroadcast(req, res) {
     try {
+      const broadcaster = (payload) => {
+        const sendToUser = req.app?.locals?.sendToUser;
+        if (typeof sendToUser === 'function') {
+          sendToUser(String(req.user.id), payload);
+        }
+      };
+
       const ownership = await this.assertOwnership(
         req.params.id,
         req.user.id,
@@ -116,7 +123,13 @@ class BroadcastController {
         userId: req.user.id,
         companyId: req.companyId || null,
         delayMs: 0,
-        reason: 'manual_http_send'
+        reason: 'manual_http_send',
+        fallbackProcess: () =>
+          broadcastService.sendBroadcast(
+            req.params.id,
+            broadcaster,
+            req.whatsappCredentials || null
+          )
       });
 
       if (!result.success) {

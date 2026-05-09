@@ -7,6 +7,7 @@ const connection = createRedisConnection({
   maxRetriesPerRequest: null,
   enableOfflineQueue: true
 });
+const localFallbackJobs = new Map();
 
 connection.on('error', (error) => {
   const message = String(error?.message || '').trim();
@@ -40,6 +41,93 @@ const createNoopQueueEvents = () => ({
   off: () => undefined,
   close: async () => undefined
 });
+
+const updateBroadcastQueueState = async ({ broadcastId, status, jobId, error = '' } = {}) => {
+  if (!broadcastId) return;
+
+  const setPayload = {
+    status,
+    updatedAt: new Date()
+  };
+
+  if (jobId) {
+    setPayload.queueJobId = jobId;
+    setPayload.queueQueuedAt = new Date();
+  }
+
+  if (error) {
+    setPayload.queueLastError = String(error).trim();
+  }
+
+  if (status === 'failed') {
+    setPayload.completedAt = new Date();
+  }
+
+  await Broadcast.updateOne(
+    { _id: broadcastId },
+    {
+      $set: setPayload
+    }
+  );
+};
+
+const scheduleLocalFallbackJob = async ({
+  jobId,
+  delayMs = 0,
+  broadcastId = null,
+  nextStatus = 'queued',
+  run
+}) => {
+  const existing = localFallbackJobs.get(jobId);
+  if (existing) {
+    return existing.job;
+  }
+
+  const job = {
+    id: jobId,
+    data: {
+      broadcastId: String(broadcastId || '')
+    },
+    localFallback: true
+  };
+
+  localFallbackJobs.set(jobId, { job });
+
+  if (broadcastId) {
+    await updateBroadcastQueueState({
+      broadcastId,
+      status: nextStatus,
+      jobId
+    });
+  }
+
+  const timer = setTimeout(async () => {
+    try {
+      const result = typeof run === 'function' ? await run() : null;
+      if (result && result.success === false) {
+        await updateBroadcastQueueState({
+          broadcastId,
+          status: 'failed',
+          error: result.error || 'Local broadcast fallback failed'
+        });
+      }
+    } catch (error) {
+      await updateBroadcastQueueState({
+        broadcastId,
+        status: 'failed',
+        error: error?.message || error
+      });
+      console.error('Local broadcast fallback job failed:', error?.message || error);
+    } finally {
+      localFallbackJobs.delete(jobId);
+    }
+  }, Math.max(0, Math.trunc(Number(delayMs) || 0)));
+
+  timer.unref?.();
+  localFallbackJobs.set(jobId, { job, timer });
+
+  return job;
+};
 
 const broadcastQueue = isRedisDisabled
   ? createNoopQueue()
@@ -159,15 +247,9 @@ const enqueueBroadcastSend = async ({
   companyId = null,
   scheduledAt = null,
   delayMs = null,
-  reason = 'manual'
+  reason = 'manual',
+  fallbackProcess = null
 }) => {
-  if (isRedisDisabled) {
-    return {
-      success: false,
-      error: `${getRedisDisabledReason()}. Configure REDIS_URL or REDIS_HOST/REDIS_PORT to enable broadcast sending.`
-    };
-  }
-
   const broadcast = await Broadcast.findById(broadcastId)
     .select('_id status scheduledAt createdById companyId queueJobId')
     .lean();
@@ -189,6 +271,34 @@ const enqueueBroadcastSend = async ({
       ? Math.max(0, Math.trunc(Number(delayMs)))
       : normalizeDelay(scheduledAt || broadcast.scheduledAt);
   const jobId = `broadcast:${String(broadcastId)}:plan`;
+
+  if (isRedisDisabled) {
+    if (typeof fallbackProcess !== 'function') {
+      return {
+        success: false,
+        error: `${getRedisDisabledReason()}. Configure REDIS_URL or REDIS_HOST/REDIS_PORT to enable broadcast sending.`
+      };
+    }
+
+    const localJob = await scheduleLocalFallbackJob({
+      jobId,
+      delayMs: delay,
+      broadcastId,
+      nextStatus: delay > 0 ? 'scheduled' : 'queued',
+      run: fallbackProcess
+    });
+
+    return {
+      success: true,
+      data: {
+        jobId: localJob.id,
+        delay,
+        status: delay > 0 ? 'scheduled' : 'queued',
+        localFallback: true
+      }
+    };
+  }
+
   const job = await broadcastQueue.add(
     'plan-broadcast',
     {

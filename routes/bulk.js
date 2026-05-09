@@ -662,7 +662,13 @@ router.post(
         userId: req.user.id,
         companyId: req.companyId || null,
         delayMs: 0,
-        reason: 'bulk_upload_send'
+        reason: 'bulk_upload_send',
+        fallbackProcess: () =>
+          broadcastService.sendBroadcast(
+            created.data._id,
+            null,
+            req.whatsappCredentials || null
+          )
       });
 
       if (!queueResult.success) {

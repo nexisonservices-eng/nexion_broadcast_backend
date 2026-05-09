@@ -2338,13 +2338,15 @@ class BroadcastService {
         credentialsSnapshot: sourceBroadcast.credentialsSnapshot
       });
 
-      const queueResult = await enqueueBroadcastSend({
-        broadcastId: retryBroadcast._id,
-        userId: retryBroadcast.createdById,
-        companyId: retryBroadcast.companyId || null,
-        delayMs: 0,
-        reason: 'broadcast_retry'
-      });
+          const queueResult = await enqueueBroadcastSend({
+            broadcastId: retryBroadcast._id,
+            userId: retryBroadcast.createdById,
+            companyId: retryBroadcast.companyId || null,
+            delayMs: 0,
+            reason: 'broadcast_retry',
+            fallbackProcess: () =>
+              this.sendBroadcast(retryBroadcast._id, broadcaster, credentials)
+          });
       if (!queueResult?.success) {
         return {
           success: false,
@@ -2565,7 +2567,8 @@ class BroadcastService {
             userId: claimed.createdById,
             companyId: claimed.companyId || null,
             delayMs: 0,
-            reason: 'scheduler'
+            reason: 'scheduler',
+            fallbackProcess: () => this.sendBroadcast(claimed._id, null, null)
           });
           if (!queueResult?.success) {
             await Broadcast.findByIdAndUpdate(
