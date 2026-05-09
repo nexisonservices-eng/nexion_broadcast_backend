@@ -22,6 +22,50 @@ const buildPhoneCandidates = (value = '') => {
   );
 };
 
+const escapeRegExp = (value = '') => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const buildPhoneLookupFilters = (value = '') => {
+  const rawValue = String(value || '').trim();
+  const normalizedPhone = normalizePhoneDigits(rawValue);
+  if (!rawValue && !normalizedPhone) return null;
+
+  const exactCandidates = buildPhoneCandidates(rawValue);
+  const digitCandidates = Array.from(
+    new Set(
+      [
+        normalizedPhone,
+        normalizedPhone.length > 10 ? normalizedPhone.slice(-10) : '',
+        normalizedPhone.length > 11 ? normalizedPhone.slice(-11) : '',
+        normalizedPhone.length > 12 ? normalizedPhone.slice(-12) : ''
+      ].filter(Boolean)
+    )
+  );
+  const suffixCandidates = Array.from(
+    new Set(
+      [
+        normalizedPhone.length >= 10 ? normalizedPhone.slice(-10) : '',
+        normalizedPhone.length >= 11 ? normalizedPhone.slice(-11) : '',
+        normalizedPhone.length >= 12 ? normalizedPhone.slice(-12) : ''
+      ].filter(Boolean)
+    )
+  );
+
+  const filters = [];
+  if (exactCandidates.length > 0) {
+    filters.push({ phone: { $in: exactCandidates } });
+  }
+  if (digitCandidates.length > 0) {
+    filters.push({ phoneDigits: { $in: digitCandidates } });
+  }
+  suffixCandidates.forEach((suffix) => {
+    const escaped = escapeRegExp(suffix);
+    filters.push({ phone: new RegExp(`${escaped}$`) });
+    filters.push({ phoneDigits: new RegExp(`${escaped}$`) });
+  });
+
+  return filters.length > 0 ? { $or: filters } : null;
+};
+
 const buildCompanyScopeFilter = (companyId) => (companyId ? { companyId } : {});
 
 const maybeApplySort = async (queryLike, sortSpec) => {
@@ -48,13 +92,14 @@ const resolveConversationForOutboundSend = async ({
   if (byScope) return byScope;
 
   const phoneCandidates = buildPhoneCandidates(to);
-  if (!phoneCandidates.length) return null;
+  const phoneLookupFilter = buildPhoneLookupFilters(to);
+  if (!phoneCandidates.length && !phoneLookupFilter) return null;
 
   return maybeApplySort(
     Conversation.findOne({
       userId,
       ...buildCompanyScopeFilter(companyId),
-      contactPhone: { $in: phoneCandidates }
+      ...(phoneLookupFilter || { contactPhone: { $in: phoneCandidates } })
     }),
     { lastMessageTime: -1, updatedAt: -1, createdAt: -1 }
   );
@@ -73,6 +118,7 @@ const resolveContactForTemplateSend = async ({
 
   const trimmedContactName = String(contactName || '').trim();
   const phoneCandidates = buildPhoneCandidates(to);
+  const phoneLookupFilter = buildPhoneLookupFilters(to);
   const rawPhoneValue = String(to || '').trim();
 
   let contact = null;
@@ -85,11 +131,11 @@ const resolveContactForTemplateSend = async ({
     });
   }
 
-  if (!contact && phoneCandidates.length > 0) {
+  if (!contact && phoneLookupFilter) {
     contact = await Contact.findOne({
       userId,
       ...buildCompanyScopeFilter(companyId),
-      phone: { $in: phoneCandidates }
+      ...phoneLookupFilter
     });
   }
 
@@ -236,6 +282,7 @@ const cleanupCreatedTemplateOutreachTarget = async ({
 module.exports = {
   normalizePhoneDigits,
   buildPhoneCandidates,
+  buildPhoneLookupFilters,
   resolveConversationForOutboundSend,
   resolveOrCreateConversationForTemplateSend,
   markOutboundTemplateContactActivity,

@@ -13,7 +13,8 @@ const { enqueueBroadcastSend } = require('../queues/broadcastQueue');
 const { enqueueBroadcastInboxWrite } = require('../queues/broadcastInboxQueue');
 const { getWhatsAppCredentialsForUser } = require('./userWhatsAppCredentialsService');
 const {
-  buildPhoneCandidates
+  buildPhoneCandidates,
+  buildPhoneLookupFilters
 } = require('./whatsappOutreach/conversationResolver');
 const {
   toCleanString,
@@ -91,13 +92,15 @@ class BroadcastService {
   }
 
   async resolveContactForRecipient({ userId, companyId, phone }) {
-    const phoneCandidates = buildPhoneCandidates(phone);
-    if (!userId || phoneCandidates.length === 0) return null;
+    if (!userId) return null;
+
+    const phoneFilter = buildPhoneLookupFilters(phone);
+    if (!phoneFilter) return null;
 
     return Contact.findOne({
       userId,
       ...(companyId ? { companyId } : {}),
-      phone: { $in: phoneCandidates }
+      ...phoneFilter
     });
   }
 
@@ -1459,6 +1462,7 @@ class BroadcastService {
               retryPolicy
             );
             retried += Number(sendTemplateOutcome?.retriedCount || 0);
+            result = sendTemplateOutcome.result;
             if (!sendTemplateOutcome.success) {
               const errorMeta = sendTemplateOutcome.errorMeta || {};
               failed++;
@@ -1482,7 +1486,6 @@ class BroadcastService {
               });
               continue;
             }
-            result = sendTemplateOutcome.result;
             await this.finalizeBroadcastDispatch({
               broadcastDispatchKey,
               status: 'sent',
@@ -1490,11 +1493,11 @@ class BroadcastService {
             });
             
             console.log(`📤 Template send result for ${phoneNumber}:`, {
-              success: result.success,
+              success: sendTemplateOutcome.success,
               templateName: normalizedTemplateName,
               language: broadcast.language || 'en_US',
               variables: this.normalizeTemplateVariables(recipientVariables),
-              error: result.error
+              error: ''
             });
           } else if (broadcast.message) {
             const freeformValidation = validateFreeformOutboundSend(contact);
@@ -1537,6 +1540,7 @@ class BroadcastService {
               retryPolicy
             );
             retried += Number(sendTextOutcome?.retriedCount || 0);
+            result = sendTextOutcome.result;
             if (!sendTextOutcome.success) {
               const errorMeta = sendTextOutcome.errorMeta || {};
               failed++;
@@ -1560,7 +1564,6 @@ class BroadcastService {
               });
               continue;
             }
-            result = sendTextOutcome.result;
             await this.finalizeBroadcastDispatch({
               broadcastDispatchKey,
               status: 'sent',
@@ -1582,7 +1585,7 @@ class BroadcastService {
             continue;
           }
 
-          if (result.success) {
+          if (result) {
             successful++;
             broadcast.stats.sent++;
             if (skipFinalize) {
@@ -1706,14 +1709,15 @@ class BroadcastService {
         retried: Number(broadcast?.analytics?.retried || 0) + retried,
         failureCodeBreakdown
       };
+      const finalStatus = failed > 0 ? 'completed_with_errors' : 'completed';
       if (!skipFinalize) {
         broadcast.deliveryResults = results;
-        broadcast.status = 'completed';
+        broadcast.status = finalStatus;
         broadcast.completedAt = new Date();
         await broadcast.save();
         this.emitBroadcastRealtimeEvent(broadcaster, {
           type: 'broadcast_updated',
-          action: 'completed',
+          action: finalStatus,
           broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
         });
       } else {
@@ -1727,6 +1731,8 @@ class BroadcastService {
               'analytics.retried': retried
             },
             $set: {
+              status: finalStatus,
+              completedAt: new Date(),
               updatedAt: new Date()
             }
           }
@@ -2144,6 +2150,51 @@ class BroadcastService {
     };
   }
 
+  async repairBroadcastDispatchInboxForBroadcast(broadcastId, limit = 50) {
+    const normalizedBroadcastId = String(broadcastId || '').trim();
+    if (!normalizedBroadcastId) {
+      return { success: false, error: 'Broadcast id is required' };
+    }
+
+    const staleBefore = new Date(
+      Date.now() - Math.max(2 * 60 * 1000, Number(process.env.BROADCAST_DISPATCH_REPAIR_STALE_MS || 5 * 60 * 1000))
+    );
+
+    const dispatches = await BroadcastDispatch.find({
+      broadcastId: normalizedBroadcastId,
+      status: 'sent',
+      $or: [{ messageId: { $exists: false } }, { messageId: null }],
+      sentAt: { $lte: staleBefore }
+    })
+      .sort({ sentAt: 1 })
+      .limit(Math.max(1, Number(limit) || 50))
+      .lean();
+
+    const repaired = [];
+    for (const dispatch of dispatches) {
+      try {
+        const result = await this.repairBroadcastDispatchInbox({
+          broadcastDispatchKey: dispatch.broadcastDispatchKey,
+          whatsappMessageId: dispatch.whatsappMessageId || ''
+        });
+        if (result?.success && result?.data?.repaired) {
+          repaired.push(dispatch.broadcastDispatchKey);
+        }
+      } catch (error) {
+        console.error('Broadcast dispatch repair failed:', error.message);
+      }
+    }
+
+    return {
+      success: true,
+      data: {
+        scanned: dispatches.length,
+        repaired: repaired.length,
+        repairedKeys: repaired
+      }
+    };
+  }
+
   async getBroadcasts(filters = {}) {
     try {
       // Keep list endpoint lightweight for fast overview updates.
@@ -2151,6 +2202,39 @@ class BroadcastService {
         .select('name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language')
         .sort({ createdAt: -1 })
         .lean();
+
+      const staleCandidates = Array.isArray(broadcasts)
+        ? broadcasts.filter((broadcast) => {
+            const status = String(broadcast?.status || '').toLowerCase();
+            const stats = broadcast?.stats || {};
+            const sent = Number(stats.sent || 0);
+            const delivered = Number(stats.delivered || 0);
+            const read = Number(stats.read || 0);
+            const failed = Number(stats.failed || 0);
+            const replied = Number(stats.replied || 0);
+            const recipientCount = Number(broadcast?.recipientCount || 0);
+            const hasAnyStats = sent > 0 || delivered > 0 || read > 0 || failed > 0 || replied > 0;
+            return (
+              ['completed', 'completed_with_errors'].includes(status) &&
+              recipientCount > 0 &&
+              !hasAnyStats
+            );
+          })
+        : [];
+
+      if (staleCandidates.length > 0) {
+        for (const staleBroadcast of staleCandidates) {
+          try {
+            const repairResult = await this.syncBroadcastStats(staleBroadcast._id);
+            if (repairResult?.success && repairResult?.data?.stats) {
+              staleBroadcast.stats = repairResult.data.stats;
+            }
+          } catch (_repairError) {
+            // Best-effort repair only; keep list endpoint responsive.
+          }
+        }
+      }
+
       return { success: true, data: broadcasts };
     } catch (error) {
       return { success: false, error: error.message };
@@ -2285,10 +2369,10 @@ class BroadcastService {
         return { success: false, error: 'Broadcast not found' };
       }
 
-      if (!['completed', 'failed'].includes(String(sourceBroadcast.status || '').toLowerCase())) {
+      if (!['completed', 'completed_with_errors', 'failed'].includes(String(sourceBroadcast.status || '').toLowerCase())) {
         return {
           success: false,
-          error: 'Retry is allowed only after a completed or failed broadcast'
+          error: 'Retry is allowed only after a completed, partially completed, or failed broadcast'
         };
       }
 

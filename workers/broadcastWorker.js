@@ -270,11 +270,13 @@ const finalizeBroadcastIfReady = async (broadcastId, userId) => {
     return { complete: false, summary };
   }
 
+  const finalStatus = Number(summary.failed || 0) > 0 ? 'completed_with_errors' : 'completed';
+
   const broadcast = await Broadcast.findByIdAndUpdate(
     broadcastId,
     {
       $set: {
-        status: 'completed',
+        status: finalStatus,
         completedAt: new Date(),
         updatedAt: new Date()
       }
@@ -287,7 +289,7 @@ const finalizeBroadcastIfReady = async (broadcastId, userId) => {
       userId,
       payload: {
         type: 'broadcast_updated',
-        action: 'completed',
+        action: finalStatus,
         broadcast: broadcast.toObject ? broadcast.toObject() : broadcast,
         queueSummary: summary
       }
@@ -477,11 +479,12 @@ const broadcastWorker = new Worker(
         });
 
         if (summary.complete) {
+          const finalStatus = Number(summary.failed || 0) > 0 ? 'completed_with_errors' : 'completed';
           await Broadcast.findByIdAndUpdate(
             broadcastId,
             {
               $set: {
-                status: 'completed',
+                status: finalStatus,
                 completedAt: new Date(),
                 updatedAt: new Date()
               }

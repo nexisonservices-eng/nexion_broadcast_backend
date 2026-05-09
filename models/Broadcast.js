@@ -36,7 +36,7 @@ const BroadcastSchema = new mongoose.Schema({
   recipientCount: { type: Number, default: 0 },
   status: { 
     type: String, 
-    enum: ['draft', 'scheduled', 'queued', 'sending', 'completed', 'paused', 'cancelled', 'failed'], 
+    enum: ['draft', 'scheduled', 'queued', 'sending', 'completed', 'completed_with_errors', 'paused', 'cancelled', 'failed'], 
     default: 'draft',
     index: true
   },

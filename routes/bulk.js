@@ -12,7 +12,7 @@ const { enqueueCsvImport } = require('../queues/csvImportQueue');
 const { processCsvImport } = require('../services/csvImportProcessor');
 const CsvImportJob = require('../models/CsvImportJob');
 const Contact = require('../models/Contact');
-const { buildPhoneCandidates } = require('../services/whatsappOutreach/conversationResolver');
+const { buildPhoneLookupFilters } = require('../services/whatsappOutreach/conversationResolver');
 const {
   buildBroadcastAudienceValidation,
   toCleanString
@@ -51,20 +51,22 @@ const buildScopedContactFilter = (req, extra = {}) => {
 };
 
 const buildContactsByPhoneMap = async (req, recipients = []) => {
-  const allPhoneCandidates = Array.from(
+  const phoneFilters = Array.from(
     new Set(
       (Array.isArray(recipients) ? recipients : [])
-        .flatMap((recipient) => buildPhoneCandidates(recipient?.phone || ''))
+        .map((recipient) => String(recipient?.phone || '').trim())
         .filter(Boolean)
     )
-  );
+  )
+    .map((phone) => buildPhoneLookupFilters(phone))
+    .filter(Boolean);
 
-  if (!allPhoneCandidates.length) {
+  if (!phoneFilters.length) {
     return new Map();
   }
 
   const contacts = await Contact.find(
-    buildScopedContactFilter(req, { phone: { $in: allPhoneCandidates } })
+    buildScopedContactFilter(req, phoneFilters.length === 1 ? phoneFilters[0] : { $or: phoneFilters })
   )
     .select(
       '_id phone isBlocked sourceType whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata whatsappOptOutAt serviceWindowClosesAt lastInboundMessageAt'

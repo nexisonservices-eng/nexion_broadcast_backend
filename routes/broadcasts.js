@@ -43,6 +43,7 @@ router.post('/:id/send', requirePlanFeature('broadcastMessaging'), requireWhatsA
 router.post('/:id/pause', (req, res) => broadcastController.pauseBroadcast(req, res));
 router.post('/:id/resume', (req, res) => broadcastController.resumeBroadcast(req, res));
 router.post('/:id/cancel', (req, res) => broadcastController.cancelScheduledBroadcast(req, res));
+router.post('/:id/repair-dispatch-inbox', (req, res) => broadcastController.repairBroadcastDispatchInbox(req, res));
 router.post(
   '/:id/retry-failed',
   requirePlanFeature('broadcastMessaging'),

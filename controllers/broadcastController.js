@@ -438,6 +438,32 @@ class BroadcastController {
     }
   }
 
+  async repairBroadcastDispatchInbox(req, res) {
+    try {
+      const { id } = req.params;
+      const ownership = await this.assertOwnership(
+        id,
+        req.user.id,
+        req.companyId,
+        req.user?.normalizedRole || req.user?.companyRole || req.user?.role,
+        req
+      );
+      if (!ownership.ok) {
+        return res.status(ownership.status).json(ownership.body);
+      }
+
+      const limit = Math.max(1, Number(req.query?.limit || req.body?.limit || 50) || 50);
+      const result = await broadcastService.repairBroadcastDispatchInboxForBroadcast(id, limit);
+      if (result.success) {
+        return res.json(result);
+      }
+
+      return res.status(400).json(result);
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
   async getQueueMetrics(req, res) {
     try {
       const [sendCounts, inboxCounts, sendLag, inboxLag, rateLimitSnapshot] = await Promise.all([
