@@ -35,6 +35,7 @@ const requireSchedulerTriggerAccess = (req, res, next) => {
 };
 
 router.get('/', (req, res) => broadcastController.getBroadcasts(req, res));
+router.get('/queue/metrics', (req, res) => broadcastController.getQueueMetrics(req, res));
 router.get('/analytics/reliability', (req, res) => broadcastController.getReliabilitySummary(req, res));
 router.get('/:id', (req, res) => broadcastController.getBroadcastById(req, res));
 router.post('/', requireWhatsAppCredentials, (req, res) => broadcastController.createBroadcast(req, res));

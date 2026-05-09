@@ -2,9 +2,11 @@ const Broadcast = require('../models/Broadcast');
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
+const BroadcastDispatch = require('../models/BroadcastDispatch');
 const LeadActivity = require('../models/LeadActivity');
 const Template = require('../models/Template');
 const whatsappService = require('./whatsappService');
+const { enqueueBroadcastSend } = require('../queues/broadcastQueue');
 const { getWhatsAppCredentialsForUser } = require('./userWhatsAppCredentialsService');
 const {
   buildPhoneCandidates
@@ -920,12 +922,15 @@ class BroadcastService {
     }
   }
 
-  async sendBroadcast(broadcastId, broadcaster, credentials = null) {
+  async sendBroadcast(broadcastId, broadcaster, credentials = null, options = {}) {
     try {
       const broadcast = await Broadcast.findById(broadcastId);
       if (!broadcast) {
         return { success: false, error: 'Broadcast not found' };
       }
+
+      const recipientSubset = Array.isArray(options?.recipientSubset) ? options.recipientSubset : null;
+      const skipFinalize = Boolean(options?.skipFinalize);
 
       const retryPolicy = this.normalizeRetryPolicy(broadcast?.retryPolicy || {});
       const deliveryPolicy = this.normalizeDeliveryPolicy(broadcast?.deliveryPolicy || {});
@@ -1002,14 +1007,21 @@ class BroadcastService {
         recipientsCount: broadcast.recipients?.length || 0
       });
 
-      broadcast.status = 'sending';
-      broadcast.startedAt = new Date();
-      await broadcast.save();
-      this.emitBroadcastRealtimeEvent(broadcaster, {
-        type: 'broadcast_updated',
-        action: 'sending',
-        broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
-      });
+      if (!skipFinalize) {
+        broadcast.status = 'sending';
+        broadcast.startedAt = new Date();
+        await broadcast.save();
+        this.emitBroadcastRealtimeEvent(broadcaster, {
+          type: 'broadcast_updated',
+          action: 'sending',
+          broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
+        });
+      } else if (String(broadcast.status || '').toLowerCase() !== 'sending') {
+        await Broadcast.updateOne(
+          { _id: broadcast._id },
+          { $set: { status: 'sending', startedAt: new Date(), updatedAt: new Date() } }
+        );
+      }
 
       const results = [];
       let successful = 0;
@@ -1095,7 +1107,7 @@ class BroadcastService {
         };
       }
 
-      const recipients = Array.isArray(broadcast.recipients) ? broadcast.recipients : [];
+      const recipients = recipientSubset || (Array.isArray(broadcast.recipients) ? broadcast.recipients : []);
       for (let batchStart = 0; batchStart < recipients.length; batchStart += batchSize) {
         const batchRecipients = recipients.slice(batchStart, batchStart + batchSize);
         for (const recipient of batchRecipients) {
@@ -1106,8 +1118,33 @@ class BroadcastService {
           let result;
           const phoneNumber = recipient.phone || recipient;
           const normalizedPhone = this.normalizePhoneNumber(phoneNumber);
+          const broadcastDispatchKey = `${broadcast._id}:${normalizedPhone || phoneNumber}`;
+          const dispatchClaim = await this.claimBroadcastDispatch({
+            broadcastDispatchKey,
+            broadcastId: broadcast._id,
+            userId: broadcast.createdById,
+            companyId: broadcast.companyId,
+            recipientPhone: phoneNumber,
+            chunkId: String(options?.chunkId || ''),
+            chunkIndex: Number(options?.chunkIndex || 0),
+            recipientIndex: Number(batchStart + batchRecipients.indexOf(recipient) || 0)
+          });
+          if (dispatchClaim?.alreadyFinal || dispatchClaim?.locked) {
+            results.push({
+              phone: phoneNumber,
+              success: true,
+              skipped: true,
+              reason: dispatchClaim?.alreadyFinal ? 'already_dispatched' : 'locked_by_active_claim'
+            });
+            continue;
+          }
           if (normalizedPhone && suppressionSet.has(normalizedPhone)) {
             suppressed += 1;
+            await this.finalizeBroadcastDispatch({
+              broadcastDispatchKey,
+              status: 'suppressed',
+              errorMessage: 'suppressed_by_compliance_policy'
+            });
             results.push({
               phone: phoneNumber,
               success: false,
@@ -1132,6 +1169,11 @@ class BroadcastService {
           if (!contact && requiresContactRecord) {
             failed++;
             broadcast.stats.failed++;
+            await this.finalizeBroadcastDispatch({
+              broadcastDispatchKey,
+              status: 'skipped',
+              errorMessage: 'contact_record_missing'
+            });
             results.push({
               phone: phoneNumber,
               success: false,
@@ -1144,6 +1186,11 @@ class BroadcastService {
           if (broadcast.templateName) {
             const normalizedTemplateName = String(broadcast.templateName || '').trim();
             if (!normalizedTemplateName) {
+              await this.finalizeBroadcastDispatch({
+                broadcastDispatchKey,
+                status: 'failed',
+                errorMessage: 'template_name_missing'
+              });
               results.push({
                 phone: phoneNumber,
                 success: false,
@@ -1160,6 +1207,11 @@ class BroadcastService {
             if (!templateValidation.ok) {
               failed++;
               broadcast.stats.failed++;
+              await this.finalizeBroadcastDispatch({
+                broadcastDispatchKey,
+                status: 'skipped',
+                errorMessage: templateValidation.error
+              });
               results.push({
                 phone: phoneNumber,
                 success: false,
@@ -1168,6 +1220,21 @@ class BroadcastService {
               });
               continue;
             }
+
+            messageTextForInbox = templatePreviewText
+              ? this.processTemplateVariables(
+                  templatePreviewText,
+                  this.normalizeTemplateVariables(recipientVariables),
+                  rowData
+                )
+              : `Template: ${normalizedTemplateName}`;
+            await this.noteBroadcastDispatchPayload({
+              broadcastDispatchKey,
+              messageText: messageTextForInbox,
+              messageKind: 'template',
+              templateName: normalizedTemplateName,
+              templateLanguage: broadcast.language || 'en_US'
+            });
 
             const sendTemplateOutcome = await this.sendWithRetry(
               () =>
@@ -1187,6 +1254,11 @@ class BroadcastService {
               const errorMeta = sendTemplateOutcome.errorMeta || {};
               failed++;
               broadcast.stats.failed++;
+              await this.finalizeBroadcastDispatch({
+                broadcastDispatchKey,
+                status: 'failed',
+                errorMessage: errorMeta.errorMessage || 'Template send failed'
+              });
               if (errorMeta.errorCode) {
                 failureCodeBreakdown[errorMeta.errorCode] =
                   Number(failureCodeBreakdown[errorMeta.errorCode] || 0) + 1;
@@ -1202,6 +1274,11 @@ class BroadcastService {
               continue;
             }
             result = sendTemplateOutcome.result;
+            await this.finalizeBroadcastDispatch({
+              broadcastDispatchKey,
+              status: 'sent',
+              whatsappMessageId: result?.data?.messages?.[0]?.id || ''
+            });
             
             console.log(`📤 Template send result for ${phoneNumber}:`, {
               success: result.success,
@@ -1210,19 +1287,16 @@ class BroadcastService {
               variables: this.normalizeTemplateVariables(recipientVariables),
               error: result.error
             });
-            
-            messageTextForInbox = templatePreviewText
-              ? this.processTemplateVariables(
-                  templatePreviewText,
-                  this.normalizeTemplateVariables(recipientVariables),
-                  rowData
-                )
-              : `Template: ${normalizedTemplateName}`;
           } else if (broadcast.message) {
             const freeformValidation = validateFreeformOutboundSend(contact);
             if (!freeformValidation.ok) {
               failed++;
               broadcast.stats.failed++;
+              await this.finalizeBroadcastDispatch({
+                broadcastDispatchKey,
+                status: 'skipped',
+                errorMessage: freeformValidation.error
+              });
               results.push({
                 phone: phoneNumber,
                 success: false,
@@ -1238,6 +1312,12 @@ class BroadcastService {
               recipientVariables,
               rowData
             );
+            messageTextForInbox = processedMessage;
+            await this.noteBroadcastDispatchPayload({
+              broadcastDispatchKey,
+              messageText: messageTextForInbox,
+              messageKind: 'text'
+            });
             const sendTextOutcome = await this.sendWithRetry(
               () => whatsappService.sendTextMessage(phoneNumber, processedMessage, resolvedCredentials),
               retryPolicy
@@ -1247,6 +1327,11 @@ class BroadcastService {
               const errorMeta = sendTextOutcome.errorMeta || {};
               failed++;
               broadcast.stats.failed++;
+              await this.finalizeBroadcastDispatch({
+                broadcastDispatchKey,
+                status: 'failed',
+                errorMessage: errorMeta.errorMessage || 'Message send failed'
+              });
               if (errorMeta.errorCode) {
                 failureCodeBreakdown[errorMeta.errorCode] =
                   Number(failureCodeBreakdown[errorMeta.errorCode] || 0) + 1;
@@ -1262,8 +1347,17 @@ class BroadcastService {
               continue;
             }
             result = sendTextOutcome.result;
-            messageTextForInbox = processedMessage;
+            await this.finalizeBroadcastDispatch({
+              broadcastDispatchKey,
+              status: 'sent',
+              whatsappMessageId: result?.data?.messages?.[0]?.id || ''
+            });
           } else {
+            await this.finalizeBroadcastDispatch({
+              broadcastDispatchKey,
+              status: 'failed',
+              errorMessage: 'No message or template specified'
+            });
             results.push({
               phone: phoneNumber,
               success: false,
@@ -1285,7 +1379,8 @@ class BroadcastService {
               result.data,
               broadcast._id,
               broadcast.createdById,
-              broadcast.companyId
+              broadcast.companyId,
+              broadcastDispatchKey
             );
 
             if (broadcast.templateName && templateCategory === 'marketing' && contact) {
@@ -1319,6 +1414,11 @@ class BroadcastService {
             failed++;
             broadcast.stats.failed++;
             const errorMeta = this.classifySendError(result?.error || result);
+            await this.finalizeBroadcastDispatch({
+              broadcastDispatchKey,
+              status: 'failed',
+              errorMessage: errorMeta.errorMessage
+            });
             console.error(`❌ Failed to send to ${phoneNumber}:`, errorMeta.errorMessage);
             results.push({
               phone: phoneNumber,
@@ -1344,6 +1444,15 @@ class BroadcastService {
           failed++;
           broadcast.stats.failed++;
           const errorMeta = this.classifySendError(error);
+          try {
+            await this.finalizeBroadcastDispatch({
+              broadcastDispatchKey,
+              status: 'failed',
+              errorMessage: errorMeta.errorMessage || error.message
+            });
+          } catch (_dispatchFinalizeError) {
+            // best effort only
+          }
           results.push({
             phone: recipient.phone || recipient,
             success: false,
@@ -1367,15 +1476,32 @@ class BroadcastService {
         retried: Number(broadcast?.analytics?.retried || 0) + retried,
         failureCodeBreakdown
       };
-      broadcast.deliveryResults = results;
-      broadcast.status = 'completed';
-      broadcast.completedAt = new Date();
-      await broadcast.save();
-      this.emitBroadcastRealtimeEvent(broadcaster, {
-        type: 'broadcast_updated',
-        action: 'completed',
-        broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
-      });
+      if (!skipFinalize) {
+        broadcast.deliveryResults = results;
+        broadcast.status = 'completed';
+        broadcast.completedAt = new Date();
+        await broadcast.save();
+        this.emitBroadcastRealtimeEvent(broadcaster, {
+          type: 'broadcast_updated',
+          action: 'completed',
+          broadcast: broadcast.toObject ? broadcast.toObject() : broadcast
+        });
+      } else {
+        await Broadcast.updateOne(
+          { _id: broadcast._id },
+          {
+            $inc: {
+              'stats.sent': successful,
+              'stats.failed': failed,
+              'analytics.suppressed': suppressed,
+              'analytics.retried': retried
+            },
+            $set: {
+              updatedAt: new Date()
+            }
+          }
+        );
+      }
 
       if (usageBatchCount > 0) {
         await this.reportUsage(broadcast.companyId, usageBatchCount);
@@ -1390,9 +1516,9 @@ class BroadcastService {
         data: {
           engine: 'broadcast_direct_meta_v2',
           broadcast,
-          results,
+          results: skipFinalize ? [] : results,
           stats: {
-            total: broadcast.recipients.length,
+            total: recipients.length,
             successful,
             failed,
             suppressed,
@@ -1414,7 +1540,7 @@ class BroadcastService {
     }
   }
 
-  async updateConversation(phone, message, whatsappResponse, broadcastId, userId, companyId) {
+  async updateConversation(phone, message, whatsappResponse, broadcastId, userId, companyId, broadcastDispatchKey = '') {
     try {
       const whatsappMessageId = whatsappResponse?.messages?.[0]?.id;
       let contact = await Contact.findOne({ userId, companyId, phone });
@@ -1472,6 +1598,7 @@ class BroadcastService {
         text: message,
         whatsappMessageId,
         status: 'sent',
+        ...(broadcastDispatchKey ? { broadcastDispatchKey } : {}),
         ...(broadcastId ? { broadcastId } : {})
       });
 
@@ -1480,6 +1607,276 @@ class BroadcastService {
       console.error('Error updating conversation:', error);
       return { conversation: null, message: null };
     }
+  }
+
+  async claimBroadcastDispatch({
+    broadcastDispatchKey,
+    broadcastId,
+    userId,
+    companyId,
+    recipientPhone,
+    chunkId = '',
+    chunkIndex = 0,
+    recipientIndex = 0
+  }) {
+    const now = new Date();
+    const staleWindowMs = Math.max(60_000, Number(process.env.BROADCAST_DISPATCH_STALE_MS || 5 * 60 * 1000));
+    const staleBefore = new Date(now.getTime() - staleWindowMs);
+
+    const existing = await BroadcastDispatch.findOne({ broadcastDispatchKey }).lean();
+    if (existing?.status === 'sent' || existing?.status === 'suppressed' || existing?.status === 'skipped') {
+      return { claimed: false, alreadyFinal: true, dispatch: existing };
+    }
+
+    if (existing?.status === 'sending' && existing?.claimedAt && new Date(existing.claimedAt) > staleBefore) {
+      return { claimed: false, locked: true, dispatch: existing };
+    }
+
+    const nextRetryCount = Number(existing?.retryCount || 0) + 1;
+    const nextStatus = existing ? 'sending' : 'pending';
+    const dispatch = await BroadcastDispatch.findOneAndUpdate(
+      { broadcastDispatchKey },
+      {
+        $setOnInsert: {
+          broadcastDispatchKey,
+          broadcastId,
+          userId,
+          companyId: companyId || null,
+          recipientPhone,
+          chunkId,
+          chunkIndex,
+          recipientIndex,
+          createdAt: now
+        },
+        $set: {
+          status: 'sending',
+          claimedAt: now,
+          lastAttemptAt: now,
+          errorMessage: '',
+          updatedAt: now
+        },
+        $inc: {
+          retryCount: existing ? 1 : 0
+        }
+      },
+      {
+        new: true,
+        upsert: true
+      }
+    ).lean();
+
+    return {
+      claimed: true,
+      dispatch,
+      previousStatus: nextStatus,
+      retryCount: nextRetryCount
+    };
+  }
+
+  async noteBroadcastDispatchPayload({
+    broadcastDispatchKey,
+    messageText = '',
+    messageKind = 'text',
+    templateName = '',
+    templateLanguage = ''
+  }) {
+    if (!broadcastDispatchKey) return;
+    await BroadcastDispatch.updateOne(
+      { broadcastDispatchKey },
+      {
+        $set: {
+          messageText: String(messageText || ''),
+          messageKind: String(messageKind || 'text'),
+          templateName: String(templateName || ''),
+          templateLanguage: String(templateLanguage || ''),
+          updatedAt: new Date()
+        }
+      }
+    );
+  }
+
+  async finalizeBroadcastDispatch({
+    broadcastDispatchKey,
+    status,
+    whatsappMessageId = '',
+    conversationId = null,
+    messageId = null,
+    errorMessage = ''
+  }) {
+    const now = new Date();
+    const normalizedStatus = String(status || '').toLowerCase();
+    const update = {
+      status: normalizedStatus,
+      lastAttemptAt: now,
+      updatedAt: now,
+      errorMessage: String(errorMessage || '').trim()
+    };
+    if (normalizedStatus === 'sent') {
+      update.sentAt = now;
+      update.whatsappMessageId = String(whatsappMessageId || '').trim();
+      update.conversationId = conversationId || null;
+      update.messageId = messageId || null;
+    } else if (normalizedStatus === 'failed') {
+      update.failedAt = now;
+    }
+
+    await BroadcastDispatch.updateOne(
+      { broadcastDispatchKey },
+      {
+        $set: update
+      }
+    );
+  }
+
+  async repairBroadcastDispatchInbox({
+    broadcastDispatchKey = '',
+    whatsappMessageId = '',
+    messageId = null
+  }) {
+    const dispatchQuery = broadcastDispatchKey
+      ? { broadcastDispatchKey }
+      : whatsappMessageId
+        ? { whatsappMessageId }
+        : null;
+
+    if (!dispatchQuery) {
+      return { success: false, error: 'Missing dispatch key or whatsapp message id' };
+    }
+
+    const dispatch = await BroadcastDispatch.findOne(dispatchQuery);
+    if (!dispatch) {
+      return { success: false, error: 'Dispatch not found' };
+    }
+
+    if (dispatch.messageId) {
+      return { success: true, data: { repaired: false, reason: 'already_linked' } };
+    }
+
+    const existingMessage =
+      (dispatch.broadcastDispatchKey
+        ? await Message.findOne({ broadcastDispatchKey: dispatch.broadcastDispatchKey }).lean()
+        : null) ||
+      (whatsappMessageId
+        ? await Message.findOne({ whatsappMessageId }).lean()
+        : null);
+
+    if (existingMessage) {
+      await BroadcastDispatch.updateOne(
+        { _id: dispatch._id },
+        {
+          $set: {
+            messageId: existingMessage._id,
+            conversationId: existingMessage.conversationId || null,
+            whatsappMessageId: existingMessage.whatsappMessageId || whatsappMessageId || '',
+            status: 'sent',
+            sentAt: existingMessage.timestamp || new Date(),
+            updatedAt: new Date()
+          }
+        }
+      );
+      return { success: true, data: { repaired: false, reason: 'message_already_exists' } };
+    }
+
+    const broadcast = await Broadcast.findById(dispatch.broadcastId).lean();
+    if (!broadcast) {
+      return { success: false, error: 'Broadcast not found for repair' };
+    }
+
+    const inboxText = String(dispatch.messageText || '').trim();
+    if (!inboxText) {
+      return { success: false, error: 'Missing dispatch message text for repair' };
+    }
+
+    const phone = String(dispatch.recipientPhone || '').trim();
+    const response = { messages: [{ id: String(whatsappMessageId || dispatch.whatsappMessageId || '') }] };
+    const updateResult = await this.updateConversation(
+      phone,
+      inboxText,
+      response,
+      dispatch.broadcastId,
+      dispatch.userId,
+      dispatch.companyId,
+      dispatch.broadcastDispatchKey
+    );
+
+    if (!updateResult?.message?._id) {
+      return { success: false, error: 'Failed to reconstruct inbox message' };
+    }
+
+    if (messageId) {
+      await BroadcastDispatch.updateOne(
+        { _id: dispatch._id },
+        {
+          $set: {
+            messageId,
+            conversationId: updateResult.conversation?._id || null,
+            whatsappMessageId: whatsappMessageId || dispatch.whatsappMessageId || '',
+            status: 'sent',
+            sentAt: new Date(),
+            updatedAt: new Date()
+          }
+        }
+      );
+    } else {
+      await BroadcastDispatch.updateOne(
+        { _id: dispatch._id },
+        {
+          $set: {
+            messageId: updateResult.message._id,
+            conversationId: updateResult.conversation?._id || null,
+            whatsappMessageId: whatsappMessageId || dispatch.whatsappMessageId || '',
+            status: 'sent',
+            sentAt: new Date(),
+            updatedAt: new Date()
+          }
+        }
+      );
+    }
+
+    return {
+      success: true,
+      data: {
+        repaired: true,
+        conversationId: String(updateResult.conversation?._id || ''),
+        messageId: String(updateResult.message._id || '')
+      }
+    };
+  }
+
+  async repairMissingBroadcastDispatchInboxes(limit = 50) {
+    const staleBefore = new Date(Date.now() - Math.max(2 * 60 * 1000, Number(process.env.BROADCAST_DISPATCH_REPAIR_STALE_MS || 5 * 60 * 1000)));
+    const dispatches = await BroadcastDispatch.find({
+      status: 'sent',
+      $or: [{ messageId: { $exists: false } }, { messageId: null }],
+      sentAt: { $lte: staleBefore }
+    })
+      .sort({ sentAt: 1 })
+      .limit(Math.max(1, Number(limit) || 50))
+      .lean();
+
+    const repaired = [];
+    for (const dispatch of dispatches) {
+      try {
+        const result = await this.repairBroadcastDispatchInbox({
+          broadcastDispatchKey: dispatch.broadcastDispatchKey,
+          whatsappMessageId: dispatch.whatsappMessageId || ''
+        });
+        if (result?.success && result?.data?.repaired) {
+          repaired.push(dispatch.broadcastDispatchKey);
+        }
+      } catch (error) {
+        console.error('Dispatch inbox repair failed:', error.message);
+      }
+    }
+
+    return {
+      success: true,
+      data: {
+        scanned: dispatches.length,
+        repaired: repaired.length,
+        repairedKeys: repaired
+      }
+    };
   }
 
   async getBroadcasts(filters = {}) {
@@ -1676,11 +2073,17 @@ class BroadcastService {
         credentialsSnapshot: sourceBroadcast.credentialsSnapshot
       });
 
-      const result = await this.sendBroadcast(retryBroadcast._id, broadcaster, credentials);
-      if (!result?.success) {
+      const queueResult = await enqueueBroadcastSend({
+        broadcastId: retryBroadcast._id,
+        userId: retryBroadcast.createdById,
+        companyId: retryBroadcast.companyId || null,
+        delayMs: 0,
+        reason: 'broadcast_retry'
+      });
+      if (!queueResult?.success) {
         return {
           success: false,
-          error: result?.error || 'Retry send failed'
+          error: queueResult?.error || 'Retry send failed'
         };
       }
 
@@ -1691,7 +2094,8 @@ class BroadcastService {
           retryBroadcastId: retryBroadcast._id,
           retriedRecipients: retryCandidates.length,
           retryAttempt,
-          result: result.data
+          queueJobId: queueResult.data.jobId,
+          queueStatus: queueResult.data.status
         }
       };
     } catch (error) {
@@ -1891,24 +2295,30 @@ class BroadcastService {
 
         claimedCount += 1;
         try {
-          const result = await this.sendBroadcast(claimed._id);
-          if (!result?.success) {
+          const queueResult = await enqueueBroadcastSend({
+            broadcastId: claimed._id,
+            userId: claimed.createdById,
+            companyId: claimed.companyId || null,
+            delayMs: 0,
+            reason: 'scheduler'
+          });
+          if (!queueResult?.success) {
             await Broadcast.findByIdAndUpdate(
               claimed._id,
-              { $set: { status: 'failed', completedAt: new Date() } },
+              { $set: { status: 'failed', queueLastError: queueResult?.error || 'Queue failed', completedAt: new Date() } },
               { new: false }
             );
             console.error(
-              `Scheduled broadcast failed: ${claimed.name}: ${result?.error || 'Unknown error'}`
+              `Scheduled broadcast queue failed: ${claimed.name}: ${queueResult?.error || 'Unknown error'}`
             );
           }
         } catch (error) {
           await Broadcast.findByIdAndUpdate(
             claimed._id,
-            { $set: { status: 'failed', completedAt: new Date() } },
+            { $set: { status: 'failed', queueLastError: error.message, completedAt: new Date() } },
             { new: false }
           );
-          console.error(`Failed to send scheduled broadcast ${claimed.name}:`, error);
+          console.error(`Failed to queue scheduled broadcast ${claimed.name}:`, error);
         }
       }
 

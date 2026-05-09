@@ -3,6 +3,7 @@ const auth = require('../middleware/auth');
 const requireWhatsAppCredentials = require('../middleware/requireWhatsAppCredentials');
 const requirePlanFeature = require('../middleware/planGuard');
 const broadcastService = require('../services/broadcastService');
+const { enqueueBroadcastSend } = require('../queues/broadcastQueue');
 const Contact = require('../models/Contact');
 const { buildPhoneCandidates } = require('../services/whatsappOutreach/conversationResolver');
 const {
@@ -398,28 +399,24 @@ router.post(
         });
       }
 
-      const broadcaster = (payload) => {
-        const sendToUser = req.app?.locals?.sendToUser;
-        if (typeof sendToUser === 'function') {
-          sendToUser(String(req.user.id), payload);
-        }
-      };
-
-      setImmediate(() => {
-        broadcastService.sendBroadcast(
-          created.data._id,
-          broadcaster,
-          req.whatsappCredentials || null
-        ).catch((error) => {
-          console.error(`Background bulk send failed for ${created.data._id}:`, error);
-        });
+      const queueResult = await enqueueBroadcastSend({
+        broadcastId: created.data._id,
+        userId: req.user.id,
+        companyId: req.companyId || null,
+        delayMs: 0,
+        reason: 'bulk_upload_send'
       });
+
+      if (!queueResult.success) {
+        return res.status(400).json(queueResult);
+      }
 
       return res.status(202).json({
         success: true,
         queued: true,
         engine: 'bulk_broadcast_unified_v3',
         broadcastId: created.data._id,
+        jobId: queueResult.data.jobId,
         total_sent: broadcastRecipients.length,
         successful: 0,
         failed: 0,

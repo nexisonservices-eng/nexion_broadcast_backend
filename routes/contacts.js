@@ -116,6 +116,77 @@ const buildBulkPhoneMatchFilter = (phones = []) => {
   return { phone: { $in: lookupPhones } };
 };
 
+const encodeContactCursor = (contact = {}) => {
+  const payload = {
+    lastContact: contact?.lastContact || contact?.createdAt || null,
+    createdAt: contact?.createdAt || null,
+    id: String(contact?._id || '').trim()
+  };
+
+  if (!payload.id || !payload.lastContact) return '';
+  return Buffer.from(JSON.stringify(payload)).toString('base64url');
+};
+
+const decodeContactCursor = (cursor = '') => {
+  const normalizedCursor = String(cursor || '').trim();
+  if (!normalizedCursor) return null;
+
+  try {
+    const decoded = JSON.parse(Buffer.from(normalizedCursor, 'base64url').toString('utf8'));
+    const lastContact = new Date(decoded?.lastContact || '');
+    const createdAt = new Date(decoded?.createdAt || decoded?.lastContact || '');
+    const id = String(decoded?.id || '').trim();
+    if (!id || Number.isNaN(lastContact.getTime())) return null;
+    return {
+      lastContact,
+      createdAt: Number.isNaN(createdAt.getTime()) ? null : createdAt,
+      id
+    };
+  } catch {
+    const fallbackDate = new Date(normalizedCursor);
+    if (Number.isNaN(fallbackDate.getTime())) return null;
+    return {
+      lastContact: fallbackDate,
+      createdAt: null,
+      id: ''
+    };
+  }
+};
+
+const buildContactCursorFilter = (cursor) => {
+  if (!cursor?.lastContact) return {};
+  const cursorLastContact = new Date(cursor.lastContact);
+  if (Number.isNaN(cursorLastContact.getTime())) return {};
+  const cursorCreatedAt =
+    cursor.createdAt instanceof Date && !Number.isNaN(cursor.createdAt.getTime())
+      ? cursor.createdAt
+      : cursor.createdAt
+        ? new Date(cursor.createdAt)
+        : null;
+  const cursorId = String(cursor.id || '').trim();
+
+  return {
+    $or: [
+      { lastContact: { $lt: cursorLastContact } },
+      cursorCreatedAt
+        ? {
+            lastContact: cursorLastContact,
+            $or: [
+              { createdAt: { $lt: cursorCreatedAt } },
+              {
+                createdAt: cursorCreatedAt,
+                _id: cursorId ? { $lt: cursorId } : { $exists: true }
+              }
+            ]
+          }
+        : {
+            lastContact: cursorLastContact,
+            _id: cursorId ? { $lt: cursorId } : { $exists: true }
+          }
+    ]
+  };
+};
+
 const buildScopeCondition = (req) => {
   const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
   const tenantWide = isTenantWideRole(normalizedRole);
@@ -459,9 +530,8 @@ router.get('/', async (req, res) => {
     const hasWhatsApp =
       String(req.query.hasWhatsApp || '').trim().toLowerCase() === 'true';
     const parsedLimit = Number(req.query.limit);
-    const parsedPage = Number(req.query.page);
     const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(Math.floor(parsedLimit), 200) : null;
-    const page = Number.isFinite(parsedPage) && parsedPage > 0 ? Math.floor(parsedPage) : 1;
+    const cursor = decodeContactCursor(req.query.cursor);
     const queryConditions = [];
 
     if (search) {
@@ -503,17 +573,22 @@ router.get('/', async (req, res) => {
     const extraFilters =
       queryConditions.length === 0 ? {} : queryConditions.length === 1 ? queryConditions[0] : { $and: queryConditions };
     const filters = buildScopedContactFilter(req, extraFilters);
-    let contactQuery = Contact.find(filters)
+    const cursorFilters = cursor ? { ...filters, ...buildContactCursorFilter(cursor) } : filters;
+    let contactQuery = Contact.find(cursorFilters)
       .select(CONTACT_LIST_FIELDS)
-      .sort({ lastContact: -1, createdAt: -1 });
+      .sort({ lastContact: -1, createdAt: -1, _id: -1 });
 
     if (limit) {
-      const skip = Math.max(0, (page - 1) * limit);
-      contactQuery = contactQuery.skip(skip).limit(limit);
+      contactQuery = contactQuery.limit(limit + 1);
     }
 
     let contacts = await contactQuery.lean();
     let totalCount = await Contact.countDocuments(filters);
+    let hasMore = false;
+    if (limit && contacts.length > limit) {
+      hasMore = true;
+      contacts = contacts.slice(0, limit);
+    }
 
     // Backward compatibility: older contacts were saved without user/company scope.
     // If scoped query returns nothing, surface legacy contacts so existing data doesn't disappear.
@@ -558,7 +633,7 @@ router.get('/', async (req, res) => {
 
       contacts = await Contact.find(legacyFilters)
         .select(CONTACT_LIST_FIELDS)
-        .sort({ lastContact: -1, createdAt: -1 })
+        .sort({ lastContact: -1, createdAt: -1, _id: -1 })
         .lean();
       totalCount = await Contact.countDocuments(legacyFilters);
     }
@@ -587,7 +662,7 @@ router.get('/', async (req, res) => {
             : { $and: globalConditions };
       contacts = await Contact.find(globalFilters)
         .select(CONTACT_LIST_FIELDS)
-        .sort({ lastContact: -1, createdAt: -1 })
+        .sort({ lastContact: -1, createdAt: -1, _id: -1 })
         .lean();
       totalCount = await Contact.countDocuments(globalFilters);
     }
@@ -595,7 +670,15 @@ router.get('/', async (req, res) => {
     contacts = contacts.map(normalizeContactConsentForResponse);
 
     res.set('X-Total-Count', String(totalCount || 0));
-    res.json(contacts);
+    res.json({
+      success: true,
+      data: contacts,
+      meta: {
+        limit: limit || null,
+        hasMore,
+        nextCursor: hasMore ? encodeContactCursor(contacts[contacts.length - 1]) : null
+      }
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

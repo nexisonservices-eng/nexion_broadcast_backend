@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const multer = require('multer');
 const axios = require('axios');
 const Message = require('../models/Message');
@@ -449,7 +450,8 @@ router.post(
       if (!to || !conversationId) {
         return res.status(400).json({
           success: false,
-          error: 'to and conversationId are required'
+          error: 'to and conversationId are required',
+          mediaPipelineRequestId
         });
       }
 
@@ -764,6 +766,9 @@ router.post(
   requireWhatsAppCredentials,
   async (req, res) => {
     try {
+      const mediaPipelineRequestId =
+        String(req.headers?.['x-request-id'] || '').trim() ||
+        `media-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
       await runAttachmentUpload(req, res);
 
       const {
@@ -783,7 +788,8 @@ router.post(
       if (!req.file) {
         return res.status(400).json({
           success: false,
-          error: 'Attachment file is required'
+          error: 'Attachment file is required',
+          mediaPipelineRequestId
         });
       }
 
@@ -796,7 +802,8 @@ router.post(
       if (!conversation) {
         return res.status(400).json({
           success: false,
-          error: 'Conversation not found for provided conversationId'
+          error: 'Conversation not found for provided conversationId',
+          mediaPipelineRequestId
         });
       }
 
@@ -812,7 +819,8 @@ router.post(
         return res.status(freeformValidation.statusCode || 403).json({
           success: false,
           error: freeformValidation.error,
-          policy: freeformValidation.policy
+          policy: freeformValidation.policy,
+          mediaPipelineRequestId
         });
       }
 
@@ -860,7 +868,8 @@ router.post(
 
           return res.status(400).json({
             success: false,
-            error: mediaUploadResult.error || 'Failed to upload document to WhatsApp'
+            error: mediaUploadResult.error || 'Failed to upload document to WhatsApp',
+            mediaPipelineRequestId
           });
         }
         uploadedMetaMediaId = String(mediaUploadResult?.data?.id || '').trim();
@@ -888,7 +897,8 @@ router.post(
 
         return res.status(400).json({
           success: false,
-          error: sendResult.error || 'Failed to send media message'
+          error: sendResult.error || 'Failed to send media message',
+          mediaPipelineRequestId
         });
       }
 
@@ -905,6 +915,7 @@ router.post(
         mediaUrl: attachment.secureUrl,
         mediaType,
         mediaCaption: normalizedCaption || undefined,
+        mediaPipelineRequestId,
         attachment,
         replyTo: replyReference?._id || undefined,
         whatsappContextMessageId: resolvedReplyContextMessageId || undefined,
@@ -959,7 +970,8 @@ router.post(
       console.error('Send attachment message error:', error);
       return res.status(statusCode).json({
         success: false,
-        error: error?.message || 'Failed to send attachment message'
+        error: error?.message || 'Failed to send attachment message',
+        mediaPipelineRequestId
       });
     }
   }
@@ -1121,6 +1133,7 @@ router.get('/attachments/:messageId/download', async (req, res) => {
 
 router.delete('/attachments/:messageId', async (req, res) => {
   try {
+    const mediaPipelineRequestId = String(req.headers?.['x-request-id'] || '').trim();
     const { messageId } = req.params;
     const filters = { _id: messageId, userId: req.user.id };
     if (req.companyId) {
@@ -1131,7 +1144,8 @@ router.delete('/attachments/:messageId', async (req, res) => {
     if (!message) {
       return res.status(404).json({
         success: false,
-        error: 'Attachment message not found'
+        error: 'Attachment message not found',
+        mediaPipelineRequestId: mediaPipelineRequestId || null
       });
     }
 
@@ -1139,7 +1153,8 @@ router.delete('/attachments/:messageId', async (req, res) => {
     if (!attachment?.publicId && !message.mediaUrl) {
       return res.status(404).json({
         success: false,
-        error: 'No attachment found for this message'
+        error: 'No attachment found for this message',
+        mediaPipelineRequestId: mediaPipelineRequestId || null
       });
     }
 
@@ -1155,7 +1170,8 @@ router.delete('/attachments/:messageId', async (req, res) => {
     ) {
       return res.status(403).json({
         success: false,
-        error: 'Attachment does not belong to current user storage path'
+        error: 'Attachment does not belong to current user storage path',
+        mediaPipelineRequestId: mediaPipelineRequestId || null
       });
     }
 
@@ -1182,19 +1198,22 @@ router.delete('/attachments/:messageId', async (req, res) => {
       sendToUser(String(req.user.id), {
         type: 'message_attachment_deleted',
         messageId: String(message._id),
-        conversationId: String(message.conversationId || '')
+        conversationId: String(message.conversationId || ''),
+        mediaPipelineRequestId: mediaPipelineRequestId || null
       });
     }
 
     return res.json({
       success: true,
-      message: 'Attachment deleted successfully'
+      message: 'Attachment deleted successfully',
+      mediaPipelineRequestId: mediaPipelineRequestId || null
     });
   } catch (error) {
     console.error('Delete attachment error:', error);
     return res.status(500).json({
       success: false,
-      error: error?.message || 'Failed to delete attachment'
+      error: error?.message || 'Failed to delete attachment',
+      mediaPipelineRequestId: String(req.headers?.['x-request-id'] || '').trim() || null
     });
   }
 });

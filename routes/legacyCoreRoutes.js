@@ -1,6 +1,11 @@
 const {
   validateFreeformOutboundSend
 } = require('../services/whatsappOutreach/policy');
+const {
+  getConversationReadState,
+  recordConversationRead,
+  shouldSkipConversationReadUpdate
+} = require('../utils/conversationReadStateCache');
 
 const registerLegacyCoreRoutes = (app, deps) => {
   const {
@@ -301,7 +306,8 @@ const registerLegacyCoreRoutes = (app, deps) => {
             text,
             req.whatsappCredentials,
             {
-              whatsappContextMessageId: resolvedReplyContextMessageId
+              whatsappContextMessageId: resolvedReplyContextMessageId,
+              allowLinkFallback: true
             }
           );
         } else {
@@ -504,33 +510,66 @@ const registerLegacyCoreRoutes = (app, deps) => {
 
   app.put('/api/conversations/:id/read', auth, async (req, res) => {
     try {
-      await Message.updateMany(
-        {
-          conversationId: req.params.id,
-          userId: req.user.id,
-          companyId: req.companyId,
-          sender: 'contact',
-          status: 'received'
-        },
-        { status: 'read' }
-      );
+      const conversationId = String(req.params.id || '').trim();
+      if (!conversationId) {
+        return res.status(400).json({ error: 'conversationId is required' });
+      }
 
-      const conversation = await Conversation.findOneAndUpdate(
-        { _id: req.params.id, userId: req.user.id, companyId: req.companyId },
-        { unreadCount: 0 },
-        { new: true }
-      );
+      const conversation = await Conversation.findOne({
+        _id: conversationId,
+        userId: req.user.id,
+        companyId: req.companyId
+      }).lean();
       if (!conversation) {
         return res.status(404).json({ error: 'Conversation not found' });
       }
 
+      const scope = {
+        companyId: req.companyId || '',
+        userId: req.user.id || '',
+        conversationId
+      };
+      const state = await getConversationReadState(scope);
+      const latestInboundMessageId = String(state?.lastInboundMessageId || '').trim();
+      const latestInboundAt = state?.lastInboundAt ? new Date(state.lastInboundAt) : null;
+      const shouldSkipWrite =
+        Number(conversation.unreadCount || 0) <= 0 &&
+        shouldSkipConversationReadUpdate(state || {}, latestInboundMessageId);
+
+      if (!shouldSkipWrite) {
+        await Message.updateMany(
+          {
+            conversationId,
+            userId: req.user.id,
+            companyId: req.companyId,
+            sender: 'contact',
+            status: 'received'
+          },
+          { status: 'read' }
+        );
+
+        await Conversation.updateOne(
+          { _id: conversationId, userId: req.user.id, companyId: req.companyId },
+          { unreadCount: 0 }
+        );
+
+        await recordConversationRead({
+          ...scope,
+          latestInboundMessageId,
+          latestInboundAt: latestInboundAt || new Date()
+        });
+      }
+
       emitRealtimeEvent(req.user.id, {
         type: 'conversation_read',
-        conversationId: req.params.id,
+        conversationId,
         unreadCount: 0
       });
 
-      return res.json(conversation);
+      return res.json({
+        ...conversation,
+        unreadCount: 0
+      });
     } catch (error) {
       return res.status(500).json({ error: error.message });
     }

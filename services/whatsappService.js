@@ -9,6 +9,99 @@ const debugLog = (...args) => {
   }
 };
 
+const truncateMediaDebugValue = (value, max = 120) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  return raw.length > max ? `${raw.slice(0, max - 3)}...` : raw;
+};
+
+const emitMediaDebugLog = ({
+  stage,
+  level = 'info',
+  requestId,
+  conversationId,
+  to,
+  mediaType,
+  file,
+  cloudinary,
+  meta,
+  whatsapp,
+  error,
+  message,
+  extra = {}
+} = {}) => {
+  const payload = {
+    ts: new Date().toISOString(),
+    event: 'media_pipeline',
+    stage: truncateMediaDebugValue(stage || 'unknown', 80),
+    requestId: truncateMediaDebugValue(requestId || '', 80) || null,
+    message: truncateMediaDebugValue(message || '', 240) || null,
+    conversationId: truncateMediaDebugValue(conversationId || '', 80) || null,
+    to: truncateMediaDebugValue(to || '', 40) || null,
+    mediaType: truncateMediaDebugValue(mediaType || '', 32) || null,
+    file: file
+      ? {
+          name: truncateMediaDebugValue(file.originalname || file.name || '', 120),
+          mimeType: truncateMediaDebugValue(file.mimetype || file.type || '', 80),
+          sizeBytes: Number(file.size || file.buffer?.length || 0) || 0
+        }
+      : null,
+    cloudinary: cloudinary
+      ? {
+          publicId: truncateMediaDebugValue(cloudinary.publicId || cloudinary.public_id || '', 180),
+          resourceType: truncateMediaDebugValue(cloudinary.resourceType || cloudinary.resource_type || '', 24),
+          format: truncateMediaDebugValue(cloudinary.format || '', 24),
+          bytes: Number(cloudinary.bytes || 0) || 0
+        }
+      : null,
+    meta: meta
+      ? {
+          mediaId: truncateMediaDebugValue(meta.id || meta.mediaId || '', 80),
+          messageId: truncateMediaDebugValue(meta?.messages?.[0]?.id || meta.messageId || '', 80)
+        }
+      : null,
+    whatsapp: whatsapp
+      ? {
+          messageId: truncateMediaDebugValue(whatsapp?.messages?.[0]?.id || whatsapp?.messageId || '', 80),
+          status: truncateMediaDebugValue(whatsapp?.status || '', 24)
+        }
+      : null,
+    error: error
+      ? {
+          message: truncateMediaDebugValue(
+            error?.message || error?.response?.data?.error?.message || '',
+            240
+          ),
+          status: Number(error?.status || error?.response?.status || 0) || null,
+          code: truncateMediaDebugValue(
+            error?.code || error?.response?.data?.error?.code || '',
+            48
+          ),
+          upstreamMessage: truncateMediaDebugValue(
+            error?.response?.data?.error?.message ||
+              error?.response?.data?.error?.error_user_msg ||
+              error?.response?.data?.message ||
+              '',
+            240
+          )
+        }
+      : null,
+    ...extra
+  };
+
+  const serialized = JSON.stringify(payload);
+  if (level === 'error') {
+    console.error(`[MEDIA_PIPELINE] ${serialized}`);
+    return payload;
+  }
+  if (level === 'warn') {
+    console.warn(`[MEDIA_PIPELINE] ${serialized}`);
+    return payload;
+  }
+  console.info(`[MEDIA_PIPELINE] ${serialized}`);
+  return payload;
+};
+
 const normalizeTemplateLookupValue = (value = '') => String(value || '').trim().toLowerCase();
 const normalizeTemplateCompactKey = (value = '') =>
   normalizeTemplateLookupValue(value).replace(/[^a-z0-9]/g, '');
@@ -466,11 +559,45 @@ class WhatsAppService {
       const normalizedCaption = String(caption || '').trim();
       const normalizedFileName = String(options?.fileName || '').trim();
       const normalizedMediaId = String(options?.mediaId || '').trim();
+      const allowLinkFallback = Boolean(options?.allowLinkFallback);
+      const normalizedMediaUrl = String(mediaUrl || '').trim();
+      const debugContext = options?.debugContext || {};
+      emitMediaDebugLog({
+        stage: 'whatsapp_send_attempt',
+        requestId: debugContext.requestId,
+        conversationId: debugContext.conversationId,
+        to: normalizedPhone,
+        mediaType: normalizedMediaType,
+        file: debugContext.file,
+        cloudinary: debugContext.cloudinary,
+        meta: debugContext.meta,
+        message: 'Sending WhatsApp media message'
+      });
+
+      if (!normalizedMediaId && !allowLinkFallback) {
+        emitMediaDebugLog({
+          stage: 'whatsapp_send_validation_failed',
+          level: 'warn',
+          requestId: debugContext.requestId,
+          conversationId: debugContext.conversationId,
+          to: normalizedPhone,
+          mediaType: normalizedMediaType,
+          file: debugContext.file,
+          message: 'WhatsApp media_id missing and link fallback disabled'
+        });
+        return {
+          success: false,
+          error: 'A WhatsApp media_id is required for outbound media sending.'
+        };
+      }
+
       const payload = {
         messaging_product: 'whatsapp',
         to: normalizedPhone,
         type: normalizedMediaType,
-        [normalizedMediaType]: normalizedMediaId ? { id: normalizedMediaId } : { link: mediaUrl }
+        [normalizedMediaType]: normalizedMediaId
+          ? { id: normalizedMediaId }
+          : { link: normalizedMediaUrl }
       };
 
       if (normalizedCaption && normalizedMediaType !== 'audio') {
@@ -493,9 +620,35 @@ class WhatsAppService {
         payload,
         { headers: this.getHeaders() }
       );
+
+      emitMediaDebugLog({
+        stage: 'whatsapp_send_success',
+        requestId: debugContext.requestId,
+        conversationId: debugContext.conversationId,
+        to: normalizedPhone,
+        mediaType: normalizedMediaType,
+        file: debugContext.file,
+        meta: debugContext.meta,
+        whatsapp: response?.data,
+        message: 'WhatsApp media message sent'
+      });
       
       return { success: true, data: response.data };
     } catch (error) {
+      const debugContext = options?.debugContext || {};
+      emitMediaDebugLog({
+        stage: 'whatsapp_send_failed',
+        level: 'error',
+        requestId: debugContext.requestId,
+        conversationId: debugContext.conversationId,
+        to: normalizedPhone,
+        mediaType: normalizedMediaType,
+        file: debugContext.file,
+        cloudinary: debugContext.cloudinary,
+        meta: debugContext.meta,
+        error,
+        message: 'Failed to send WhatsApp media message'
+      });
       console.error('Error sending media message:', error.response?.data || error.message);
       const normalizedError =
         error.response?.data?.error?.message ||
@@ -509,7 +662,7 @@ class WhatsAppService {
     }
   }
 
-  async uploadMediaAsset(file, credentials = null) {
+  async uploadMediaAsset(file, credentials = null, options = {}) {
     if (credentials) {
       this.initialize(credentials);
     }
@@ -530,9 +683,20 @@ class WhatsAppService {
         };
       }
 
+      const debugContext = options?.debugContext || {};
+      emitMediaDebugLog({
+        stage: 'whatsapp_media_upload_attempt',
+        requestId: debugContext.requestId,
+        conversationId: debugContext.conversationId,
+        to: debugContext.to,
+        mediaType: debugContext.mediaType,
+        file,
+        cloudinary: debugContext.cloudinary,
+        message: 'Uploading media to WhatsApp media endpoint'
+      });
+
       const form = new FormData();
       form.append('messaging_product', 'whatsapp');
-      form.append('type', String(file?.mimetype || 'application/octet-stream'));
       form.append('file', file.buffer, {
         filename: String(file?.originalname || 'attachment').trim() || 'attachment',
         contentType: String(file?.mimetype || 'application/octet-stream'),
@@ -551,8 +715,31 @@ class WhatsAppService {
         }
       );
 
+      emitMediaDebugLog({
+        stage: 'whatsapp_media_upload_success',
+        requestId: debugContext.requestId,
+        conversationId: debugContext.conversationId,
+        to: debugContext.to,
+        mediaType: debugContext.mediaType,
+        file,
+        meta: response?.data,
+        message: 'Media uploaded to WhatsApp'
+      });
+
       return { success: true, data: response.data };
     } catch (error) {
+      const debugContext = options?.debugContext || {};
+      emitMediaDebugLog({
+        stage: 'whatsapp_media_upload_failed',
+        level: 'error',
+        requestId: debugContext.requestId,
+        conversationId: debugContext.conversationId,
+        to: debugContext.to,
+        mediaType: debugContext.mediaType,
+        file,
+        error,
+        message: 'Failed to upload media to WhatsApp'
+      });
       console.error('Error uploading media asset:', error.response?.data || error.message);
       const normalizedError =
         error.response?.data?.error?.message ||

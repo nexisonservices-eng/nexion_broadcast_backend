@@ -13,6 +13,89 @@ const {
   normalizePhoneDigits
 } = require('../services/whatsappOutreach/conversationResolver');
 const { logConsentEvent } = require('../services/whatsappConsentLogService');
+const broadcastService = require('../services/broadcastService');
+const { invalidateInboxConversation } = require('../utils/teamInboxCache');
+const {
+  recordConversationInboundUnread
+} = require('../utils/conversationReadStateCache');
+
+const truncateMediaDebugValue = (value, max = 120) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  return raw.length > max ? `${raw.slice(0, max - 3)}...` : raw;
+};
+
+const emitMediaDebugLog = ({
+  stage,
+  level = 'info',
+  requestId,
+  userId,
+  companyId,
+  from,
+  messageId,
+  mediaType,
+  mediaId,
+  mimeType,
+  fileName,
+  storedAttachment,
+  error,
+  message,
+  extra = {}
+} = {}) => {
+  const payload = {
+    ts: new Date().toISOString(),
+    event: 'media_pipeline',
+    stage: truncateMediaDebugValue(stage || 'unknown', 80),
+    requestId: truncateMediaDebugValue(requestId || '', 80) || null,
+    message: truncateMediaDebugValue(message || '', 240) || null,
+    userId: truncateMediaDebugValue(userId || '', 40) || null,
+    companyId: truncateMediaDebugValue(companyId || '', 40) || null,
+    from: truncateMediaDebugValue(from || '', 40) || null,
+    messageId: truncateMediaDebugValue(messageId || '', 80) || null,
+    mediaType: truncateMediaDebugValue(mediaType || '', 32) || null,
+    mediaId: truncateMediaDebugValue(mediaId || '', 80) || null,
+    mimeType: truncateMediaDebugValue(mimeType || '', 80) || null,
+    fileName: truncateMediaDebugValue(fileName || '', 120) || null,
+    storedAttachment: storedAttachment
+      ? {
+          publicId: truncateMediaDebugValue(storedAttachment?.publicId || '', 180),
+          resourceType: truncateMediaDebugValue(storedAttachment?.resourceType || '', 24),
+          fileCategory: truncateMediaDebugValue(storedAttachment?.fileCategory || '', 24),
+          bytes: Number(storedAttachment?.bytes || 0) || 0
+        }
+      : null,
+    error: error
+      ? {
+          message: truncateMediaDebugValue(
+            error?.message || error?.response?.data?.error?.message || '',
+            240
+          ),
+          status: Number(error?.status || error?.response?.status || 0) || null,
+          code: truncateMediaDebugValue(error?.code || error?.response?.data?.error?.code || '', 48),
+          upstreamMessage: truncateMediaDebugValue(
+            error?.response?.data?.error?.message ||
+              error?.response?.data?.error?.error_user_msg ||
+              error?.response?.data?.message ||
+              '',
+            240
+          )
+        }
+      : null,
+    ...extra
+  };
+
+  const serialized = JSON.stringify(payload);
+  if (level === 'error') {
+    console.error(`[MEDIA_PIPELINE] ${serialized}`);
+    return payload;
+  }
+  if (level === 'warn') {
+    console.warn(`[MEDIA_PIPELINE] ${serialized}`);
+    return payload;
+  }
+  console.info(`[MEDIA_PIPELINE] ${serialized}`);
+  return payload;
+};
 
 const registerWhatsAppWebhookRoutes = (app, deps) => {
   const {
@@ -307,6 +390,22 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         incomingMediaPayload?.filename || `${mediaType || 'attachment'}-${messageId || Date.now()}`
       ).trim();
 
+      if (mediaType && incomingMediaId) {
+        emitMediaDebugLog({
+          stage: 'inbound_media_detected',
+          requestId: messageId,
+          userId,
+          companyId,
+          from,
+          messageId,
+          mediaType,
+          mediaId: incomingMediaId,
+          mimeType: incomingMimeType,
+          fileName: incomingMediaFileName,
+          message: 'Inbound WhatsApp media detected'
+        });
+      }
+
       let storedIncomingAttachment = null;
       if (mediaType && incomingMediaId) {
         try {
@@ -333,7 +432,37 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
             fallbackMimeType: incomingMimeType,
             fallbackFileName: incomingMediaFileName
           });
+
+          emitMediaDebugLog({
+            stage: 'inbound_media_store_success',
+            requestId: messageId,
+            userId,
+            companyId,
+            from,
+            messageId,
+            mediaType,
+            mediaId: incomingMediaId,
+            mimeType: incomingMimeType,
+            fileName: incomingMediaFileName,
+            storedAttachment: storedIncomingAttachment,
+            message: 'Inbound WhatsApp media stored in Cloudinary'
+          });
         } catch (incomingMediaError) {
+          emitMediaDebugLog({
+            stage: 'inbound_media_store_failed',
+            level: 'error',
+            requestId: messageId,
+            userId,
+            companyId,
+            from,
+            messageId,
+            mediaType,
+            mediaId: incomingMediaId,
+            mimeType: incomingMimeType,
+            fileName: incomingMediaFileName,
+            error: incomingMediaError,
+            message: 'Failed to persist inbound WhatsApp media'
+          });
           console.error(
             `Failed to persist incoming ${mediaType} media for user ${userId}:`,
             incomingMediaError?.message || incomingMediaError
@@ -531,6 +660,28 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         timestamp: new Date()
       });
       await message.populate('replyTo', '_id text sender whatsappMessageId mediaType mediaCaption timestamp');
+      await recordConversationInboundUnread({
+        userId,
+        companyId,
+        conversationId: conversation._id,
+        messageId: message._id,
+        messageAt: inboundActivityAt,
+        unreadCount: Number(conversation.unreadCount || 1)
+      });
+      await invalidateInboxConversation({
+        userId,
+        companyId,
+        conversationId: conversation._id
+      });
+
+      emitRealtimeEvent(userId, {
+        type: 'crm_changed',
+        contactId: String(contact._id),
+        conversationId: String(conversation._id),
+        reason: 'whatsapp_inbound_message',
+        lastInboundMessageAt: inboundActivityAt.toISOString(),
+        serviceWindowClosesAt: serviceWindowClosesAt.toISOString()
+      });
 
       const incomingScoreResult = await applyIncomingMessageScore({
         messageId: message._id,
@@ -644,12 +795,36 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         message = await Message.findOne({ whatsappMessageId: messageId });
       }
       if (!message) {
-        console.log('No message found for whatsappMessageId:', messageId);
-        return;
+        console.log('No message found for whatsappMessageId:', messageId, 'attempting repair from dispatch');
+        const repairResult = await broadcastService.repairBroadcastDispatchInbox({
+          whatsappMessageId: messageId
+        });
+        if (repairResult?.success) {
+          message = await Message.findOne({ whatsappMessageId: messageId, companyId });
+          if (!message) {
+            message = await Message.findOne({ whatsappMessageId: messageId });
+          }
+        }
+        if (!message) {
+          console.log('No message found after repair attempt for whatsappMessageId:', messageId);
+          return;
+        }
       }
 
       const effectiveUserId = message.userId || userId;
       const effectiveCompanyId = message.companyId || companyId;
+      const mediaPipelineRequestId = String(message.mediaPipelineRequestId || '').trim();
+      if (mediaPipelineRequestId) {
+        emitMediaDebugLog({
+          stage: 'outbound_media_status_resolved',
+          requestId: mediaPipelineRequestId,
+          userId: effectiveUserId,
+          companyId: effectiveCompanyId,
+          from: recipient,
+          messageId,
+          message: 'Resolved outbound media status back to message pipeline id'
+        });
+      }
 
       const oldStatus = message.status;
       const updatedMessage = await Message.findOneAndUpdate(
@@ -680,6 +855,11 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           console.error('Error updating conversation lastMessageStatus:', conversationStatusError);
         }
       }
+      await invalidateInboxConversation({
+        userId: effectiveUserId,
+        companyId: effectiveCompanyId,
+        conversationId: updatedMessage.conversationId
+      });
 
       emitRealtimeEvent(effectiveUserId, {
         type: 'message_status',
@@ -688,7 +868,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         errorMessage: updatedMessage.errorMessage || '',
         conversationId: message.conversationId,
         broadcastId: updatedMessage.broadcastId ? String(updatedMessage.broadcastId) : null,
-        previousStatus: oldStatus
+        previousStatus: oldStatus,
+        mediaPipelineRequestId: mediaPipelineRequestId || null
       });
 
       if (status === 'read' && oldStatus !== 'read') {

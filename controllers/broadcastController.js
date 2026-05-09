@@ -1,4 +1,5 @@
 const broadcastService = require('../services/broadcastService');
+const { enqueueBroadcastSend, getBroadcastQueueCounts } = require('../queues/broadcastQueue');
 const {
   normalizeRole,
   isTenantWideRole
@@ -105,24 +106,24 @@ class BroadcastController {
         }
       }
 
-      const broadcaster = (payload) => {
-        const sendToUser = req.app?.locals?.sendToUser;
-        if (typeof sendToUser === 'function') {
-          sendToUser(String(req.user.id), payload);
-        }
-      };
-      setImmediate(() => {
-        broadcastService
-          .sendBroadcast(req.params.id, broadcaster, req.whatsappCredentials)
-          .catch((error) => {
-            console.error(`Background broadcast send failed for ${req.params.id}:`, error);
-          });
+      const result = await enqueueBroadcastSend({
+        broadcastId: req.params.id,
+        userId: req.user.id,
+        companyId: req.companyId || null,
+        delayMs: 0,
+        reason: 'manual_http_send'
       });
+
+      if (!result.success) {
+        return res.status(400).json(result);
+      }
 
       res.status(202).json({
         success: true,
         queued: true,
         broadcastId: req.params.id,
+        jobId: result.data.jobId,
+        queueStatus: result.data.status,
         message: 'Broadcast queued. Sending will continue in the background.'
       });
     } catch (error) {
@@ -414,6 +415,21 @@ class BroadcastController {
       }
 
       return res.status(400).json(result);
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async getQueueMetrics(req, res) {
+    try {
+      const counts = await getBroadcastQueueCounts();
+      return res.json({
+        success: true,
+        data: {
+          queue: 'broadcast-send',
+          counts
+        }
+      });
     } catch (error) {
       return res.status(500).json({ success: false, error: error.message });
     }

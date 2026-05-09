@@ -16,7 +16,7 @@ const ContactSchema = new mongoose.Schema({
 
   name: { type: String, default: '' },
 
-  phone: { type: String, unique: true, required: true, index: true },
+  phone: { type: String, required: true, index: true },
 
   email: String,
 
@@ -47,6 +47,11 @@ ContactSchema.pre('save', function(next) {
   next();
 
 });
+
+ContactSchema.index({ companyId: 1, userId: 1, phone: 1 });
+ContactSchema.index({ companyId: 1, userId: 1, lastContact: -1, createdAt: -1, _id: -1 });
+ContactSchema.index({ companyId: 1, userId: 1, lastInboundMessageAt: -1, createdAt: -1, _id: -1 });
+ContactSchema.index({ companyId: 1, userId: 1, whatsappOptInStatus: 1, sourceType: 1, lastContact: -1, createdAt: -1 });
 
 
 

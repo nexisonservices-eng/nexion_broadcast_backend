@@ -16,6 +16,7 @@ const MessageSchema = new mongoose.Schema({
   mediaUrl: String,
   mediaType: { type: String, enum: ['image', 'video', 'audio', 'document'] },
   mediaCaption: String,
+  mediaPipelineRequestId: { type: String, index: true },
   attachment: {
     storageProvider: { type: String, default: 'cloudinary' },
     direction: { type: String, enum: ['sent', 'received'], default: 'sent' },
@@ -48,6 +49,7 @@ const MessageSchema = new mongoose.Schema({
   whatsappTimestamp: Date,
   errorMessage: String,
   broadcastId: { type: mongoose.Schema.Types.ObjectId, ref: 'Broadcast', index: true },
+  broadcastDispatchKey: { type: String, unique: true, sparse: true, index: true },
   rawMessageType: String,
   reactionEmoji: String,
   whatsappContextMessageId: { type: String, index: true },
@@ -75,8 +77,10 @@ const MessageSchema = new mongoose.Schema({
   }
 });
 
-MessageSchema.index({ companyId: 1, userId: 1, conversationId: 1, timestamp: 1 });
+MessageSchema.index({ companyId: 1, userId: 1, conversationId: 1, timestamp: -1, _id: -1 });
+MessageSchema.index({ companyId: 1, userId: 1, conversationId: 1, sender: 1, status: 1, timestamp: -1, _id: -1 });
 MessageSchema.index({ companyId: 1, userId: 1, whatsappMessageId: 1 }, { unique: true, sparse: true });
+MessageSchema.index({ companyId: 1, userId: 1, mediaPipelineRequestId: 1 }, { sparse: true });
 MessageSchema.index({ companyId: 1, broadcastId: 1, status: 1 });
 MessageSchema.index({ companyId: 1, userId: 1, 'attachment.publicId': 1 });
 MessageSchema.index({ companyId: 1, userId: 1, mediaType: 1, timestamp: -1 });

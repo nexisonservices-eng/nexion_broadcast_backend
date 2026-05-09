@@ -428,6 +428,8 @@ server.listen(PORT, async () => {
     await Promise.all([
       Contact.syncIndexes(),
       Template.syncIndexes(),
+      Conversation.syncIndexes(),
+      Message.syncIndexes(),
       Deal.syncIndexes(),
       CrmAutomationRun.syncIndexes(),
       MetaAdsWallet.syncIndexes(),

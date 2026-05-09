@@ -120,10 +120,7 @@ TemplateSchema.index(
     }
   }
 );
-TemplateSchema.index({ status: 1, isActive: 1 });
-
-TemplateSchema.index({ companyId: 1, userId: 1, name: 1 }, { unique: true });
-
+TemplateSchema.index({ userId: 1, companyId: 1, category: 1, status: 1, isActive: 1, createdAt: -1 });
 TemplateSchema.index({ companyId: 1, userId: 1, whatsappTemplateId: 1 }, { sparse: true });
 
 

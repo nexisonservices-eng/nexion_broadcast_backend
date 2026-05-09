@@ -40,7 +40,9 @@ ConversationSchema.pre('save', function(next) {
 });
 
 ConversationSchema.index({ companyId: 1, userId: 1, contactPhone: 1, status: 1 });
-ConversationSchema.index({ companyId: 1, userId: 1, assignedTo: 1, status: 1 });
-ConversationSchema.index({ companyId: 1, userId: 1, lastMessageTime: -1 });
+ConversationSchema.index({ companyId: 1, userId: 1, contactId: 1 });
+ConversationSchema.index({ companyId: 1, userId: 1, assignedTo: 1, status: 1, lastMessageTime: -1, _id: -1 });
+ConversationSchema.index({ companyId: 1, userId: 1, lastMessageTime: -1, _id: -1 });
+ConversationSchema.index({ companyId: 1, userId: 1, status: 1, lastMessageTime: -1, _id: -1 });
 
 module.exports = mongoose.model('Conversation', ConversationSchema);

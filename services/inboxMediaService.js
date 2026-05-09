@@ -32,6 +32,13 @@ const DEFAULT_ALLOWED_DOCUMENT_MIME = [
   'application/x-zip-compressed'
 ];
 
+const DEFAULT_ALLOWED_VIDEO_MIME = [
+  'video/mp4',
+  'video/3gpp',
+  'video/quicktime',
+  'video/webm'
+];
+
 const DEFAULT_ALLOWED_AUDIO_MIME = [
   'audio/aac',
   'audio/amr',
@@ -42,6 +49,7 @@ const DEFAULT_ALLOWED_AUDIO_MIME = [
   'audio/opus',
   'audio/webm',
   'audio/x-m4a',
+  'audio/wav',
   'audio/3gpp',
   'audio/3gpp2'
 ];
@@ -49,6 +57,7 @@ const DEFAULT_ALLOWED_AUDIO_MIME = [
 const DEFAULT_MAX_IMAGE_MB = 10;
 const DEFAULT_MAX_DOCUMENT_MB = 25;
 const DEFAULT_MAX_AUDIO_MB = 16;
+const DEFAULT_MAX_VIDEO_MB = 16;
 const DEFAULT_SIGNED_URL_TTL_SECONDS = 300;
 
 let cloudinaryConfigured = false;
@@ -154,6 +163,9 @@ const allowedDocumentMimeTypes = () =>
 const allowedAudioMimeTypes = () =>
   parseListFromEnv(process.env.ALLOWED_AUDIO_MIME, DEFAULT_ALLOWED_AUDIO_MIME);
 
+const allowedVideoMimeTypes = () =>
+  parseListFromEnv(process.env.ALLOWED_VIDEO_MIME, DEFAULT_ALLOWED_VIDEO_MIME);
+
 const toBytes = (megabytes, fallbackMb) => {
   const parsed = Number(megabytes);
   const safeMb = Number.isFinite(parsed) && parsed > 0 ? parsed : fallbackMb;
@@ -163,10 +175,28 @@ const toBytes = (megabytes, fallbackMb) => {
 const resolveMaxImageBytes = () => toBytes(process.env.MAX_IMAGE_SIZE_MB, DEFAULT_MAX_IMAGE_MB);
 const resolveMaxDocumentBytes = () => toBytes(process.env.MAX_DOC_SIZE_MB, DEFAULT_MAX_DOCUMENT_MB);
 const resolveMaxAudioBytes = () => toBytes(process.env.MAX_AUDIO_SIZE_MB, DEFAULT_MAX_AUDIO_MB);
+const resolveMaxVideoBytes = () => toBytes(process.env.MAX_VIDEO_SIZE_MB, DEFAULT_MAX_VIDEO_MB);
 
-const inferDocumentMimeTypeFromFileName = (name = '') => {
+const inferMimeTypeFromFileName = (name = '') => {
   const extension = String(path.extname(String(name || '') || '').toLowerCase() || '').replace('.', '');
   const map = {
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    png: 'image/png',
+    webp: 'image/webp',
+    gif: 'image/gif',
+    mp3: 'audio/mpeg',
+    m4a: 'audio/mp4',
+    aac: 'audio/aac',
+    amr: 'audio/amr',
+    ogg: 'audio/ogg',
+    opus: 'audio/opus',
+    wav: 'audio/wav',
+    mp4: 'video/mp4',
+    mov: 'video/quicktime',
+    webm: 'video/webm',
+    '3gp': 'video/3gpp',
+    '3g2': 'video/3gpp2',
     pdf: 'application/pdf',
     doc: 'application/msword',
     docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -185,6 +215,7 @@ const resolveFileCategory = (mimeType = '') => {
   const normalizedMime = normalizeMimeType(mimeType);
   if (allowedImageMimeTypes().includes(normalizedMime)) return 'image';
   if (allowedAudioMimeTypes().includes(normalizedMime)) return 'audio';
+  if (allowedVideoMimeTypes().includes(normalizedMime)) return 'video';
   if (allowedDocumentMimeTypes().includes(normalizedMime)) return 'document';
   return '';
 };
@@ -198,13 +229,13 @@ const validateAttachmentFile = (file = {}) => {
 
   const fileSize = Number(file.size || file.buffer.length || 0);
   const originalName = String(file.originalname || '').trim();
-  const mimeTypeFallback = inferDocumentMimeTypeFromFileName(originalName);
+  const mimeTypeFallback = inferMimeTypeFromFileName(originalName);
   const mimeType = normalizeMimeType(file.mimetype || mimeTypeFallback || '');
   const fileCategory = resolveFileCategory(mimeType);
 
   if (!fileCategory) {
     const error = new Error(
-      `Unsupported file type "${mimeType || 'unknown'}". Allowed: images (${allowedImageMimeTypes().join(', ')}), audio (${allowedAudioMimeTypes().join(', ')}), and documents (${allowedDocumentMimeTypes().join(', ')})`
+      `Unsupported file type "${mimeType || 'unknown'}". Allowed: images (${allowedImageMimeTypes().join(', ')}), audio (${allowedAudioMimeTypes().join(', ')}), video (${allowedVideoMimeTypes().join(', ')}), and documents (${allowedDocumentMimeTypes().join(', ')})`
     );
     error.status = 415;
     throw error;
@@ -215,6 +246,8 @@ const validateAttachmentFile = (file = {}) => {
       ? resolveMaxImageBytes()
       : fileCategory === 'audio'
         ? resolveMaxAudioBytes()
+        : fileCategory === 'video'
+          ? resolveMaxVideoBytes()
         : resolveMaxDocumentBytes();
   if (fileSize > maxBytes) {
     const maxMb = (maxBytes / (1024 * 1024)).toFixed(0);
@@ -273,7 +306,12 @@ const uploadInboxAttachment = async ({
       ? resolveCompanyInboxFolderPath({ companyContext, direction })
       : resolveInboxFolderPath({ username: safeUsername, direction }));
   await ensureFolderPath(folder);
-  const resourceType = fileCategory === 'image' ? 'image' : 'raw';
+  const resourceType =
+    fileCategory === 'image'
+      ? 'image'
+      : fileCategory === 'video'
+        ? 'video'
+        : 'raw';
   const publicIdBase = buildPublicIdBase({ originalName, extension, userId });
   const dataUri = `data:${mimeType || 'application/octet-stream'};base64,${file.buffer.toString('base64')}`;
 

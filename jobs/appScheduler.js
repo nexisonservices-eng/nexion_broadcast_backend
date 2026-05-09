@@ -23,6 +23,12 @@ const startAppScheduler = ({
       }
 
       await broadcastService.checkScheduledBroadcasts();
+      const repairResult = await broadcastService.repairMissingBroadcastDispatchInboxes(25);
+      if (repairResult?.data?.repaired) {
+        console.log(
+          `Broadcast inbox repair completed: repaired ${repairResult.data.repaired} dispatch(es).`
+        );
+      }
       await missedCallAutomationService.processPendingMissedCalls({ app });
     } catch (error) {
       console.error('Scheduler error:', error.message);

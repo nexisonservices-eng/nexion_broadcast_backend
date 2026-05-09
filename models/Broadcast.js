@@ -36,10 +36,13 @@ const BroadcastSchema = new mongoose.Schema({
   recipientCount: { type: Number, default: 0 },
   status: { 
     type: String, 
-    enum: ['draft', 'scheduled', 'sending', 'completed', 'paused', 'cancelled', 'failed'], 
+    enum: ['draft', 'scheduled', 'queued', 'sending', 'completed', 'paused', 'cancelled', 'failed'], 
     default: 'draft',
     index: true
   },
+  queueJobId: { type: String, default: '' },
+  queueQueuedAt: { type: Date, default: null },
+  queueLastError: { type: String, default: '' },
   scheduledAt: Date,
   startedAt: Date,
   completedAt: Date,
