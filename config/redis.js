@@ -12,6 +12,14 @@ const isRedisDisabled =
   String(process.env.DISABLE_REDIS || process.env.REDIS_DISABLED || '').trim().toLowerCase() ===
     'true' || !hasExplicitRedisConfig;
 
+const getRedisDisabledReason = () => {
+  if (String(process.env.DISABLE_REDIS || process.env.REDIS_DISABLED || '').trim().toLowerCase() === 'true') {
+    return 'Redis is disabled by environment configuration';
+  }
+
+  return 'Redis is not configured for this deployment';
+};
+
 const redisUrl =
   String(process.env.REDIS_URL || '').trim() ||
   `redis://${String(process.env.REDIS_HOST || '127.0.0.1').trim()}:${String(
@@ -102,6 +110,7 @@ module.exports = {
   redisOptions,
   hasExplicitRedisConfig,
   isRedisDisabled,
+  getRedisDisabledReason,
   createRedisConnection,
   createNoopRedisConnection
 };

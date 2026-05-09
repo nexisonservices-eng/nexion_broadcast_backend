@@ -1,6 +1,6 @@
 const { Queue, QueueEvents } = require('bullmq');
 const Broadcast = require('../models/Broadcast');
-const { createRedisConnection, isRedisDisabled } = require('../config/redis');
+const { createRedisConnection, isRedisDisabled, getRedisDisabledReason } = require('../config/redis');
 
 const queueName = 'broadcast-send';
 const connection = createRedisConnection({
@@ -164,7 +164,7 @@ const enqueueBroadcastSend = async ({
   if (isRedisDisabled) {
     return {
       success: false,
-      error: 'Broadcast queue is disabled in local mode'
+      error: `${getRedisDisabledReason()}. Configure REDIS_URL or REDIS_HOST/REDIS_PORT to enable broadcast sending.`
     };
   }
 

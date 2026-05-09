@@ -1,5 +1,5 @@
 const { Queue, QueueEvents } = require('bullmq');
-const { createRedisConnection, isRedisDisabled } = require('../config/redis');
+const { createRedisConnection, isRedisDisabled, getRedisDisabledReason } = require('../config/redis');
 
 const queueName = 'broadcast-inbox-write';
 const connection = createRedisConnection({
@@ -59,7 +59,10 @@ const broadcastInboxQueueEvents = isRedisDisabled
 
 const enqueueBroadcastInboxWrite = async (payload = {}) => {
   if (isRedisDisabled) {
-    return { success: false, error: 'Broadcast inbox queue is disabled in local mode' };
+    return {
+      success: false,
+      error: `${getRedisDisabledReason()}. Configure REDIS_URL or REDIS_HOST/REDIS_PORT to enable broadcast inbox writes.`
+    };
   }
 
   const {
