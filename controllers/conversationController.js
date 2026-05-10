@@ -379,21 +379,74 @@ const loadConversationSummaryPage = async ({
   cacheKeyParts,
   queryHint = null
 }) => {
-  const loadSummaryRows = async () => {
-    const summaryRows = await loadConversationSummaryRows({
-      finalFilters: summaryFilters,
-      limit,
-      queryHint
-    });
+  const mergeConversationRows = (primaryRows = [], secondaryRows = []) => {
+    const mergedById = new Map();
 
-    if (summaryRows.conversations.length) {
-      return summaryRows;
+    const addRows = (rows = []) => {
+      (Array.isArray(rows) ? rows : []).forEach((conversation) => {
+        const conversationId = String(conversation?._id || '').trim();
+        if (!conversationId || mergedById.has(conversationId)) return;
+        mergedById.set(conversationId, conversation);
+      });
+    };
+
+    addRows(primaryRows);
+    addRows(secondaryRows);
+
+    return Array.from(mergedById.values()).sort(
+      (left, right) =>
+        new Date(right?.lastMessageTime || right?.updatedAt || right?.createdAt || 0).valueOf() -
+        new Date(left?.lastMessageTime || left?.updatedAt || left?.createdAt || 0).valueOf()
+    );
+  };
+
+  const loadMergedRows = async () => {
+    const [summaryRows, fallbackRows] = await Promise.all([
+      loadConversationSummaryRows({
+        finalFilters: summaryFilters,
+        limit,
+        queryHint
+      }),
+      loadConversationFallbackRows({
+        finalFilters: fallbackFilters,
+        limit
+      })
+    ]);
+
+    const mergedConversations = mergeConversationRows(
+      summaryRows?.conversations || [],
+      fallbackRows?.conversations || []
+    );
+
+    const summaryConversationIds = new Set(
+      (Array.isArray(summaryRows?.conversations) ? summaryRows.conversations : [])
+        .map((conversation) => String(conversation?._id || '').trim())
+        .filter(Boolean)
+    );
+    const fallbackConversationIds = (Array.isArray(fallbackRows?.conversations) ? fallbackRows.conversations : [])
+      .map((conversation) => String(conversation?._id || '').trim())
+      .filter(Boolean);
+    const shouldBackfillSummaries = fallbackConversationIds.some(
+      (conversationId) => !summaryConversationIds.has(conversationId)
+    );
+
+    if (shouldBackfillSummaries) {
+      void upsertConversationSummaries(fallbackRows.conversations).catch((error) => {
+        console.error('Failed to backfill conversation summaries from merged page:', error);
+      });
     }
 
-    return loadConversationFallbackRows({
-      finalFilters: fallbackFilters,
-      limit
-    });
+    return {
+      conversations: mergedConversations,
+      hasMore:
+        Boolean(summaryRows?.hasMore) ||
+        Boolean(fallbackRows?.hasMore) ||
+        mergedConversations.length > limit,
+      nextCursor:
+        mergedConversations.length > limit
+          ? encodeConversationCursor(mergedConversations[limit - 1])
+          : summaryRows?.nextCursor || fallbackRows?.nextCursor || null
+    };
   };
 
   const cachedSummaryRows = scope
@@ -403,9 +456,9 @@ const loadConversationSummaryPage = async ({
         versionGroup: 'summaryPages',
         keyParts: cacheKeyParts,
         ttlSeconds: CACHE_TTL_SECONDS.summaryPages,
-        loader: loadSummaryRows
+        loader: loadMergedRows
       })
-    : await loadSummaryRows();
+    : await loadMergedRows();
 
   const conversations = await attachContactSnapshotsToConversations(
     cachedSummaryRows?.conversations || [],
