@@ -296,6 +296,16 @@ const finalizeBroadcastIfReady = async (broadcastId, userId) => {
     });
   }
 
+  try {
+    // Best-effort recovery: rebuild any missing Team Inbox rows from sent dispatches.
+    await broadcastService.repairBroadcastDispatchInboxForBroadcast(
+      broadcastId,
+      Math.max(50, Number(process.env.BROADCAST_DISPATCH_REPAIR_BATCH || 100))
+    );
+  } catch (error) {
+    console.error('Broadcast inbox repair failed after completion:', error.message);
+  }
+
   await clearBroadcastChunkProgress(broadcastId);
   return { complete: true, summary, broadcast };
 };

@@ -195,14 +195,16 @@ const buildConversationCursorFilter = (cursor) => {
   };
 };
 
-const buildScopedFilters = (req, extra = {}) => {
+const buildScopedFilters = (req, extra = {}, options = {}) => {
   const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+  const normalizedScope = String(options?.scope || req?.query?.scope || '').trim().toLowerCase();
+  const isTeamScope = normalizedScope === 'team';
   const filters = {
     companyId: req.companyId,
     ...extra
   };
 
-  if (!isTenantWideRole(normalizedRole)) {
+  if (!isTenantWideRole(normalizedRole) && !isTeamScope) {
     filters.userId = req.user.id;
   }
 
@@ -225,7 +227,7 @@ const attachContactSnapshotsToConversations = async (conversations = [], req) =>
   const uniqueContactIds = Array.from(new Set(contactIds));
   const contacts = await Contact.find({
     _id: { $in: uniqueContactIds },
-    ...buildScopedFilters(req)
+    ...buildScopedFilters(req, {}, { scope: req.query?.scope })
   })
     .select(TEAM_INBOX_CONTACT_SUMMARY_FIELDS)
     .lean();
@@ -424,7 +426,7 @@ class ConversationController {
       const conversationFilter = normalizeConversationFilter(
         req.query?.filter || req.query?.conversationFilter || ''
       );
-      const filters = buildScopedFilters(req);
+      const filters = buildScopedFilters(req, {}, { scope: req.query?.scope });
       const scopeVariants = getInboxScopeVariants({
         companyId: filters.companyId,
         userId: filters.userId || ''
@@ -542,7 +544,7 @@ class ConversationController {
       const requestedSourceType = toCleanString(req.query?.sourceType || '').toLowerCase();
       const limit = Math.max(1, Math.min(500, Number(req.query?.limit || 100)));
       const cursor = decodeContactCursor(req.query?.cursor);
-      const filters = buildScopedFilters(req);
+      const filters = buildScopedFilters(req, {}, { scope: req.query?.scope });
       const searchPlan = buildContactSearchPlan(search);
 
       if (searchPlan.summaryClause) {
@@ -609,7 +611,9 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const contact = await Contact.findOne(buildScopedFilters(req, { _id: id })).lean();
+      const contact = await Contact.findOne(
+        buildScopedFilters(req, { _id: id }, { scope: req.query?.scope })
+      ).lean();
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -627,7 +631,7 @@ class ConversationController {
     try {
       // Get all unique contacts from conversations
       const conversations = await Conversation.find({
-        ...buildScopedFilters(req),
+        ...buildScopedFilters(req, {}, { scope: req.query?.scope }),
         status: { $in: ['active', 'pending'] }
       })
         .select('contactPhone contactName lastMessageTime lastMessage status')
@@ -662,7 +666,9 @@ class ConversationController {
       const { name, phone, email, tags, notes, stage, status, source, ownerId, nextFollowUpAt } = req.body;
       
       // Check if contact already exists
-      const existingContact = await Contact.findOne(buildScopedFilters(req, { phone }));
+      const existingContact = await Contact.findOne(
+        buildScopedFilters(req, { phone }, { scope: req.query?.scope })
+      );
       if (existingContact) {
         return res.status(400).json({ 
           success: false, 
@@ -712,7 +718,9 @@ class ConversationController {
       } = req.body;
       
       // Find contact by ID
-      const contact = await Contact.findOne(buildScopedFilters(req, { _id: id }));
+      const contact = await Contact.findOne(
+        buildScopedFilters(req, { _id: id }, { scope: req.query?.scope })
+      );
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -755,7 +763,7 @@ class ConversationController {
       }
       
       const updatedContact = await Contact.findOneAndUpdate(
-        buildScopedFilters(req, { _id: id }),
+        buildScopedFilters(req, { _id: id }, { scope: req.query?.scope }),
         updateData, 
         { new: true, runValidators: true }
       );
@@ -796,7 +804,9 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const contact = await Contact.findOne(buildScopedFilters(req, { _id: id }));
+      const contact = await Contact.findOne(
+        buildScopedFilters(req, { _id: id }, { scope: req.query?.scope })
+      );
       if (!contact) {
         return res.status(404).json({ 
           success: false, 
@@ -816,7 +826,9 @@ class ConversationController {
     try {
       const { id } = req.params;
       
-      const conversation = await Conversation.findOne(buildScopedFilters(req, { _id: id }));
+      const conversation = await Conversation.findOne(
+        buildScopedFilters(req, { _id: id }, { scope: req.query?.scope })
+      );
       if (!conversation) {
         return res.status(404).json({ 
           success: false, 

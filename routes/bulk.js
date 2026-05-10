@@ -6,7 +6,7 @@ const broadcastService = require('../services/broadcastService');
 const { enqueueBroadcastSend } = require('../queues/broadcastQueue');
 const Contact = require('../models/Contact');
 const {
-  buildPhoneCandidates,
+  buildPhoneCandidates: buildPhoneCandidatesFromResolver,
   buildPhoneLookupFilters
 } = require('../services/whatsappOutreach/conversationResolver');
 const {
@@ -16,6 +16,24 @@ const {
 
 const router = express.Router();
 router.use(auth);
+
+const buildPhoneCandidates = typeof buildPhoneCandidatesFromResolver === 'function'
+  ? buildPhoneCandidatesFromResolver
+  : (value = '') => {
+      const rawValue = String(value || '').trim();
+      const normalizedPhone = rawValue.replace(/\D/g, '');
+
+      return Array.from(
+        new Set(
+          [
+            rawValue,
+            normalizedPhone,
+            normalizedPhone ? `+${normalizedPhone}` : '',
+            normalizedPhone.length > 10 ? normalizedPhone.slice(-10) : ''
+          ].filter(Boolean)
+        )
+      );
+    };
 
 const buildScopedContactFilter = (req, extra = {}) => {
   const scopedConditions = [{ userId: req.user.id }];

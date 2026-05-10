@@ -22,17 +22,19 @@ const {
   isTenantWideRole
 } = require('../utils/accessControl');
 
-const buildScopedMessageFilters = (req, extra = {}) => {
+const buildScopedMessageFilters = (req, extra = {}, options = {}) => {
   const normalizedRole = normalizeRole(
     req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role
   );
+  const normalizedScope = String(options?.scope || req?.query?.scope || '').trim().toLowerCase();
+  const isTeamScope = normalizedScope === 'team';
   const normalizedCompanyId = String(req?.companyId || req?.user?.companyId || '').trim();
   const filters = {
     ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
     ...extra
   };
 
-  if (!isTenantWideRole(normalizedRole)) {
+  if (!isTenantWideRole(normalizedRole) && !isTeamScope) {
     filters.userId = req.user.id;
   }
 
@@ -95,10 +97,14 @@ router.get('/:id/messages', async (req, res) => {
     const scope = scopeVariants[scopeVariants.length - 1] || scopeVariants[0] || '';
     const threadScope = scope ? `${scope}:${conversationId}` : '';
     const queryCursor = cursor ? buildMessageCursorFilter(cursor) : {};
-    const queryFilters = buildScopedMessageFilters(req, {
-      conversationId,
-      ...queryCursor
-    });
+    const queryFilters = buildScopedMessageFilters(
+      req,
+      {
+        conversationId,
+        ...queryCursor
+      },
+      { scope: req.query?.scope }
+    );
 
     const loadMessages = async (filters) =>
       Message.find(filters)
