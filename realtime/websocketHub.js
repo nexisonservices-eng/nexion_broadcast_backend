@@ -16,8 +16,12 @@ const {
 const createWebSocketHub = ({ wss }) => {
   const clients = new Map();
   const roomMembers = new Map();
+  const clientMeta = new Map();
+  const crmSubscriptions = new Map();
 
   const getRoomKey = (kind, value) => `${kind}:${String(value || '').trim()}`;
+  const getClientKey = (ws, fallbackUserId = '') =>
+    ws.__clientKey || String(fallbackUserId || 'anonymous').trim() || 'anonymous';
   const resolveDataCompanyId = (data = {}) =>
     String(
       data?.companyId ||
@@ -127,6 +131,12 @@ const createWebSocketHub = ({ wss }) => {
         client.send(message);
       }
     });
+  };
+
+  const sendJson = (ws, data) => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(data));
+    }
   };
 
   const sendToLocalUser = (userId, data) => {
@@ -294,6 +304,39 @@ const createWebSocketHub = ({ wss }) => {
     broadcastLocal({ type: 'user_list', users: userList });
   };
 
+  const broadcastCrmChannel = (channel, data, exceptKey = '') => {
+    const subscribers = crmSubscriptions.get(channel);
+    if (!subscribers || subscribers.size === 0) return;
+
+    subscribers.forEach((clientKey) => {
+      if (exceptKey && clientKey === exceptKey) return;
+      const meta = clientMeta.get(clientKey);
+      sendJson(meta?.ws, data);
+    });
+  };
+
+  const removeClientFromCrmChannels = (clientKey) => {
+    crmSubscriptions.forEach((subscribers, channel) => {
+      if (!subscribers.delete(clientKey)) return;
+      if (subscribers.size === 0) {
+        crmSubscriptions.delete(channel);
+        return;
+      }
+
+      broadcastCrmChannel(
+        channel,
+        {
+          type: 'crm_presence_leave',
+          scope: 'crm',
+          channel,
+          userId: clientMeta.get(clientKey)?.userId || clientKey,
+          timestamp: new Date().toISOString()
+        },
+        clientKey
+      );
+    });
+  };
+
   const publishPresenceUpdate = async ({
     userId,
     companyId,
@@ -365,6 +408,11 @@ const createWebSocketHub = ({ wss }) => {
 
         nextSocketSet.add(ws);
         ws.userId = nextUserId;
+        clientMeta.set(getClientKey(ws, nextUserId), {
+          ws,
+          userId: nextUserId,
+          companyId: String(data.companyId || ws.companyId || '').trim()
+        });
         joinRoom(getRoomKey('user', nextUserId), ws);
         syncCompanyRoom(ws, data.companyId || ws.companyId || '');
         syncConversationRoom(ws, data.activeConversationId || ws.activeConversationId || '');
@@ -451,6 +499,70 @@ const createWebSocketHub = ({ wss }) => {
         }
         break;
       }
+      case 'crm_subscribe': {
+        const channel = String(data.channel || data.contactId || 'crm').trim() || 'crm';
+        if (!crmSubscriptions.has(channel)) crmSubscriptions.set(channel, new Set());
+        crmSubscriptions.get(channel).add(getClientKey(ws, userId));
+        sendJson(ws, {
+          type: 'crm_subscribed',
+          scope: 'crm',
+          channel,
+          timestamp: new Date().toISOString()
+        });
+        break;
+      }
+      case 'crm_unsubscribe': {
+        const channel = String(data.channel || data.contactId || 'crm').trim() || 'crm';
+        const subscribers = crmSubscriptions.get(channel);
+        if (subscribers) {
+          subscribers.delete(getClientKey(ws, userId));
+          if (subscribers.size === 0) crmSubscriptions.delete(channel);
+        }
+        sendJson(ws, {
+          type: 'crm_unsubscribed',
+          scope: 'crm',
+          channel,
+          timestamp: new Date().toISOString()
+        });
+        break;
+      }
+      case 'crm_presence_viewing':
+      case 'crm_presence_editing':
+      case 'crm_presence_leave': {
+        const channel = String(data.channel || data.contactId || 'crm').trim() || 'crm';
+        const clientKey = getClientKey(ws, userId);
+        const subscribers = crmSubscriptions.get(channel);
+
+        if (data.type === 'crm_presence_leave') {
+          if (subscribers) {
+            subscribers.delete(clientKey);
+            if (subscribers.size === 0) crmSubscriptions.delete(channel);
+          }
+        } else {
+          if (!crmSubscriptions.has(channel)) crmSubscriptions.set(channel, new Set());
+          crmSubscriptions.get(channel).add(clientKey);
+        }
+
+        broadcastCrmChannel(
+          channel,
+          {
+            ...data,
+            scope: 'crm',
+            channel,
+            userId: clientMeta.get(clientKey)?.userId || userId,
+            timestamp: new Date().toISOString()
+          },
+          clientKey
+        );
+        sendJson(ws, {
+          type: 'crm_mutation_ack',
+          scope: 'crm',
+          channel,
+          requestId: data.requestId || '',
+          timestamp: new Date().toISOString()
+        });
+        break;
+      }
       case 'typing':
       case 'typing:start':
       case 'typing:stop': {
@@ -489,6 +601,7 @@ const createWebSocketHub = ({ wss }) => {
     console.log('WebSocket connection established');
     const initialUserId = String(req.headers['user-id'] || 'anonymous').trim() || 'anonymous';
     let userId = initialUserId;
+    ws.__clientKey = `${initialUserId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
     ws.lastSeenAt = new Date();
     ws.activeConversationId = '';
 
@@ -496,6 +609,7 @@ const createWebSocketHub = ({ wss }) => {
     getSocketSet(userId)?.add(ws);
     ws.joinedRooms = ws.joinedRooms instanceof Set ? ws.joinedRooms : new Set();
     joinRoom(getRoomKey('user', userId), ws);
+    clientMeta.set(getClientKey(ws, userId), { ws, userId, companyId: '' });
 
     console.log('Total connected users:', clients.size);
 
@@ -529,6 +643,9 @@ const createWebSocketHub = ({ wss }) => {
 
     ws.on('close', () => {
         removeSocket(userId, ws);
+        const clientKey = getClientKey(ws, userId);
+        removeClientFromCrmChannels(clientKey);
+        clientMeta.delete(clientKey);
         const socketCount = clients.get(userId)?.size || 0;
         const lastSeenAt = ws.lastSeenAt || new Date();
 

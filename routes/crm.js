@@ -38,20 +38,6 @@ const {
   getCrmOwnerPerformanceReport
 } = require('../services/crmReportsService');
 const { getLeadScoringSettings } = require('../services/leadScoringService');
-const { buildCrmContactSearchPlan } = require('../utils/crmContactSearchPlan');
-const { buildCrmContactListHint } = require('../utils/crmContactQueryPlan');
-const {
-  CONTACT_CURSOR_SORT,
-  buildCrmContactCursorFilter,
-  decodeCrmContactCursor,
-  encodeCrmContactCursor
-} = require('../utils/crmContactPagination');
-const { buildDealSearchPlan } = require('../utils/dealSearchPlan');
-const {
-  buildDealCursorFilter,
-  decodeDealCursor,
-  encodeDealCursor
-} = require('../utils/dealPagination');
 
 const router = express.Router();
 router.use(auth);
@@ -99,6 +85,8 @@ const CRM_CONTACT_LIST_FIELDS = [
   'lastStageChangedAt',
   'leadScore',
   'leadScoreBreakdown',
+  'archivedAt',
+  'archivedBy',
   'isBlocked',
   'whatsappOptInStatus',
   'whatsappOptInAt',
@@ -119,15 +107,34 @@ const CRM_CONTACT_LIST_FIELDS = [
   'createdAt',
   'updatedAt'
 ].join(' ');
-const CRM_CONTACT_LIST_SORT = CONTACT_CURSOR_SORT;
+const CRM_CONTACT_FIELD_WHITELIST = new Set(CRM_CONTACT_LIST_FIELDS.split(/\s+/).filter(Boolean));
 const CRM_TASK_CONTACT_FIELDS = 'name phone stage status leadScore temperature ownerId nextFollowUpAt';
 const CRM_DEAL_CONTACT_FIELDS =
-  'name phone stage status temperature ownerId leadScore nextFollowUpAt dealValue';
+  'name phone email stage status temperature ownerId leadScore nextFollowUpAt dealValue';
+const CRM_DEAL_LIST_FIELDS = [
+  '_id',
+  'title',
+  'stage',
+  'status',
+  'value',
+  'probability',
+  'currency',
+  'expectedCloseAt',
+  'ownerId',
+  'productName',
+  'source',
+  'notes',
+  'lostReason',
+  'wonAt',
+  'lostAt',
+  'createdAt',
+  'updatedAt',
+  'contactId'
+].join(' ');
 const CRM_MESSAGE_FIELDS =
   '_id sender senderName text mediaType mediaCaption status timestamp broadcastId';
 const CRM_CONVERSATION_FIELDS =
   '_id status assignedTo lastMessage lastMessageTime lastMessageFrom unreadCount contactPhone contactName';
-const CRM_PIPELINE_VIEW_LIMIT = 12;
 const DEFAULT_LEAD_PIPELINE_STAGES = [
   { key: 'new', label: 'New Lead', color: '#5f8fc3', order: 0 },
   { key: 'contacted', label: 'Contacted', color: '#4a8bbd', order: 1 },
@@ -151,6 +158,27 @@ const toObjectIdIfValid = (value) => (mongoose.Types.ObjectId.isValid(value) ? v
 const toFiniteNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+};
+const encodeCursor = (payload = {}) => Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+const decodeCursor = (value) => {
+  const normalized = toCleanString(value);
+  if (!normalized) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(normalized, 'base64url').toString('utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+const buildContactProjection = (fields) => {
+  const requestedFields = toCleanString(fields)
+    .split(',')
+    .map((field) => field.trim())
+    .filter(Boolean);
+  if (!requestedFields.length || requestedFields.includes('list')) return CRM_CONTACT_LIST_FIELDS;
+  const allowedFields = requestedFields.filter((field) => CRM_CONTACT_FIELD_WHITELIST.has(field));
+  if (!allowedFields.includes('_id')) allowedFields.unshift('_id');
+  return allowedFields.length ? allowedFields.join(' ') : CRM_CONTACT_LIST_FIELDS;
 };
 const slugifyPipelineStageKey = (value) =>
   toCleanString(value)
@@ -261,12 +289,42 @@ const emitCrmRealtimeEvent = (req, payload = {}) => {
     contactId: toCleanString(payload?.contactId),
     dealId: toCleanString(payload?.dealId),
     taskId: toCleanString(payload?.taskId),
-    pipelineViewId: toCleanString(payload?.pipelineViewId),
+    filterPresetId: toCleanString(payload?.filterPresetId),
     conversationId: toCleanString(payload?.conversationId)
   });
 };
 
-const normalizePipelineViewFilters = (filters = {}) => ({
+const toCrmContactRealtimePayload = (contact = {}) => {
+  const source = typeof contact?.toObject === 'function' ? contact.toObject() : contact || {};
+  return {
+    _id: String(source?._id || source?.id || '').trim(),
+    name: toCleanString(source?.name),
+    phone: toCleanString(source?.phone),
+    email: toCleanString(source?.email),
+    tags: Array.isArray(source?.tags) ? source.tags : [],
+    stage: toCleanString(source?.stage || 'new').toLowerCase(),
+    status: toCleanString(source?.status || 'new').toLowerCase(),
+    source: toCleanString(source?.source),
+    sourceType: toCleanString(source?.sourceType),
+    ownerId: toCleanString(source?.ownerId),
+    temperature: toCleanString(source?.temperature),
+    dealValue: Number.isFinite(Number(source?.dealValue)) ? Number(source.dealValue) : 0,
+    lostReason: toCleanString(source?.lostReason),
+    nextFollowUpAt: source?.nextFollowUpAt || null,
+    lastContact: source?.lastContact || null,
+    lastContactAt: source?.lastContactAt || null,
+    lastStageChangedAt: source?.lastStageChangedAt || null,
+    leadScore: Number.isFinite(Number(source?.leadScore)) ? Number(source.leadScore) : 0,
+    leadScoreBreakdown: source?.leadScoreBreakdown || {},
+    whatsappOptInStatus: toCleanString(source?.whatsappOptInStatus),
+    lastInboundMessageAt: source?.lastInboundMessageAt || null,
+    notes: toCleanString(source?.notes),
+    createdAt: source?.createdAt || null,
+    updatedAt: source?.updatedAt || null
+  };
+};
+
+const normalizeFilterPresetFilters = (filters = {}) => ({
   search: toCleanString(filters?.search),
   queue: ['all', ...CONTACT_QUEUES].includes(toCleanString(filters?.queue).toLowerCase())
     ? toCleanString(filters?.queue).toLowerCase()
@@ -275,14 +333,40 @@ const normalizePipelineViewFilters = (filters = {}) => ({
     ? toCleanString(filters?.status).toLowerCase()
     : 'all',
   owner: toCleanString(filters?.owner) || 'all',
-  viewMode: toCleanString(filters?.viewMode).toLowerCase() === 'board' ? 'board' : 'list'
+  sortOrder: ['newest', 'oldest'].includes(toCleanString(filters?.sortOrder).toLowerCase())
+    ? toCleanString(filters?.sortOrder).toLowerCase()
+    : 'newest',
+  archive: ['active', 'archived', 'all'].includes(toCleanString(filters?.archive).toLowerCase())
+    ? toCleanString(filters?.archive).toLowerCase()
+    : 'active',
+  dealStatus: ['all', ...DEAL_STATUSES].includes(toCleanString(filters?.dealStatus).toLowerCase())
+    ? toCleanString(filters?.dealStatus).toLowerCase()
+    : 'all',
+  dealStage: ['all', ...DEAL_STAGES].includes(toCleanString(filters?.dealStage).toLowerCase())
+    ? toCleanString(filters?.dealStage).toLowerCase()
+    : 'all',
+  dealOwnerId: toCleanString(filters?.dealOwnerId),
+  dealSearch: toCleanString(filters?.dealSearch),
+  dealCreatedFrom: toCleanString(filters?.dealCreatedFrom),
+  dealCreatedTo: toCleanString(filters?.dealCreatedTo),
+  dealUpdatedFrom: toCleanString(filters?.dealUpdatedFrom),
+  dealUpdatedTo: toCleanString(filters?.dealUpdatedTo),
+  dealExpectedCloseFrom: toCleanString(filters?.dealExpectedCloseFrom),
+  dealExpectedCloseTo: toCleanString(filters?.dealExpectedCloseTo),
+  dealValueMin: toCleanString(filters?.dealValueMin),
+  dealValueMax: toCleanString(filters?.dealValueMax),
+  dealQuickFilter: ['all', 'my_deals', 'recently_updated', 'high_value', 'closing_this_week'].includes(
+    toCleanString(filters?.dealQuickFilter).toLowerCase()
+  )
+    ? toCleanString(filters?.dealQuickFilter).toLowerCase()
+    : 'all'
 });
 
-const toPipelineViewResponse = (view) => ({
+const toFilterPresetResponse = (view) => ({
   id: String(view?._id || view?.id || '').trim(),
   label: String(view?.label || '').trim(),
-  filters: normalizePipelineViewFilters(view?.filters || {}),
-  isDefault: Boolean(view?.isDefault),
+  filters: normalizeFilterPresetFilters(view?.filters || {}),
+  presetType: toCleanString(view?.presetType) || 'filter_preset',
   createdAt: view?.createdAt || null,
   updatedAt: view?.updatedAt || null
 });
@@ -389,6 +473,146 @@ const buildScopedFilter = (req, extra = {}) => {
   return { $and: conditions };
 };
 
+const buildDealCursorFilter = (cursorValue) => {
+  const decodedCursor = decodeCursor(cursorValue);
+  if (!decodedCursor?._id || !decodedCursor?.updatedAt) return null;
+
+  const cursorId = toObjectIdIfValid(decodedCursor._id);
+  const cursorUpdatedAt = new Date(decodedCursor.updatedAt);
+  if (!cursorId || Number.isNaN(cursorUpdatedAt.getTime())) return null;
+
+  return {
+    $or: [
+      { updatedAt: { $lt: cursorUpdatedAt } },
+      { updatedAt: cursorUpdatedAt, _id: { $lt: new mongoose.Types.ObjectId(cursorId) } }
+    ]
+  };
+};
+
+const buildDealListSort = () => ({ updatedAt: -1, _id: -1 });
+
+const buildDealSearchFilter = async (req, search) => {
+  const normalizedSearch = toCleanString(search);
+  if (!normalizedSearch) return {};
+
+  const searchRegex = new RegExp(normalizedSearch, 'i');
+  const contactFilter = buildScopedFilter(req, {
+    $or: [
+      { name: { $regex: normalizedSearch, $options: 'i' } },
+      { phone: { $regex: normalizedSearch, $options: 'i' } },
+      { email: { $regex: normalizedSearch, $options: 'i' } },
+      { ownerId: { $regex: normalizedSearch, $options: 'i' } },
+      { tags: { $in: [searchRegex] } }
+    ]
+  });
+  const contactIds = await Contact.distinct('_id', contactFilter);
+  const normalizedContactIds = (contactIds || [])
+    .map((contactId) => String(contactId || '').trim())
+    .filter((contactId) => toObjectIdIfValid(contactId));
+
+  const searchClauses = [
+    { title: { $regex: normalizedSearch, $options: 'i' } },
+    { productName: { $regex: normalizedSearch, $options: 'i' } },
+    { source: { $regex: normalizedSearch, $options: 'i' } },
+    { notes: { $regex: normalizedSearch, $options: 'i' } },
+    { lostReason: { $regex: normalizedSearch, $options: 'i' } }
+  ];
+
+  if (normalizedContactIds.length > 0) {
+    searchClauses.push({
+      contactId: { $in: normalizedContactIds.map((contactId) => new mongoose.Types.ObjectId(contactId)) }
+    });
+  }
+
+  return { $or: searchClauses };
+};
+
+const buildDealFieldRangeFilter = (field, fromValue, toValue) => {
+  const parsedFrom = safeDate(fromValue);
+  const parsedTo = safeDate(toValue);
+  if (fromValue && !parsedFrom) {
+    const error = new Error(`Invalid ${field}From date`);
+    error.status = 400;
+    throw error;
+  }
+  if (toValue && !parsedTo) {
+    const error = new Error(`Invalid ${field}To date`);
+    error.status = 400;
+    throw error;
+  }
+  if (!parsedFrom && !parsedTo) return {};
+
+  const filter = {};
+  filter[field] = {};
+  if (parsedFrom) filter[field].$gte = parsedFrom;
+  if (parsedTo) filter[field].$lte = parsedTo;
+  return filter;
+};
+
+const buildDealListFilter = async (req, query = {}) => {
+  const extraFilters = [];
+  const normalizedStage = toCleanString(query?.stage).toLowerCase();
+  const normalizedStatus = toCleanString(query?.status).toLowerCase();
+  const normalizedOwnerId = toCleanString(query?.ownerId);
+  const normalizedContactId = toCleanString(query?.contactId);
+  const normalizedSearch = toCleanString(query?.search);
+  const normalizedValueMin = toFiniteNumber(query?.valueMin);
+  const normalizedValueMax = toFiniteNumber(query?.valueMax);
+
+  if (normalizedStage && normalizedStage !== 'all') {
+    if (!DEAL_STAGES.includes(normalizedStage)) {
+      const error = new Error('Invalid deal stage filter');
+      error.status = 400;
+      throw error;
+    }
+    extraFilters.push({ stage: normalizedStage });
+  }
+
+  if (normalizedStatus && normalizedStatus !== 'all') {
+    if (!DEAL_STATUSES.includes(normalizedStatus)) {
+      const error = new Error('Invalid deal status filter');
+      error.status = 400;
+      throw error;
+    }
+    extraFilters.push({ status: normalizedStatus });
+  }
+
+  if (normalizedOwnerId) {
+    extraFilters.push({ ownerId: normalizedOwnerId });
+  }
+
+  if (normalizedContactId) {
+    if (!toObjectIdIfValid(normalizedContactId)) {
+      const error = new Error('Invalid contactId');
+      error.status = 400;
+      throw error;
+    }
+    extraFilters.push({ contactId: normalizedContactId });
+  }
+
+  const createdRange = buildDealFieldRangeFilter('createdAt', query?.createdFrom, query?.createdTo);
+  const updatedRange = buildDealFieldRangeFilter('updatedAt', query?.updatedFrom, query?.updatedTo);
+  const expectedCloseRange = buildDealFieldRangeFilter(
+    'expectedCloseAt',
+    query?.expectedCloseFrom,
+    query?.expectedCloseTo
+  );
+
+  if (Object.keys(createdRange).length > 0) extraFilters.push(createdRange);
+  if (Object.keys(updatedRange).length > 0) extraFilters.push(updatedRange);
+  if (Object.keys(expectedCloseRange).length > 0) extraFilters.push(expectedCloseRange);
+
+  if (Number.isFinite(normalizedValueMin) || Number.isFinite(normalizedValueMax)) {
+    const valueFilter = {};
+    if (Number.isFinite(normalizedValueMin)) valueFilter.$gte = normalizedValueMin;
+    if (Number.isFinite(normalizedValueMax)) valueFilter.$lte = normalizedValueMax;
+    extraFilters.push({ value: valueFilter });
+  }
+
+  const searchFilter = normalizedSearch ? await buildDealSearchFilter(req, normalizedSearch) : {};
+  return buildScopedFilter(req, mergeFiltersWithAnd(...extraFilters, searchFilter));
+};
+
 const buildContactQueueFilter = (req, queue) => {
   const normalizedQueue = toCleanString(queue).toLowerCase();
   if (!normalizedQueue) return {};
@@ -433,6 +657,122 @@ const buildContactQueueFilter = (req, queue) => {
   }
 };
 
+const buildCrmContactScopedFilter = async (req, query = {}, options = {}) => {
+  const {
+    search,
+    stage,
+    status,
+    ownerId,
+    queue,
+    minScore,
+    maxScore,
+    hasFollowUp,
+    archive
+  } = query || {};
+  const includeStage = options.includeStage !== false;
+  const extraFilter = {};
+  const normalizedStage = toCleanString(stage).toLowerCase();
+  const normalizedStatus = toCleanString(status).toLowerCase();
+  const normalizedOwnerId = toCleanString(ownerId);
+
+  if (includeStage && normalizedStage) {
+    const stageMap = await loadPipelineStageMap(req);
+    if (!stageMap.keySet.has(normalizedStage)) {
+      const error = new Error('Invalid stage filter');
+      error.status = 400;
+      throw error;
+    }
+    extraFilter.stage = normalizedStage;
+  }
+
+  if (normalizedStatus) {
+    if (!LEAD_STATUSES.includes(normalizedStatus)) {
+      const error = new Error('Invalid status filter');
+      error.status = 400;
+      throw error;
+    }
+    extraFilter.status = normalizedStatus;
+  }
+
+  if (normalizedOwnerId) {
+    extraFilter.ownerId = normalizedOwnerId;
+  }
+
+  const normalizedQueue = toCleanString(queue).toLowerCase();
+  if (normalizedQueue && !CONTACT_QUEUES.includes(normalizedQueue)) {
+    const error = new Error('Invalid queue filter');
+    error.status = 400;
+    throw error;
+  }
+
+  const minScoreNumber = Number(minScore);
+  const maxScoreNumber = Number(maxScore);
+  if (Number.isFinite(minScoreNumber) || Number.isFinite(maxScoreNumber)) {
+    extraFilter.leadScore = {};
+    if (Number.isFinite(minScoreNumber)) extraFilter.leadScore.$gte = minScoreNumber;
+    if (Number.isFinite(maxScoreNumber)) extraFilter.leadScore.$lte = maxScoreNumber;
+  }
+
+  if (String(hasFollowUp || '').toLowerCase() === 'true') {
+    extraFilter.nextFollowUpAt = { $ne: null };
+  }
+  if (String(hasFollowUp || '').toLowerCase() === 'false') {
+    extraFilter.nextFollowUpAt = null;
+  }
+
+  const normalizedArchive = toCleanString(archive).toLowerCase();
+  if (normalizedArchive === 'archived') {
+    extraFilter.archivedAt = { $ne: null };
+  } else if (normalizedArchive !== 'all') {
+    extraFilter.$or = [
+      { archivedAt: null },
+      { archivedAt: { $exists: false } }
+    ];
+  }
+
+  const normalizedSearch = toCleanString(search);
+  const searchFilter = normalizedSearch
+    ? {
+        $or: [
+          { name: { $regex: normalizedSearch, $options: 'i' } },
+          { phone: { $regex: normalizedSearch, $options: 'i' } },
+          { email: { $regex: normalizedSearch, $options: 'i' } },
+          { source: { $regex: normalizedSearch, $options: 'i' } },
+          { ownerId: { $regex: normalizedSearch, $options: 'i' } },
+          { stage: { $regex: normalizedSearch, $options: 'i' } },
+          { notes: { $regex: normalizedSearch, $options: 'i' } },
+          { tags: { $in: [new RegExp(normalizedSearch, 'i')] } }
+        ]
+      }
+    : {};
+
+  const queueFilter = buildContactQueueFilter(req, normalizedQueue);
+  if (normalizedQueue === 'today_calls') {
+    const { startOfDay, endOfDay } = getDayRange(new Date());
+    const todayCallTasks = await LeadTask.find(
+      buildScopedFilter(req, {
+        taskType: 'call',
+        status: { $in: TASK_OPEN_STATUSES },
+        dueAt: { $gte: startOfDay, $lte: endOfDay }
+      })
+    )
+      .select('contactId')
+      .lean();
+
+    const contactIds = Array.from(
+      new Set((todayCallTasks || []).map((task) => String(task?.contactId || '').trim()).filter(Boolean))
+    );
+
+    extraFilter._id = {
+      $in: contactIds
+        .filter((contactId) => toObjectIdIfValid(contactId))
+        .map((contactId) => new mongoose.Types.ObjectId(contactId))
+    };
+  }
+
+  return buildScopedFilter(req, mergeFiltersWithAnd(extraFilter, searchFilter, queueFilter || {}));
+};
+
 const buildTaskBucketFilter = (bucket) => {
   const normalizedBucket = toCleanString(bucket).toLowerCase();
   if (!normalizedBucket) return {};
@@ -463,6 +803,114 @@ const buildTaskBucketFilter = (bucket) => {
     default:
       return null;
   }
+};
+
+const buildTaskSearchFilter = async (req, search) => {
+  const normalizedSearch = toCleanString(search);
+  if (!normalizedSearch) return {};
+
+  const searchRegex = new RegExp(normalizedSearch, 'i');
+  const contactSearchFilter = buildScopedFilter(req, {
+    $or: [
+      { name: { $regex: normalizedSearch, $options: 'i' } },
+      { phone: { $regex: normalizedSearch, $options: 'i' } },
+      { email: { $regex: normalizedSearch, $options: 'i' } },
+      { source: { $regex: normalizedSearch, $options: 'i' } },
+      { ownerId: { $regex: normalizedSearch, $options: 'i' } },
+      { stage: { $regex: normalizedSearch, $options: 'i' } },
+      { notes: { $regex: normalizedSearch, $options: 'i' } },
+      { tags: { $in: [searchRegex] } }
+    ]
+  });
+
+  const matchingContactIds = await Contact.distinct('_id', contactSearchFilter);
+  const normalizedContactIds = (matchingContactIds || [])
+    .map((contactId) => String(contactId || '').trim())
+    .filter((contactId) => toObjectIdIfValid(contactId));
+
+  const orClauses = [
+    { title: { $regex: normalizedSearch, $options: 'i' } },
+    { description: { $regex: normalizedSearch, $options: 'i' } },
+    { taskType: { $regex: normalizedSearch, $options: 'i' } },
+    { assignedTo: { $regex: normalizedSearch, $options: 'i' } },
+    { completedBy: { $regex: normalizedSearch, $options: 'i' } },
+    { 'comments.text': { $regex: normalizedSearch, $options: 'i' } }
+  ];
+
+  if (normalizedContactIds.length > 0) {
+    orClauses.push({
+      contactId: {
+        $in: normalizedContactIds.map((contactId) => new mongoose.Types.ObjectId(contactId))
+      }
+    });
+  }
+
+  return { $or: orClauses };
+};
+
+const TASK_PRIORITY_RANK = {
+  low: 0,
+  medium: 1,
+  high: 2
+};
+
+const getTaskPriorityRank = (value) => {
+  const normalized = toCleanString(value).toLowerCase();
+  return Number.isFinite(TASK_PRIORITY_RANK[normalized]) ? TASK_PRIORITY_RANK[normalized] : TASK_PRIORITY_RANK.medium;
+};
+
+const getTaskPriorityFromRank = (rank) => {
+  const normalizedRank = Number(rank);
+  if (normalizedRank >= TASK_PRIORITY_RANK.high) return 'high';
+  if (normalizedRank <= TASK_PRIORITY_RANK.low) return 'low';
+  return 'medium';
+};
+
+const buildTaskCursorFilter = (cursorValue) => {
+  const decodedCursor = decodeCursor(cursorValue);
+  if (!decodedCursor?.createdAt || !decodedCursor?._id) return null;
+
+  const cursorId = toObjectIdIfValid(decodedCursor._id);
+  const cursorCreatedAt = new Date(decodedCursor.createdAt);
+  if (!cursorId || Number.isNaN(cursorCreatedAt.getTime())) return null;
+
+  const cursorDueAt = decodedCursor?.dueAt ? new Date(decodedCursor.dueAt) : null;
+  const cursorPriority = getTaskPriorityFromRank(decodedCursor?.priorityRank);
+  const lowerPriorityValues =
+    cursorPriority === 'high'
+      ? ['medium', 'low']
+      : cursorPriority === 'medium'
+        ? ['low']
+        : [];
+  const sameDueAtFilters = [
+    lowerPriorityValues.length
+      ? { dueAt: cursorDueAt, priority: { $in: lowerPriorityValues } }
+      : null,
+    {
+      dueAt: cursorDueAt,
+      priority: cursorPriority,
+      $or: [
+        { createdAt: { $lt: cursorCreatedAt } },
+        { createdAt: cursorCreatedAt, _id: { $lt: cursorId } }
+      ]
+    }
+  ].filter(Boolean);
+
+  if (cursorDueAt === null) {
+    return {
+      $or: [
+        ...sameDueAtFilters,
+        { dueAt: { $ne: null } }
+      ]
+    };
+  }
+
+  return {
+    $or: [
+      { dueAt: { $gt: cursorDueAt } },
+      ...sameDueAtFilters
+    ]
+  };
 };
 
 const normalizeTaskRecurrence = (recurrence = null) => {
@@ -813,17 +1261,19 @@ const buildDealSummary = async (req, extraFilter = {}) => {
 };
 
 const syncContactDealSnapshot = async (req, contactId) => {
-  if (!toObjectIdIfValid(contactId)) return;
+  if (!toObjectIdIfValid(contactId)) return null;
 
   try {
     const contact = await Contact.findOne(buildScopedFilter(req, { _id: contactId }));
-    if (!contact) return;
+    if (!contact) return null;
 
     const dealSummary = await buildDealSummary(req, { contactId });
     contact.dealValue = Number(dealSummary.pipelineValue || 0);
     await contact.save();
+    return contact;
   } catch (error) {
     console.error('CRM deal snapshot sync failed:', error.message);
+    return null;
   }
 };
 
@@ -1100,169 +1550,122 @@ const getCrmRouteErrorStatus = (error) => {
   return error?.status || 500;
 };
 
-router.get('/pipeline-views', async (req, res) => {
+router.get('/filter-presets', async (req, res) => {
   try {
-    const views = await CrmPipelineView.find({
+    const presets = await CrmPipelineView.find({
       userId: String(req.user?.id || '').trim(),
-      ...(req.companyId ? { companyId: String(req.companyId).trim() } : {})
+      ...(req.companyId ? { companyId: String(req.companyId).trim() } : {}),
+      presetType: 'filter_preset'
     })
-      .sort({ isDefault: -1, updatedAt: -1, createdAt: -1 })
+      .sort({ updatedAt: -1, createdAt: -1 })
       .lean();
 
-    const defaultView = views.find((view) => Boolean(view?.isDefault));
-    res.json({
-      success: true,
-      data: {
-        views: views.map(toPipelineViewResponse),
-        defaultViewId: defaultView ? String(defaultView._id || '').trim() : ''
-      }
-    });
+    res.json({ success: true, data: presets.map(toFilterPresetResponse) });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-router.post('/pipeline-views', async (req, res) => {
+router.post('/filter-presets', async (req, res) => {
   try {
     const label = toCleanString(req.body?.label);
     if (!label) {
-      return res.status(400).json({ success: false, error: 'View label is required' });
+      return res.status(400).json({ success: false, error: 'Preset label is required' });
     }
 
-    const viewCount = await CrmPipelineView.countDocuments({
-      userId: String(req.user?.id || '').trim(),
-      ...(req.companyId ? { companyId: String(req.companyId).trim() } : {})
-    });
-    if (viewCount >= CRM_PIPELINE_VIEW_LIMIT) {
-      return res.status(400).json({
-        success: false,
-        error: `You can save up to ${CRM_PIPELINE_VIEW_LIMIT} CRM views.`
-      });
-    }
-
-    const view = await CrmPipelineView.create({
+    const preset = await CrmPipelineView.create({
       userId: String(req.user?.id || '').trim(),
       companyId: req.companyId ? String(req.companyId).trim() : '',
       label,
-      filters: normalizePipelineViewFilters(req.body?.filters || {}),
-      isDefault: Boolean(req.body?.isDefault)
+      filters: normalizeFilterPresetFilters(req.body?.filters || {}),
+      presetType: 'filter_preset'
     });
-
-    if (view.isDefault) {
-      await CrmPipelineView.updateMany(
-        {
-          userId: view.userId,
-          _id: { $ne: view._id }
-        },
-        { $set: { isDefault: false } }
-      );
-    }
 
     emitCrmRealtimeEvent(req, {
-      entity: 'pipeline_view',
+      entity: 'filter_preset',
       action: 'created',
-      pipelineViewId: String(view._id || '').trim()
+      filterPresetId: String(preset._id || '').trim()
     });
 
-    res.status(201).json({
-      success: true,
-      data: toPipelineViewResponse(view)
-    });
+    res.status(201).json({ success: true, data: toFilterPresetResponse(preset) });
   } catch (error) {
     if (String(error?.code || '') === '11000') {
-      return res.status(409).json({ success: false, error: 'A saved view with that name already exists.' });
+      return res.status(409).json({ success: false, error: 'A filter preset with that name already exists.' });
     }
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-router.patch('/pipeline-views/:id', async (req, res) => {
+router.patch('/filter-presets/:id', async (req, res) => {
   try {
     const { id } = req.params;
     if (!toObjectIdIfValid(id)) {
-      return res.status(400).json({ success: false, error: 'Invalid view id' });
+      return res.status(400).json({ success: false, error: 'Invalid preset id' });
     }
 
-    const view = await CrmPipelineView.findOne({
+    const preset = await CrmPipelineView.findOne({
       _id: id,
       userId: String(req.user?.id || '').trim(),
-      ...(req.companyId ? { companyId: String(req.companyId).trim() } : {})
+      ...(req.companyId ? { companyId: String(req.companyId).trim() } : {}),
+      presetType: 'filter_preset'
     });
 
-    if (!view) {
-      return res.status(404).json({ success: false, error: 'Saved view not found' });
+    if (!preset) {
+      return res.status(404).json({ success: false, error: 'Filter preset not found' });
     }
 
     if (req.body?.label !== undefined) {
       const label = toCleanString(req.body.label);
       if (!label) {
-        return res.status(400).json({ success: false, error: 'View label is required' });
+        return res.status(400).json({ success: false, error: 'Preset label is required' });
       }
-      view.label = label;
+      preset.label = label;
     }
-
     if (req.body?.filters !== undefined) {
-      view.filters = normalizePipelineViewFilters(req.body.filters);
+      preset.filters = normalizeFilterPresetFilters(req.body.filters);
     }
-
-    if (req.body?.isDefault !== undefined) {
-      view.isDefault = Boolean(req.body.isDefault);
-    }
-
-    await view.save();
-
-    if (view.isDefault) {
-      await CrmPipelineView.updateMany(
-        {
-          userId: view.userId,
-          _id: { $ne: view._id }
-        },
-        { $set: { isDefault: false } }
-      );
-    }
+    await preset.save();
 
     emitCrmRealtimeEvent(req, {
-      entity: 'pipeline_view',
+      entity: 'filter_preset',
       action: 'updated',
-      pipelineViewId: String(view._id || '').trim()
+      filterPresetId: String(preset._id || '').trim()
     });
 
-    res.json({
-      success: true,
-      data: toPipelineViewResponse(view)
-    });
+    res.json({ success: true, data: toFilterPresetResponse(preset) });
   } catch (error) {
     if (String(error?.code || '') === '11000') {
-      return res.status(409).json({ success: false, error: 'A saved view with that name already exists.' });
+      return res.status(409).json({ success: false, error: 'A filter preset with that name already exists.' });
     }
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-router.delete('/pipeline-views/:id', async (req, res) => {
+router.delete('/filter-presets/:id', async (req, res) => {
   try {
     const { id } = req.params;
     if (!toObjectIdIfValid(id)) {
-      return res.status(400).json({ success: false, error: 'Invalid view id' });
+      return res.status(400).json({ success: false, error: 'Invalid preset id' });
     }
 
-    const view = await CrmPipelineView.findOneAndDelete({
+    const preset = await CrmPipelineView.findOneAndDelete({
       _id: id,
       userId: String(req.user?.id || '').trim(),
-      ...(req.companyId ? { companyId: String(req.companyId).trim() } : {})
+      ...(req.companyId ? { companyId: String(req.companyId).trim() } : {}),
+      presetType: 'filter_preset'
     });
 
-    if (!view) {
-      return res.status(404).json({ success: false, error: 'Saved view not found' });
+    if (!preset) {
+      return res.status(404).json({ success: false, error: 'Filter preset not found' });
     }
 
     emitCrmRealtimeEvent(req, {
-      entity: 'pipeline_view',
+      entity: 'filter_preset',
       action: 'deleted',
-      pipelineViewId: String(view._id || '').trim()
+      filterPresetId: String(preset._id || '').trim()
     });
 
-    res.json({ success: true, data: { id: String(view._id || '').trim() } });
+    res.json({ success: true, data: { id: String(preset._id || '').trim() } });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -1591,196 +1994,68 @@ router.delete('/pipeline-stages/:id', async (req, res) => {
 
 router.get('/contacts', async (req, res) => {
   try {
-    const {
-      search,
-      stage,
-      status,
-      ownerId,
-      queue,
-      minScore,
-      maxScore,
-      hasFollowUp,
-      cursor: cursorParam = '',
-      page = 1,
-      limit = 50
-    } = req.query;
-
-    const extraFilter = {};
-    const normalizedStage = toCleanString(stage).toLowerCase();
-    const normalizedStatus = toCleanString(status).toLowerCase();
-    const normalizedOwnerId = toCleanString(ownerId);
-    const stageMap = await loadPipelineStageMap(req);
-
-    if (normalizedStage) {
-      if (!stageMap.keySet.has(normalizedStage)) {
-        return res.status(400).json({ success: false, error: 'Invalid stage filter' });
-      }
-      extraFilter.stage = normalizedStage;
-    }
-
-    if (normalizedStatus) {
-      if (!LEAD_STATUSES.includes(normalizedStatus)) {
-        return res.status(400).json({ success: false, error: 'Invalid status filter' });
-      }
-      extraFilter.status = normalizedStatus;
-    }
-
-    if (normalizedOwnerId) {
-      extraFilter.ownerId = normalizedOwnerId;
-    }
-
-    const normalizedQueue = toCleanString(queue).toLowerCase();
-    if (normalizedQueue && !CONTACT_QUEUES.includes(normalizedQueue)) {
-      return res.status(400).json({ success: false, error: 'Invalid queue filter' });
-    }
-
-    const minScoreNumber = Number(minScore);
-    const maxScoreNumber = Number(maxScore);
-    if (Number.isFinite(minScoreNumber) || Number.isFinite(maxScoreNumber)) {
-      extraFilter.leadScore = {};
-      if (Number.isFinite(minScoreNumber)) extraFilter.leadScore.$gte = minScoreNumber;
-      if (Number.isFinite(maxScoreNumber)) extraFilter.leadScore.$lte = maxScoreNumber;
-    }
-
-    if (String(hasFollowUp || '').toLowerCase() === 'true') {
-      extraFilter.nextFollowUpAt = { $ne: null };
-    }
-    if (String(hasFollowUp || '').toLowerCase() === 'false') {
-      extraFilter.nextFollowUpAt = null;
-    }
-
-    const normalizedSearch = toCleanString(search);
-    const searchPlan = buildCrmContactSearchPlan(normalizedSearch);
-    const searchFilter = searchPlan.summaryClause || {};
-    const normalizedCursor = toCleanString(cursorParam);
-    const hasCursor = Boolean(normalizedCursor);
-    const cursor = hasCursor ? decodeCrmContactCursor(normalizedCursor) : null;
-    if (hasCursor && !cursor) {
-      return res.status(400).json({ success: false, error: 'Invalid cursor' });
-    }
-
+    const { page = 1, limit = 50, cursor = '' } = req.query;
+    const sortOrder = toCleanString(req.query?.sortOrder).toLowerCase();
+    const useCursor = Boolean(toCleanString(cursor)) || toCleanString(req.query?.cursorMode).toLowerCase() === 'true';
+    const contactSort =
+      sortOrder === 'oldest'
+        ? { createdAt: 1, _id: 1 }
+        : sortOrder === 'newest'
+          ? { createdAt: -1, _id: -1 }
+          : { nextFollowUpAt: 1, leadScore: -1, lastContact: -1, createdAt: -1 };
     const pageNumber = Math.max(Number(page) || 1, 1);
     const pageSize = Math.min(Math.max(Number(limit) || 50, 1), 200);
     const skip = (pageNumber - 1) * pageSize;
-    const queueFilter = buildContactQueueFilter(req, normalizedQueue);
-    const ownerScopeId = normalizedOwnerId || (normalizedQueue === 'my_leads' ? toCleanString(req?.user?.id) : '');
-    const listHint = buildCrmContactListHint({ ownerScopeId, searchPlan });
-    if (normalizedQueue === 'today_calls') {
-      const { startOfDay, endOfDay } = getDayRange(new Date());
-      const todayCallTasks = await LeadTask.find(
-        buildScopedFilter(req, {
-          taskType: 'call',
-          status: { $in: TASK_OPEN_STATUSES },
-          dueAt: { $gte: startOfDay, $lte: endOfDay }
-        })
-      )
-        .select('contactId')
-        .lean();
-
-      const contactIds = Array.from(
-        new Set((todayCallTasks || []).map((task) => String(task?.contactId || '').trim()).filter(Boolean))
-      );
-
-      extraFilter._id = {
-        $in: contactIds.map((contactId) => new mongoose.Types.ObjectId(contactId))
-      };
-    }
-    const baseScopedFilter = mergeFiltersWithAnd(extraFilter, searchFilter, queueFilter || {});
-    const cursorFilter = hasCursor ? buildCrmContactCursorFilter(cursor) : {};
-    const scopedFilter = buildScopedFilter(req, mergeFiltersWithAnd(baseScopedFilter, cursorFilter));
-
-    if (hasCursor) {
-      let contactQuery = Contact.find(scopedFilter)
-        .select(CRM_CONTACT_LIST_FIELDS)
-        .sort(CRM_CONTACT_LIST_SORT)
-        .limit(pageSize + 1)
-        .lean();
-
-      if (listHint) {
-        contactQuery = contactQuery.hint(listHint);
+    let scopedFilter = await buildCrmContactScopedFilter(req, req.query);
+    const totalFilter = scopedFilter;
+    const decodedCursor = decodeCursor(cursor);
+    if (useCursor && decodedCursor?.createdAt && decodedCursor?._id) {
+      const cursorDate = new Date(decodedCursor.createdAt);
+      const cursorId = toObjectIdIfValid(decodedCursor._id);
+      if (!Number.isNaN(cursorDate.getTime()) && cursorId) {
+        const cursorFilter =
+          sortOrder === 'oldest'
+            ? {
+                $or: [
+                  { createdAt: { $gt: cursorDate } },
+                  { createdAt: cursorDate, _id: { $gt: new mongoose.Types.ObjectId(cursorId) } }
+                ]
+              }
+            : {
+                $or: [
+                  { createdAt: { $lt: cursorDate } },
+                  { createdAt: cursorDate, _id: { $lt: new mongoose.Types.ObjectId(cursorId) } }
+                ]
+              };
+        scopedFilter = mergeFiltersWithAnd(scopedFilter, cursorFilter);
       }
-
-      let contacts = await contactQuery;
-      let hasMore = contacts.length > pageSize;
-      if (hasMore) {
-        contacts = contacts.slice(0, pageSize);
-      }
-
-      if (!contacts.length && searchPlan.fallbackClause) {
-        const fallbackScopedFilter = buildScopedFilter(
-          req,
-          mergeFiltersWithAnd(extraFilter, searchPlan.fallbackClause, queueFilter || {}, cursorFilter)
-        );
-        let fallbackQuery = Contact.find(fallbackScopedFilter)
-          .select(CRM_CONTACT_LIST_FIELDS)
-          .sort(CRM_CONTACT_LIST_SORT)
-          .limit(pageSize + 1)
-          .lean();
-
-        if (listHint) {
-          fallbackQuery = fallbackQuery.hint(listHint);
-        }
-
-        contacts = await fallbackQuery;
-        hasMore = contacts.length > pageSize;
-        if (hasMore) {
-          contacts = contacts.slice(0, pageSize);
-        }
-      }
-
-      return res.json({
-        success: true,
-        data: contacts,
-        pagination: {
-          limit: pageSize,
-          hasMore,
-          nextCursor: hasMore ? encodeCrmContactCursor(contacts[contacts.length - 1]) : null,
-          cursor: normalizedCursor || null
-        }
-      });
     }
+    const projection = buildContactProjection(req.query?.fields);
 
-    let contactQuery = Contact.find(scopedFilter)
-      .select(CRM_CONTACT_LIST_FIELDS)
-      .sort(CRM_CONTACT_LIST_SORT)
-      .skip(skip)
-      .limit(pageSize)
-      .lean();
-
-    if (listHint) {
-      contactQuery = contactQuery.hint(listHint);
-    }
-
-    let [contacts, total] = await Promise.all([
-      contactQuery,
-      Contact.countDocuments(scopedFilter)
+    const [contacts, total] = await Promise.all([
+      Contact.find(scopedFilter)
+        .select(projection)
+        .sort(contactSort)
+        .skip(useCursor ? 0 : skip)
+        .limit(useCursor ? pageSize + 1 : pageSize)
+        .lean(),
+      Contact.countDocuments(totalFilter)
     ]);
-
-    if (!contacts.length && searchPlan.fallbackClause) {
-      const fallbackScopedFilter = buildScopedFilter(
-        req,
-        mergeFiltersWithAnd(extraFilter, searchPlan.fallbackClause, queueFilter || {})
-      );
-      let fallbackQuery = Contact.find(fallbackScopedFilter)
-        .select(CRM_CONTACT_LIST_FIELDS)
-        .sort(CRM_CONTACT_LIST_SORT)
-        .skip(skip)
-        .limit(pageSize)
-        .lean();
-
-      if (listHint) {
-        fallbackQuery = fallbackQuery.hint(listHint);
-      }
-
-      [contacts, total] = await Promise.all([
-        fallbackQuery,
-        Contact.countDocuments(fallbackScopedFilter)
-      ]);
-    }
+    const pageContacts = useCursor ? contacts.slice(0, pageSize) : contacts;
+    const lastContact = pageContacts[pageContacts.length - 1] || null;
+    const nextCursor =
+      useCursor && contacts.length > pageSize && lastContact
+        ? encodeCursor({
+            createdAt: lastContact.createdAt || new Date(0).toISOString(),
+            _id: String(lastContact._id || '')
+          })
+        : '';
 
     res.json({
       success: true,
-      data: contacts,
+      data: pageContacts,
+      nextCursor,
+      hasMore: useCursor ? contacts.length > pageSize : pageNumber < Math.max(Math.ceil(total / pageSize), 1),
       pagination: {
         page: pageNumber,
         limit: pageSize,
@@ -1789,7 +2064,226 @@ router.get('/contacts', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error?.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+router.post('/contacts/bulk', async (req, res) => {
+  try {
+    const action = toCleanString(req.body?.action).toLowerCase();
+    const validContactIds = Array.isArray(req.body?.contactIds)
+      ? req.body.contactIds.filter((contactId) => toObjectIdIfValid(contactId))
+      : [];
+    if (!['assign', 'add_tags', 'remove_tags', 'archive', 'unarchive', 'export', 'delete'].includes(action)) {
+      return res.status(400).json({ success: false, error: 'Invalid bulk action' });
+    }
+    if (!validContactIds.length) {
+      return res.status(400).json({ success: false, error: 'Choose at least one lead.' });
+    }
+
+    const filter = buildScopedFilter(req, {
+      _id: { $in: validContactIds.map((contactId) => new mongoose.Types.ObjectId(contactId)) }
+    });
+    const contacts = await Contact.find(filter).select(CRM_CONTACT_LIST_FIELDS).lean();
+    if (!contacts.length) {
+      return res.status(404).json({ success: false, error: 'No leads found for bulk action' });
+    }
+
+    if (action === 'export') {
+      return res.json({
+        success: true,
+        data: {
+          action,
+          count: contacts.length,
+          contacts
+        }
+      });
+    }
+
+    if (action === 'delete') {
+      const actorId = toCleanString(req.user?.id);
+      const result = await Contact.deleteMany(filter);
+      await Promise.all(
+        contacts.map((contact) =>
+          logLeadActivity({
+            req,
+            contactId: contact._id,
+            type: 'contact_deleted',
+            meta: {
+              bulkAction: action
+            },
+            createdBy: actorId
+          })
+        )
+      );
+
+      emitCrmRealtimeEvent(req, {
+        entity: 'contact',
+        action: 'bulk_deleted',
+        bulkAction: action,
+        contactIds: contacts.map((contact) => String(contact._id || '')),
+        count: Number(result?.deletedCount || contacts.length)
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          action,
+          count: Number(result?.deletedCount || contacts.length)
+        }
+      });
+    }
+
+    const now = new Date();
+    const actorId = toCleanString(req.user?.id);
+    const update = {};
+    if (action === 'assign') {
+      update.$set = { ownerId: toCleanString(req.body?.ownerId) || null };
+    } else if (action === 'add_tags') {
+      const tags = toCleanStringArray(req.body?.tags);
+      update.$addToSet = { tags: { $each: tags } };
+    } else if (action === 'remove_tags') {
+      const tags = toCleanStringArray(req.body?.tags);
+      update.$pull = { tags: { $in: tags } };
+    } else if (action === 'archive') {
+      update.$set = { archivedAt: now, archivedBy: actorId };
+    } else if (action === 'unarchive') {
+      update.$set = { archivedAt: null, archivedBy: null };
+    }
+
+    const result = await Contact.updateMany(filter, update);
+    const activityType = action === 'assign' ? 'owner_changed' : 'contact_updated';
+    await Promise.all(
+      contacts.map((contact) =>
+        logLeadActivity({
+          req,
+          contactId: contact._id,
+          type: activityType,
+          meta: {
+            bulkAction: action,
+            ownerId: action === 'assign' ? toCleanString(req.body?.ownerId) || null : undefined,
+            tags: ['add_tags', 'remove_tags'].includes(action) ? toCleanStringArray(req.body?.tags) : undefined
+          },
+          createdBy: actorId
+        })
+      )
+    );
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'contact',
+      action: 'bulk_updated',
+      bulkAction: action,
+      contactIds: contacts.map((contact) => String(contact._id || '')),
+      count: Number(result?.modifiedCount || contacts.length)
+    });
+
+    res.json({
+      success: true,
+      data: {
+        action,
+        count: Number(result?.modifiedCount || contacts.length)
+      }
+    });
+  } catch (error) {
+    res.status(error?.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+router.get('/contacts/summary', async (req, res) => {
+  try {
+    const scopedFilter = await buildCrmContactScopedFilter(req, req.query, { includeStage: false });
+
+    const [summaryResult] = await Contact.aggregate([
+      { $match: scopedFilter },
+      {
+        $project: {
+          stage: { $toLower: { $ifNull: ['$stage', 'new'] } },
+          status: { $toLower: { $ifNull: ['$status', 'new'] } },
+          leadScore: { $ifNull: ['$leadScore', 0] },
+          dealValue: { $ifNull: ['$dealValue', 0] }
+        }
+      },
+      {
+        $facet: {
+          total: [
+            {
+              $group: {
+                _id: null,
+                count: { $sum: 1 },
+                value: { $sum: '$dealValue' },
+                qualified: {
+                  $sum: {
+                    $cond: [
+                      { $or: [{ $eq: ['$status', 'qualified'] }, { $eq: ['$stage', 'qualified'] }] },
+                      1,
+                      0
+                    ]
+                  }
+                },
+                averageLeadScore: { $avg: '$leadScore' }
+              }
+            }
+          ],
+          byStage: [
+            {
+              $group: {
+                _id: '$stage',
+                count: { $sum: 1 },
+                value: { $sum: '$dealValue' },
+                averageLeadScore: { $avg: '$leadScore' }
+              }
+            }
+          ]
+        }
+      }
+    ]);
+
+    const total = summaryResult?.total?.[0] || {};
+    const byStage = (summaryResult?.byStage || []).reduce((acc, item) => {
+      const key = toCleanString(item?._id).toLowerCase() || 'new';
+      acc[key] = {
+        count: Number(item?.count || 0),
+        value: Number(item?.value || 0),
+        averageLeadScore: Number(Number(item?.averageLeadScore || 0).toFixed(2))
+      };
+      return acc;
+    }, {});
+
+    res.json({
+      success: true,
+      data: {
+        total: Number(total?.count || 0),
+        value: Number(total?.value || 0),
+        qualified: Number(total?.qualified || 0),
+        averageLeadScore: Number(Number(total?.averageLeadScore || 0).toFixed(2)),
+        byStage,
+        generatedAt: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    res.status(error?.status || 500).json({ success: false, error: error.message });
+  }
+});
+
+router.get('/contacts/owners', async (req, res) => {
+  try {
+    const ownerQuery = {
+      ...(req.query || {}),
+      ownerId: ''
+    };
+    const scopedFilter = await buildCrmContactScopedFilter(req, ownerQuery, { includeStage: false });
+    const owners = await Contact.distinct('ownerId', scopedFilter);
+
+    res.json({
+      success: true,
+      data: (Array.isArray(owners) ? owners : [])
+        .map((ownerId) => toCleanString(ownerId))
+        .filter(Boolean)
+        .sort((left, right) => left.localeCompare(right))
+        .slice(0, 200)
+    });
+  } catch (error) {
+    res.status(error?.status || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -1948,7 +2442,8 @@ router.patch('/contacts/:id/stage', async (req, res) => {
     emitCrmRealtimeEvent(req, {
       entity: 'contact',
       action: 'stage_updated',
-      contactId: String(contact._id || '').trim()
+      contactId: String(contact._id || '').trim(),
+      contact: toCrmContactRealtimePayload(contact)
     });
 
     res.json({ success: true, data: contact });
@@ -2057,7 +2552,8 @@ router.patch('/contacts/:id/profile', async (req, res) => {
     emitCrmRealtimeEvent(req, {
       entity: 'contact',
       action: 'profile_updated',
-      contactId: String(contact._id || '').trim()
+      contactId: String(contact._id || '').trim(),
+      contact: toCrmContactRealtimePayload(contact)
     });
 
     res.json({ success: true, data: contact });
@@ -2097,7 +2593,8 @@ router.patch('/contacts/:id/owner', async (req, res) => {
     emitCrmRealtimeEvent(req, {
       entity: 'contact',
       action: 'owner_updated',
-      contactId: String(contact._id || '').trim()
+      contactId: String(contact._id || '').trim(),
+      contact: toCrmContactRealtimePayload(contact)
     });
 
     res.json({ success: true, data: contact });
@@ -2148,7 +2645,8 @@ router.post('/contacts/:id/notes', async (req, res) => {
     emitCrmRealtimeEvent(req, {
       entity: 'contact',
       action: 'notes_updated',
-      contactId: String(contact._id || '').trim()
+      contactId: String(contact._id || '').trim(),
+      contact: toCrmContactRealtimePayload(contact)
     });
 
     res.json({ success: true, data: contact });
@@ -2209,6 +2707,12 @@ router.post('/contacts/:id/documents', async (req, res) => {
       file: req.file,
       user: req.user,
       contact,
+      companyContext: {
+        companyId: req.companyId || req.user?.companyId || null,
+        companyName: req.user?.companyName || '',
+        companySlug: req.user?.companySlug || '',
+        cloudinaryFolderRoot: req.user?.cloudinaryFolderRoot || ''
+      },
       sender: String(req.user?.username || req.user?.email || req.user?.id || '').trim(),
       recipient: String(contact?.phone || '').trim()
     });
@@ -2249,7 +2753,8 @@ router.post('/contacts/:id/documents', async (req, res) => {
       entity: 'contact',
       action: 'document_uploaded',
       contactId: String(contact._id || '').trim(),
-      conversationId: String(conversationId || '').trim()
+      conversationId: String(conversationId || '').trim(),
+      contact: toCrmContactRealtimePayload(contact)
     });
 
     res.status(201).json({ success: true, data: document });
@@ -2260,212 +2765,75 @@ router.post('/contacts/:id/documents', async (req, res) => {
 
 router.get('/deals', async (req, res) => {
   try {
-    const {
-      search,
-      stage,
-      status,
-      ownerId,
-      contactId,
-      expectedCloseFrom,
-      expectedCloseTo,
-      page = 1,
-      limit = 50
-    } = req.query;
-
-    const extraFilter = {};
-    const normalizedStage = toCleanString(stage).toLowerCase();
-    const normalizedStatus = toCleanString(status).toLowerCase();
-    const normalizedOwnerId = toCleanString(ownerId);
-    const normalizedContactId = toCleanString(contactId);
-
-    if (normalizedStage) {
-      if (!DEAL_STAGES.includes(normalizedStage)) {
-        return res.status(400).json({ success: false, error: 'Invalid deal stage filter' });
-      }
-      extraFilter.stage = normalizedStage;
-    }
-
-    if (normalizedStatus) {
-      if (!DEAL_STATUSES.includes(normalizedStatus)) {
-        return res.status(400).json({ success: false, error: 'Invalid deal status filter' });
-      }
-      extraFilter.status = normalizedStatus;
-    }
-
-    if (normalizedOwnerId) {
-      extraFilter.ownerId = normalizedOwnerId;
-    }
-
-    if (normalizedContactId) {
-      if (!toObjectIdIfValid(normalizedContactId)) {
-        return res.status(400).json({ success: false, error: 'Invalid contactId' });
-      }
-      extraFilter.contactId = normalizedContactId;
-    }
-
-    const parsedExpectedCloseFrom = safeDate(expectedCloseFrom);
-    const parsedExpectedCloseTo = safeDate(expectedCloseTo);
-    if (expectedCloseFrom && !parsedExpectedCloseFrom) {
-      return res.status(400).json({ success: false, error: 'Invalid expectedCloseFrom date' });
-    }
-    if (expectedCloseTo && !parsedExpectedCloseTo) {
-      return res.status(400).json({ success: false, error: 'Invalid expectedCloseTo date' });
-    }
-    if (parsedExpectedCloseFrom || parsedExpectedCloseTo) {
-      extraFilter.expectedCloseAt = {};
-      if (parsedExpectedCloseFrom) extraFilter.expectedCloseAt.$gte = parsedExpectedCloseFrom;
-      if (parsedExpectedCloseTo) extraFilter.expectedCloseAt.$lte = parsedExpectedCloseTo;
-    }
-
-    const normalizedSearch = toCleanString(search);
-    const searchPlan = buildDealSearchPlan(normalizedSearch);
-    const searchFilter = searchPlan.summaryClause || {};
-
-    const cursorParam = String(req.query?.cursor || '').trim();
-    const hasCursor = Boolean(cursorParam);
-    const cursor = hasCursor ? decodeDealCursor(cursorParam) : null;
-    if (hasCursor && !cursor) {
-      return res.status(400).json({ success: false, error: 'Invalid cursor' });
-    }
-
+    const { page = 1, limit = 50, cursor = '' } = req.query;
+    const useCursor = Boolean(toCleanString(cursor)) || toCleanString(req.query?.cursorMode).toLowerCase() === 'true';
     const pageNumber = Math.max(Number(page) || 1, 1);
-    const pageSize = Math.min(Math.max(Number(limit) || 50, 1), 200);
-    const skip = (pageNumber - 1) * pageSize;
-    const sortClause = { expectedCloseAtSort: 1, updatedAt: -1, createdAt: -1, _id: -1 };
-    const cursorFilter = hasCursor ? buildDealCursorFilter(cursor) : {};
+    const pageSize = Math.min(Math.max(Number(limit) || 50, 1), 100);
+    const sortOrder = buildDealListSort();
+    const listFilter = await buildDealListFilter(req, req.query);
+    const totalFilter = listFilter;
+    const decodedCursor = decodeCursor(cursor);
+    let scopedFilter = listFilter;
+    if (useCursor && decodedCursor?.updatedAt && decodedCursor?._id) {
+      const cursorFilter = buildDealCursorFilter(cursor);
+      if (cursorFilter) {
+        scopedFilter = mergeFiltersWithAnd(scopedFilter, cursorFilter);
+      }
+    }
 
-    const scopedFilter = buildScopedFilter(
-      req,
-      mergeFiltersWithAnd(extraFilter, searchFilter, cursorFilter)
-    );
-
-    if (hasCursor) {
-      let dealQuery = Deal.find(scopedFilter)
+    const [deals, total] = await Promise.all([
+      Deal.find(scopedFilter)
+        .select(CRM_DEAL_LIST_FIELDS)
         .populate('contactId', CRM_DEAL_CONTACT_FIELDS)
-        .sort(sortClause)
-        .limit(pageSize + 1)
-        .lean();
-
-      if (searchPlan.hint) {
-        dealQuery = dealQuery.hint(searchPlan.hint);
-      }
-
-      let deals = await dealQuery;
-      let hasMore = deals.length > pageSize;
-      if (hasMore) {
-        deals = deals.slice(0, pageSize);
-      }
-
-      if (!deals.length && searchPlan.fallbackClause) {
-        const fallbackScopedFilter = buildScopedFilter(
-          req,
-          mergeFiltersWithAnd(extraFilter, searchPlan.fallbackClause, cursorFilter)
-        );
-        let fallbackQuery = Deal.find(fallbackScopedFilter)
-          .populate('contactId', CRM_DEAL_CONTACT_FIELDS)
-          .sort(sortClause)
-          .limit(pageSize + 1)
-          .lean();
-
-        if (searchPlan.hint) {
-          fallbackQuery = fallbackQuery.hint(searchPlan.hint);
-        }
-
-        deals = await fallbackQuery;
-        hasMore = deals.length > pageSize;
-        if (hasMore) {
-          deals = deals.slice(0, pageSize);
-        }
-      }
-
-      return res.json({
-        success: true,
-        data: deals,
-        pagination: {
-          limit: pageSize,
-          hasMore,
-          nextCursor: hasMore ? encodeDealCursor(deals[deals.length - 1]) : null,
-          cursor: cursorParam || null
-        }
-      });
-    }
-
-    const scopedPageFilter = buildScopedFilter(req, mergeFiltersWithAnd(extraFilter, searchFilter));
-
-    let dealQuery = Deal.find(scopedPageFilter)
-      .populate('contactId', CRM_DEAL_CONTACT_FIELDS)
-      .sort(sortClause)
-      .skip(skip)
-      .limit(pageSize)
-      .lean();
-
-    if (searchPlan.hint) {
-      dealQuery = dealQuery.hint(searchPlan.hint);
-    }
-
-    let [deals, total] = await Promise.all([
-      dealQuery,
-      Deal.countDocuments(scopedPageFilter)
+        .sort(sortOrder)
+        .skip(useCursor ? 0 : (pageNumber - 1) * pageSize)
+        .limit(useCursor ? pageSize + 1 : pageSize)
+        .lean(),
+      useCursor ? Promise.resolve(0) : Deal.countDocuments(totalFilter)
     ]);
 
-    if (!deals.length && searchPlan.fallbackClause) {
-      const fallbackScopedFilter = buildScopedFilter(
-        req,
-        mergeFiltersWithAnd(extraFilter, searchPlan.fallbackClause)
-      );
-      let fallbackQuery = Deal.find(fallbackScopedFilter)
-        .populate('contactId', CRM_DEAL_CONTACT_FIELDS)
-        .sort(sortClause)
-        .skip(skip)
-        .limit(pageSize)
-        .lean();
-
-      if (searchPlan.hint) {
-        fallbackQuery = fallbackQuery.hint(searchPlan.hint);
-      }
-
-      [deals, total] = await Promise.all([
-        fallbackQuery,
-        Deal.countDocuments(fallbackScopedFilter)
-      ]);
-    }
+    const pageDeals = useCursor ? deals.slice(0, pageSize) : deals;
+    const lastDeal = pageDeals[pageDeals.length - 1] || null;
+    const nextCursor =
+      useCursor && deals.length > pageSize && lastDeal
+        ? encodeCursor({
+            updatedAt: lastDeal.updatedAt || new Date(0).toISOString(),
+            _id: String(lastDeal._id || '')
+          })
+        : '';
 
     res.json({
       success: true,
-      data: deals,
-      pagination: {
-        page: pageNumber,
-        limit: pageSize,
-        total,
-        totalPages: Math.max(Math.ceil(total / pageSize), 1)
-      }
+      data: pageDeals,
+      nextCursor,
+      hasMore: useCursor ? deals.length > pageSize : pageNumber < Math.max(Math.ceil(total / pageSize), 1),
+      pagination: useCursor
+        ? {
+            limit: pageSize,
+            nextCursor,
+            hasMore: deals.length > pageSize,
+            total: 0,
+            totalPages: 0
+          }
+        : {
+            page: pageNumber,
+            limit: pageSize,
+            total,
+            totalPages: Math.max(Math.ceil(total / pageSize), 1)
+          }
     });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error?.status || 500).json({ success: false, error: error.message });
   }
 });
 
 router.get('/deals/metrics', async (req, res) => {
   try {
-    const extraFilter = {};
-    const normalizedOwnerId = toCleanString(req.query?.ownerId);
-    const normalizedContactId = toCleanString(req.query?.contactId);
-
-    if (normalizedOwnerId) {
-      extraFilter.ownerId = normalizedOwnerId;
-    }
-
-    if (normalizedContactId) {
-      if (!toObjectIdIfValid(normalizedContactId)) {
-        return res.status(400).json({ success: false, error: 'Invalid contactId' });
-      }
-      extraFilter.contactId = normalizedContactId;
-    }
-
-    const dealSummary = await buildDealSummary(req, extraFilter);
+    const metricsFilter = await buildDealListFilter(req, req.query);
+    const dealSummary = await buildDealSummary(req, metricsFilter);
     res.json({ success: true, data: dealSummary });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error?.status || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -2551,7 +2919,7 @@ router.post('/deals', async (req, res) => {
       updatedBy: req.user.id || null
     });
 
-    await syncContactDealSnapshot(req, deal.contactId);
+    const syncedContact = await syncContactDealSnapshot(req, deal.contactId);
 
     await logLeadActivity({
       req,
@@ -2572,7 +2940,8 @@ router.post('/deals', async (req, res) => {
       entity: 'deal',
       action: 'created',
       contactId: String(deal.contactId || '').trim(),
-      dealId: String(deal._id || '').trim()
+      dealId: String(deal._id || '').trim(),
+      contact: syncedContact ? toCrmContactRealtimePayload(syncedContact) : null
     });
 
     res.status(201).json({ success: true, data: deal });
@@ -2682,7 +3051,7 @@ router.patch('/deals/:id', async (req, res) => {
     deal.updatedBy = req.user.id || null;
 
     await deal.save();
-    await syncContactDealSnapshot(req, deal.contactId);
+    const syncedContact = await syncContactDealSnapshot(req, deal.contactId);
 
     const activityType =
       previousDeal.status !== 'won' && deal.status === 'won'
@@ -2719,7 +3088,8 @@ router.patch('/deals/:id', async (req, res) => {
       entity: 'deal',
       action: 'updated',
       contactId: String(deal.contactId || '').trim(),
-      dealId: String(deal._id || '').trim()
+      dealId: String(deal._id || '').trim(),
+      contact: syncedContact ? toCrmContactRealtimePayload(syncedContact) : null
     });
 
     res.json({ success: true, data: deal });
@@ -2741,7 +3111,7 @@ router.delete('/deals/:id', async (req, res) => {
     }
 
     await Deal.deleteOne(buildScopedFilter(req, { _id: deal._id }));
-    await syncContactDealSnapshot(req, deal.contactId);
+    const syncedContact = await syncContactDealSnapshot(req, deal.contactId);
 
     await logLeadActivity({
       req,
@@ -2761,7 +3131,8 @@ router.delete('/deals/:id', async (req, res) => {
       entity: 'deal',
       action: 'deleted',
       contactId: String(deal.contactId || '').trim(),
-      dealId: String(deal._id || '').trim()
+      dealId: String(deal._id || '').trim(),
+      contact: syncedContact ? toCrmContactRealtimePayload(syncedContact) : null
     });
 
     res.json({
@@ -2907,6 +3278,8 @@ router.get('/tasks', async (req, res) => {
       bucket,
       dueFrom,
       dueTo,
+      search,
+      cursor = '',
       page = 1,
       limit = 50
     } = req.query;
@@ -2952,8 +3325,9 @@ router.get('/tasks', async (req, res) => {
     const normalizedAssignedTo = toCleanString(assignedTo);
     if (normalizedAssignedTo) extraFilter.assignedTo = normalizedAssignedTo;
 
+    const normalizedBucket = toCleanString(bucket).toLowerCase();
     const bucketFilter = buildTaskBucketFilter(bucket);
-    if (String(bucket || '').trim() && !bucketFilter) {
+    if (normalizedBucket && normalizedBucket !== 'all' && !bucketFilter) {
       return res.status(400).json({ success: false, error: 'Invalid task bucket' });
     }
 
@@ -2981,22 +3355,45 @@ router.get('/tasks', async (req, res) => {
 
     const pageNumber = Math.max(Number(page) || 1, 1);
     const pageSize = Math.min(Math.max(Number(limit) || 50, 1), 200);
-    const skip = (pageNumber - 1) * pageSize;
-    const scopedFilter = buildScopedFilter(req, mergeFiltersWithAnd(extraFilter, bucketFilter || {}));
+    const useCursor = Boolean(toCleanString(cursor)) || toCleanString(req.query?.cursorMode).toLowerCase() === 'true';
+    const searchFilter = await buildTaskSearchFilter(req, search);
+    const cursorFilter = useCursor ? buildTaskCursorFilter(cursor) : null;
+    const totalFilter = buildScopedFilter(
+      req,
+      mergeFiltersWithAnd(extraFilter, bucketFilter || {}, searchFilter || {})
+    );
+    const scopedFilter = buildScopedFilter(
+      req,
+      mergeFiltersWithAnd(extraFilter, bucketFilter || {}, searchFilter || {}, cursorFilter || {})
+    );
 
     const [tasks, total] = await Promise.all([
       LeadTask.find(scopedFilter)
         .populate('contactId', CRM_TASK_CONTACT_FIELDS)
-        .sort({ dueAt: 1, priority: -1, createdAt: -1 })
-        .skip(skip)
-        .limit(pageSize)
+        .sort({ dueAt: 1, priority: -1, createdAt: -1, _id: -1 })
+        .skip(useCursor ? 0 : (pageNumber - 1) * pageSize)
+        .limit(useCursor ? pageSize + 1 : pageSize)
         .lean(),
-      LeadTask.countDocuments(scopedFilter)
+      LeadTask.countDocuments(totalFilter)
     ]);
+
+    const pageTasks = useCursor ? tasks.slice(0, pageSize) : tasks;
+    const lastTask = pageTasks[pageTasks.length - 1] || null;
+    const nextCursor =
+      useCursor && tasks.length > pageSize && lastTask
+        ? encodeCursor({
+            dueAt: lastTask.dueAt ? new Date(lastTask.dueAt).toISOString() : null,
+            priorityRank: getTaskPriorityRank(lastTask.priority),
+            createdAt: lastTask.createdAt ? new Date(lastTask.createdAt).toISOString() : null,
+            _id: String(lastTask._id || '')
+          })
+        : '';
 
     res.json({
       success: true,
-      data: tasks,
+      data: pageTasks,
+      nextCursor,
+      hasMore: useCursor ? tasks.length > pageSize : pageNumber < Math.max(Math.ceil(total / pageSize), 1),
       pagination: {
         page: pageNumber,
         limit: pageSize,
@@ -3014,6 +3411,62 @@ router.get('/tasks/summary', async (req, res) => {
     const extraFilter = {};
     const normalizedAssignedTo = toCleanString(req.query?.assignedTo);
     const normalizedContactId = toCleanString(req.query?.contactId);
+    const normalizedStatusList = String(req.query?.status || '')
+      .split(',')
+      .map((item) => toCleanString(item).toLowerCase())
+      .filter(Boolean);
+    const normalizedPriorityList = String(req.query?.priority || '')
+      .split(',')
+      .map((item) => toCleanString(item).toLowerCase())
+      .filter(Boolean);
+    const normalizedTaskTypeList = String(req.query?.taskType || '')
+      .split(',')
+      .map((item) => toCleanString(item).toLowerCase())
+      .filter(Boolean);
+    const normalizedBucket = toCleanString(req.query?.bucket).toLowerCase();
+    const parsedDueFrom = safeDate(req.query?.dueFrom);
+    const parsedDueTo = safeDate(req.query?.dueTo);
+    const searchFilter = await buildTaskSearchFilter(req, req.query?.search);
+
+    if (normalizedStatusList.length > 0) {
+      const invalidStatus = normalizedStatusList.find((item) => !TASK_STATUSES.includes(item));
+      if (invalidStatus) {
+        return res.status(400).json({ success: false, error: `Invalid task status: ${invalidStatus}` });
+      }
+      extraFilter.status = { $in: normalizedStatusList };
+    }
+
+    if (normalizedPriorityList.length > 0) {
+      const invalidPriority = normalizedPriorityList.find((item) => !TASK_PRIORITIES.includes(item));
+      if (invalidPriority) {
+        return res.status(400).json({ success: false, error: `Invalid task priority: ${invalidPriority}` });
+      }
+      extraFilter.priority = { $in: normalizedPriorityList };
+    }
+
+    if (normalizedTaskTypeList.length > 0) {
+      const invalidTaskType = normalizedTaskTypeList.find((item) => !TASK_TYPES.includes(item));
+      if (invalidTaskType) {
+        return res.status(400).json({ success: false, error: `Invalid task type: ${invalidTaskType}` });
+      }
+      extraFilter.taskType = { $in: normalizedTaskTypeList };
+    }
+
+    if (normalizedBucket) {
+      const bucketFilter = buildTaskBucketFilter(normalizedBucket);
+      if (!bucketFilter && normalizedBucket !== 'all') {
+        return res.status(400).json({ success: false, error: 'Invalid task bucket' });
+      }
+      if (bucketFilter) {
+        Object.assign(extraFilter, bucketFilter);
+      }
+    }
+
+    if (parsedDueFrom || parsedDueTo) {
+      extraFilter.dueAt = {};
+      if (parsedDueFrom) extraFilter.dueAt.$gte = parsedDueFrom;
+      if (parsedDueTo) extraFilter.dueAt.$lte = parsedDueTo;
+    }
 
     if (normalizedAssignedTo) {
       extraFilter.assignedTo = normalizedAssignedTo;
@@ -3026,7 +3479,7 @@ router.get('/tasks/summary', async (req, res) => {
       extraFilter.contactId = normalizedContactId;
     }
 
-    const summary = await buildTaskSummary(req, extraFilter);
+    const summary = await buildTaskSummary(req, mergeFiltersWithAnd(extraFilter, searchFilter || {}));
 
     res.json({ success: true, data: summary });
   } catch (error) {

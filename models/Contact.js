@@ -173,5 +173,51 @@ ContactSchema.index({ companyId: 1, userId: 1, lastContact: -1, createdAt: -1, _
 ContactSchema.index({ companyId: 1, userId: 1, lastContactAt: -1, createdAt: -1, _id: -1 });
 ContactSchema.index({ companyId: 1, userId: 1, lastInboundMessageAt: -1, createdAt: -1, _id: -1 });
 ContactSchema.index({ companyId: 1, userId: 1, whatsappOptInStatus: 1, sourceType: 1, lastContact: -1, createdAt: -1 });
+ContactSchema.index({
+  companyId: 1,
+  stage: 1,
+  status: 1,
+  ownerId: 1,
+  nextFollowUpAt: 1,
+  leadScore: -1,
+  createdAt: -1
+});
+ContactSchema.index({
+  userId: 1,
+  stage: 1,
+  status: 1,
+  ownerId: 1,
+  nextFollowUpAt: 1,
+  leadScore: -1,
+  createdAt: -1
+});
+ContactSchema.index({
+  companyId: 1,
+  updatedAt: -1,
+  createdAt: -1
+});
+ContactSchema.index({
+  userId: 1,
+  updatedAt: -1,
+  createdAt: -1
+});
+ContactSchema.index({
+  companyId: 1,
+  archivedAt: 1,
+  stage: 1,
+  status: 1,
+  ownerId: 1,
+  createdAt: -1,
+  _id: -1
+});
+ContactSchema.index({
+  userId: 1,
+  archivedAt: 1,
+  stage: 1,
+  status: 1,
+  ownerId: 1,
+  createdAt: -1,
+  _id: -1
+});
 
 module.exports = mongoose.model('Contact', ContactSchema);

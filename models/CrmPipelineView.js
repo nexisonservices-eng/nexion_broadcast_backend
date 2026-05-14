@@ -23,11 +23,13 @@ const CrmPipelineViewSchema = new mongoose.Schema(
       queue: { type: String, default: 'all' },
       status: { type: String, default: 'all' },
       owner: { type: String, default: 'all' },
-      viewMode: { type: String, default: 'list', enum: ['list', 'board'] }
+      sortOrder: { type: String, default: 'newest', enum: ['newest', 'oldest'] },
+      archive: { type: String, default: 'active', enum: ['active', 'archived', 'all'] }
     },
-    isDefault: {
-      type: Boolean,
-      default: false,
+    presetType: {
+      type: String,
+      default: 'filter_preset',
+      enum: ['filter_preset'],
       index: true
     }
   },
@@ -36,7 +38,6 @@ const CrmPipelineViewSchema = new mongoose.Schema(
   }
 );
 
-CrmPipelineViewSchema.index({ userId: 1, label: 1 }, { unique: true });
-CrmPipelineViewSchema.index({ userId: 1, isDefault: 1 });
+CrmPipelineViewSchema.index({ userId: 1, presetType: 1, label: 1 }, { unique: true });
 
 module.exports = mongoose.model('CrmPipelineView', CrmPipelineViewSchema);
