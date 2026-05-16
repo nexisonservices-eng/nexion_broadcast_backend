@@ -552,10 +552,11 @@ class WhatsAppService {
     if (credentials) {
       this.initialize(credentials);
     }
+    let normalizedPhone = '';
+    let normalizedMediaType = '';
     try {
-      const normalizedPhone = normalizeWhatsAppPhone(to);
-
-      const normalizedMediaType = String(mediaType || '').trim().toLowerCase();
+      normalizedPhone = normalizeWhatsAppPhone(to);
+      normalizedMediaType = String(mediaType || '').trim().toLowerCase();
       const normalizedCaption = String(caption || '').trim();
       const normalizedFileName = String(options?.fileName || '').trim();
       const normalizedMediaId = String(options?.mediaId || '').trim();
@@ -573,6 +574,23 @@ class WhatsAppService {
         meta: debugContext.meta,
         message: 'Sending WhatsApp media message'
       });
+
+      if (!['image', 'audio', 'document'].includes(normalizedMediaType)) {
+        emitMediaDebugLog({
+          stage: 'whatsapp_send_validation_failed',
+          level: 'warn',
+          requestId: debugContext.requestId,
+          conversationId: debugContext.conversationId,
+          to: normalizedPhone,
+          mediaType: normalizedMediaType,
+          file: debugContext.file,
+          message: 'Outbound media type is disabled'
+        });
+        return {
+          success: false,
+          error: 'This website only supports sending images, audio, and documents.'
+        };
+      }
 
       if (!normalizedMediaId && !allowLinkFallback) {
         emitMediaDebugLog({
@@ -600,7 +618,7 @@ class WhatsAppService {
           : { link: normalizedMediaUrl }
       };
 
-      if (normalizedCaption && normalizedMediaType !== 'audio') {
+      if (normalizedCaption && normalizedMediaType !== 'audio' && normalizedMediaType !== 'sticker') {
         payload[normalizedMediaType].caption = normalizedCaption;
       }
 
@@ -697,9 +715,14 @@ class WhatsAppService {
 
       const form = new FormData();
       form.append('messaging_product', 'whatsapp');
+      const normalizedMimeType = String(file?.mimetype || '')
+        .trim()
+        .toLowerCase()
+        .split(';')[0]
+        .trim();
       form.append('file', file.buffer, {
         filename: String(file?.originalname || 'attachment').trim() || 'attachment',
-        contentType: String(file?.mimetype || 'application/octet-stream'),
+        contentType: normalizedMimeType || 'application/octet-stream',
         knownLength: Number(file?.size || file?.buffer?.length || 0)
       });
 
@@ -740,15 +763,33 @@ class WhatsAppService {
         error,
         message: 'Failed to upload media to WhatsApp'
       });
-      console.error('Error uploading media asset:', error.response?.data || error.message);
+      console.error('Error uploading media asset:', {
+        response: error.response?.data || null,
+        message: error.message,
+        status: Number(error?.response?.status || 0) || null,
+        code: String(error?.code || '').trim() || null
+      });
       const normalizedError =
         error.response?.data?.error?.message ||
         error.response?.data?.error?.error_user_msg ||
         error.message ||
         'Failed to upload media asset';
+      const errorCode =
+        String(error.response?.data?.error?.code || error.response?.data?.error?.error_subcode || '')
+          .trim() || '';
+      const errorDetails =
+        String(
+          error.response?.data?.error?.error_data?.details ||
+            error.response?.data?.error?.error_user_title ||
+            error.response?.data?.error?.fbtrace_id ||
+            ''
+        ).trim() || '';
       return {
         success: false,
-        error: normalizedError
+        error: normalizedError,
+        errorCode: errorCode || null,
+        errorDetails: errorDetails || null,
+        response: error.response?.data || null
       };
     }
   }

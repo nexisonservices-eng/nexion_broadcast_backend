@@ -159,6 +159,9 @@ class BroadcastController {
       const filters = {};
       if (req.query.status) filters.status = req.query.status;
       if (req.query.createdBy) filters.createdBy = req.query.createdBy;
+      if (req.query.search) filters.search = req.query.search;
+      if (req.query.cursor) filters.cursor = req.query.cursor;
+      if (req.query.limit) filters.limit = req.query.limit;
       if (!tenantWideAccess) {
         filters.createdById = req.user.id;
       }

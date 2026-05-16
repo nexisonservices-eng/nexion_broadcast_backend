@@ -263,7 +263,7 @@ const attachContactSnapshotsToConversations = async (conversations = [], req) =>
   });
 };
 
-const loadConversationSummaryRows = async ({ finalFilters, limit, skip = 0, queryHint = null }) => {
+const loadConversationSummaryRows = async ({ finalFilters, limit, queryHint = null }) => {
   let query = ConversationSummary.find(finalFilters)
     .select(TEAM_INBOX_CONVERSATION_FIELDS)
     .sort({ lastMessageTime: -1, _id: -1 })
@@ -271,10 +271,6 @@ const loadConversationSummaryRows = async ({ finalFilters, limit, skip = 0, quer
 
   if (queryHint) {
     query = query.hint(queryHint);
-  }
-
-  if (skip > 0) {
-    query = query.skip(skip);
   }
 
   if (limit > 0) {
@@ -398,7 +394,6 @@ const loadConversationSummaryPage = async ({
   summaryFilters,
   fallbackFilters,
   limit,
-  skip = 0,
   req,
   scope,
   cacheKeyParts,
@@ -425,11 +420,9 @@ const loadConversationSummaryPage = async ({
   };
 
   const loadMergedRows = async () => {
-    const pageSkip = Math.max(0, skip);
     const summaryRows = await loadConversationSummaryRows({
       finalFilters: summaryFilters,
       limit: fetchLimit,
-      skip: pageSkip,
       queryHint
     });
 
@@ -441,7 +434,6 @@ const loadConversationSummaryPage = async ({
       ? await loadConversationFallbackRows({
           finalFilters: fallbackFilters,
           limit: fetchLimit,
-          skip: pageSkip
         })
       : { conversations: [], hasMore: false, nextCursor: null };
 
@@ -528,8 +520,6 @@ class ConversationController {
 
       const parsedLimit = Number(req.query?.limit);
       const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 200)) : 0;
-      const parsedPage = Number(req.query?.page);
-      const page = Number.isFinite(parsedPage) && parsedPage > 0 ? Math.max(1, Math.trunc(parsedPage)) : 1;
       const cursor = decodeConversationCursor(req.query?.cursor);
       const normalizedSearch = String(search || '').trim();
       const normalizedSearchLower = normalizedSearch.toLowerCase();
@@ -540,7 +530,6 @@ class ConversationController {
         conversationFilter,
         normalizedSearchLower,
         String(limit || 0),
-        String(page || 1),
         encodeConversationCursorCacheKey(cursor)
       ];
       const summaryFilters = { ...filters };
@@ -585,7 +574,6 @@ class ConversationController {
                 summaryFilters,
                 fallbackFilters,
                 limit,
-                skip: cursor ? 0 : Math.max(0, (page - 1) * limit),
                 req,
                 scope,
                 cacheKeyParts,
@@ -606,7 +594,31 @@ class ConversationController {
         : null;
 
       if (cachedResponse) {
-        return res.json(cachedResponse);
+        const hydratedResponse = await getOrSetCachedJson({
+          namespace: 'conversations',
+          scope,
+          versionGroup: 'hydratedPages',
+          keyParts: [...cacheKeyParts, 'hydrated'],
+          ttlSeconds: CACHE_TTL_SECONDS.conversations,
+          loader: async () => {
+            const conversations = await attachContactSnapshotsToConversations(
+              cachedResponse.data || [],
+              req
+            );
+
+            return {
+              success: true,
+              data: conversations,
+              meta: cachedResponse.meta || {
+                limit: limit || null,
+                hasMore: false,
+                nextCursor: null
+              }
+            };
+          }
+        });
+
+        return res.json(hydratedResponse || cachedResponse);
       }
 
       return res.json({

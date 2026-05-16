@@ -955,8 +955,6 @@ const registerLegacyCoreRoutes = (app, deps) => {
 
   app.get('/api/analytics', auth, async (req, res) => {
     try {
-      const last7Days = new Date();
-      last7Days.setDate(last7Days.getDate() - 7);
       const analyticsScopeFilter = req.companyId
         ? {
             $or: [
@@ -965,234 +963,309 @@ const registerLegacyCoreRoutes = (app, deps) => {
             ]
           }
         : { userId: req.user.id };
-      const scopedConversations = await Conversation.find(analyticsScopeFilter).select('_id').lean();
-      const scopedConversationIds = scopedConversations
-        .map((conversation) => conversation?._id)
-        .filter(Boolean);
-      const analyticsMessageFilter = scopedConversationIds.length
-        ? {
-            conversationId: { $in: scopedConversationIds },
-            sender: 'agent'
-          }
-        : {
-            ...analyticsScopeFilter,
-            sender: 'agent'
-          };
-      const analyticsContactMessageFilter = scopedConversationIds.length
-        ? {
-            conversationId: { $in: scopedConversationIds },
-            sender: 'contact',
-            timestamp: { $gte: last7Days }
-          }
-        : {
-            ...analyticsScopeFilter,
-            sender: 'contact',
-            timestamp: { $gte: last7Days }
-          };
+      const analyticsScopeKey = req.companyId
+        ? `company:${String(req.companyId)}:user:${String(req.user.id)}`
+        : `user:${String(req.user.id)}`;
+      const last7Days = new Date();
+      last7Days.setDate(last7Days.getDate() - 7);
+      const last12Hours = new Date();
+      last12Hours.setHours(last12Hours.getHours() - 12);
+      const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+      const hourlyLabelFormatter = new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: true });
 
-      const [totalConversations, activeConversations, allAgentMessages, userBroadcasts, messageTotals, messagesReceived] = await Promise.all([
-        Conversation.countDocuments(analyticsScopeFilter),
-        Conversation.countDocuments({
-          ...analyticsScopeFilter,
-          status: 'active'
-        }),
-        Message.find({
-          ...analyticsMessageFilter,
-          timestamp: { $gte: last7Days }
-        })
-          .select('timestamp conversationId status mediaType')
-          .lean(),
-        Broadcast.find(analyticsScopeFilter).select('stats').lean(),
-        Message.aggregate([
-          {
-            $match: {
-              ...analyticsMessageFilter
-            }
-          },
-          {
-            $group: {
-              _id: null,
-              sent: { $sum: 1 },
-              delivered: {
-                $sum: {
-                  $cond: [{ $in: ['$status', ['delivered', 'read']] }, 1, 0]
+      const analytics = await getOrSetCachedJson({
+        namespace: 'dashboard',
+        scope: analyticsScopeKey,
+        versionGroup: 'summary-v1',
+        keyParts: ['broadcast-analytics'],
+        ttlSeconds: 20,
+        loader: async () => {
+          const dailyBuckets = new Map();
+          const hourlyBuckets = new Map();
+
+          for (let i = 6; i >= 0; i -= 1) {
+            const day = new Date();
+            day.setHours(0, 0, 0, 0);
+            day.setDate(day.getDate() - i);
+            const key = day.toISOString().slice(0, 10);
+            dailyBuckets.set(key, {
+              date: dayNames[day.getDay()],
+              sent: 0,
+              delivered: 0,
+              read: 0,
+              conversations: 0
+            });
+          }
+
+          for (let i = 11; i >= 0; i -= 1) {
+            const hour = new Date();
+            hour.setMinutes(0, 0, 0);
+            hour.setHours(hour.getHours() - i);
+            const key = hour.toISOString().slice(0, 13);
+            hourlyBuckets.set(key, {
+              hour: hourlyLabelFormatter.format(hour),
+              messages: 0,
+              conversations: 0
+            });
+          }
+
+          const [
+            totalConversations,
+            activeConversations,
+            messageTotals,
+            campaignTotals,
+            receivedCount,
+            dailyTrendsAgg,
+            hourlyActivityAgg,
+            messageTypesAgg
+          ] = await Promise.all([
+            Conversation.countDocuments(analyticsScopeFilter),
+            Conversation.countDocuments({
+              ...analyticsScopeFilter,
+              status: 'active'
+            }),
+            Message.aggregate([
+              {
+                $match: {
+                  ...analyticsScopeFilter,
+                  sender: 'agent'
                 }
               },
-              read: {
-                $sum: {
-                  $cond: [{ $eq: ['$status', 'read'] }, 1, 0]
-                }
-              },
-              failed: {
-                $sum: {
-                  $cond: [{ $eq: ['$status', 'failed'] }, 1, 0]
+              {
+                $group: {
+                  _id: null,
+                  sent: { $sum: 1 },
+                  delivered: {
+                    $sum: {
+                      $cond: [{ $in: ['$status', ['delivered', 'read']] }, 1, 0]
+                    }
+                  },
+                  read: {
+                    $sum: {
+                      $cond: [{ $eq: ['$status', 'read'] }, 1, 0]
+                    }
+                  },
+                  failed: {
+                    $sum: {
+                      $cond: [{ $eq: ['$status', 'failed'] }, 1, 0]
+                    }
+                  }
                 }
               }
-            }
-          }
-        ]),
-        Message.countDocuments(analyticsContactMessageFilter)
-      ]);
+            ]),
+            Broadcast.aggregate([
+              {
+                $match: analyticsScopeFilter
+              },
+              {
+                $group: {
+                  _id: null,
+                  sent: { $sum: '$stats.sent' },
+                  delivered: { $sum: '$stats.delivered' },
+                  read: { $sum: '$stats.read' },
+                  failed: { $sum: '$stats.failed' }
+                }
+              }
+            ]),
+            Message.countDocuments({
+              ...analyticsScopeFilter,
+              sender: 'contact',
+              timestamp: { $gte: last7Days }
+            }),
+            Message.aggregate([
+              {
+                $match: {
+                  ...analyticsScopeFilter,
+                  sender: 'agent',
+                  timestamp: { $gte: last7Days }
+                }
+              },
+              {
+                $group: {
+                  _id: {
+                    day: {
+                      $dateToString: {
+                        format: '%Y-%m-%d',
+                        date: '$timestamp'
+                      }
+                    },
+                    conversationId: '$conversationId'
+                  },
+                  sent: { $sum: 1 },
+                  delivered: {
+                    $sum: {
+                      $cond: [{ $in: ['$status', ['delivered', 'read']] }, 1, 0]
+                    }
+                  },
+                  read: {
+                    $sum: {
+                      $cond: [{ $eq: ['$status', 'read'] }, 1, 0]
+                    }
+                  }
+                }
+              },
+              {
+                $group: {
+                  _id: '$_id.day',
+                  sent: { $sum: '$sent' },
+                  delivered: { $sum: '$delivered' },
+                  read: { $sum: '$read' },
+                  conversations: { $sum: 1 }
+                }
+              }
+            ]),
+            Message.aggregate([
+              {
+                $match: {
+                  ...analyticsScopeFilter,
+                  sender: 'agent',
+                  timestamp: { $gte: last12Hours }
+                }
+              },
+              {
+                $group: {
+                  _id: {
+                    hour: {
+                      $dateToString: {
+                        format: '%Y-%m-%d-%H',
+                        date: '$timestamp'
+                      }
+                    },
+                    conversationId: '$conversationId'
+                  },
+                  messages: { $sum: 1 }
+                }
+              },
+              {
+                $group: {
+                  _id: '$_id.hour',
+                  messages: { $sum: '$messages' },
+                  conversations: { $sum: 1 }
+                }
+              }
+            ]),
+            Message.aggregate([
+              {
+                $match: {
+                  ...analyticsScopeFilter,
+                  sender: 'agent',
+                  timestamp: { $gte: last7Days }
+                }
+              },
+              {
+                $group: {
+                  _id: {
+                    mediaType: {
+                      $cond: [
+                        { $in: ['$mediaType', ['image', 'video', 'audio', 'document', 'sticker']] },
+                        '$mediaType',
+                        'text'
+                      ]
+                    }
+                  },
+                  value: { $sum: 1 }
+                }
+              }
+            ])
+          ]);
 
-      const campaignTotals = userBroadcasts.reduce(
-        (acc, b) => {
-          const sent = Number(b?.stats?.sent || 0);
-          const delivered = Number(b?.stats?.delivered || 0);
-          const read = Number(b?.stats?.read || 0);
-          const failed = Number(b?.stats?.failed || 0);
-          return {
-            sent: acc.sent + sent,
-            delivered: acc.delivered + Math.max(delivered, read),
-            read: acc.read + read,
-            failed: acc.failed + failed
+          (Array.isArray(dailyTrendsAgg) ? dailyTrendsAgg : []).forEach((item) => {
+            const bucket = dailyBuckets.get(String(item?._id || '')) || null;
+            if (!bucket) return;
+            bucket.sent = Number(item?.sent || 0);
+            bucket.delivered = Number(item?.delivered || 0);
+            bucket.read = Number(item?.read || 0);
+            bucket.conversations = Number(item?.conversations || 0);
+          });
+
+          (Array.isArray(hourlyActivityAgg) ? hourlyActivityAgg : []).forEach((item) => {
+            const key = String(item?._id || '').trim();
+            const bucket = hourlyBuckets.get(key) || null;
+            if (!bucket) return;
+            bucket.messages = Number(item?.messages || 0);
+            bucket.conversations = Number(item?.conversations || 0);
+          });
+
+          const messageTypeCounts = {
+            text: 0,
+            image: 0,
+            video: 0,
+            audio: 0,
+            document: 0,
+            sticker: 0
           };
-        },
-        { sent: 0, delivered: 0, read: 0, failed: 0 }
-      );
+          (Array.isArray(messageTypesAgg) ? messageTypesAgg : []).forEach((item) => {
+            const mediaType = String(item?._id?.mediaType || 'text').trim().toLowerCase();
+            const count = Number(item?.value || 0);
+            if (Object.prototype.hasOwnProperty.call(messageTypeCounts, mediaType)) {
+              messageTypeCounts[mediaType] += count;
+            } else {
+              messageTypeCounts.text += count;
+            }
+          });
 
-      const headlineTotals = messageTotals[0] || { sent: 0, delivered: 0, read: 0, failed: 0 };
-      const messagesFailed = Math.max(Number(headlineTotals.failed || 0), Number(campaignTotals.failed || 0));
-      const messagesRead = Math.max(Number(headlineTotals.read || 0), Number(campaignTotals.read || 0));
-      const totalDeliveredOrRead = Math.max(
-        Number(headlineTotals.delivered || 0),
-        Number(campaignTotals.delivered || 0)
-      );
-      const messagesSent = Math.max(
-        Number(headlineTotals.sent || 0),
-        Number(campaignTotals.sent || 0),
-        totalDeliveredOrRead + messagesFailed
-      );
+          const headlineTotals = messageTotals[0] || { sent: 0, delivered: 0, read: 0, failed: 0 };
+          const broadcastTotals = campaignTotals[0] || { sent: 0, delivered: 0, read: 0, failed: 0 };
+          const messagesFailed = Math.max(Number(headlineTotals.failed || 0), Number(broadcastTotals.failed || 0));
+          const messagesRead = Math.max(Number(headlineTotals.read || 0), Number(broadcastTotals.read || 0));
+          const totalDeliveredOrRead = Math.max(
+            Number(headlineTotals.delivered || 0),
+            Number(broadcastTotals.delivered || 0)
+          );
+          const messagesSent = Math.max(
+            Number(headlineTotals.sent || 0),
+            Number(broadcastTotals.sent || 0),
+            totalDeliveredOrRead + messagesFailed
+          );
+          const deliveryRate = messagesSent > 0 ? ((totalDeliveredOrRead / messagesSent) * 100).toFixed(1) : '0.0';
+          const readRate = messagesSent > 0 ? ((messagesRead / messagesSent) * 100).toFixed(1) : '0.0';
 
-      const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-      const dailyMap = new Map();
-      const dailyConversationSets = new Map();
+          const dailyTrends = Array.from(dailyBuckets.values());
+          const hourlyActivity = Array.from(hourlyBuckets.values());
 
-      for (let i = 6; i >= 0; i -= 1) {
-        const day = new Date();
-        day.setHours(0, 0, 0, 0);
-        day.setDate(day.getDate() - i);
-        const key = day.toISOString().slice(0, 10);
-
-        dailyMap.set(key, { date: dayNames[day.getDay()], sent: 0, delivered: 0, read: 0, conversations: 0 });
-        dailyConversationSets.set(key, new Set());
-      }
-
-      allAgentMessages.forEach((msg) => {
-        const ts = new Date(msg.timestamp);
-        ts.setHours(0, 0, 0, 0);
-        const key = ts.toISOString().slice(0, 10);
-        if (!dailyMap.has(key)) return;
-
-        const bucket = dailyMap.get(key);
-        bucket.sent += 1;
-
-        if (msg.status === 'delivered' || msg.status === 'read') {
-          bucket.delivered += 1;
-        }
-        if (msg.status === 'read') {
-          bucket.read += 1;
-        }
-
-        if (msg.conversationId) {
-          dailyConversationSets.get(key).add(String(msg.conversationId));
-        }
-      });
-
-      const dailyTrends = Array.from(dailyMap.entries()).map(([key, value]) => ({
-        ...value,
-        conversations: dailyConversationSets.get(key).size
-      }));
-
-      const hourlyMap = new Map();
-      const hourlyConversationSets = new Map();
-      for (let i = 11; i >= 0; i -= 1) {
-        const hour = new Date();
-        hour.setMinutes(0, 0, 0);
-        hour.setHours(hour.getHours() - i);
-        const key = hour.toISOString().slice(0, 13);
-        const label = hour.toLocaleTimeString('en-US', { hour: 'numeric', hour12: true });
-        hourlyMap.set(key, { hour: label, messages: 0, conversations: 0 });
-        hourlyConversationSets.set(key, new Set());
-      }
-
-      allAgentMessages.forEach((msg) => {
-        const hour = new Date(msg.timestamp);
-        hour.setMinutes(0, 0, 0);
-        const key = hour.toISOString().slice(0, 13);
-        if (!hourlyMap.has(key)) return;
-        hourlyMap.get(key).messages += 1;
-        if (msg.conversationId) {
-          hourlyConversationSets.get(key).add(String(msg.conversationId));
+          return {
+            totalConversations,
+            activeConversations,
+            messagesSent,
+            messagesDelivered: totalDeliveredOrRead,
+            messagesRead,
+            messagesFailed,
+            messagesReceived: Number(receivedCount || 0),
+            avgResponseTime: '2m 34s',
+            responseRate: messagesSent > 0 ? Math.round((messagesRead / messagesSent) * 100) : 0,
+            customerSatisfaction: 4.7,
+            sentGrowth: '12',
+            deliveredGrowth: '8',
+            readRateGrowth: '5',
+            failedGrowth: '-2',
+            dailyTrends,
+            hourlyActivity,
+            messageTypes: [
+              { name: 'Text Messages', value: messageTypeCounts.text, color: '#3b82f6' },
+              { name: 'Image Messages', value: messageTypeCounts.image, color: '#2563eb' },
+              { name: 'Video Messages', value: messageTypeCounts.video, color: '#f59e0b' },
+              { name: 'Sticker Messages', value: messageTypeCounts.sticker, color: '#a855f7' },
+              {
+                name: 'Document/Audio',
+                value: messageTypeCounts.document + messageTypeCounts.audio,
+                color: '#8b5cf6'
+              }
+            ],
+            performanceMetrics: {
+              avgDeliveryTime: '1.2 minutes',
+              avgReadTime: '8.5 minutes',
+              peakHour: hourlyActivity.length
+                ? hourlyActivity.reduce((a, b) => (a.messages > b.messages ? a : b)).hour
+                : 'N/A',
+              bestDay: dailyTrends.length
+                ? dailyTrends.reduce((a, b) => (a.sent > b.sent ? a : b)).date
+                : 'N/A',
+              deliveryRate: `${deliveryRate}%`,
+              readRate: `${readRate}%`
+            }
+          };
         }
       });
-
-      const hourlyActivity = Array.from(hourlyMap.entries()).map(([key, value]) => ({
-        ...value,
-        conversations: hourlyConversationSets.get(key).size
-      }));
-
-      const messageTypeCounts = {
-        text: 0,
-        image: 0,
-        video: 0,
-        audio: 0,
-        document: 0
-      };
-
-      allAgentMessages.forEach((msg) => {
-        const mediaType = msg.mediaType || 'text';
-        if (Object.prototype.hasOwnProperty.call(messageTypeCounts, mediaType)) {
-          messageTypeCounts[mediaType] += 1;
-        } else {
-          messageTypeCounts.text += 1;
-        }
-      });
-
-      const messageTypes = [
-        { name: 'Text Messages', value: messageTypeCounts.text, color: '#3b82f6' },
-        { name: 'Image Messages', value: messageTypeCounts.image, color: '#2563eb' },
-        { name: 'Video Messages', value: messageTypeCounts.video, color: '#f59e0b' },
-        {
-          name: 'Document/Audio',
-          value: messageTypeCounts.document + messageTypeCounts.audio,
-          color: '#8b5cf6'
-        }
-      ];
-
-      const deliveryRate = messagesSent > 0 ? ((totalDeliveredOrRead / messagesSent) * 100).toFixed(1) : '0.0';
-      const readRate = messagesSent > 0 ? ((messagesRead / messagesSent) * 100).toFixed(1) : '0.0';
-
-      const analytics = {
-        totalConversations,
-        activeConversations,
-        messagesSent,
-        messagesDelivered: totalDeliveredOrRead,
-        messagesRead,
-        messagesFailed,
-        messagesReceived,
-        avgResponseTime: '2m 34s',
-        responseRate: 94.5,
-        customerSatisfaction: 4.7,
-        sentGrowth: '12',
-        deliveredGrowth: '8',
-        readRateGrowth: '5',
-        failedGrowth: '-2',
-        dailyTrends,
-        hourlyActivity,
-        messageTypes,
-        performanceMetrics: {
-          avgDeliveryTime: '1.2 minutes',
-          avgReadTime: '8.5 minutes',
-          peakHour: hourlyActivity.length
-            ? hourlyActivity.reduce((a, b) => (a.messages > b.messages ? a : b)).hour
-            : 'N/A',
-          bestDay: dailyTrends.length
-            ? dailyTrends.reduce((a, b) => (a.sent > b.sent ? a : b)).date
-            : 'N/A',
-          deliveryRate: `${deliveryRate}%`,
-          readRate: `${readRate}%`
-        }
-      };
 
       res.json(analytics);
     } catch (error) {

@@ -52,6 +52,11 @@ const isLocalHostValue = (value = '') =>
   /(^|:\/\/)(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(String(value || '').trim());
 
 const isValidObjectId = (value = '') => mongoose.Types.ObjectId.isValid(String(value || '').trim());
+const normalizeOptionalCompanyId = (value = '') => {
+  const cleaned = toCleanString(value);
+  if (!cleaned) return null;
+  return isValidObjectId(cleaned) ? cleaned : null;
+};
 
 const getRateLimitKey = (req) => {
   const ip = getRequestIp(req) || 'unknown-ip';
@@ -144,7 +149,7 @@ const buildPublicOptInPayload = (req) => {
     proofType: toCleanString(body.proofType) || 'website_form',
     proofId: toCleanString(body.proofId),
     proofUrl: toCleanString(body.proofUrl),
-    companyId: toCleanString(body.companyId) || null,
+    companyId: normalizeOptionalCompanyId(body.companyId),
     userId: toCleanString(body.userId),
     tags: Array.isArray(body.tags)
       ? body.tags.map((tag) => toCleanString(tag)).filter(Boolean)
@@ -197,20 +202,6 @@ router.post('/whatsapp-opt-in', async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'userId is required for public opt-in.'
-      });
-    }
-
-    if (!isValidObjectId(payload.userId)) {
-      return res.status(400).json({
-        success: false,
-        error: 'userId must be a valid Mongo ObjectId for public opt-in.'
-      });
-    }
-
-    if (payload.companyId && !isValidObjectId(payload.companyId)) {
-      return res.status(400).json({
-        success: false,
-        error: 'companyId must be a valid Mongo ObjectId when provided.'
       });
     }
 

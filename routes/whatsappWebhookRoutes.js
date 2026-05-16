@@ -244,7 +244,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
 
   const extractIncomingMessagePayload = (messageData = {}) => {
     const type = String(messageData?.type || '').trim().toLowerCase();
-    const mediaTypes = new Set(['image', 'video', 'audio', 'document']);
+    const mediaTypes = new Set(['image', 'video', 'audio', 'document', 'sticker']);
     const reactionTargetMessageId = firstNonEmpty(messageData?.reaction?.message_id);
 
     let text = '';
@@ -778,13 +778,18 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       const messageId = statusData.id;
       const status = statusData.status;
       const recipient = statusData.recipient_id;
-      const statusError = [
+      const statusErrorParts = [
         statusData?.errors?.[0]?.message,
+        statusData?.errors?.[0]?.error_data?.message,
         statusData?.errors?.[0]?.error_data?.details,
-        statusData?.errors?.[0]?.title
+        statusData?.errors?.[0]?.title,
+        statusData?.errors?.[0]?.code ? `code ${statusData.errors[0].code}` : '',
+        statusData?.errors?.[0]?.error_data?.code ? `code ${statusData.errors[0].error_data.code}` : ''
       ]
         .map((value) => String(value || '').trim())
-        .find(Boolean) || '';
+        .filter(Boolean);
+      const statusError =
+        statusErrorParts.length > 0 ? statusErrorParts.join(' • ') : '';
 
       console.log('Received status update:', {
         messageId,
@@ -840,6 +845,14 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         {
           status,
           errorMessage: status === 'failed' ? statusError : '',
+          errorCode:
+            status === 'failed'
+              ? String(
+                  statusData?.errors?.[0]?.code ||
+                    statusData?.errors?.[0]?.error_data?.code ||
+                    ''
+                ).trim() || undefined
+              : undefined,
           updatedAt: new Date()
         },
         { new: true }
@@ -883,6 +896,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         messageId,
         status,
         errorMessage: updatedMessage.errorMessage || '',
+        errorCode: updatedMessage.errorCode || '',
+        errorDetails: statusError || '',
         conversationId: message.conversationId,
         broadcastId: updatedMessage.broadcastId ? String(updatedMessage.broadcastId) : null,
         previousStatus: oldStatus,

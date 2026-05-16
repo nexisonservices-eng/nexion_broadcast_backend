@@ -1,7 +1,9 @@
 const crypto = require('crypto');
 const { createRedisConnection } = require('../config/redis');
+const { publishRealtimeEvent } = require('../realtime/realtimeBus');
 
 const CACHE_NAMESPACE = 'team-inbox';
+const INVALIDATION_CHANNEL = 'nexion:team-inbox:cache-invalidation';
 const CACHE_TTL_SECONDS = {
   conversations: 30,
   summaryPages: 20,
@@ -11,9 +13,13 @@ const VERSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 // Bump the cache groups whenever the inbox pagination contract changes.
 // This avoids reusing stale first-page responses that can incorrectly report
 // hasMore=false after a pagination fix ships.
-const CONVERSATION_CACHE_VERSION_GROUPS = ['list-v2', 'summaryPages-v2'];
+const CONVERSATION_CACHE_VERSION_GROUPS = ['list-v2', 'summaryPages-v2', 'hydratedPages-v1'];
 
 let redisClient = null;
+let invalidationPublisher = null;
+let invalidationSubscriber = null;
+let invalidationSubscribed = false;
+const processInstanceId = crypto.randomUUID();
 
 const getRedisClient = () => {
   if (!redisClient) {
@@ -31,6 +37,42 @@ const getRedisClient = () => {
     });
   }
   return redisClient;
+};
+
+const getInvalidationPublisher = () => {
+  if (!invalidationPublisher) {
+    invalidationPublisher = createRedisConnection();
+    invalidationPublisher.on('error', (error) => {
+      const message = String(error?.message || '').trim();
+      if (
+        error?.code === 'ECONNREFUSED' ||
+        message.includes('ECONNREFUSED') ||
+        message.includes('connect ECONNREFUSED')
+      ) {
+        return;
+      }
+      console.error('Team inbox invalidation Redis publisher error:', message || error);
+    });
+  }
+  return invalidationPublisher;
+};
+
+const getInvalidationSubscriber = () => {
+  if (!invalidationSubscriber) {
+    invalidationSubscriber = createRedisConnection();
+    invalidationSubscriber.on('error', (error) => {
+      const message = String(error?.message || '').trim();
+      if (
+        error?.code === 'ECONNREFUSED' ||
+        message.includes('ECONNREFUSED') ||
+        message.includes('connect ECONNREFUSED')
+      ) {
+        return;
+      }
+      console.error('Team inbox invalidation Redis subscriber error:', message || error);
+    });
+  }
+  return invalidationSubscriber;
 };
 
 const toCleanString = (value) => String(value || '').trim();
@@ -122,6 +164,80 @@ const bumpConversationCacheGroups = async ({
   );
 };
 
+const publishInboxInvalidation = async (payload = {}) => {
+  try {
+    const publisher = getInvalidationPublisher();
+    await publisher.publish(
+      INVALIDATION_CHANNEL,
+      JSON.stringify({
+        originId: processInstanceId,
+        payload
+      })
+    );
+  } catch (error) {
+    const message = String(error?.message || '').trim();
+    if (
+      error?.code === 'ECONNREFUSED' ||
+      message.includes('ECONNREFUSED') ||
+      message.includes('connect ECONNREFUSED')
+    ) {
+      return;
+    }
+    console.error('Failed to publish team inbox invalidation:', message || error);
+  }
+};
+
+const ensureInboxInvalidationSubscriber = () => {
+  if (invalidationSubscribed) return;
+  invalidationSubscribed = true;
+
+  const subscriber = getInvalidationSubscriber();
+  subscriber.subscribe(INVALIDATION_CHANNEL).catch((error) => {
+    console.error('Failed to subscribe team inbox invalidation channel:', error?.message || error);
+  });
+
+  subscriber.on('message', async (channel, message) => {
+    if (channel !== INVALIDATION_CHANNEL) return;
+    try {
+      const parsed = JSON.parse(message);
+      if (parsed?.originId === processInstanceId) return;
+      const payload = parsed?.payload || {};
+      const companyId = toCleanString(payload?.companyId);
+      const userId = toCleanString(payload?.userId);
+      const conversationId = toCleanString(payload?.conversationId);
+      const versionGroups = Array.isArray(payload?.versionGroups)
+        ? payload.versionGroups
+        : payload?.versionGroup
+          ? [payload.versionGroup]
+          : [];
+
+      if (conversationId) {
+        await bumpConversationCacheGroups({
+          companyId,
+          userId,
+          versionGroups: versionGroups.length ? versionGroups : CONVERSATION_CACHE_VERSION_GROUPS
+        });
+        await Promise.all(
+          getInboxScopeVariants({ companyId, userId }).flatMap((scope) => [
+            bumpVersion('messages', `${scope}:${conversationId}`, 'thread')
+          ])
+        );
+        return;
+      }
+
+      await bumpConversationCacheGroups({
+        companyId,
+        userId,
+        versionGroups: versionGroups.length ? versionGroups : CONVERSATION_CACHE_VERSION_GROUPS
+      });
+    } catch (error) {
+      console.error('Failed to process team inbox invalidation:', error?.message || error);
+    }
+  });
+};
+
+ensureInboxInvalidationSubscriber();
+
 const getCachedJson = async (key) => {
   if (!key) return null;
   try {
@@ -187,6 +303,22 @@ const invalidateInboxScope = async ({ companyId = '', userId = '', versionGroup 
     userId,
     versionGroups
   });
+  void publishInboxInvalidation({
+    companyId,
+    userId,
+    versionGroups
+  });
+  void publishRealtimeEvent({
+    scope: 'company',
+    companyId: toCleanString(companyId) || null,
+    data: {
+      type: 'team_inbox_cache_invalidated',
+      companyId: toCleanString(companyId) || null,
+      userId: toCleanString(userId) || null,
+      versionGroups,
+      updatedAt: new Date().toISOString()
+    }
+  });
 };
 
 const invalidateInboxConversation = async ({
@@ -211,6 +343,23 @@ const invalidateInboxConversation = async ({
       bumpVersion('messages', `${scope}:${normalizedConversationId}`, 'thread')
     ])
   );
+  void publishInboxInvalidation({
+    companyId,
+    userId,
+    conversationId: normalizedConversationId
+  });
+  void publishRealtimeEvent({
+    scope: 'company',
+    companyId: toCleanString(companyId) || null,
+    conversationId: normalizedConversationId,
+    data: {
+      type: 'team_inbox_cache_invalidated',
+      companyId: toCleanString(companyId) || null,
+      userId: toCleanString(userId) || null,
+      conversationId: normalizedConversationId,
+      updatedAt: new Date().toISOString()
+    }
+  });
 };
 
 module.exports = {

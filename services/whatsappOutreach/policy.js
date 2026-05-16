@@ -161,7 +161,17 @@ const getWhatsAppMessagingPolicy = (contact = {}, options = {}) => {
   );
   const normalizedOptInScope = normalizeOptInScope(contact?.whatsappOptInScope);
   const serviceWindowClosesAt = toSafeDate(contact?.serviceWindowClosesAt);
-  const lastInboundMessageAt = toSafeDate(contact?.lastInboundMessageAt);
+  const contactLastInboundMessageAt = toSafeDate(contact?.lastInboundMessageAt);
+  const conversationLastInboundMessageAt = toSafeDate(options?.conversationLastInboundMessageAt);
+  const lastInboundMessageAt =
+    contactLastInboundMessageAt && conversationLastInboundMessageAt
+      ? new Date(
+          Math.max(
+            contactLastInboundMessageAt.getTime(),
+            conversationLastInboundMessageAt.getTime()
+          )
+        )
+      : contactLastInboundMessageAt || conversationLastInboundMessageAt;
   const inferredServiceWindowClosesAt = lastInboundMessageAt
     ? new Date(lastInboundMessageAt.getTime() + 24 * 60 * 60 * 1000)
     : null;

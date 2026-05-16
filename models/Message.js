@@ -14,7 +14,7 @@ const MessageSchema = new mongoose.Schema({
   senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   text: String,
   mediaUrl: String,
-  mediaType: { type: String, enum: ['image', 'video', 'audio', 'document'] },
+  mediaType: { type: String, enum: ['image', 'video', 'audio', 'document', 'sticker'] },
   mediaCaption: String,
   mediaPipelineRequestId: { type: String, index: true },
   attachment: {
@@ -48,6 +48,7 @@ const MessageSchema = new mongoose.Schema({
   whatsappMessageId: { type: String, unique: true, sparse: true },
   whatsappTimestamp: Date,
   errorMessage: String,
+  errorCode: String,
   broadcastId: { type: mongoose.Schema.Types.ObjectId, ref: 'Broadcast', index: true },
   broadcastDispatchKey: { type: String, unique: true, sparse: true, index: true },
   rawMessageType: String,

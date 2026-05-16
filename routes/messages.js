@@ -27,6 +27,28 @@ const {
   normalizeRole,
   isTenantWideRole
 } = require('../utils/accessControl');
+const { createRedisRateLimiter } = require('../middleware/redisRateLimit');
+
+const threadReadRateLimit = createRedisRateLimiter({
+  namespace: 'thread-message-read',
+  windowMs: 60_000,
+  max: 240,
+  message: 'Message history is being loaded too quickly.'
+});
+
+const sendMessageRateLimit = createRedisRateLimiter({
+  namespace: 'message-send',
+  windowMs: 60_000,
+  max: 60,
+  message: 'Message sending is being rate limited. Please wait and retry.'
+});
+
+const attachmentRateLimit = createRedisRateLimiter({
+  namespace: 'message-attachment',
+  windowMs: 60_000,
+  max: 30,
+  message: 'Attachment actions are being rate limited. Please wait and retry.'
+});
 const {
   upsertConversationSummary
 } = require('../services/conversationSummaryService');
@@ -53,7 +75,8 @@ const {
   validateFreeformOutboundSend,
   validateTemplateOutboundSend,
   applyMarketingTemplateSent,
-  toCleanString
+  toCleanString,
+  getWhatsAppMessagingPolicy
 } = require('../services/whatsappOutreach/policy');
 const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
 const { resolveCompanyFolders } = require('../services/cloudinaryCompanyFolders');
@@ -67,7 +90,7 @@ router.use(
 );
 
 // Compatibility endpoint for Team Inbox message history when conversation routes are unavailable.
-router.get('/conversation/:id', async (req, res) => {
+router.get('/conversation/:id', threadReadRateLimit, async (req, res) => {
   try {
     const conversationId = String(req.params.id || '').trim();
     if (!conversationId) {
@@ -361,6 +384,17 @@ const resolveAttachmentMessageFilters = ({ req, messageId }) => {
   return filters;
 };
 
+const resolveLatestInboundConversationActivity = async ({ req, conversationId }) => {
+  const filters = buildScopedMessageFilters(req, {
+    conversationId,
+    sender: 'contact'
+  });
+  return Message.findOne(filters)
+    .select('_id timestamp whatsappTimestamp createdAt')
+    .sort({ timestamp: -1, _id: -1 })
+    .lean();
+};
+
 const loadAuthorizedAttachmentMessage = async ({ req, messageId }) => {
   const filters = resolveAttachmentMessageFilters({ req, messageId });
   const message = await Message.findOne(filters)
@@ -461,13 +495,23 @@ const fetchAttachmentUpstream = async (urls = []) => {
 
   for (const candidateUrl of urls) {
     try {
-      const upstreamResponse = await axios.get(candidateUrl, {
-        responseType: 'arraybuffer',
-        maxRedirects: 5,
-        validateStatus: () => true
+      const upstreamResponse = await fetch(candidateUrl, {
+        method: 'GET',
+        redirect: 'follow'
       });
-      if (upstreamResponse.status >= 200 && upstreamResponse.status < 300) {
-        return upstreamResponse;
+
+      if (upstreamResponse.ok) {
+        const arrayBuffer = await upstreamResponse.arrayBuffer();
+        const headers = {};
+        upstreamResponse.headers.forEach((value, key) => {
+          headers[String(key).toLowerCase()] = value;
+        });
+
+        return {
+          status: upstreamResponse.status,
+          headers,
+          data: Buffer.from(arrayBuffer)
+        };
       }
 
       const statusCode = Number(upstreamResponse.status || 0);
@@ -546,6 +590,7 @@ const buildScopedMessageFilters = (req, extra = {}) => {
 
 router.post(
   '/template-header-media',
+  attachmentRateLimit,
   requirePlanFeature('broadcastMessaging'),
   async (req, res) => {
     try {
@@ -587,6 +632,7 @@ router.post(
 
 router.post(
   '/react',
+  sendMessageRateLimit,
   requirePlanFeature('broadcastMessaging'),
   requireWhatsAppCredentials,
   async (req, res) => {
@@ -746,6 +792,7 @@ router.post(
 
 router.post(
   '/template-header-media',
+  attachmentRateLimit,
   requirePlanFeature('templates'),
   requireWhatsAppCredentials,
   async (req, res) => {
@@ -782,6 +829,7 @@ router.post(
 
 router.post(
   '/send-template',
+  sendMessageRateLimit,
   requirePlanFeature('broadcastMessaging'),
   requireWhatsAppCredentials,
   async (req, res) => {
@@ -966,6 +1014,7 @@ router.post(
 
 router.post(
   '/send-attachment',
+  attachmentRateLimit,
   requirePlanFeature('broadcastMessaging'),
   requireWhatsAppCredentials,
   async (req, res) => {
@@ -980,7 +1029,8 @@ router.post(
         conversationId,
         caption = '',
         replyToMessageId = '',
-        whatsappContextMessageId = ''
+        whatsappContextMessageId = '',
+        conversationLastInboundMessageAt = ''
       } = req.body || {};
       if (!to || !conversationId) {
         return res.status(400).json({
@@ -1016,9 +1066,40 @@ router.post(
         companyId: conversation.companyId || req.companyId || null,
         conversation
       });
-      const freeformValidation = outboundContact
+      const parsedConversationLastInboundMessageAt = new Date(
+        String(conversationLastInboundMessageAt || '').trim()
+      );
+      const hasConversationLastInboundMessageAt =
+        !Number.isNaN(parsedConversationLastInboundMessageAt.getTime());
+      let freeformValidation = outboundContact
         ? validateFreeformOutboundSend(outboundContact)
         : { ok: true, policy: null };
+      if (!freeformValidation.ok && outboundContact && hasConversationLastInboundMessageAt) {
+        const fallbackPolicy = getWhatsAppMessagingPolicy(outboundContact, {
+          conversationLastInboundMessageAt: parsedConversationLastInboundMessageAt
+        });
+        if (fallbackPolicy.freeformAllowed) {
+          freeformValidation = { ok: true, policy: fallbackPolicy };
+        }
+      }
+      if (!freeformValidation.ok && outboundContact) {
+        const latestInboundActivity = await resolveLatestInboundConversationActivity({
+          req,
+          conversationId: conversation._id
+        });
+        if (latestInboundActivity) {
+          const fallbackPolicy = getWhatsAppMessagingPolicy(outboundContact, {
+            conversationLastInboundMessageAt:
+              latestInboundActivity.timestamp ||
+              latestInboundActivity.whatsappTimestamp ||
+              latestInboundActivity.createdAt ||
+              null
+          });
+          if (fallbackPolicy.freeformAllowed) {
+            freeformValidation = { ok: true, policy: fallbackPolicy };
+          }
+        }
+      }
       if (!freeformValidation.ok) {
         return res.status(freeformValidation.statusCode || 403).json({
           success: false,
@@ -1051,32 +1132,79 @@ router.post(
       });
 
       const normalizedFileCategory = String(attachment?.fileCategory || '').trim().toLowerCase();
+      const normalizedMimeType = String(attachment?.mimeType || req.file?.mimetype || '')
+        .trim()
+        .toLowerCase();
+      const normalizedExtension = String(attachment?.extension || '').trim().toLowerCase();
+      if (
+        normalizedFileCategory === 'video' ||
+        normalizedMimeType === 'image/webp' ||
+        normalizedExtension === 'webp'
+      ) {
+        try {
+          await deleteInboxAttachment({ attachment });
+        } catch (_cleanupError) {
+          // best-effort cleanup
+        }
+        return res.status(415).json({
+          success: false,
+          error: 'This website only supports sending images, audio, and documents.',
+          errorCode: 'UNSUPPORTED_OUTBOUND_MEDIA_TYPE',
+          errorDetails: `Outbound media type "${normalizedFileCategory || normalizedMimeType || normalizedExtension || 'unknown'}" is disabled.`,
+          mediaPipelineRequestId
+        });
+      }
       const mediaType =
         normalizedFileCategory === 'image'
           ? 'image'
           : normalizedFileCategory === 'audio'
             ? 'audio'
             : 'document';
-      let uploadedMetaMediaId = '';
-      if (mediaType !== 'image') {
-        const mediaUploadResult = await whatsappService.uploadMediaAsset(
-          req.file,
-          req.whatsappCredentials
-        );
-        if (!mediaUploadResult.success) {
-          try {
-            await deleteInboxAttachment({ attachment });
-          } catch (_cleanupError) {
-            // no-op: best-effort cleanup on downstream send failure
+      const mediaUploadResult = await whatsappService.uploadMediaAsset(
+        req.file,
+        req.whatsappCredentials,
+        {
+          debugContext: {
+            requestId: mediaPipelineRequestId,
+            conversationId: conversation._id,
+            to,
+            mediaType
           }
-
-          return res.status(400).json({
-            success: false,
-            error: mediaUploadResult.error || 'Failed to upload document to WhatsApp',
-            mediaPipelineRequestId
-          });
         }
-        uploadedMetaMediaId = String(mediaUploadResult?.data?.id || '').trim();
+      );
+      if (!mediaUploadResult.success) {
+        try {
+          await deleteInboxAttachment({ attachment });
+        } catch (_cleanupError) {
+          // no-op: best-effort cleanup on downstream send failure
+        }
+
+        return res.status(400).json({
+          success: false,
+          error: mediaUploadResult.error || 'Failed to upload media to WhatsApp',
+          errorCode: mediaUploadResult.errorCode || null,
+          errorDetails: mediaUploadResult.errorDetails || null,
+          mediaPipelineRequestId
+        });
+      }
+      const uploadedMetaMediaId = String(
+        mediaUploadResult?.data?.id ||
+          mediaUploadResult?.data?.media_id ||
+          mediaUploadResult?.data?.mediaId ||
+          mediaUploadResult?.media_id ||
+          mediaUploadResult?.mediaId ||
+          ''
+      ).trim();
+      if (!uploadedMetaMediaId) {
+        try {
+          console.warn('WhatsApp media upload returned no media id', {
+            conversationId: String(conversation?._id || ''),
+            mediaType,
+            mediaUploadResult: mediaUploadResult?.data || mediaUploadResult
+          });
+        } catch (_logError) {
+          // ignore logging failures
+        }
       }
 
       const sendResult = await whatsappService.sendMediaMessage(
@@ -1088,7 +1216,15 @@ router.post(
         {
           whatsappContextMessageId: resolvedReplyContextMessageId,
           fileName: mediaType === 'document' ? attachment?.originalFileName : '',
-          mediaId: uploadedMetaMediaId
+          mediaId: uploadedMetaMediaId,
+          debugContext: {
+            requestId: mediaPipelineRequestId,
+            conversationId: conversation._id,
+            to,
+            mediaType,
+            cloudinary: attachment,
+            meta: mediaUploadResult?.data || null
+          }
         }
       );
 
@@ -1102,6 +1238,8 @@ router.post(
         return res.status(400).json({
           success: false,
           error: sendResult.error || 'Failed to send media message',
+          errorCode: sendResult.errorCode || null,
+          errorDetails: sendResult.errorDetails || null,
           mediaPipelineRequestId
         });
       }
@@ -1193,6 +1331,8 @@ router.post(
       return res.status(statusCode).json({
         success: false,
         error: error?.message || 'Failed to send attachment message',
+        errorCode: error?.code || null,
+        errorDetails: error?.response?.data?.error?.message || error?.response?.data?.message || null,
         mediaPipelineRequestId
       });
     }

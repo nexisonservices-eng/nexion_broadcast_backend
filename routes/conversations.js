@@ -21,6 +21,21 @@ const {
   normalizeRole,
   isTenantWideRole
 } = require('../utils/accessControl');
+const { createRedisRateLimiter } = require('../middleware/redisRateLimit');
+
+const inboxListRateLimit = createRedisRateLimiter({
+  namespace: 'inbox-conversation-list',
+  windowMs: 60_000,
+  max: 120,
+  message: 'Conversation list is being refreshed too quickly.'
+});
+
+const inboxThreadRateLimit = createRedisRateLimiter({
+  namespace: 'inbox-thread-read',
+  windowMs: 60_000,
+  max: 240,
+  message: 'Thread history is being requested too quickly.'
+});
 
 const buildScopedMessageFilters = (req, extra = {}, options = {}) => {
   const normalizedRole = normalizeRole(
@@ -50,7 +65,7 @@ router.use(
 );
 
 // Get all conversations with optional filters
-router.get('/', (req, res) => conversationController.getConversations(req, res));
+router.get('/', inboxListRateLimit, (req, res) => conversationController.getConversations(req, res));
 
 // Get all contacts with optional filters
 router.get('/contacts', (req, res) => conversationController.getContacts(req, res));
@@ -77,7 +92,7 @@ router.delete('/delete-all', (req, res) => conversationController.deleteAllConve
 router.delete('/delete-selected', (req, res) => conversationController.deleteSelectedConversations(req, res));
 
 // Get paged messages for a conversation (compatibility path used by Team Inbox clients)
-router.get('/:id/messages', async (req, res) => {
+router.get('/:id/messages', inboxThreadRateLimit, async (req, res) => {
   try {
     const conversationId = String(req.params.id || '').trim();
     if (!conversationId) {

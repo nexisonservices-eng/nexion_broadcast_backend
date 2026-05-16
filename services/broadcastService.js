@@ -21,6 +21,10 @@ const {
   buildConversationPhoneLookupFilter
 } = require('../utils/conversationIdentity');
 const {
+  CACHE_TTL_SECONDS,
+  getOrSetCachedJson
+} = require('../utils/teamInboxCache');
+const {
   toCleanString,
   validateTemplateOutboundSend,
   validateFreeformOutboundSend,
@@ -2558,9 +2562,80 @@ class BroadcastService {
 
   async getBroadcasts(filters = {}) {
     try {
+      const companyId = filters?.companyId || null;
+      const createdById = filters?.createdById || null;
+      const statusFilter = String(filters?.status || '').trim();
+      const search = String(filters?.search || '').trim();
+      const hasPagination = Number(filters?.limit || 0) > 0 || String(filters?.cursor || '').trim();
+      const limit = Math.max(1, Math.min(100, Number(filters?.limit || 20)));
+      const cursor = hasPagination ? this.decodePaginationCursor(filters?.cursor || '') : null;
+
+      const query = {};
+      if (companyId) query.companyId = companyId;
+      if (createdById) query.createdById = createdById;
+
+      if (statusFilter) {
+        const statuses = statusFilter.split(',').map((value) => String(value || '').trim()).filter(Boolean);
+        if (statuses.length === 1) {
+          query.status = statuses[0];
+        } else if (statuses.length > 1) {
+          query.status = { $in: statuses };
+        }
+      }
+
+      if (search) {
+        query.name = { $regex: search, $options: 'i' };
+      }
+
+      if (hasPagination && cursor?.createdAt && cursor?.id) {
+        const createdAt = new Date(cursor.createdAt);
+        if (!Number.isNaN(createdAt.getTime())) {
+          query.$or = [
+            { createdAt: { $lt: createdAt } },
+            { createdAt, _id: { $lt: cursor.id } }
+          ];
+        }
+      }
+
+      const projection = 'name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource';
+
+      if (hasPagination) {
+        const rows = await Broadcast.find(query)
+          .select(projection)
+          .sort({ createdAt: -1, _id: -1 })
+          .limit(limit + 1)
+          .lean();
+
+        const hasMore = rows.length > limit;
+        const items = rows.slice(0, limit).map((broadcast) => ({
+          ...broadcast,
+          sentCount: Number(broadcast?.stats?.sent || 0),
+          completedCount: Number(broadcast?.stats?.sent || 0)
+        }));
+        const lastItem = items[items.length - 1] || null;
+
+        return {
+          success: true,
+          data: {
+            items,
+            meta: {
+              hasMore,
+              nextCursor: hasMore && lastItem
+                ? this.encodePaginationCursor({
+                    createdAt: lastItem.createdAt,
+                    id: String(lastItem._id || '')
+                  })
+                : '',
+              limit,
+              count: items.length
+            }
+          }
+        };
+      }
+
       // Keep list endpoint lightweight for fast overview updates.
       const broadcasts = await Broadcast.find(filters)
-        .select('name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language')
+        .select(projection)
         .sort({ createdAt: -1 })
         .lean();
 
@@ -2650,74 +2725,154 @@ class BroadcastService {
 
   async getReliabilitySummary(filters = {}) {
     try {
-      const query = { ...(filters || {}) };
-      const createdAt = {};
-
-      if (filters?.createdFrom) {
-        const from = new Date(filters.createdFrom);
-        if (!Number.isNaN(from.getTime())) {
-          createdAt.$gte = from;
-        }
-      }
-      if (filters?.createdTo) {
-        const to = new Date(filters.createdTo);
-        if (!Number.isNaN(to.getTime())) {
-          createdAt.$lte = to;
-        }
-      }
-      if (Object.keys(createdAt).length > 0) {
-        query.createdAt = createdAt;
-      }
-
-      delete query.createdFrom;
-      delete query.createdTo;
-
-      const broadcasts = await Broadcast.find(query).lean();
-
-      const summary = {
-        campaigns: 0,
-        recipientCount: 0,
-        suppressed: 0,
-        deferred: 0,
-        retried: 0,
-        skippedQuietHours: 0,
-        failureCodeBreakdown: {}
+      const normalizedFilters = {
+        companyId: filters?.companyId || null,
+        createdById: filters?.createdById || null,
+        status: String(filters?.status || '').trim(),
+        createdFrom: String(filters?.createdFrom || '').trim(),
+        createdTo: String(filters?.createdTo || '').trim()
       };
+      const cacheScope = [
+        `company:${normalizedFilters.companyId || 'all'}`,
+        `user:${normalizedFilters.createdById || 'all'}`,
+        `status:${normalizedFilters.status || 'all'}`,
+        `from:${normalizedFilters.createdFrom || 'all'}`,
+        `to:${normalizedFilters.createdTo || 'all'}`
+      ].join('|');
 
-      (Array.isArray(broadcasts) ? broadcasts : []).forEach((broadcast) => {
-        const analytics = broadcast?.analytics || {};
-        const recipientCount = Number(
-          broadcast?.recipientCount || (Array.isArray(broadcast?.recipients) ? broadcast.recipients.length : 0)
-        );
-        summary.campaigns += 1;
-        summary.recipientCount += Number.isFinite(recipientCount) ? Math.max(0, recipientCount) : 0;
-        summary.suppressed += Number(analytics?.suppressed || 0) || 0;
-        summary.deferred += Number(analytics?.deferred || 0) || 0;
-        summary.retried += Number(analytics?.retried || 0) || 0;
-        summary.skippedQuietHours += Number(analytics?.skippedQuietHours || 0) || 0;
+      return await getOrSetCachedJson({
+        namespace: 'broadcasts',
+        scope: cacheScope,
+        versionGroup: 'reliability-summary-v2',
+        keyParts: ['dashboard'],
+        ttlSeconds: Math.max(10, Number(CACHE_TTL_SECONDS?.summaryPages || 20)),
+        loader: async () => {
+          const query = {};
+          if (normalizedFilters.companyId) {
+            query.companyId = normalizedFilters.companyId;
+          }
+          if (normalizedFilters.createdById) {
+            query.createdById = normalizedFilters.createdById;
+          }
+          if (normalizedFilters.status) {
+            const statuses = normalizedFilters.status
+              .split(',')
+              .map((value) => String(value || '').trim())
+              .filter(Boolean);
+            if (statuses.length === 1) {
+              query.status = statuses[0];
+            } else if (statuses.length > 1) {
+              query.status = { $in: statuses };
+            }
+          }
 
-        const breakdown = analytics?.failureCodeBreakdown;
-        if (breakdown && typeof breakdown === 'object') {
-          Object.entries(breakdown).forEach(([code, count]) => {
-            const key = String(code || '').trim();
-            if (!key) return;
-            summary.failureCodeBreakdown[key] =
-              Number(summary.failureCodeBreakdown[key] || 0) + (Number(count || 0) || 0);
-          });
+          const createdAt = {};
+          if (normalizedFilters.createdFrom) {
+            const from = new Date(normalizedFilters.createdFrom);
+            if (!Number.isNaN(from.getTime())) {
+              createdAt.$gte = from;
+            }
+          }
+          if (normalizedFilters.createdTo) {
+            const to = new Date(normalizedFilters.createdTo);
+            if (!Number.isNaN(to.getTime())) {
+              createdAt.$lte = to;
+            }
+          }
+          if (Object.keys(createdAt).length > 0) {
+            query.createdAt = createdAt;
+          }
+
+          const summaryPipeline = [
+            { $match: query },
+            {
+              $project: {
+                recipientCountResolved: {
+                  $ifNull: [
+                    '$recipientCount',
+                    {
+                      $size: {
+                        $ifNull: ['$recipients', []]
+                      }
+                    }
+                  ]
+                },
+                analytics: {
+                  suppressed: { $ifNull: ['$analytics.suppressed', 0] },
+                  deferred: { $ifNull: ['$analytics.deferred', 0] },
+                  retried: { $ifNull: ['$analytics.retried', 0] },
+                  skippedQuietHours: { $ifNull: ['$analytics.skippedQuietHours', 0] },
+                  failureCodeBreakdown: { $ifNull: ['$analytics.failureCodeBreakdown', {}] }
+                }
+              }
+            },
+            {
+              $facet: {
+                totals: [
+                  {
+                    $group: {
+                      _id: null,
+                      campaigns: { $sum: 1 },
+                      recipientCount: { $sum: '$recipientCountResolved' },
+                      suppressed: { $sum: '$analytics.suppressed' },
+                      deferred: { $sum: '$analytics.deferred' },
+                      retried: { $sum: '$analytics.retried' },
+                      skippedQuietHours: { $sum: '$analytics.skippedQuietHours' }
+                    }
+                  }
+                ],
+                failureCodes: [
+                  {
+                    $project: {
+                      entries: {
+                        $objectToArray: '$analytics.failureCodeBreakdown'
+                      }
+                    }
+                  },
+                  { $unwind: { path: '$entries', preserveNullAndEmptyArrays: true } },
+                  {
+                    $group: {
+                      _id: '$entries.k',
+                      count: { $sum: { $ifNull: ['$entries.v', 0] } }
+                    }
+                  }
+                ]
+              }
+            }
+          ];
+
+          const aggregateResult = await Broadcast.aggregate(summaryPipeline);
+          const totals = Array.isArray(aggregateResult?.[0]?.totals) ? aggregateResult[0].totals[0] || {} : {};
+          const failureCodes = Array.isArray(aggregateResult?.[0]?.failureCodes)
+            ? aggregateResult[0].failureCodes
+            : [];
+          const failureCodeBreakdown = failureCodes.reduce((accumulator, item) => {
+            const key = String(item?._id || '').trim();
+            if (!key) return accumulator;
+            accumulator[key] = Number(item?.count || 0) || 0;
+            return accumulator;
+          }, {});
+
+          const topFailureCode = failureCodes
+            .map((item) => ({ code: String(item?._id || '').trim(), count: Number(item?.count || 0) }))
+            .filter((item) => item.code)
+            .sort((a, b) => b.count - a.count)[0] || null;
+
+          return {
+            success: true,
+            data: {
+              campaigns: Number(totals?.campaigns || 0) || 0,
+              recipientCount: Number(totals?.recipientCount || 0) || 0,
+              suppressed: Number(totals?.suppressed || 0) || 0,
+              deferred: Number(totals?.deferred || 0) || 0,
+              retried: Number(totals?.retried || 0) || 0,
+              skippedQuietHours: Number(totals?.skippedQuietHours || 0) || 0,
+              failureCodeBreakdown,
+              topFailureCode
+            }
+          };
         }
       });
-
-      const topFailureCode = Object.entries(summary.failureCodeBreakdown)
-        .map(([code, count]) => ({ code, count: Number(count || 0) }))
-        .sort((a, b) => b.count - a.count)[0] || null;
-
-      return {
-        success: true,
-        data: {
-          ...summary,
-          topFailureCode
-        }
-      };
     } catch (error) {
       return { success: false, error: error.message };
     }

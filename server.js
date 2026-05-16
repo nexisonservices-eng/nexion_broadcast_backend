@@ -191,7 +191,8 @@ const corsOptions = {
     'Authorization',
     'X-Requested-With',
     'ngrok-skip-browser-warning',
-    'x-opt-in-public-key'
+    'x-opt-in-public-key',
+    'x-request-id'
   ],
   preflightContinue: false,
   optionsSuccessStatus: 204
