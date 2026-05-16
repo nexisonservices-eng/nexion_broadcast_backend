@@ -8,7 +8,10 @@ const CACHE_TTL_SECONDS = {
   messages: 45
 };
 const VERSION_TTL_SECONDS = 60 * 60 * 24 * 30;
-const CONVERSATION_CACHE_VERSION_GROUPS = ['list', 'summaryPages'];
+// Bump the cache groups whenever the inbox pagination contract changes.
+// This avoids reusing stale first-page responses that can incorrectly report
+// hasMore=false after a pagination fix ships.
+const CONVERSATION_CACHE_VERSION_GROUPS = ['list-v2', 'summaryPages-v2'];
 
 let redisClient = null;
 

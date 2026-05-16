@@ -12,6 +12,9 @@ const {
   buildPhoneCandidates,
   normalizePhoneDigits
 } = require('../services/whatsappOutreach/conversationResolver');
+const {
+  buildConversationPhoneLookupFilter,
+} = require('../utils/conversationIdentity');
 const { logConsentEvent } = require('../services/whatsappConsentLogService');
 const broadcastService = require('../services/broadcastService');
 const { invalidateInboxConversation } = require('../utils/teamInboxCache');
@@ -590,12 +593,13 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
 
       const isReactionMessage = String(rawMessageType || '').trim().toLowerCase() === 'reaction';
 
+      const conversationLookupFilter = buildConversationPhoneLookupFilter(from);
       let conversation = await Conversation.findOne({
         userId,
         companyId,
-        contactPhone: from,
-        status: { $in: ['active', 'pending'] }
-      });
+        status: { $in: ['active', 'pending'] },
+        ...(conversationLookupFilter || { contactPhone: from })
+      }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
       if (!conversation) {
         conversation = await Conversation.create({
           userId,

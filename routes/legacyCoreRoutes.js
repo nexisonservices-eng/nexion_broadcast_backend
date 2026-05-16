@@ -26,6 +26,10 @@ const {
 } = require('../utils/accessControl');
 const { buildContactSearchPlan } = require('../utils/contactSearchPlan');
 const {
+  buildConversationPhoneLookupFilter,
+  dedupeConversationsByIdentity
+} = require('../utils/conversationIdentity');
+const {
   syncConversationSummaryFromConversation,
   upsertConversationSummaries,
   upsertConversationSummary
@@ -81,66 +85,6 @@ const registerLegacyCoreRoutes = (app, deps) => {
   const isValidObjectId = (value = '') => /^[a-f\d]{24}$/i.test(String(value || '').trim());
   const buildCompanyScopeFilter = (companyId) => (companyId ? { companyId } : {});
 
-  const enrichConversationsWithLatestAgentStatus = async (conversations = [], req) => {
-    const safeConversations = Array.isArray(conversations) ? conversations : [];
-    const conversationObjectIds = safeConversations
-      .map((conversation) => String(conversation?._id || '').trim())
-      .filter((conversationId) => mongoose.Types.ObjectId.isValid(conversationId))
-      .map((conversationId) => new mongoose.Types.ObjectId(conversationId));
-
-    if (!conversationObjectIds.length) {
-      return safeConversations;
-    }
-
-    const latestAgentMessages = await Message.aggregate([
-      {
-        $match: {
-          userId: req.user.id,
-          ...(req.companyId ? { companyId: req.companyId } : {}),
-          conversationId: { $in: conversationObjectIds },
-          sender: 'agent'
-        }
-      },
-      {
-        $sort: {
-          conversationId: 1,
-          timestamp: -1,
-          createdAt: -1,
-          _id: -1
-        }
-      },
-      {
-        $group: {
-          _id: '$conversationId',
-          lastMessageStatus: { $first: '$status' },
-          lastMessageWhatsappMessageId: { $first: '$whatsappMessageId' },
-          lastMessageTime: { $first: '$timestamp' }
-        }
-      }
-    ]);
-
-    const latestByConversationId = new Map(
-      latestAgentMessages.map((message) => [String(message?._id || '').trim(), message])
-    );
-
-    return safeConversations.map((conversation) => {
-      const conversationId = String(conversation?._id || '').trim();
-      const latestMessage = latestByConversationId.get(conversationId);
-      if (!latestMessage) return conversation;
-
-      const derivedStatus = String(latestMessage?.lastMessageStatus || '').trim().toLowerCase();
-      return {
-        ...conversation,
-        lastMessageFrom: 'agent',
-        lastMessageStatus: derivedStatus || String(conversation?.lastMessageStatus || '').trim(),
-        lastMessageWhatsappMessageId:
-          String(latestMessage?.lastMessageWhatsappMessageId || '').trim() ||
-          String(conversation?.lastMessageWhatsappMessageId || '').trim(),
-        lastMessageTime: latestMessage?.lastMessageTime || conversation?.lastMessageTime
-      };
-    });
-  };
-
   const resolveReplyReferenceForOutboundSend = async ({
     userId,
     companyId,
@@ -182,24 +126,13 @@ const registerLegacyCoreRoutes = (app, deps) => {
     });
     if (byScopeConversation) return byScopeConversation;
 
-    const normalizedPhone = normalizePhoneDigits(to);
-    if (!normalizedPhone) return null;
-
-    const phoneCandidates = Array.from(
-      new Set(
-        [
-          String(to || '').trim(),
-          normalizedPhone,
-          `+${normalizedPhone}`,
-          normalizedPhone.length > 10 ? normalizedPhone.slice(-10) : ''
-        ].filter(Boolean)
-      )
-    );
+    const phoneLookupFilter = buildConversationPhoneLookupFilter(to);
+    if (!phoneLookupFilter) return null;
 
     return Conversation.findOne({
       userId,
       ...buildCompanyScopeFilter(req.companyId),
-      contactPhone: { $in: phoneCandidates }
+      ...phoneLookupFilter
     }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
   };
 
@@ -595,7 +528,7 @@ const registerLegacyCoreRoutes = (app, deps) => {
         conversations,
         req
       );
-      res.json(enrichedConversations);
+      res.json(dedupeConversationsByIdentity(enrichedConversations));
     } catch (error) {
       res.status(500).json({ error: error.message });
     }
@@ -605,12 +538,13 @@ const registerLegacyCoreRoutes = (app, deps) => {
     try {
       const { contactId, contactPhone, contactName, status } = req.body;
 
+      const phoneLookupFilter = buildConversationPhoneLookupFilter(contactPhone);
       const existingConversation = await Conversation.findOne({
         userId: req.user.id,
         companyId: req.companyId,
-        contactPhone,
-        status: { $in: ['active', 'pending'] }
-      });
+        status: { $in: ['active', 'pending'] },
+        ...(phoneLookupFilter || { contactPhone })
+      }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
 
       if (existingConversation) {
         return res.status(400).json({ error: 'Conversation already exists for this contact' });
@@ -651,11 +585,7 @@ const registerLegacyCoreRoutes = (app, deps) => {
       if (!conversation) {
         return res.status(404).json({ error: 'Conversation not found' });
       }
-      const [enrichedConversation] = await enrichConversationsWithLatestAgentStatus(
-        [conversation],
-        req
-      );
-      return res.json(enrichedConversation || conversation);
+      return res.json(conversation);
     } catch (error) {
       return res.status(500).json({ error: error.message });
     }
@@ -785,10 +715,6 @@ const registerLegacyCoreRoutes = (app, deps) => {
           .select(
             '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
           )
-          .populate(
-            'replyTo',
-            '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
-          )
           .sort({ timestamp: -1, _id: -1 })
           .limit(limit + 1)
           .lean();
@@ -840,6 +766,12 @@ const registerLegacyCoreRoutes = (app, deps) => {
           ttlSeconds: CACHE_TTL_SECONDS.messages,
           loader: async () => {
               const messages = await loadScopedMessages();
+              if (messages.some((message) => String(message?.replyTo || '').trim())) {
+                await Message.populate(messages, {
+                  path: 'replyTo',
+                  select: '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
+                });
+              }
               const page = buildChronologicalPage({
                 documents: messages,
                 limit,

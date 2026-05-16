@@ -12,6 +12,7 @@
     "test:compat": "node --test test/messages.routes.test.js test/conversations.routes.test.js test/message.pagination.parity.test.js",
     "backfill:imported-consent": "node scripts/backfillImportedCsvConsent.js",
     "backfill:conversation-summaries": "node scripts/backfillConversationSummaries.js",
+    "cleanup:conversation-duplicates": "node scripts/dedupeConversationDuplicates.js",
     "backfill:contact-search-fields": "node scripts/backfillContactSearchFields.js",
     "backfill:message-tenant-scope": "node scripts/backfillMessageTenantScope.js",
     "backfill:deal-search-fields": "node scripts/backfillDealSearchFields.js",

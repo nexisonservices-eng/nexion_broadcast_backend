@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const ConversationSummary = require('../models/ConversationSummary');
 
 const toObjectIdValue = (value) => {
@@ -22,6 +23,11 @@ const toDateValue = (value) => {
 const toNumberValue = (value, fallback = null) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const isValidObjectIdValue = (value) => {
+  const normalized = toObjectIdValue(value);
+  return Boolean(normalized) && mongoose.Types.ObjectId.isValid(normalized);
 };
 
 const normalizeSummaryPayload = (payload = {}) => {
@@ -96,6 +102,10 @@ const buildSummaryUpdate = (payload = {}) => {
   const companyId = normalized.companyId;
 
   if (!conversationId || !userId) {
+    return null;
+  }
+
+  if (!isValidObjectIdValue(conversationId) || !isValidObjectIdValue(userId)) {
     return null;
   }
 

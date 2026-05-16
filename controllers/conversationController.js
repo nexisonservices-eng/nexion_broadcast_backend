@@ -1,4 +1,4 @@
-const mongoose = require('mongoose');
+﻿const mongoose = require('mongoose');
 const Conversation = require('../models/Conversation');
 const ConversationSummary = require('../models/ConversationSummary');
 const Contact = require('../models/Contact');
@@ -110,6 +110,7 @@ const buildContactCursorFilter = (cursor) => {
 
 const TEAM_INBOX_CONVERSATION_FIELDS = [
   '_id',
+  'conversationId',
   'userId',
   'companyId',
   'contactId',
@@ -117,9 +118,6 @@ const TEAM_INBOX_CONVERSATION_FIELDS = [
   'contactName',
   'status',
   'assignedTo',
-  'assignedToId',
-  'tags',
-  'priority',
   'lastMessageTime',
   'lastMessage',
   'lastMessageMediaType',
@@ -129,10 +127,8 @@ const TEAM_INBOX_CONVERSATION_FIELDS = [
   'lastMessageWhatsappMessageId',
   'lastMessageStatus',
   'unreadCount',
-  'notes',
   'createdAt',
-  'updatedAt',
-  'resolvedAt'
+  'updatedAt'
 ].join(' ');
 
 const encodeConversationCursor = (conversation = {}) => {
@@ -150,6 +146,26 @@ const encodeConversationCursor = (conversation = {}) => {
   }
 
   return Buffer.from(JSON.stringify(payload)).toString('base64url');
+};
+
+const getConversationSortValue = (conversation = {}) => {
+  const timestamp = new Date(
+    conversation?.lastMessageTime || conversation?.updatedAt || conversation?.createdAt || 0
+  ).valueOf();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+};
+
+const compareConversationRowsForList = (left = {}, right = {}) => {
+  const leftTimestamp = getConversationSortValue(left);
+  const rightTimestamp = getConversationSortValue(right);
+  if (leftTimestamp !== rightTimestamp) {
+    return rightTimestamp - leftTimestamp;
+  }
+
+  const leftId = String(left?._id || '').trim();
+  const rightId = String(right?._id || '').trim();
+  if (leftId === rightId) return 0;
+  return rightId.localeCompare(leftId);
 };
 
 const decodeConversationCursor = (cursor = '') => {
@@ -247,7 +263,7 @@ const attachContactSnapshotsToConversations = async (conversations = [], req) =>
   });
 };
 
-const loadConversationSummaryRows = async ({ finalFilters, limit, queryHint = null }) => {
+const loadConversationSummaryRows = async ({ finalFilters, limit, skip = 0, queryHint = null }) => {
   let query = ConversationSummary.find(finalFilters)
     .select(TEAM_INBOX_CONVERSATION_FIELDS)
     .sort({ lastMessageTime: -1, _id: -1 })
@@ -255,6 +271,10 @@ const loadConversationSummaryRows = async ({ finalFilters, limit, queryHint = nu
 
   if (queryHint) {
     query = query.hint(queryHint);
+  }
+
+  if (skip > 0) {
+    query = query.skip(skip);
   }
 
   if (limit > 0) {
@@ -341,11 +361,15 @@ const encodeConversationCursorCacheKey = (cursor = null) => {
   return `${lastMessageTime.toISOString()}::${String(cursor.id || '').trim()}`;
 };
 
-const loadConversationFallbackRows = async ({ finalFilters, limit }) => {
+const loadConversationFallbackRows = async ({ finalFilters, limit, skip = 0 }) => {
   let query = Conversation.find(finalFilters)
     .select(TEAM_INBOX_CONVERSATION_FIELDS)
     .sort({ lastMessageTime: -1, _id: -1 })
     .lean();
+
+  if (skip > 0) {
+    query = query.skip(skip);
+  }
 
   if (limit > 0) {
     query = query.limit(limit + 1);
@@ -374,11 +398,13 @@ const loadConversationSummaryPage = async ({
   summaryFilters,
   fallbackFilters,
   limit,
+  skip = 0,
   req,
   scope,
   cacheKeyParts,
   queryHint = null
 }) => {
+  const fetchLimit = limit > 0 ? Math.max(limit + 1, limit) : 0;
   const mergeConversationRows = (primaryRows = [], secondaryRows = []) => {
     const mergedById = new Map();
 
@@ -394,29 +420,36 @@ const loadConversationSummaryPage = async ({
     addRows(secondaryRows);
 
     return Array.from(mergedById.values()).sort(
-      (left, right) =>
-        new Date(right?.lastMessageTime || right?.updatedAt || right?.createdAt || 0).valueOf() -
-        new Date(left?.lastMessageTime || left?.updatedAt || left?.createdAt || 0).valueOf()
+      compareConversationRowsForList
     );
   };
 
   const loadMergedRows = async () => {
-    const [summaryRows, fallbackRows] = await Promise.all([
-      loadConversationSummaryRows({
-        finalFilters: summaryFilters,
-        limit,
-        queryHint
-      }),
-      loadConversationFallbackRows({
-        finalFilters: fallbackFilters,
-        limit
-      })
-    ]);
+    const pageSkip = Math.max(0, skip);
+    const summaryRows = await loadConversationSummaryRows({
+      finalFilters: summaryFilters,
+      limit: fetchLimit,
+      skip: pageSkip,
+      queryHint
+    });
+
+    const shouldLoadFallback =
+      Boolean(summaryRows?.hasMore) ||
+      (limit > 0 && Array.isArray(summaryRows?.conversations) && summaryRows.conversations.length < limit);
+
+    const fallbackRows = shouldLoadFallback
+      ? await loadConversationFallbackRows({
+          finalFilters: fallbackFilters,
+          limit: fetchLimit,
+          skip: pageSkip
+        })
+      : { conversations: [], hasMore: false, nextCursor: null };
 
     const mergedConversations = mergeConversationRows(
       summaryRows?.conversations || [],
       fallbackRows?.conversations || []
     );
+    const pagedConversations = limit > 0 ? mergedConversations.slice(0, limit) : mergedConversations;
 
     const summaryConversationIds = new Set(
       (Array.isArray(summaryRows?.conversations) ? summaryRows.conversations : [])
@@ -436,16 +469,18 @@ const loadConversationSummaryPage = async ({
       });
     }
 
+    const pageHasMore =
+      Boolean(summaryRows?.hasMore) ||
+      Boolean(fallbackRows?.hasMore) ||
+      (limit > 0 && mergedConversations.length > limit);
+
     return {
-      conversations: mergedConversations,
-      hasMore:
-        Boolean(summaryRows?.hasMore) ||
-        Boolean(fallbackRows?.hasMore) ||
-        mergedConversations.length > limit,
+      conversations: pagedConversations,
+      hasMore: pageHasMore && pagedConversations.length > 0,
       nextCursor:
-        mergedConversations.length > limit
-          ? encodeConversationCursor(mergedConversations[limit - 1])
-          : summaryRows?.nextCursor || fallbackRows?.nextCursor || null
+        pageHasMore && pagedConversations.length > 0
+          ? encodeConversationCursor(pagedConversations[pagedConversations.length - 1])
+          : null
     };
   };
 
@@ -493,6 +528,8 @@ class ConversationController {
 
       const parsedLimit = Number(req.query?.limit);
       const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 200)) : 0;
+      const parsedPage = Number(req.query?.page);
+      const page = Number.isFinite(parsedPage) && parsedPage > 0 ? Math.max(1, Math.trunc(parsedPage)) : 1;
       const cursor = decodeConversationCursor(req.query?.cursor);
       const normalizedSearch = String(search || '').trim();
       const normalizedSearchLower = normalizedSearch.toLowerCase();
@@ -503,6 +540,7 @@ class ConversationController {
         conversationFilter,
         normalizedSearchLower,
         String(limit || 0),
+        String(page || 1),
         encodeConversationCursorCacheKey(cursor)
       ];
       const summaryFilters = { ...filters };
@@ -547,6 +585,7 @@ class ConversationController {
                 summaryFilters,
                 fallbackFilters,
                 limit,
+                skip: cursor ? 0 : Math.max(0, (page - 1) * limit),
                 req,
                 scope,
                 cacheKeyParts,

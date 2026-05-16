@@ -1,70 +1,14 @@
 const Contact = require('../../models/Contact');
 const Conversation = require('../../models/Conversation');
 const {
+  buildConversationPhoneLookupFilter,
+  buildPhoneCandidates,
+  normalizePhoneDigits
+} = require('../../utils/conversationIdentity');
+const buildPhoneLookupFilters = buildConversationPhoneLookupFilter;
+const {
   syncConversationSummaryFromConversation
 } = require('../../services/conversationSummaryService');
-
-const normalizePhoneDigits = (value = '') => String(value || '').replace(/\D/g, '');
-
-const buildPhoneCandidates = (value = '') => {
-  const rawValue = String(value || '').trim();
-  const normalizedPhone = normalizePhoneDigits(rawValue);
-
-  return Array.from(
-    new Set(
-      [
-        rawValue,
-        normalizedPhone,
-        normalizedPhone ? `+${normalizedPhone}` : '',
-        normalizedPhone.length > 10 ? normalizedPhone.slice(-10) : ''
-      ].filter(Boolean)
-    )
-  );
-};
-
-const escapeRegExp = (value = '') => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-const buildPhoneLookupFilters = (value = '') => {
-  const rawValue = String(value || '').trim();
-  const normalizedPhone = normalizePhoneDigits(rawValue);
-  if (!rawValue && !normalizedPhone) return null;
-
-  const exactCandidates = buildPhoneCandidates(rawValue);
-  const digitCandidates = Array.from(
-    new Set(
-      [
-        normalizedPhone,
-        normalizedPhone.length > 10 ? normalizedPhone.slice(-10) : '',
-        normalizedPhone.length > 11 ? normalizedPhone.slice(-11) : '',
-        normalizedPhone.length > 12 ? normalizedPhone.slice(-12) : ''
-      ].filter(Boolean)
-    )
-  );
-  const suffixCandidates = Array.from(
-    new Set(
-      [
-        normalizedPhone.length >= 10 ? normalizedPhone.slice(-10) : '',
-        normalizedPhone.length >= 11 ? normalizedPhone.slice(-11) : '',
-        normalizedPhone.length >= 12 ? normalizedPhone.slice(-12) : ''
-      ].filter(Boolean)
-    )
-  );
-
-  const filters = [];
-  if (exactCandidates.length > 0) {
-    filters.push({ phone: { $in: exactCandidates } });
-  }
-  if (digitCandidates.length > 0) {
-    filters.push({ phoneDigits: { $in: digitCandidates } });
-  }
-  suffixCandidates.forEach((suffix) => {
-    const escaped = escapeRegExp(suffix);
-    filters.push({ phone: new RegExp(`${escaped}$`) });
-    filters.push({ phoneDigits: new RegExp(`${escaped}$`) });
-  });
-
-  return filters.length > 0 ? { $or: filters } : null;
-};
 
 const buildCompanyScopeFilter = (companyId) => (companyId ? { companyId } : {});
 
@@ -92,7 +36,7 @@ const resolveConversationForOutboundSend = async ({
   if (byScope) return byScope;
 
   const phoneCandidates = buildPhoneCandidates(to);
-  const phoneLookupFilter = buildPhoneLookupFilters(to);
+  const phoneLookupFilter = buildConversationPhoneLookupFilter(to);
   if (!phoneCandidates.length && !phoneLookupFilter) return null;
 
   return maybeApplySort(
@@ -118,7 +62,7 @@ const resolveContactForTemplateSend = async ({
 
   const trimmedContactName = String(contactName || '').trim();
   const phoneCandidates = buildPhoneCandidates(to);
-  const phoneLookupFilter = buildPhoneLookupFilters(to);
+  const phoneLookupFilter = buildConversationPhoneLookupFilter(to);
   const rawPhoneValue = String(to || '').trim();
 
   let contact = null;
@@ -200,10 +144,18 @@ const resolveOrCreateConversationForTemplateSend = async ({
   });
 
   const phoneCandidates = buildPhoneCandidates(contact?.phone || to);
+  const conversationPhoneLookupFilter = buildConversationPhoneLookupFilter(contact?.phone || to);
   const conversationMatchConditions = [
     { userId },
     buildCompanyScopeFilter(companyId),
-    contact?._id ? { $or: [{ contactId: contact._id }, { contactPhone: { $in: phoneCandidates } }] } : null
+    contact?._id
+      ? {
+          $or: [
+            { contactId: contact._id },
+            conversationPhoneLookupFilter || { contactPhone: { $in: phoneCandidates } }
+          ]
+        }
+      : null
   ].filter(Boolean);
 
   let conversation = await maybeApplySort(

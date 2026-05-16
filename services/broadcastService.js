@@ -16,6 +16,10 @@ const {
   buildPhoneCandidates,
   buildPhoneLookupFilters
 } = require('./whatsappOutreach/conversationResolver');
+const { buildContactSearchPlan } = require('../utils/contactSearchPlan');
+const {
+  buildConversationPhoneLookupFilter
+} = require('../utils/conversationIdentity');
 const {
   toCleanString,
   validateTemplateOutboundSend,
@@ -50,6 +54,26 @@ const ADMIN_API_BASE_URLS = [
 const ADMIN_INTERNAL_API_KEY = process.env.ADMIN_INTERNAL_API_KEY || '';
 
 class BroadcastService {
+  encodePaginationCursor(value = {}) {
+    try {
+      return Buffer.from(JSON.stringify(value || {}), 'utf8').toString('base64');
+    } catch (_error) {
+      return '';
+    }
+  }
+
+  decodePaginationCursor(cursor = '') {
+    const normalized = String(cursor || '').trim();
+    if (!normalized) return null;
+    try {
+      const json = Buffer.from(normalized, 'base64').toString('utf8');
+      const parsed = JSON.parse(json);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
   emitBroadcastRealtimeEvent(broadcaster, payload) {
     if (typeof broadcaster !== 'function') return;
     try {
@@ -110,6 +134,93 @@ class BroadcastService {
     companyId = null,
     recipientSubset = null
   } = {}) {
+    const campaignAudienceSource = broadcast?.audienceSource && typeof broadcast.audienceSource === 'object'
+      ? broadcast.audienceSource
+      : {};
+    const campaignAudienceSnapshot = broadcast?.audienceSnapshot && typeof broadcast.audienceSnapshot === 'object'
+      ? broadcast.audienceSnapshot
+      : {};
+    const campaignBroadcastId = String(
+      campaignAudienceSource?.campaignBroadcastId ||
+        campaignAudienceSnapshot?.campaignBroadcastId ||
+        campaignAudienceSnapshot?.sourceBroadcastId ||
+        ''
+    ).trim();
+
+    if (String(campaignAudienceSource?.type || '').trim().toLowerCase() === 'campaign' && campaignBroadcastId) {
+      const baseBroadcast = await Broadcast.findOne({
+        _id: campaignBroadcastId,
+        ...(companyId || broadcast?.companyId ? { companyId: companyId || broadcast?.companyId } : {})
+      })
+        .select('_id name companyId createdById recipientCount')
+        .lean();
+
+      if (!baseBroadcast) {
+        return [];
+      }
+
+      const excludedPhones = new Set(
+        [
+          ...(Array.isArray(campaignAudienceSnapshot?.excludedPhones) ? campaignAudienceSnapshot.excludedPhones : []),
+          ...(Array.isArray(campaignAudienceSnapshot?.excludedRecipientPhones) ? campaignAudienceSnapshot.excludedRecipientPhones : [])
+        ]
+          .map((phone) => this.normalizePhoneNumber(phone))
+          .filter(Boolean)
+      );
+
+      const dispatchRecipients = await BroadcastDispatch.find({
+        broadcastId: baseBroadcast._id,
+        ...(companyId || baseBroadcast?.companyId ? { companyId: companyId || baseBroadcast.companyId } : {})
+      })
+        .select('recipientPhone recipientIndex messageText messageKind status sentAt failedAt whatsappMessageId chunkId chunkIndex')
+        .sort({ recipientIndex: 1, _id: 1 })
+        .lean();
+
+      const recipientMap = new Map();
+      for (const dispatch of dispatchRecipients) {
+        const phone = this.normalizePhoneNumber(dispatch?.recipientPhone || '');
+        if (!phone || excludedPhones.has(phone)) {
+          continue;
+        }
+        if (!recipientMap.has(phone)) {
+          recipientMap.set(phone, {
+            phone: String(dispatch?.recipientPhone || '').trim(),
+            name: '',
+            contactId: '',
+            sourceType: 'campaign',
+            variables: [],
+            attributes: {
+              dispatchId: String(dispatch?._id || ''),
+              broadcastId: String(dispatch?.broadcastId || ''),
+              recipientIndex: Number(dispatch?.recipientIndex || 0),
+              status: String(dispatch?.status || ''),
+              sentAt: dispatch?.sentAt || null
+            }
+          });
+        }
+      }
+
+      const additionalRecipients = Array.isArray(broadcast?.recipients) ? broadcast.recipients : [];
+      for (const recipient of additionalRecipients) {
+        const phone = this.normalizePhoneNumber(recipient?.phone || '');
+        if (!phone || excludedPhones.has(phone)) {
+          continue;
+        }
+        if (!recipientMap.has(phone)) {
+          recipientMap.set(phone, {
+            phone: String(recipient?.phone || '').trim(),
+            name: String(recipient?.name || '').trim(),
+            contactId: String(recipient?.contactId || recipient?.attributes?._id || '').trim(),
+            sourceType: String(recipient?.sourceType || 'campaign').trim() || 'campaign',
+            variables: Array.isArray(recipient?.variables) ? recipient.variables : [],
+            attributes: recipient?.attributes || {}
+          });
+        }
+      }
+
+      return Array.from(recipientMap.values()).filter((recipient) => Boolean(this.normalizePhoneNumber(recipient?.phone || '')));
+    }
+
     if (Array.isArray(recipientSubset) && recipientSubset.length > 0) {
       return recipientSubset;
     }
@@ -1123,6 +1234,255 @@ class BroadcastService {
     }
   }
 
+  async getCampaignSelectionBroadcasts(filters = {}) {
+    try {
+      const companyId = filters?.companyId || null;
+      const createdById = filters?.createdById || null;
+      const statusFilter = String(filters?.status || '').trim();
+      const search = String(filters?.search || '').trim();
+      const limit = Math.max(1, Math.min(50, Number(filters?.limit || 20)));
+      const cursor = this.decodePaginationCursor(filters?.cursor || '');
+
+      const query = {};
+      if (companyId) query.companyId = companyId;
+      if (createdById) query.createdById = createdById;
+
+      if (statusFilter) {
+        const statuses = statusFilter.split(',').map((value) => String(value || '').trim()).filter(Boolean);
+        if (statuses.length === 1) {
+          query.status = statuses[0];
+        } else if (statuses.length > 1) {
+          query.status = { $in: statuses };
+        }
+      } else {
+        query.status = { $in: ['completed', 'completed_with_errors'] };
+      }
+
+      if (search) {
+        query.name = { $regex: search, $options: 'i' };
+      }
+
+      if (cursor?.createdAt && cursor?.id) {
+        const createdAt = new Date(cursor.createdAt);
+        if (!Number.isNaN(createdAt.getTime())) {
+          query.$or = [
+            { createdAt: { $lt: createdAt } },
+            { createdAt, _id: { $lt: cursor.id } }
+          ];
+        }
+      }
+
+      const rows = await Broadcast.find(query)
+        .select('name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource')
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(limit + 1)
+        .lean();
+
+      const hasMore = rows.length > limit;
+      const items = rows.slice(0, limit).map((broadcast) => ({
+        ...broadcast,
+        sentCount: Number(broadcast?.stats?.sent || 0),
+        completedCount: Number(broadcast?.stats?.sent || 0)
+      }));
+      const lastItem = items[items.length - 1] || null;
+
+      return {
+        success: true,
+        data: {
+          items,
+          meta: {
+            hasMore,
+            nextCursor: hasMore && lastItem
+              ? this.encodePaginationCursor({
+                  createdAt: lastItem.createdAt,
+                  id: String(lastItem._id || '')
+                })
+              : '',
+            limit,
+            count: items.length
+          }
+        }
+      };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async getBroadcastAudienceRecipients(broadcastId, filters = {}) {
+    try {
+      const broadcast = await Broadcast.findById(broadcastId)
+        .select('_id name companyId createdById recipientCount audienceSource audienceSnapshot recipients')
+        .lean();
+
+      if (!broadcast) {
+        return { success: false, error: 'Broadcast not found' };
+      }
+
+      const companyId = filters?.companyId || broadcast.companyId || null;
+      const createdById = filters?.createdById || broadcast.createdById || null;
+      const search = String(filters?.search || '').trim();
+      const limit = Math.max(1, Math.min(100, Number(filters?.limit || 50)));
+      const cursor = this.decodePaginationCursor(filters?.cursor || '');
+      const query = {
+        broadcastId: broadcast._id,
+        ...(companyId ? { companyId } : {})
+      };
+
+      if (cursor?.recipientIndex !== undefined && cursor?.id) {
+        const recipientIndex = Number(cursor.recipientIndex || 0);
+        if (Number.isFinite(recipientIndex)) {
+          query.$or = [
+            { recipientIndex: { $gt: recipientIndex } },
+            { recipientIndex, _id: { $gt: cursor.id } }
+          ];
+        }
+      }
+
+      if (search) {
+        const searchPlan = buildContactSearchPlan(search);
+        const contactQuery = {
+          ...(companyId ? { companyId } : {}),
+          ...(createdById ? { userId: createdById } : {})
+        };
+        if (searchPlan.summaryClause) {
+          Object.assign(contactQuery, searchPlan.summaryClause);
+        }
+
+        let contacts = [];
+        if (Object.keys(contactQuery).length > 0) {
+          contacts = await Contact.find(contactQuery)
+            .select('_id name phone phoneDigits email sourceType whatsappOptInStatus')
+            .limit(Math.max(limit * 10, 200))
+            .lean();
+        }
+
+        if ((!contacts || contacts.length === 0) && searchPlan.fallbackClause) {
+          const fallbackQuery = {
+            ...(companyId ? { companyId } : {}),
+            ...(createdById ? { userId: createdById } : {}),
+            ...searchPlan.fallbackClause
+          };
+          contacts = await Contact.find(fallbackQuery)
+            .select('_id name phone phoneDigits email sourceType whatsappOptInStatus')
+            .limit(Math.max(limit * 10, 200))
+            .lean();
+        }
+
+        const candidatePhones = Array.from(
+          new Set(
+            (contacts || [])
+              .map((contact) => String(contact?.phone || '').trim())
+              .filter(Boolean)
+          )
+        );
+
+        if (candidatePhones.length === 0) {
+          return {
+            success: true,
+            data: {
+              items: [],
+              meta: {
+                hasMore: false,
+                nextCursor: '',
+                limit,
+                count: 0,
+                totalCount: 0
+              }
+            }
+          };
+        }
+
+        query.recipientPhone = { $in: candidatePhones };
+      }
+
+      const dispatches = await BroadcastDispatch.find(query)
+        .select('broadcastDispatchKey recipientPhone recipientIndex status sentAt failedAt whatsappMessageId messageText messageKind templateName templateLanguage createdAt updatedAt')
+        .sort({ recipientIndex: 1, _id: 1 })
+        .limit(limit + 1)
+        .lean();
+
+      const hasMore = dispatches.length > limit;
+      const pageDispatches = dispatches.slice(0, limit);
+      const candidatePhones = pageDispatches
+        .map((dispatch) => String(dispatch?.recipientPhone || '').trim())
+        .filter(Boolean);
+      const normalizedPhones = candidatePhones.map((phone) => this.normalizePhoneNumber(phone)).filter(Boolean);
+
+      const contacts = candidatePhones.length > 0
+        ? await Contact.find({
+            ...(companyId ? { companyId } : {}),
+            ...(createdById ? { userId: createdById } : {}),
+            $or: [
+              { phone: { $in: candidatePhones } },
+              { phoneDigits: { $in: normalizedPhones } }
+            ]
+          })
+            .select('_id name phone phoneDigits email sourceType whatsappOptInStatus tags')
+            .lean()
+        : [];
+
+      const contactByPhone = new Map();
+      for (const contact of contacts) {
+        const exactPhone = String(contact?.phone || '').trim();
+        const digitPhone = this.normalizePhoneNumber(contact?.phone || '');
+        if (exactPhone && !contactByPhone.has(exactPhone)) {
+          contactByPhone.set(exactPhone, contact);
+        }
+        if (digitPhone && !contactByPhone.has(digitPhone)) {
+          contactByPhone.set(digitPhone, contact);
+        }
+      }
+
+      const items = pageDispatches.map((dispatch) => {
+        const exactPhone = String(dispatch?.recipientPhone || '').trim();
+        const digitPhone = this.normalizePhoneNumber(exactPhone);
+        const contact = contactByPhone.get(exactPhone) || contactByPhone.get(digitPhone) || null;
+        return {
+          dispatchId: String(dispatch?._id || ''),
+          broadcastDispatchKey: String(dispatch?.broadcastDispatchKey || ''),
+          recipientIndex: Number(dispatch?.recipientIndex || 0),
+          phone: exactPhone,
+          name: String(contact?.name || '').trim(),
+          contactId: String(contact?._id || '').trim(),
+          sourceType: String(contact?.sourceType || 'campaign').trim() || 'campaign',
+          whatsappOptInStatus: String(contact?.whatsappOptInStatus || '').trim(),
+          status: String(dispatch?.status || ''),
+          sentAt: dispatch?.sentAt || null,
+          failedAt: dispatch?.failedAt || null,
+          messageText: String(dispatch?.messageText || '').trim(),
+          messageKind: String(dispatch?.messageKind || '').trim(),
+          templateName: String(dispatch?.templateName || '').trim(),
+          templateLanguage: String(dispatch?.templateLanguage || '').trim(),
+          data: contact || null
+        };
+      });
+
+      const lastItem = items[items.length - 1] || null;
+      const totalCount = await BroadcastDispatch.countDocuments(query);
+
+      return {
+        success: true,
+        data: {
+          items,
+          meta: {
+            hasMore,
+            nextCursor: hasMore && lastItem
+              ? this.encodePaginationCursor({
+                  recipientIndex: lastItem.recipientIndex,
+                  id: lastItem.dispatchId
+                })
+              : '',
+            limit,
+            count: items.length,
+            totalCount
+          }
+        }
+      };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
   async sendBroadcast(broadcastId, broadcaster, credentials = null, options = {}) {
     try {
       const broadcast = await Broadcast.findById(broadcastId);
@@ -1802,12 +2162,13 @@ class BroadcastService {
         await contact.save();
       }
 
+      const conversationLookupFilter = buildConversationPhoneLookupFilter(phone);
       let conversation = await Conversation.findOne({
         userId,
         companyId,
-        contactPhone: phone,
-        status: { $in: ['active', 'pending'] }
-      });
+        status: { $in: ['active', 'pending'] },
+        ...(conversationLookupFilter || { contactPhone: phone })
+      }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
       if (!conversation) {
         conversation = await Conversation.create({
           userId,

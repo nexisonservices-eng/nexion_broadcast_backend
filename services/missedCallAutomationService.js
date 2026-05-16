@@ -12,6 +12,9 @@ const {
   buildPhoneCandidates
 } = require('./whatsappOutreach/conversationResolver');
 const {
+  buildConversationPhoneLookupFilter
+} = require('../utils/conversationIdentity');
+const {
   toCleanString,
   validateTemplateOutboundSend,
   applyMarketingTemplateSent
@@ -316,11 +319,13 @@ async function updateConversationForMissedCallAutomation({
     await contact.save();
   }
 
+  const conversationLookupFilter = buildConversationPhoneLookupFilter(phone);
   let conversation = await Conversation.findOne({
     userId,
-    contactPhone: phone,
-    status: { $in: ['active', 'pending'] }
-  });
+    ...(companyId ? { companyId } : {}),
+    status: { $in: ['active', 'pending'] },
+    ...(conversationLookupFilter || { contactPhone: phone })
+  }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
 
   if (!conversation) {
     conversation = await Conversation.create({

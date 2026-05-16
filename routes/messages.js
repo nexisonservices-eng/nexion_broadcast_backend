@@ -96,10 +96,6 @@ router.get('/conversation/:id', async (req, res) => {
         .select(
           '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
         )
-        .populate(
-          'replyTo',
-          '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
-        )
         .sort({ timestamp: -1, _id: -1 })
         .limit(limit + 1)
         .lean();
@@ -143,6 +139,12 @@ router.get('/conversation/:id', async (req, res) => {
           ttlSeconds: CACHE_TTL_SECONDS.messages,
           loader: async () => {
             const messages = await loadScopedMessages();
+            if (messages.some((message) => String(message?.replyTo || '').trim())) {
+              await Message.populate(messages, {
+                path: 'replyTo',
+                select: '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
+              });
+            }
             const page = buildChronologicalPage({
               documents: messages,
               limit,

@@ -1,4 +1,5 @@
 const express = require('express');
+const mongoose = require('mongoose');
 const Contact = require('../models/Contact');
 const Conversation = require('../models/Conversation');
 const ConversationSummary = require('../models/ConversationSummary');
@@ -1665,21 +1666,24 @@ router.put('/:id', async (req, res) => {
 
     if (contact) {
       const conversationUpdate = {};
-      if (name !== undefined) {
+      if (normalizedPayload.name !== undefined) {
         conversationUpdate.contactName = contact.name || '';
       }
-      if (phone !== undefined) {
+      if (normalizedPayload.phone !== undefined) {
         conversationUpdate.contactPhone = contact.phone || '';
       }
       if (Object.keys(conversationUpdate).length > 0) {
-        await Conversation.updateMany(
-          buildScopedContactFilter(req, { contactId: contact._id }),
-          conversationUpdate
-        );
-        await ConversationSummary.updateMany(
-          buildScopedContactFilter(req, { contactId: contact._id }),
-          conversationUpdate
-        );
+        const contactId = String(contact?._id || '').trim();
+        if (mongoose.Types.ObjectId.isValid(contactId)) {
+          await Conversation.updateMany(
+            buildScopedContactFilter(req, { contactId }),
+            conversationUpdate
+          );
+          await ConversationSummary.updateMany(
+            buildScopedContactFilter(req, { contactId }),
+            conversationUpdate
+          );
+        }
       }
       emitCrmRealtimeEvent(req, {
         action: 'contact_updated',

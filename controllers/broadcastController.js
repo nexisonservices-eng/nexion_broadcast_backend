@@ -106,9 +106,12 @@ class BroadcastController {
         return res.status(ownership.status).json(ownership.body);
       }
 
+      const recipientCount = Number(ownership.data?.recipientCount || 0);
       req.broadcastMessageCount = Array.isArray(ownership.data?.recipients)
         ? ownership.data.recipients.length
-        : 1;
+        : recipientCount > 0
+          ? recipientCount
+          : 1;
 
       if (String(req.user?.planCode || '').toLowerCase() === 'trial') {
         const usedMessages = Number(req.user?.trialUsage?.whatsappMessages || 0);
@@ -164,6 +167,54 @@ class BroadcastController {
       }
       
       const result = await broadcastService.getBroadcasts(filters);
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async getCampaignSelectionBroadcasts(req, res) {
+    try {
+      const normalizedRole = normalizeRole(req.user?.normalizedRole || req.user?.companyRole || req.user?.role);
+      const tenantWideAccess = isTenantWideRole(normalizedRole);
+      const filters = {
+        search: req.query.search || '',
+        status: req.query.status || '',
+        cursor: req.query.cursor || '',
+        limit: req.query.limit || 20
+      };
+      if (!tenantWideAccess) {
+        filters.createdById = req.user.id;
+      }
+      if (req.companyId) {
+        filters.companyId = req.companyId;
+      }
+      const result = await broadcastService.getCampaignSelectionBroadcasts(filters);
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async getBroadcastAudienceRecipients(req, res) {
+    try {
+      const normalizedRole = normalizeRole(req.user?.normalizedRole || req.user?.companyRole || req.user?.role);
+      const tenantWideAccess = isTenantWideRole(normalizedRole);
+      const filters = {
+        search: req.query.search || '',
+        cursor: req.query.cursor || '',
+        limit: req.query.limit || 50
+      };
+      if (!tenantWideAccess) {
+        filters.createdById = req.user.id;
+      }
+      if (req.companyId) {
+        filters.companyId = req.companyId;
+      }
+      const result = await broadcastService.getBroadcastAudienceRecipients(req.params.id, filters);
+      if (!result.success) {
+        return res.status(404).json(result);
+      }
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
