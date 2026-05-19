@@ -1,6 +1,7 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const multer = require('multer');
+const axios = require('axios');
 const auth = require('../middleware/auth');
 const { requireCrmPolicy } = require('../middleware/crmPolicy');
 const Contact = require('../models/Contact');
@@ -10,6 +11,7 @@ const Broadcast = require('../models/Broadcast');
 const Message = require('../models/Message');
 const LeadTask = require('../models/LeadTask');
 const LeadActivity = require('../models/LeadActivity');
+const GoogleCalendarConnection = require('../models/GoogleCalendarConnection');
 const CrmAutomationRun = require('../models/CrmAutomationRun');
 const CrmPipelineView = require('../models/CrmPipelineView');
 const CrmPipelineStage = require('../models/CrmPipelineStage');
@@ -38,6 +40,7 @@ const {
   getCrmOwnerPerformanceReport
 } = require('../services/crmReportsService');
 const { getLeadScoringSettings } = require('../services/leadScoringService');
+const { encryptGoogleToken, decryptGoogleToken } = require('../utils/googleTokenCrypto');
 
 const router = express.Router();
 router.use(auth);
@@ -145,6 +148,8 @@ const DEFAULT_LEAD_PIPELINE_STAGES = [
   { key: 'lost', label: 'Lost', color: '#c45a5a', order: 6 }
 ];
 const DEFAULT_LEAD_STAGE_KEY_SET = new Set(DEFAULT_LEAD_PIPELINE_STAGES.map((stage) => stage.key));
+const GOOGLE_CALENDAR_API_BASE = 'https://www.googleapis.com/calendar/v3';
+const GOOGLE_OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -290,6 +295,7 @@ const emitCrmRealtimeEvent = (req, payload = {}) => {
     dealId: toCleanString(payload?.dealId),
     taskId: toCleanString(payload?.taskId),
     filterPresetId: toCleanString(payload?.filterPresetId),
+    meetingId: toCleanString(payload?.meetingId),
     conversationId: toCleanString(payload?.conversationId)
   });
 };
@@ -1073,9 +1079,11 @@ const buildMeetingListItem = (activity = {}) => {
       leadScore: Number(contact?.leadScore || 0)
     },
     summary: toCleanString(activity?.meta?.summary) || 'Meeting',
+    description: toCleanString(activity?.meta?.description),
     meetingUrl: toCleanString(activity?.meta?.meetingUrl),
     eventId: toCleanString(activity?.meta?.eventId),
     eventHtmlLink: toCleanString(activity?.meta?.eventHtmlLink),
+    calendarId: toCleanString(activity?.meta?.calendarId) || 'primary',
     start: activity?.meta?.start || null,
     end: activity?.meta?.end || null,
     createdBy: toCleanString(activity?.createdBy)
@@ -1281,6 +1289,132 @@ const safeDate = (value) => {
   if (!value) return null;
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+const getGoogleConnectionFilter = ({ userId, companyId }) => ({
+  userId: toCleanString(userId),
+  companyId: toCleanString(companyId)
+});
+
+const refreshGoogleAccessToken = async ({ refreshToken, clientId, clientSecret }) => {
+  const formData = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    grant_type: 'refresh_token'
+  });
+
+  const response = await axios.post(GOOGLE_OAUTH_TOKEN_URL, formData.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 20000
+  });
+
+  return {
+    accessToken: toCleanString(response?.data?.access_token),
+    tokenType: toCleanString(response?.data?.token_type) || 'Bearer',
+    expiresIn: Number(response?.data?.expires_in || 0)
+  };
+};
+
+const resolveCrmGoogleAccessToken = async (req) => {
+  const userId = toCleanString(req.user?.id);
+  if (!userId) return '';
+
+  const connection = await GoogleCalendarConnection.findOne(
+    getGoogleConnectionFilter({ userId, companyId: req.companyId })
+  );
+  if (!connection) return '';
+
+  const accessToken = decryptGoogleToken(connection.accessToken);
+  const expiresAtMs = connection?.expiresAt ? new Date(connection.expiresAt).getTime() : 0;
+  if (accessToken && (!expiresAtMs || expiresAtMs - Date.now() > 60 * 1000)) {
+    return accessToken;
+  }
+
+  const refreshToken = decryptGoogleToken(connection.refreshToken);
+  const clientId = toCleanString(process.env.GOOGLE_CLIENT_ID);
+  const clientSecret = toCleanString(process.env.GOOGLE_CLIENT_SECRET);
+  if (!refreshToken || !clientId || !clientSecret) return accessToken;
+
+  const refreshed = await refreshGoogleAccessToken({ refreshToken, clientId, clientSecret });
+  if (!refreshed.accessToken) return accessToken;
+
+  connection.accessToken = encryptGoogleToken(refreshed.accessToken);
+  connection.tokenType = refreshed.tokenType || connection.tokenType || 'Bearer';
+  if (refreshed.expiresIn > 0) {
+    connection.expiresAt = new Date(Date.now() + refreshed.expiresIn * 1000);
+  }
+  connection.lastSyncedAt = new Date();
+  connection.lastError = '';
+  await connection.save();
+
+  return refreshed.accessToken;
+};
+
+const updateGoogleCalendarMeeting = async ({ req, activity, nextMeta }) => {
+  const eventId = toCleanString(nextMeta?.eventId || activity?.meta?.eventId);
+  if (!eventId) return null;
+
+  const accessToken = await resolveCrmGoogleAccessToken(req);
+  if (!accessToken) {
+    const error = new Error('Google authentication failed. Reconnect Google Calendar and try again.');
+    error.statusCode = 401;
+    throw error;
+  }
+
+  const calendarId = encodeURIComponent(toCleanString(nextMeta?.calendarId) || 'primary');
+  const encodedEventId = encodeURIComponent(eventId);
+  const payload = {
+    summary: toCleanString(nextMeta?.summary) || 'Meeting',
+    description: toCleanString(nextMeta?.description),
+    start: nextMeta?.start,
+    end: nextMeta?.end
+  };
+
+  const response = await axios.patch(
+    `${GOOGLE_CALENDAR_API_BASE}/calendars/${calendarId}/events/${encodedEventId}`,
+    payload,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      },
+      params: {
+        conferenceDataVersion: 1,
+        sendUpdates: 'none'
+      },
+      timeout: 20000
+    }
+  );
+
+  return response?.data || null;
+};
+
+const deleteGoogleCalendarMeeting = async ({ req, activity }) => {
+  const eventId = toCleanString(activity?.meta?.eventId);
+  if (!eventId) return;
+
+  const accessToken = await resolveCrmGoogleAccessToken(req);
+  if (!accessToken) {
+    const error = new Error('Google authentication failed. Reconnect Google Calendar and try again.');
+    error.statusCode = 401;
+    throw error;
+  }
+
+  const calendarId = encodeURIComponent(toCleanString(activity?.meta?.calendarId) || 'primary');
+  const encodedEventId = encodeURIComponent(eventId);
+  await axios.delete(
+    `${GOOGLE_CALENDAR_API_BASE}/calendars/${calendarId}/events/${encodedEventId}`,
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      },
+      params: {
+        sendUpdates: 'none'
+      },
+      timeout: 20000
+    }
+  );
 };
 
 const toCleanStringArray = (value) => {
@@ -3977,6 +4111,153 @@ router.get('/meetings', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.patch('/meetings/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!toObjectIdIfValid(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid meeting id' });
+    }
+
+    const activity = await LeadActivity.findOne(
+      buildActivityScopeFilter(req, {
+        _id: id,
+        type: 'meeting_scheduled'
+      })
+    );
+    if (!activity) {
+      return res.status(404).json({ success: false, error: 'Meeting not found' });
+    }
+
+    const existingMeta = activity.meta && typeof activity.meta === 'object' ? activity.meta : {};
+    const summary =
+      req.body?.summary !== undefined
+        ? toCleanString(req.body.summary)
+        : toCleanString(existingMeta.summary) || 'Meeting';
+    if (!summary) {
+      return res.status(400).json({ success: false, error: 'Meeting title cannot be empty' });
+    }
+
+    const startDateTime =
+      req.body?.startDateTime !== undefined
+        ? safeDate(req.body.startDateTime)
+        : safeDate(existingMeta?.start?.dateTime || existingMeta?.start);
+    const endDateTime =
+      req.body?.endDateTime !== undefined
+        ? safeDate(req.body.endDateTime)
+        : safeDate(existingMeta?.end?.dateTime || existingMeta?.end);
+
+    if (!startDateTime || !endDateTime) {
+      return res.status(400).json({ success: false, error: 'Valid start and end times are required' });
+    }
+    if (endDateTime.getTime() <= startDateTime.getTime()) {
+      return res.status(400).json({ success: false, error: 'End time must be later than start time' });
+    }
+
+    const timeZone =
+      toCleanString(req.body?.timeZone) ||
+      toCleanString(existingMeta?.start?.timeZone) ||
+      toCleanString(existingMeta?.end?.timeZone) ||
+      'UTC';
+    const nextMeta = {
+      ...existingMeta,
+      summary,
+      description:
+        req.body?.description !== undefined
+          ? toCleanString(req.body.description)
+          : toCleanString(existingMeta.description),
+      start: { dateTime: startDateTime.toISOString(), timeZone },
+      end: { dateTime: endDateTime.toISOString(), timeZone },
+      calendarId: toCleanString(existingMeta.calendarId) || 'primary'
+    };
+
+    const googleEvent = toCleanString(nextMeta.eventId)
+      ? await updateGoogleCalendarMeeting({ req, activity, nextMeta })
+      : null;
+
+    if (googleEvent) {
+      nextMeta.eventHtmlLink = toCleanString(googleEvent.htmlLink) || nextMeta.eventHtmlLink;
+      nextMeta.meetingUrl = toCleanString(googleEvent.hangoutLink) || nextMeta.meetingUrl;
+      nextMeta.start = googleEvent.start || nextMeta.start;
+      nextMeta.end = googleEvent.end || nextMeta.end;
+    }
+
+    activity.meta = nextMeta;
+    await activity.save();
+
+    const populatedActivity = await LeadActivity.findOne(
+      buildActivityScopeFilter(req, { _id: activity._id, type: 'meeting_scheduled' })
+    )
+      .populate({
+        path: 'contactId',
+        select: 'name phone stage ownerId leadScore'
+      })
+      .lean();
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'meeting',
+      action: 'updated',
+      contactId: String(activity.contactId || '').trim(),
+      meetingId: String(activity._id || '').trim()
+    });
+
+    res.json({
+      success: true,
+      data: buildMeetingListItem(populatedActivity || activity)
+    });
+  } catch (error) {
+    const statusCode = Number(error?.statusCode || error?.response?.status || 500);
+    const googleMessage = toCleanString(error?.response?.data?.error?.message);
+    res.status(statusCode).json({
+      success: false,
+      error: googleMessage || error.message || 'Failed to update meeting'
+    });
+  }
+});
+
+router.delete('/meetings/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!toObjectIdIfValid(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid meeting id' });
+    }
+
+    const activity = await LeadActivity.findOne(
+      buildActivityScopeFilter(req, {
+        _id: id,
+        type: 'meeting_scheduled'
+      })
+    );
+    if (!activity) {
+      return res.status(404).json({ success: false, error: 'Meeting not found' });
+    }
+
+    await deleteGoogleCalendarMeeting({ req, activity });
+    await LeadActivity.deleteOne(buildActivityScopeFilter(req, { _id: activity._id }));
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'meeting',
+      action: 'deleted',
+      contactId: String(activity.contactId || '').trim(),
+      meetingId: String(activity._id || '').trim()
+    });
+
+    res.json({
+      success: true,
+      data: {
+        _id: activity._id,
+        deleted: true
+      }
+    });
+  } catch (error) {
+    const statusCode = Number(error?.statusCode || error?.response?.status || 500);
+    const googleMessage = toCleanString(error?.response?.data?.error?.message);
+    res.status(statusCode).json({
+      success: false,
+      error: googleMessage || error.message || 'Failed to delete meeting'
+    });
   }
 });
 

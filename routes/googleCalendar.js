@@ -61,6 +61,23 @@ const getConnectionFilter = ({ userId, companyId }) => ({
   companyId: normalizeCompanyId(companyId)
 });
 
+const emitCrmRealtimeEvent = (req, payload = {}) => {
+  const sendToUser = req?.app?.locals?.sendToUser;
+  const userId = toCleanString(req?.user?.id);
+  if (typeof sendToUser !== 'function' || !userId) return;
+
+  sendToUser(userId, {
+    type: 'crm_changed',
+    scope: 'crm',
+    timestamp: new Date().toISOString(),
+    ...payload,
+    contactId: toCleanString(payload?.contactId),
+    conversationId: toCleanString(payload?.conversationId),
+    meetingId: toCleanString(payload?.meetingId),
+    taskId: toCleanString(payload?.taskId)
+  });
+};
+
 const toObjectIdIfValid = (value) => (mongoose.Types.ObjectId.isValid(value) ? value : null);
 const TASK_PRIORITIES = ['low', 'medium', 'high'];
 
@@ -165,9 +182,11 @@ const logMeetingActivity = async ({
   contactId,
   conversationId,
   summary,
+  description,
   meetingUrl,
   eventId,
   eventHtmlLink,
+  calendarId,
   start,
   end,
   meta = {}
@@ -197,7 +216,7 @@ const logMeetingActivity = async ({
 
     const normalizedConversationId = toObjectIdIfValid(conversationId) || null;
 
-    await LeadActivity.create({
+    return await LeadActivity.create({
       userId: normalizedUserId,
       companyId: companyId || null,
       contactId: normalizedContactId,
@@ -205,9 +224,11 @@ const logMeetingActivity = async ({
       type: 'meeting_scheduled',
       meta: {
         summary: toCleanString(summary),
+        description: toCleanString(description),
         meetingUrl: toCleanString(meetingUrl),
         eventId: toCleanString(eventId),
         eventHtmlLink: toCleanString(eventHtmlLink),
+        calendarId: toCleanString(calendarId) || 'primary',
         start: start || null,
         end: end || null,
         ...meta
@@ -1038,15 +1059,17 @@ router.post('/meet-link', meetLinkRateLimiter, async (req, res) => {
           })
         : null;
 
-    await logMeetingActivity({
+    const meetingActivity = await logMeetingActivity({
       userId: req.user?.id,
       companyId: req.companyId || null,
       contactId: activityContactId,
       conversationId: activityConversationId,
       summary,
+      description,
       meetingUrl,
       eventId: eventData?.id || null,
       eventHtmlLink: eventData?.htmlLink || null,
+      calendarId: calendarIdRaw,
       start: eventData?.start || { dateTime: startDateTime, timeZone },
       end: eventData?.end || { dateTime: endDateTime, timeZone },
       meta: {
@@ -1054,6 +1077,24 @@ router.post('/meet-link', meetLinkRateLimiter, async (req, res) => {
         followUpTaskCreated: Boolean(followUpTask?._id)
       }
     });
+
+    emitCrmRealtimeEvent(req, {
+      entity: 'meeting',
+      action: 'created',
+      contactId: activityContactId,
+      conversationId: activityConversationId,
+      meetingId: meetingActivity?._id
+    });
+
+    if (followUpTask?._id) {
+      emitCrmRealtimeEvent(req, {
+        entity: 'task',
+        action: 'created',
+        contactId: activityContactId,
+        conversationId: activityConversationId,
+        taskId: followUpTask._id
+      });
+    }
 
     return res.json({
       success: true,
