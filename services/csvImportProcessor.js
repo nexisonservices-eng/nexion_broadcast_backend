@@ -1,22 +1,43 @@
-const fs = require('fs');
-const csvParser = require('csv-parser');
-const CsvImportJob = require('../models/CsvImportJob');
+const fs = require("fs");
+const csvParser = require("csv-parser");
+const CsvImportJob = require("../models/CsvImportJob");
 const {
   bulkUpsertImportedContacts,
   countCsvDataRows,
   removeFileQuietly,
-  getEtaMs
-} = require('./csvImportService');
-const { publishBroadcastEvent } = require('../realtime/broadcastEventBus');
+  getEtaMs,
+} = require("./csvImportService");
+const { publishBroadcastEvent } = require("../realtime/broadcastEventBus");
 
-const batchSize = Math.max(50, Number(process.env.CSV_IMPORT_BATCH_SIZE || 500));
-const progressFlushMs = Math.max(250, Number(process.env.CSV_IMPORT_PROGRESS_FLUSH_MS || 1000));
+const batchSize = Math.max(
+  50,
+  Number(process.env.CSV_IMPORT_BATCH_SIZE || 500),
+);
+const progressFlushMs = Math.max(
+  250,
+  Number(process.env.CSV_IMPORT_PROGRESS_FLUSH_MS || 1000),
+);
+
+const isCancelled = async (importJobId, cachedJob = null) => {
+  try {
+    const job =
+      cachedJob ||
+      (await CsvImportJob.findById(importJobId).select("status").lean());
+    return (
+      String(job?.status || "")
+        .trim()
+        .toLowerCase() === "cancelled"
+    );
+  } catch {
+    return false;
+  }
+};
 
 const emitImportEvent = async (userId, payload) => {
   if (!userId || !payload) return;
   await publishBroadcastEvent({
     userId,
-    payload
+    payload,
   });
 };
 
@@ -27,10 +48,10 @@ const updateImportJob = async (importJobId, patch = {}) => {
     {
       $set: {
         ...patch,
-        updatedAt: new Date()
-      }
+        updatedAt: new Date(),
+      },
     },
-    { new: true }
+    { new: true },
   );
 };
 
@@ -38,13 +59,19 @@ const buildProgressPayload = (job, extra = {}) => {
   const totalRows = Math.max(0, Number(job?.totalRows || 0));
   const processedRows = Math.max(0, Number(job?.processedRows || 0));
   const percentComplete =
-    totalRows > 0 ? Math.min(100, Math.round((processedRows / totalRows) * 100)) : 0;
-  const etaMs = getEtaMs(job?.startedAt ? new Date(job.startedAt).getTime() : null, processedRows, totalRows);
+    totalRows > 0
+      ? Math.min(100, Math.round((processedRows / totalRows) * 100))
+      : 0;
+  const etaMs = getEtaMs(
+    job?.startedAt ? new Date(job.startedAt).getTime() : null,
+    processedRows,
+    totalRows,
+  );
 
   return {
-    type: 'csv_import_progress',
-    importJobId: String(job?._id || ''),
-    status: String(job?.status || 'processing'),
+    type: "csv_import_progress",
+    importJobId: String(job?._id || ""),
+    status: String(job?.status || "processing"),
     totalRows,
     processedRows,
     successCount: Math.max(0, Number(job?.successCount || 0)),
@@ -53,19 +80,19 @@ const buildProgressPayload = (job, extra = {}) => {
     skippedCount: Math.max(0, Number(job?.skippedCount || 0)),
     percentComplete,
     etaMs,
-    currentStage: String(job?.currentStage || 'processing'),
-    ...extra
+    currentStage: String(job?.currentStage || "processing"),
+    ...extra,
   };
 };
 
 const processCsvImport = async (job) => {
-  const importJobId = String(job?.data?.importJobId || '').trim();
-  const userId = String(job?.data?.userId || '').trim();
-  const companyId = String(job?.data?.companyId || '').trim() || null;
-  const filePath = String(job?.data?.filePath || '').trim();
+  const importJobId = String(job?.data?.importJobId || "").trim();
+  const userId = String(job?.data?.userId || "").trim();
+  const companyId = String(job?.data?.companyId || "").trim() || null;
+  const filePath = String(job?.data?.filePath || "").trim();
 
   if (!importJobId || !userId || !filePath) {
-    throw new Error('Missing csv import job inputs');
+    throw new Error("Missing csv import job inputs");
   }
 
   let importJob = await CsvImportJob.findById(importJobId);
@@ -75,9 +102,9 @@ const processCsvImport = async (job) => {
 
   const totalRows = await countCsvDataRows(filePath);
   importJob = await updateImportJob(importJobId, {
-    status: 'processing',
+    status: "processing",
     startedAt: importJob.startedAt || new Date(),
-    currentStage: 'counting_rows',
+    currentStage: "counting_rows",
     totalRows,
     processedRows: 0,
     successCount: 0,
@@ -85,14 +112,17 @@ const processCsvImport = async (job) => {
     duplicateCount: 0,
     skippedCount: 0,
     percentComplete: 0,
-    errorMessage: '',
-    queueJobId: String(job.id || importJob.queueJobId || '')
+    errorMessage: "",
+    queueJobId: String(job.id || importJob.queueJobId || ""),
   });
 
-  await emitImportEvent(userId, buildProgressPayload(importJob, {
-    type: 'csv_import_progress',
-    stage: 'counting_rows'
-  }));
+  await emitImportEvent(
+    userId,
+    buildProgressPayload(importJob, {
+      type: "csv_import_progress",
+      stage: "counting_rows",
+    }),
+  );
 
   const batch = [];
   let processedRows = 0;
@@ -101,45 +131,61 @@ const processCsvImport = async (job) => {
   let duplicateCount = 0;
   let skippedCount = 0;
   let lastFlushAt = Date.now();
+  let lastCancelCheckAt = 0;
+  let cancelled = false;
 
   const flushBatch = async () => {
     if (!batch.length) return;
+    if (cancelled) {
+      batch.length = 0;
+      return;
+    }
 
     const batchRows = batch.splice(0, batch.length);
     const result = await bulkUpsertImportedContacts(batchRows, {
       userId,
       companyId,
       consentReferenceId: `csv-import-${importJobId}`,
-      importJobId
+      importJobId,
     });
 
     successCount += Number(result.success || 0);
     skippedCount += Number(result.skipped || 0);
-    duplicateCount += 0;
+    duplicateCount += Number(result.duplicateCount || 0);
     processedRows += batchRows.length;
 
     const now = new Date();
     importJob = await updateImportJob(importJobId, {
-      currentStage: 'writing',
+      currentStage: "writing",
       processedRows,
       successCount,
       failedCount,
       duplicateCount,
       skippedCount,
-      percentComplete: totalRows > 0 ? Math.min(100, Math.round((processedRows / totalRows) * 100)) : 0,
-      etaMs: getEtaMs(importJob.startedAt ? new Date(importJob.startedAt).getTime() : null, processedRows, totalRows),
-      lastProgressAt: now
+      percentComplete:
+        totalRows > 0
+          ? Math.min(100, Math.round((processedRows / totalRows) * 100))
+          : 0,
+      etaMs: getEtaMs(
+        importJob.startedAt ? new Date(importJob.startedAt).getTime() : null,
+        processedRows,
+        totalRows,
+      ),
+      lastProgressAt: now,
     });
 
-    await emitImportEvent(userId, buildProgressPayload(importJob, {
-      stage: 'writing',
-      summary: {
-        processedRows,
-        successCount,
-        failedCount,
-        skippedCount
-      }
-    }));
+    await emitImportEvent(
+      userId,
+      buildProgressPayload(importJob, {
+        stage: "writing",
+        summary: {
+          processedRows,
+          successCount,
+          failedCount,
+          skippedCount,
+        },
+      }),
+    );
   };
 
   await new Promise((resolve, reject) => {
@@ -153,35 +199,62 @@ const processCsvImport = async (job) => {
     };
 
     stream
-      .on('error', cleanupAndReject)
+      .on("error", cleanupAndReject)
       .pipe(parser)
-      .on('data', async (row) => {
+      .on("data", async (row) => {
         stream.pause();
         try {
+          const now = Date.now();
+          const shouldCheckCancel =
+            now - lastCancelCheckAt >= Math.max(500, progressFlushMs);
+          if (
+            cancelled ||
+            (shouldCheckCancel && (await isCancelled(importJobId, importJob)))
+          ) {
+            lastCancelCheckAt = now;
+            cancelled = true;
+            stream.resume();
+            return;
+          }
+          if (shouldCheckCancel) {
+            lastCancelCheckAt = now;
+          }
+
           batch.push({
             data: row,
-            rowNumber: processedRows + batch.length + 2
+            rowNumber: processedRows + batch.length + 2,
           });
 
           if (batch.length >= batchSize) {
             await flushBatch();
           }
 
-          const now = Date.now();
           if (now - lastFlushAt >= progressFlushMs) {
             lastFlushAt = now;
             importJob = await updateImportJob(importJobId, {
-              currentStage: 'processing',
+              currentStage: "processing",
               processedRows,
               successCount,
               failedCount,
               duplicateCount,
               skippedCount,
-              percentComplete: totalRows > 0 ? Math.min(100, Math.round((processedRows / totalRows) * 100)) : 0,
-              etaMs: getEtaMs(importJob.startedAt ? new Date(importJob.startedAt).getTime() : null, processedRows, totalRows),
-              lastProgressAt: new Date()
+              percentComplete:
+                totalRows > 0
+                  ? Math.min(100, Math.round((processedRows / totalRows) * 100))
+                  : 0,
+              etaMs: getEtaMs(
+                importJob.startedAt
+                  ? new Date(importJob.startedAt).getTime()
+                  : null,
+                processedRows,
+                totalRows,
+              ),
+              lastProgressAt: new Date(),
             });
-            await emitImportEvent(userId, buildProgressPayload(importJob, { stage: 'processing' }));
+            await emitImportEvent(
+              userId,
+              buildProgressPayload(importJob, { stage: "processing" }),
+            );
           }
 
           stream.resume();
@@ -189,13 +262,53 @@ const processCsvImport = async (job) => {
           cleanupAndReject(error);
         }
       })
-      .on('error', cleanupAndReject)
-      .on('end', async () => {
+      .on("error", cleanupAndReject)
+      .on("end", async () => {
         try {
+          if (cancelled || (await isCancelled(importJobId, importJob))) {
+            cancelled = true;
+            importJob = await updateImportJob(importJobId, {
+              status: "cancelled",
+              currentStage: "cancelled",
+              processedRows,
+              successCount,
+              failedCount,
+              duplicateCount,
+              skippedCount,
+              percentComplete:
+                totalRows > 0
+                  ? Math.min(100, Math.round((processedRows / totalRows) * 100))
+                  : 0,
+              etaMs: null,
+              completedAt: new Date(),
+              lastProgressAt: new Date(),
+            });
+
+            await emitImportEvent(userId, {
+              type: "csv_import_cancelled",
+              importJobId,
+              status: "cancelled",
+              totalRows,
+              processedRows,
+              successCount,
+              failedCount,
+              duplicateCount,
+              skippedCount,
+              percentComplete:
+                totalRows > 0
+                  ? Math.min(100, Math.round((processedRows / totalRows) * 100))
+                  : 0,
+            });
+
+            await removeFileQuietly(filePath);
+            resolve(importJob);
+            return;
+          }
+
           await flushBatch();
           importJob = await updateImportJob(importJobId, {
-            status: 'completed',
-            currentStage: 'completed',
+            status: "completed",
+            currentStage: "completed",
             processedRows,
             successCount,
             failedCount,
@@ -204,13 +317,13 @@ const processCsvImport = async (job) => {
             percentComplete: 100,
             etaMs: 0,
             completedAt: new Date(),
-            lastProgressAt: new Date()
+            lastProgressAt: new Date(),
           });
 
           await emitImportEvent(userId, {
-            type: 'csv_import_completed',
+            type: "csv_import_completed",
             importJobId,
-            status: 'completed',
+            status: "completed",
             totalRows,
             processedRows,
             successCount,
@@ -218,7 +331,7 @@ const processCsvImport = async (job) => {
             duplicateCount,
             skippedCount,
             percentComplete: 100,
-            etaMs: 0
+            etaMs: 0,
           });
 
           await removeFileQuietly(filePath);
@@ -233,23 +346,23 @@ const processCsvImport = async (job) => {
 };
 
 const failCsvImport = async ({ importJobId, userId, filePath, error }) => {
-  const message = String(error?.message || 'CSV import failed').trim();
+  const message = String(error?.message || "CSV import failed").trim();
   if (importJobId) {
     await updateImportJob(importJobId, {
-      status: 'failed',
-      currentStage: 'failed',
+      status: "failed",
+      currentStage: "failed",
       errorMessage: message,
       completedAt: new Date(),
-      lastProgressAt: new Date()
+      lastProgressAt: new Date(),
     });
   }
 
   if (userId) {
     await emitImportEvent(userId, {
-      type: 'csv_import_failed',
+      type: "csv_import_failed",
       importJobId,
-      status: 'failed',
-      error: message
+      status: "failed",
+      error: message,
     });
   }
 
@@ -259,5 +372,5 @@ const failCsvImport = async ({ importJobId, userId, filePath, error }) => {
 module.exports = {
   processCsvImport,
   failCsvImport,
-  buildProgressPayload
+  buildProgressPayload,
 };

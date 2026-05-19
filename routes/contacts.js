@@ -1,5 +1,8 @@
 const express = require('express');
+const multer = require('multer');
 const mongoose = require('mongoose');
+const sharp = require('sharp');
+const { createWorker } = require('tesseract.js');
 const Contact = require('../models/Contact');
 const Conversation = require('../models/Conversation');
 const ConversationSummary = require('../models/ConversationSummary');
@@ -15,9 +18,94 @@ const { logConsentEvent } = require('../services/whatsappConsentLogService');
 const { invalidateInboxScope } = require('../utils/teamInboxCache');
 const { buildContactSearchPlan } = require('../utils/contactSearchPlan');
 const { buildPhoneCandidates } = require('../services/whatsappOutreach/conversationResolver');
+const { extractBusinessCardFields } = require('../utils/businessCardParser');
 
 const router = express.Router();
 router.use(auth);
+
+const CARD_SCAN_UPLOAD_LIMIT_BYTES = 12 * 1024 * 1024;
+const OCR_IMAGE_MAX_WIDTH = 1800;
+const OCR_IMAGE_QUALITY_THRESHOLD = 160;
+const ocrUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: CARD_SCAN_UPLOAD_LIMIT_BYTES
+  },
+  fileFilter: (req, file, callback) => {
+    if (!file?.mimetype || !String(file.mimetype).startsWith('image/')) {
+      return callback(new Error('Please upload an image file for OCR scanning.'));
+    }
+    callback(null, true);
+  }
+});
+
+let ocrWorkerPromise = null;
+
+const getOcrWorker = async () => {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = (async () => {
+      const worker = await createWorker('eng');
+      if (worker?.setParameters) {
+        await worker.setParameters({
+          preserve_interword_spaces: '1'
+        });
+      }
+      return worker;
+    })().catch((error) => {
+      ocrWorkerPromise = null;
+      throw error;
+    });
+  }
+
+  return ocrWorkerPromise;
+};
+
+const escapeRegExp = (value = '') => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const normalizeEmailValue = (value = '') => String(value || '').trim().toLowerCase();
+
+const buildContactDuplicateLookup = (phone = '', email = '') => {
+  const conditions = [];
+  const phoneCandidates = getPhoneLookupCandidates(phone);
+  if (phoneCandidates.length) {
+    conditions.push({
+      $or: [
+        { phone: { $in: phoneCandidates } },
+        { phoneDigits: { $in: phoneCandidates.map((candidate) => normalizePhoneNumber(candidate)) } }
+      ]
+    });
+  }
+
+  const normalizedEmail = normalizeEmailValue(email);
+  if (normalizedEmail) {
+    conditions.push({
+      email: {
+        $regex: `^${escapeRegExp(normalizedEmail)}$`,
+        $options: 'i'
+      }
+    });
+  }
+
+  return conditions.length ? { $or: conditions } : null;
+};
+
+const preprocessCardImage = async (buffer) => {
+  const image = sharp(buffer).rotate();
+  const metadata = await image.metadata();
+  const width = Math.max(1, Number(metadata.width || OCR_IMAGE_MAX_WIDTH));
+  const targetWidth = Math.min(width, OCR_IMAGE_MAX_WIDTH);
+  return image
+    .resize({
+      width: targetWidth,
+      withoutEnlargement: true
+    })
+    .grayscale()
+    .normalize()
+    .threshold(OCR_IMAGE_QUALITY_THRESHOLD)
+    .sharpen()
+    .png()
+    .toBuffer();
+};
 
 const emitCrmRealtimeEvent = (req, payload = {}) => {
   const sendToUser = req?.app?.locals?.sendToUser;
@@ -47,6 +135,8 @@ const CONTACT_LIST_FIELDS = [
   'name',
   'phone',
   'email',
+  'companyName',
+  'designation',
   'tags',
   'stage',
   'status',
@@ -360,6 +450,26 @@ const normalizeImportedContactData = (contactData = {}) => {
       ])
     ),
     email: toCleanString(getImportedFieldValue(contactData, ['email', 'emailAddress', 'email address'])),
+    companyName: toCleanString(
+      getImportedFieldValue(contactData, [
+        'companyName',
+        'company name',
+        'company',
+        'organization',
+        'organisation',
+        'business name'
+      ])
+    ),
+    designation: toCleanString(
+      getImportedFieldValue(contactData, [
+        'designation',
+        'jobTitle',
+        'job title',
+        'title',
+        'role',
+        'position'
+      ])
+    ),
     status: toCleanString(
       getImportedFieldValue(contactData, ['status', 'whatsappOptInStatus', 'optInStatus', 'opt in status'])
     ),
@@ -1267,10 +1377,14 @@ router.post('/', async (req, res) => {
       const mergedTags = getMergedTags(existingContact.tags, normalizedPayload.tags);
       const nextName = toCleanString(normalizedPayload.name) || existingContact.name;
       const nextEmail = toCleanString(normalizedPayload.email) || existingContact.email;
+      const nextCompanyName = toCleanString(normalizedPayload.companyName) || existingContact.companyName;
+      const nextDesignation = toCleanString(normalizedPayload.designation) || existingContact.designation;
       const nextSource = toCleanString(normalizedPayload.source) || existingContact.source;
 
       existingContact.name = nextName;
       existingContact.email = nextEmail;
+      existingContact.companyName = nextCompanyName;
+      existingContact.designation = nextDesignation;
       existingContact.tags = mergedTags;
       existingContact.source = nextSource;
       existingContact.phone = getPreferredPhoneValue(normalizedPayload) || existingContact.phone;
@@ -1554,6 +1668,107 @@ router.post('/import', async (req, res) => {
       error: 'Import failed: ' + error.message 
     });
   }
+});
+
+const normalizeScanContactPayload = (fields = {}) => ({
+  name: toCleanString(fields.fullName),
+  phone: toCleanString(fields.mobileNumber),
+  email: toCleanString(fields.email),
+  companyName: toCleanString(fields.companyName),
+  designation: toCleanString(fields.designation),
+  tags: []
+});
+
+const findScanDuplicateContacts = async (req, extractedContact = {}) => {
+  const lookupFilter = buildContactDuplicateLookup(
+    extractedContact.phone,
+    extractedContact.email
+  );
+
+  if (!lookupFilter) {
+    return [];
+  }
+
+  const duplicateContacts = await Contact.find(
+    buildScopedContactFilter(req, lookupFilter)
+  )
+    .select('_id name phone email companyName designation tags stage status sourceType createdAt updatedAt')
+    .lean();
+
+  const normalizedPhoneCandidates = getPhoneLookupCandidates(extractedContact.phone);
+  const normalizedPhoneDigits = normalizedPhoneCandidates.map((candidate) => normalizePhoneNumber(candidate));
+  const normalizedEmail = normalizeEmailValue(extractedContact.email);
+
+  return (Array.isArray(duplicateContacts) ? duplicateContacts : []).map((contact) => {
+    const contactPhoneCandidates = getPhoneLookupCandidates(contact?.phone || '');
+    const contactPhoneDigits = contactPhoneCandidates.map((candidate) => normalizePhoneNumber(candidate));
+    const contactEmail = normalizeEmailValue(contact?.email || '');
+    const matchReasons = [];
+
+    if (
+      normalizedPhoneCandidates.some((candidate) => contactPhoneCandidates.includes(candidate)) ||
+      normalizedPhoneDigits.some((candidate) => contactPhoneDigits.includes(candidate))
+    ) {
+      matchReasons.push('phone');
+    }
+
+    if (normalizedEmail && contactEmail && normalizedEmail === contactEmail) {
+      matchReasons.push('email');
+    }
+
+    return {
+      ...contact,
+      matchReasons: Array.from(new Set(matchReasons))
+    };
+  });
+};
+
+router.post('/scan-card', (req, res) => {
+  ocrUpload.single('image')(req, res, async (error) => {
+    if (error) {
+      return res.status(400).json({
+        success: false,
+        error: error.message || 'Unable to process the uploaded image.'
+      });
+    }
+
+    const startedAt = Date.now();
+    try {
+      if (!req.file?.buffer) {
+        return res.status(400).json({
+          success: false,
+          error: 'Please upload a business card image.'
+        });
+      }
+
+      const preprocessedImage = await preprocessCardImage(req.file.buffer);
+      const worker = await getOcrWorker();
+      const ocrResult = await worker.recognize(preprocessedImage);
+      const rawText = String(ocrResult?.data?.text || '').trim();
+      const parsedCard = extractBusinessCardFields(rawText);
+      const extractedContact = normalizeScanContactPayload(parsedCard);
+      const duplicateContacts = await findScanDuplicateContacts(req, extractedContact);
+
+      return res.json({
+        success: true,
+        data: {
+          contact: extractedContact,
+          duplicates: duplicateContacts,
+          rawText,
+          lines: parsedCard.lines || [],
+          inferenceSignals: parsedCard.inferenceSignals || {},
+          timings: {
+            totalMs: Date.now() - startedAt
+          }
+        }
+      });
+    } catch (scanError) {
+      return res.status(500).json({
+        success: false,
+        error: scanError.message || 'Failed to scan business card'
+      });
+    }
+  });
 });
 
 // Update contact

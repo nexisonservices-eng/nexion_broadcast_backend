@@ -313,6 +313,11 @@ const resolveCompanyStorageContext = (req) => ({
   cloudinaryFolderRoot: req.user?.cloudinaryFolderRoot || ''
 });
 
+const resolveBroadcastTemplateHeaderFolder = (req) => {
+  const companyContext = resolveCompanyStorageContext(req);
+  return resolveCompanyFolders(companyContext).metaTemplateImagesFolder;
+};
+
 const buildAttachmentLabel = (mediaType = '') => {
   const normalized = String(mediaType || '').trim().toLowerCase();
   if (normalized === 'image') return '[Image]';
@@ -603,22 +608,17 @@ router.post(
         });
       }
 
-      const storageUsername = resolveAttachmentUsername(req);
-      const attachment = await uploadInboxAttachment({
-        file: req.file,
-        username: storageUsername,
-        direction: 'sent',
-        folderOverride: resolveBroadcastTemplateHeaderFolder(req),
-        userId: req.user.id,
-        sender: req.user.id,
-        recipient: 'broadcast-template-header'
+      const folder = resolveBroadcastTemplateHeaderFolder(req);
+      const mediaUrl = await uploadCampaignCreative(req.file, {
+        folder,
+        resourceType: 'auto'
       });
 
       return res.json({
         success: true,
         data: {
-          mediaUrl: attachment.secureUrl,
-          attachment
+          mediaUrl,
+          folder
         }
       });
     } catch (error) {
