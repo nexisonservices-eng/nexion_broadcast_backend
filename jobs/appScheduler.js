@@ -1,6 +1,9 @@
 const cron = require('node-cron');
 const { processConsentExportJobs } = require('../services/consentExportJobRunner');
 const { archiveOldConsentLogs } = require('../services/consentRetentionService');
+const {
+  runDataRetentionMaintenance
+} = require('../services/dataRetentionService');
 const { runCrmFollowUpAutomation } = require('../services/crmOpsService');
 
 const startAppScheduler = ({
@@ -169,6 +172,20 @@ const startAppScheduler = ({
       }
     } catch (error) {
       console.error('Consent retention error:', error.message);
+    }
+  });
+
+  cron.schedule('30 2 * * *', async () => {
+    try {
+      if (mongoose.connection.readyState !== 1) return;
+      const result = await runDataRetentionMaintenance();
+      if (result?.messagesArchived || result?.broadcastDispatchesArchived) {
+        console.log(
+          `Data retention archived messages=${result.messagesArchived || 0}, broadcastDispatches=${result.broadcastDispatchesArchived || 0}.`
+        );
+      }
+    } catch (error) {
+      console.error('Data retention error:', error.message);
     }
   });
 };

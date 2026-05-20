@@ -34,11 +34,21 @@ const {
 } = require("./whatsappOutreach/policy");
 const axios = require("axios");
 const { createRedisConnection, isRedisDisabled } = require("../config/redis");
+const mongoose = require("mongoose");
 
 const broadcastRateLimiterRedis = createRedisConnection({
   maxRetriesPerRequest: 1,
   enableOfflineQueue: true,
 });
+
+const toQueryObjectId = (value) => {
+  const normalized = String(value || "").trim();
+  if (!normalized) return null;
+  if (mongoose.Types.ObjectId.isValid(normalized)) {
+    return new mongoose.Types.ObjectId(normalized);
+  }
+  return normalized;
+};
 
 const BROADCAST_RATE_LIMIT_MAX = Math.max(
   1,
@@ -2428,7 +2438,10 @@ class BroadcastService {
         retried: Number(broadcast?.analytics?.retried || 0) + retried,
         failureCodeBreakdown,
       };
-      const finalStatus = failed > 0 ? "completed_with_errors" : "completed";
+      const finalFailedCount = Array.isArray(results)
+        ? results.filter((item) => item?.success === false && !item?.skipped).length
+        : failed;
+      const finalStatus = finalFailedCount > 0 ? "completed_with_errors" : "completed";
       if (!skipFinalize) {
         broadcast.deliveryResults = results;
         broadcast.status = finalStatus;
@@ -3027,6 +3040,56 @@ class BroadcastService {
           .limit(limit + 1)
           .lean();
 
+        const needsStatsRepair = (broadcast = {}) => {
+          const status = String(broadcast?.status || "").toLowerCase();
+          const stats = broadcast?.stats || {};
+          const sent = Number(stats.sent || 0);
+          const delivered = Number(stats.delivered || 0);
+          const read = Number(stats.read || 0);
+          const failed = Number(stats.failed || 0);
+          const replied = Number(stats.replied || 0);
+          const recipientCount = Number(broadcast?.recipientCount || 0);
+          const hasAnyStats =
+            sent > 0 ||
+            delivered > 0 ||
+            read > 0 ||
+            failed > 0 ||
+            replied > 0;
+          const deliveryStatsMissing =
+            sent > 0 && delivered === 0 && read === 0 && failed === 0;
+          const statsLookIncomplete =
+            recipientCount > 0 &&
+            (sent < recipientCount || deliveryStatsMissing);
+          const statusRepairNeeded =
+            status === "completed_with_errors" && failed > 0;
+
+          return (
+            ["completed", "completed_with_errors", "failed"].includes(status) &&
+            (statsLookIncomplete ||
+              (recipientCount > 0 && !hasAnyStats) ||
+              statusRepairNeeded)
+          );
+        };
+
+        const staleRows = Array.isArray(rows)
+          ? rows.filter((broadcast) => needsStatsRepair(broadcast))
+          : [];
+
+        if (staleRows.length > 0) {
+          for (const staleBroadcast of staleRows) {
+            try {
+              const repairResult = await this.syncBroadcastStats(
+                staleBroadcast._id,
+              );
+              if (repairResult?.success && repairResult?.data?.stats) {
+                staleBroadcast.stats = repairResult.data.stats;
+              }
+            } catch (_repairError) {
+              // Best-effort repair only; keep list endpoint responsive.
+            }
+          }
+        }
+
         const hasMore = rows.length > limit;
         const items = rows.slice(0, limit).map((broadcast) => ({
           ...broadcast,
@@ -3077,10 +3140,20 @@ class BroadcastService {
               read > 0 ||
               failed > 0 ||
               replied > 0;
-            return (
-              ["completed", "completed_with_errors"].includes(status) &&
+            const deliveryStatsMissing =
+              sent > 0 && delivered === 0 && read === 0 && failed === 0;
+            const statsLookIncomplete =
               recipientCount > 0 &&
-              !hasAnyStats
+              (sent < recipientCount || deliveryStatsMissing);
+            const statusRepairNeeded =
+              status === "completed_with_errors" && failed > 0;
+            return (
+              ["completed", "completed_with_errors", "failed"].includes(
+                status,
+              ) &&
+              (statsLookIncomplete ||
+                (recipientCount > 0 && !hasAnyStats) ||
+                statusRepairNeeded)
             );
           })
         : [];
@@ -3186,10 +3259,10 @@ class BroadcastService {
         loader: async () => {
           const query = {};
           if (normalizedFilters.companyId) {
-            query.companyId = normalizedFilters.companyId;
+            query.companyId = toQueryObjectId(normalizedFilters.companyId);
           }
           if (normalizedFilters.createdById) {
-            query.createdById = normalizedFilters.createdById;
+            query.createdById = toQueryObjectId(normalizedFilters.createdById);
           }
           if (normalizedFilters.status) {
             const statuses = normalizedFilters.status
@@ -3326,6 +3399,196 @@ class BroadcastService {
               skippedQuietHours: Number(totals?.skippedQuietHours || 0) || 0,
               failureCodeBreakdown,
               topFailureCode,
+            },
+          };
+        },
+      });
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async getOverviewSummary(filters = {}) {
+    try {
+      const normalizedFilters = {
+        companyId: filters?.companyId || null,
+        createdById: filters?.createdById || null,
+        status: String(filters?.status || "").trim(),
+        createdFrom: String(filters?.createdFrom || "").trim(),
+        createdTo: String(filters?.createdTo || "").trim(),
+      };
+      const cacheScope = [
+        `company:${normalizedFilters.companyId || "all"}`,
+        `user:${normalizedFilters.createdById || "all"}`,
+        `status:${normalizedFilters.status || "all"}`,
+        `from:${normalizedFilters.createdFrom || "all"}`,
+        `to:${normalizedFilters.createdTo || "all"}`,
+      ].join("|");
+
+      return await getOrSetCachedJson({
+        namespace: "broadcasts",
+        scope: cacheScope,
+        versionGroup: "overview-summary-v1",
+        keyParts: ["dashboard"],
+        ttlSeconds: Math.max(10, Number(CACHE_TTL_SECONDS?.summaryPages || 20)),
+        loader: async () => {
+          const query = {};
+          if (normalizedFilters.companyId) {
+            query.companyId = toQueryObjectId(normalizedFilters.companyId);
+          }
+          if (normalizedFilters.createdById) {
+            query.createdById = toQueryObjectId(normalizedFilters.createdById);
+          }
+          if (normalizedFilters.status) {
+            const statuses = normalizedFilters.status
+              .split(",")
+              .map((value) => String(value || "").trim())
+              .filter(Boolean);
+            if (statuses.length === 1) {
+              query.status = statuses[0];
+            } else if (statuses.length > 1) {
+              query.status = { $in: statuses };
+            }
+          }
+
+          const createdAt = {};
+          if (normalizedFilters.createdFrom) {
+            const from = new Date(normalizedFilters.createdFrom);
+            if (!Number.isNaN(from.getTime())) {
+              createdAt.$gte = from;
+            }
+          }
+          if (normalizedFilters.createdTo) {
+            const to = new Date(normalizedFilters.createdTo);
+            if (!Number.isNaN(to.getTime())) {
+              createdAt.$lte = to;
+            }
+          }
+          if (Object.keys(createdAt).length > 0) {
+            query.createdAt = createdAt;
+          }
+
+          const summaryPipeline = [
+            { $match: query },
+            {
+              $project: {
+                recipientCountResolved: {
+                  $ifNull: [
+                    "$recipientCount",
+                    {
+                      $size: {
+                        $ifNull: ["$recipients", []],
+                      },
+                    },
+                  ],
+                },
+                stats: {
+                  sent: { $ifNull: ["$stats.sent", 0] },
+                  delivered: { $ifNull: ["$stats.delivered", 0] },
+                  read: { $ifNull: ["$stats.read", 0] },
+                  replied: { $ifNull: ["$stats.replied", 0] },
+                  failed: { $ifNull: ["$stats.failed", 0] },
+                },
+                status: { $ifNull: ["$status", ""] },
+                analytics: {
+                  suppressed: { $ifNull: ["$analytics.suppressed", 0] },
+                  deferred: { $ifNull: ["$analytics.deferred", 0] },
+                  retried: { $ifNull: ["$analytics.retried", 0] },
+                  skippedQuietHours: {
+                    $ifNull: ["$analytics.skippedQuietHours", 0],
+                  },
+                },
+              },
+            },
+            {
+              $facet: {
+                totals: [
+                  {
+                    $group: {
+                      _id: null,
+                      campaigns: { $sum: 1 },
+                      recipientCount: { $sum: "$recipientCountResolved" },
+                      sent: { $sum: "$stats.sent" },
+                      delivered: {
+                        $sum: {
+                          $cond: [
+                            { $gte: ["$stats.delivered", "$stats.read"] },
+                            "$stats.delivered",
+                            "$stats.read",
+                          ],
+                        },
+                      },
+                      read: { $sum: "$stats.read" },
+                      replied: { $sum: "$stats.replied" },
+                      failed: { $sum: "$stats.failed" },
+                      sending: {
+                        $sum: {
+                          $cond: [
+                            { $eq: [{ $toLower: "$status" }, "sending"] },
+                            "$recipientCountResolved",
+                            0,
+                          ],
+                        },
+                      },
+                      processing: {
+                        $sum: {
+                          $cond: [
+                            { $eq: [{ $toLower: "$status" }, "processing"] },
+                            1,
+                            0,
+                          ],
+                        },
+                      },
+                      queued: {
+                        $sum: {
+                          $cond: [
+                            {
+                              $in: [
+                                { $toLower: "$status" },
+                                ["queued", "scheduled"],
+                              ],
+                            },
+                            1,
+                            0,
+                          ],
+                        },
+                      },
+                      suppressed: { $sum: "$analytics.suppressed" },
+                      deferred: { $sum: "$analytics.deferred" },
+                      retried: { $sum: "$analytics.retried" },
+                      skippedQuietHours: {
+                        $sum: "$analytics.skippedQuietHours",
+                      },
+                    },
+                  },
+                ],
+              },
+            },
+          ];
+
+          const aggregateResult = await Broadcast.aggregate(summaryPipeline);
+          const totals = Array.isArray(aggregateResult?.[0]?.totals)
+            ? aggregateResult[0].totals[0] || {}
+            : {};
+
+          return {
+            success: true,
+            data: {
+              campaigns: Number(totals?.campaigns || 0) || 0,
+              recipientCount: Number(totals?.recipientCount || 0) || 0,
+              sent: Number(totals?.sent || 0) || 0,
+              delivered: Number(totals?.delivered || 0) || 0,
+              read: Number(totals?.read || 0) || 0,
+              replied: Number(totals?.replied || 0) || 0,
+              failed: Number(totals?.failed || 0) || 0,
+              sending: Number(totals?.sending || 0) || 0,
+              processing: Number(totals?.processing || 0) || 0,
+              queued: Number(totals?.queued || 0) || 0,
+              suppressed: Number(totals?.suppressed || 0) || 0,
+              deferred: Number(totals?.deferred || 0) || 0,
+              retried: Number(totals?.retried || 0) || 0,
+              skippedQuietHours:
+                Number(totals?.skippedQuietHours || 0) || 0,
             },
           };
         },
@@ -3513,7 +3776,9 @@ class BroadcastService {
 
       // Find all messages sent from this broadcast
       const startTime = new Date(broadcast.startedAt || broadcast.createdAt);
-      const endTime = new Date(broadcast.completedAt || Date.now());
+      // Use the current time as the upper bound so late delivery/read webhooks
+      // that arrive after completedAt still get counted during a sync.
+      const endTime = new Date();
 
       const broadcastIdQuery = {
         userId: broadcast.createdById,
@@ -3524,44 +3789,65 @@ class BroadcastService {
       };
 
       let messages = await Message.find(broadcastIdQuery);
+      const messageIds = new Set(
+        messages.map((message) => String(message?._id || "")).filter(Boolean),
+      );
 
-      // Backward compatibility for older records without broadcastId
-      if (messages.length === 0) {
-        const recipientPhones = (broadcast.recipients || [])
-          .map((r) => r.phone || r)
-          .filter(Boolean);
+      // Supplement with legacy conversation-based lookup so partially linked
+      // broadcasts do not undercount sent/delivered/read/failed stats.
+      const recipientPhones = (broadcast.recipients || [])
+        .map((r) => r.phone || r)
+        .map((phone) => String(phone || "").trim())
+        .filter(Boolean);
+      const recipientCount = Number(broadcast?.recipientCount || 0);
+      const hasDeliveryStats = messages.some((msg) => {
+        const status = String(msg?.status || "").toLowerCase();
+        return ["sent", "delivered", "read", "failed"].includes(status);
+      });
+      const shouldSupplementLegacyRows =
+        recipientPhones.length > 0 &&
+        (messages.length === 0 ||
+          (recipientCount > 0 && messages.length < recipientCount) ||
+          !hasDeliveryStats);
 
-        const conversations = recipientPhones.length
-          ? await Conversation.find({
-              userId: broadcast.createdById,
-              contactPhone: { $in: recipientPhones },
-            })
-          : [];
+      if (shouldSupplementLegacyRows) {
+        const conversations = await Conversation.find({
+          userId: broadcast.createdById,
+          contactPhone: { $in: recipientPhones },
+        });
 
         const conversationIds = conversations.map((c) => c._id);
 
         if (conversationIds.length > 0) {
-          let convoQuery = {
+          const convoMessages = await Message.find({
             userId: broadcast.createdById,
             sender: "agent",
             conversationId: { $in: conversationIds },
             timestamp: { $gte: startTime, $lte: endTime },
-          };
+          });
 
-          messages = await Message.find(convoQuery);
-
-          if (messages.length > 0) {
-            await Message.updateMany(
-              {
-                _id: { $in: messages.map((m) => m._id) },
-                broadcastId: { $exists: false },
-              },
-              { $set: { broadcastId: broadcast._id } },
-            );
+          for (const message of convoMessages) {
+            const messageKey = String(message?._id || "");
+            if (!messageKey || messageIds.has(messageKey)) continue;
+            messageIds.add(messageKey);
+            messages.push(message);
           }
         }
 
-        // Intentionally avoid broad text-based legacy fallback queries:
+        if (messages.length > 0) {
+          await Message.updateMany(
+            {
+              _id: { $in: messages.map((m) => m._id) },
+              broadcastId: { $exists: false },
+              conversationId: {
+                $in: recipientPhones.length > 0 ? conversationIds : [],
+              },
+            },
+            { $set: { broadcastId: broadcast._id } },
+          );
+        }
+
+        // Avoid broad text-based legacy fallback queries:
         // they can cross-match unrelated broadcasts and cause stat drops/fluctuations.
       }
 
@@ -3580,16 +3866,46 @@ class BroadcastService {
         failed: messages.filter((msg) => msg.status === "failed").length,
         replied: 0, // Will be calculated below
       };
-      const deliveryFailedCount = Array.isArray(broadcast?.deliveryResults)
-        ? broadcast.deliveryResults.filter(
-            (item) => item?.success === false && !item?.skipped,
-          ).length
-        : 0;
-      stats.failed = Math.max(
-        stats.failed,
-        deliveryFailedCount,
-        Number(broadcast?.stats?.failed || 0),
-      );
+      const recipientDetails = await this.buildRecipientStatusDetails(broadcast);
+      if (Array.isArray(recipientDetails) && recipientDetails.length > 0) {
+        const resolvedStats = recipientDetails.reduce(
+          (accumulator, detail) => {
+            const status = String(detail?.status || "").toLowerCase();
+            if (detail?.sent || ["sent", "delivered", "read", "failed"].includes(status)) {
+              accumulator.sent += 1;
+            }
+            if (detail?.delivered || status === "delivered" || status === "read") {
+              accumulator.delivered += 1;
+            }
+            if (detail?.read || status === "read") {
+              accumulator.read += 1;
+            }
+            if (status === "failed") {
+              accumulator.failed += 1;
+            }
+            if (detail?.replied) {
+              accumulator.replied += 1;
+            }
+            return accumulator;
+          },
+          {
+            sent: 0,
+            delivered: 0,
+            read: 0,
+            failed: 0,
+            replied: 0,
+          },
+        );
+
+        stats.sent = Math.max(stats.sent, resolvedStats.sent);
+        stats.delivered = Math.max(stats.delivered, resolvedStats.delivered);
+        stats.read = Math.max(stats.read, resolvedStats.read);
+        stats.failed = resolvedStats.failed;
+        stats.replied = Math.max(stats.replied, resolvedStats.replied);
+      }
+
+      const currentStatus = String(broadcast?.status || "").toLowerCase();
+      const resolvedFinalStatus = stats.failed > 0 ? "completed_with_errors" : "completed";
 
       // Debug: Log message statuses to identify issues
       console.log("🔍 DEBUG: Message statuses found:", {
@@ -3653,13 +3969,20 @@ class BroadcastService {
         currentStats.read !== stats.read ||
         currentStats.failed !== stats.failed ||
         currentStats.replied !== stats.replied;
+      const statusChanged = currentStatus !== resolvedFinalStatus;
       let updatedBroadcast = null;
 
-      if (statsChanged) {
+      if (statsChanged || statusChanged) {
         // Update only the stats field without touching other fields
         await Broadcast.updateOne(
           { _id: broadcastId },
-          { $set: { stats: stats, updatedAt: new Date() } },
+          {
+            $set: {
+              stats: stats,
+              status: resolvedFinalStatus,
+              updatedAt: new Date(),
+            },
+          },
         );
 
         // Get updated broadcast with virtual fields

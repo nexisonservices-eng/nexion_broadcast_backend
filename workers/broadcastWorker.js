@@ -29,6 +29,12 @@ const inboxEventBatchSize = Math.max(1, Number(process.env.BROADCAST_INBOX_EVENT
 const inboxEventFlushMs = Math.max(250, Number(process.env.BROADCAST_INBOX_EVENT_FLUSH_MS || 1000));
 const leadActivityBatchSize = Math.max(1, Number(process.env.BROADCAST_LEAD_ACTIVITY_BATCH_SIZE || 25));
 const leadActivityFlushMs = Math.max(250, Number(process.env.BROADCAST_LEAD_ACTIVITY_FLUSH_MS || 1000));
+const workerModeArg = process.argv.find((arg) => String(arg || '').startsWith('--mode='));
+const workerMode = String(workerModeArg ? workerModeArg.split('=')[1] : 'all')
+  .trim()
+  .toLowerCase();
+const enableBroadcastDispatchWorker = workerMode === 'all' || workerMode === 'dispatch';
+const enableBroadcastInboxWorker = workerMode === 'all' || workerMode === 'inbox';
 
 const splitRecipients = (recipients, size) => {
   const chunks = [];
@@ -310,9 +316,11 @@ const finalizeBroadcastIfReady = async (broadcastId, userId) => {
   return { complete: true, summary, broadcast };
 };
 
-const broadcastWorker = new Worker(
-  'broadcast-send',
-  async (job) => {
+let broadcastWorker = null;
+if (enableBroadcastDispatchWorker) {
+  broadcastWorker = new Worker(
+    'broadcast-send',
+    async (job) => {
     const broadcastId = String(job.data?.broadcastId || '');
     const userId = String(job.data?.userId || '');
     if (!broadcastId) {
@@ -509,20 +517,23 @@ const broadcastWorker = new Worker(
     }
 
     throw new Error(`Unsupported broadcast job type: ${job.name}`);
-  },
-  {
-    connection,
-    concurrency: workerConcurrency,
-    limiter: {
-      max: workerLimiterMax,
-      duration: workerLimiterDuration
+    },
+    {
+      connection,
+      concurrency: workerConcurrency,
+      limiter: {
+        max: workerLimiterMax,
+        duration: workerLimiterDuration
+      }
     }
-  }
-);
+  );
+}
 
-const broadcastInboxWorker = new Worker(
-  broadcastInboxQueueName,
-  async (job) => {
+let broadcastInboxWorker = null;
+if (enableBroadcastInboxWorker) {
+  broadcastInboxWorker = new Worker(
+    broadcastInboxQueueName,
+    async (job) => {
     const {
       broadcastId,
       userId,
@@ -610,34 +621,43 @@ const broadcastInboxWorker = new Worker(
       conversationId: String(conversation?._id || ''),
       messageId: String(savedMessage?._id || '')
     };
-  },
-  {
-    connection: broadcastInboxConnection,
-    concurrency: Math.max(2, Math.min(12, Number(process.env.BROADCAST_INBOX_WORKER_CONCURRENCY || 6)))
-  }
-);
+    },
+    {
+      connection: broadcastInboxConnection,
+      concurrency: Math.max(2, Math.min(12, Number(process.env.BROADCAST_INBOX_WORKER_CONCURRENCY || 6)))
+    }
+  );
+}
 
-broadcastWorker.on('completed', (job) => {
-  console.log(`Broadcast job completed: ${job.id}`);
-});
+if (broadcastWorker) {
+  broadcastWorker.on('completed', (job) => {
+    console.log(`Broadcast job completed: ${job.id}`);
+  });
 
-broadcastWorker.on('failed', async (job, error) => {
-  console.error(`Broadcast job failed: ${job?.id || 'unknown'}`, error?.message || error);
-});
+  broadcastWorker.on('failed', async (job, error) => {
+    console.error(`Broadcast job failed: ${job?.id || 'unknown'}`, error?.message || error);
+  });
+}
 
-broadcastInboxWorker.on('completed', (job) => {
-  console.log(`Broadcast inbox job completed: ${job.id}`);
-});
+if (broadcastInboxWorker) {
+  broadcastInboxWorker.on('completed', (job) => {
+    console.log(`Broadcast inbox job completed: ${job.id}`);
+  });
 
-broadcastInboxWorker.on('failed', async (job, error) => {
-  console.error(`Broadcast inbox job failed: ${job?.id || 'unknown'}`, error?.message || error);
-});
+  broadcastInboxWorker.on('failed', async (job, error) => {
+    console.error(`Broadcast inbox job failed: ${job?.id || 'unknown'}`, error?.message || error);
+  });
+}
 
 const shutdown = async () => {
   await flushAllInboxNotifiers();
   await flushAllLeadActivities();
-  await broadcastWorker.close();
-  await broadcastInboxWorker.close();
+  if (broadcastWorker) {
+    await broadcastWorker.close();
+  }
+  if (broadcastInboxWorker) {
+    await broadcastInboxWorker.close();
+  }
   await connection.quit();
   await broadcastInboxConnection.quit();
   process.exit(0);
@@ -647,5 +667,5 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 console.log(
-  `Broadcast worker started with concurrency=${workerConcurrency}, limiter=${workerLimiterMax}/${workerLimiterDuration}ms`
+  `Broadcast worker started in mode=${workerMode || 'all'} with concurrency=${workerConcurrency}, limiter=${workerLimiterMax}/${workerLimiterDuration}ms`
 );

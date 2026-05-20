@@ -41,5 +41,7 @@ BroadcastDispatchSchema.index({ broadcastId: 1, status: 1, updatedAt: -1 });
 BroadcastDispatchSchema.index({ broadcastId: 1, recipientIndex: 1, _id: 1 });
 BroadcastDispatchSchema.index({ broadcastId: 1, recipientPhone: 1, recipientIndex: 1, _id: 1 });
 BroadcastDispatchSchema.index({ userId: 1, companyId: 1, createdAt: -1 });
+BroadcastDispatchSchema.index({ companyId: 1, broadcastId: 1, status: 1, recipientIndex: 1, _id: 1 });
+BroadcastDispatchSchema.index({ companyId: 1, broadcastId: 1, recipientPhone: 1, status: 1 });
 
 module.exports = mongoose.model('BroadcastDispatch', BroadcastDispatchSchema);

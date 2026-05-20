@@ -85,5 +85,6 @@ MessageSchema.index({ companyId: 1, userId: 1, mediaPipelineRequestId: 1 }, { sp
 MessageSchema.index({ companyId: 1, broadcastId: 1, status: 1 });
 MessageSchema.index({ companyId: 1, userId: 1, 'attachment.publicId': 1 });
 MessageSchema.index({ companyId: 1, userId: 1, mediaType: 1, timestamp: -1 });
+MessageSchema.index({ companyId: 1, broadcastId: 1, timestamp: -1, _id: -1 });
 
 module.exports = mongoose.model('Message', MessageSchema);

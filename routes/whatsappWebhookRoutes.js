@@ -932,7 +932,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
             _id: updatedMessage.broadcastId,
             createdById: effectiveUserId,
             companyId: effectiveCompanyId,
-            status: { $in: ['sending', 'completed'] }
+            status: { $in: ['sending', 'completed', 'completed_with_errors', 'failed'] }
           });
 
           if (!broadcast) {

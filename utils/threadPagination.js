@@ -1,6 +1,6 @@
 const mongoose = require('mongoose');
 
-const DEFAULT_PAGE_LIMIT = 30;
+const DEFAULT_PAGE_LIMIT = 20;
 const MAX_PAGE_LIMIT = 80;
 
 const toCleanString = (value) => String(value || '').trim();

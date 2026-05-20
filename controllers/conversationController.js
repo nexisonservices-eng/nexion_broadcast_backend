@@ -27,7 +27,8 @@ const {
 const { buildInboxSearchPlan } = require('../utils/inboxSearchPlan');
 const { buildContactSearchPlan } = require('../utils/contactSearchPlan');
 
-const TEAM_INBOX_CONTACT_SUMMARY_FIELDS =
+const TEAM_INBOX_CONTACT_LIST_FIELDS = '_id name leadScore';
+const TEAM_INBOX_CONTACT_DETAIL_FIELDS =
   '_id name phone tags status stage leadScore leadScoreBreakdown isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt';
 const CONTACT_LIST_FIELDS =
   '_id name phone email tags stage status source ownerId sourceType lastContact lastContactAt nextFollowUpAt isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata whatsappMarketingWindowStartedAt whatsappMarketingSendCount whatsappMarketingLastSentAt whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt leadScore createdAt updatedAt';
@@ -227,7 +228,11 @@ const buildScopedFilters = (req, extra = {}, options = {}) => {
   return filters;
 };
 
-const attachContactSnapshotsToConversations = async (conversations = [], req) => {
+const attachContactSnapshotsToConversations = async (
+  conversations = [],
+  req,
+  { fields = TEAM_INBOX_CONTACT_LIST_FIELDS } = {}
+) => {
   const safeConversations = Array.isArray(conversations) ? conversations : [];
   const contactIds = safeConversations
     .map((conversation) => String(conversation?.contactId || '').trim())
@@ -245,7 +250,7 @@ const attachContactSnapshotsToConversations = async (conversations = [], req) =>
     _id: { $in: uniqueContactIds },
     ...buildScopedFilters(req, {}, { scope: req.query?.scope })
   })
-    .select(TEAM_INBOX_CONTACT_SUMMARY_FIELDS)
+    .select(String(fields || TEAM_INBOX_CONTACT_LIST_FIELDS).trim() || TEAM_INBOX_CONTACT_LIST_FIELDS)
     .lean();
 
   const contactById = new Map(
@@ -603,7 +608,8 @@ class ConversationController {
           loader: async () => {
             const conversations = await attachContactSnapshotsToConversations(
               cachedResponse.data || [],
-              req
+              req,
+              { fields: TEAM_INBOX_CONTACT_LIST_FIELDS }
             );
 
             return {
@@ -668,7 +674,9 @@ class ConversationController {
         filters.sourceType = requestedSourceType;
       }
 
-      const totalCount = await Contact.countDocuments(filters);
+      const includeTotalCount =
+        String(req.query?.includeTotalCount ?? 'true').trim().toLowerCase() !== 'false';
+      const totalCount = includeTotalCount ? await Contact.countDocuments(filters) : null;
       const cursorFilters = cursor ? { ...filters, ...buildContactCursorFilter(cursor) } : filters;
       let contactQuery = Contact.find(cursorFilters)
         .select(CONTACT_LIST_FIELDS)
@@ -696,14 +704,17 @@ class ConversationController {
         return true;
       });
       
-      res.setHeader('x-total-count', String(totalCount));
+      if (includeTotalCount) {
+        res.setHeader('x-total-count', String(totalCount));
+      }
       res.json({
         success: true,
         data: filteredContacts,
         meta: {
           limit,
           hasMore,
-          nextCursor: hasMore ? encodeContactCursor(filteredContacts[filteredContacts.length - 1]) : null
+          nextCursor: hasMore ? encodeContactCursor(filteredContacts[filteredContacts.length - 1]) : null,
+          totalCount: includeTotalCount && Number.isFinite(totalCount) ? totalCount : null
         }
       });
     } catch (error) {
@@ -760,6 +771,29 @@ class ConversationController {
       });
       
       res.json({ success: true, data: uniqueContacts });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async getUnreadConversationCount(req, res) {
+    try {
+      const filters = buildScopedFilters(req, {}, { scope: req.query?.scope });
+      const summaryFilters = {
+        ...filters,
+        unreadCount: { $gt: 0 },
+      };
+
+      const unreadConversationCount = await ConversationSummary.countDocuments(
+        summaryFilters,
+      );
+
+      res.json({
+        success: true,
+        data: {
+          unreadConversationCount,
+        },
+      });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }

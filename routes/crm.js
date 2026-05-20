@@ -479,6 +479,38 @@ const buildScopedFilter = (req, extra = {}) => {
   return { $and: conditions };
 };
 
+const hydrateDocsWithContacts = async (docs = [], req, selectFields = '') => {
+  const list = Array.isArray(docs) ? docs : [];
+  const contactIds = Array.from(
+    new Set(
+      list
+        .map((doc) => String(doc?.contactId || '').trim())
+        .filter((contactId) => toObjectIdIfValid(contactId))
+    )
+  );
+
+  if (!contactIds.length) return list;
+
+  const contacts = await Contact.find(
+    buildScopedFilter(req, { _id: { $in: contactIds.map((id) => toObjectIdIfValid(id) || id) } })
+  )
+    .select(selectFields)
+    .lean();
+
+  const contactsById = new Map(
+    contacts.map((contact) => [String(contact?._id || '').trim(), contact])
+  );
+
+  return list.map((doc) => {
+    const contactId = String(doc?.contactId || '').trim();
+    if (!contactId) return doc;
+    return {
+      ...doc,
+      contactId: contactsById.get(contactId) || doc.contactId || null
+    };
+  });
+};
+
 const buildDealCursorFilter = (cursorValue) => {
   const decodedCursor = decodeCursor(cursorValue);
   if (!decodedCursor?._id || !decodedCursor?.updatedAt) return null;
@@ -2451,7 +2483,6 @@ router.get('/contacts/:id', async (req, res) => {
         .limit(6)
         .lean(),
       Deal.find(buildScopedFilter(req, { contactId: contact._id }))
-        .populate('contactId', CRM_DEAL_CONTACT_FIELDS)
         .sort({ updatedAt: -1, expectedCloseAt: 1, createdAt: -1 })
         .limit(6)
         .lean(),
@@ -2490,6 +2521,7 @@ router.get('/contacts/:id', async (req, res) => {
       : [];
 
     const recentMessages = await attachBroadcastContextToMessages(req, recentMessagesRaw);
+    const hydratedRecentDeals = await hydrateDocsWithContacts(recentDeals, req, CRM_DEAL_CONTACT_FIELDS);
 
     const timeline = buildUnifiedTimeline({
       activities: recentActivities,
@@ -2514,7 +2546,7 @@ router.get('/contacts/:id', async (req, res) => {
         consentAudit: buildConsentAudit(contact, recentConsentLogs),
         leadScoring: buildLeadScoringInsight(contact, leadScoringSettings),
         recentTasks,
-        recentDeals,
+        recentDeals: hydratedRecentDeals,
         recentDocuments,
         recentActivities,
         recentMeetings,
@@ -2918,7 +2950,6 @@ router.get('/deals', async (req, res) => {
     const [deals, total] = await Promise.all([
       Deal.find(scopedFilter)
         .select(CRM_DEAL_LIST_FIELDS)
-        .populate('contactId', CRM_DEAL_CONTACT_FIELDS)
         .sort(sortOrder)
         .skip(useCursor ? 0 : (pageNumber - 1) * pageSize)
         .limit(useCursor ? pageSize + 1 : pageSize)
@@ -2926,10 +2957,11 @@ router.get('/deals', async (req, res) => {
       useCursor ? Promise.resolve(0) : Deal.countDocuments(totalFilter)
     ]);
 
-    const pageDeals = useCursor ? deals.slice(0, pageSize) : deals;
-    const lastDeal = pageDeals[pageDeals.length - 1] || null;
+    const hydratedDeals = await hydrateDocsWithContacts(deals, req, CRM_DEAL_CONTACT_FIELDS);
+    const hydratedPageDeals = useCursor ? hydratedDeals.slice(0, pageSize) : hydratedDeals;
+    const lastDeal = hydratedPageDeals[hydratedPageDeals.length - 1] || null;
     const nextCursor =
-      useCursor && deals.length > pageSize && lastDeal
+      useCursor && hydratedDeals.length > pageSize && lastDeal
         ? encodeCursor({
             updatedAt: lastDeal.updatedAt || new Date(0).toISOString(),
             _id: String(lastDeal._id || '')
@@ -2938,14 +2970,16 @@ router.get('/deals', async (req, res) => {
 
     res.json({
       success: true,
-      data: pageDeals,
+      data: hydratedPageDeals,
       nextCursor,
-      hasMore: useCursor ? deals.length > pageSize : pageNumber < Math.max(Math.ceil(total / pageSize), 1),
+      hasMore: useCursor
+        ? hydratedDeals.length > pageSize
+        : pageNumber < Math.max(Math.ceil(total / pageSize), 1),
       pagination: useCursor
         ? {
             limit: pageSize,
             nextCursor,
-            hasMore: deals.length > pageSize,
+            hasMore: hydratedDeals.length > pageSize,
             total: 0,
             totalPages: 0
           }
@@ -3503,7 +3537,6 @@ router.get('/tasks', async (req, res) => {
 
     const [tasks, total] = await Promise.all([
       LeadTask.find(scopedFilter)
-        .populate('contactId', CRM_TASK_CONTACT_FIELDS)
         .sort({ dueAt: 1, priority: -1, createdAt: -1, _id: -1 })
         .skip(useCursor ? 0 : (pageNumber - 1) * pageSize)
         .limit(useCursor ? pageSize + 1 : pageSize)
@@ -3511,10 +3544,11 @@ router.get('/tasks', async (req, res) => {
       LeadTask.countDocuments(totalFilter)
     ]);
 
-    const pageTasks = useCursor ? tasks.slice(0, pageSize) : tasks;
+    const hydratedTasks = await hydrateDocsWithContacts(tasks, req, CRM_TASK_CONTACT_FIELDS);
+    const pageTasks = useCursor ? hydratedTasks.slice(0, pageSize) : hydratedTasks;
     const lastTask = pageTasks[pageTasks.length - 1] || null;
     const nextCursor =
-      useCursor && tasks.length > pageSize && lastTask
+      useCursor && hydratedTasks.length > pageSize && lastTask
         ? encodeCursor({
             dueAt: lastTask.dueAt ? new Date(lastTask.dueAt).toISOString() : null,
             priorityRank: getTaskPriorityRank(lastTask.priority),

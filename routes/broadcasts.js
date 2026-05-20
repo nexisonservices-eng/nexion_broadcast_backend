@@ -48,6 +48,9 @@ router.get("/selection/campaigns", (req, res) =>
 router.get("/queue/metrics", (req, res) =>
   broadcastController.getQueueMetrics(req, res),
 );
+router.get("/analytics/overview", (req, res) =>
+  broadcastController.getOverviewSummary(req, res),
+);
 router.get("/analytics/reliability", (req, res) =>
   broadcastController.getReliabilitySummary(req, res),
 );

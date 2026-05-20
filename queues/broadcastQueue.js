@@ -8,6 +8,10 @@ const connection = createRedisConnection({
   enableOfflineQueue: true
 });
 const localFallbackJobs = new Map();
+const BROADCAST_QUEUE_SOFT_LIMIT = Math.max(
+  0,
+  Number(process.env.BROADCAST_QUEUE_SOFT_LIMIT || 0)
+);
 
 connection.on('error', (error) => {
   const message = String(error?.message || '').trim();
@@ -177,6 +181,9 @@ const getBroadcastChunkProgressKeys = (broadcastId) => ({
   state: `broadcast:${broadcastId}:chunks:state`
 });
 
+const getBroadcastQueueBackpressureKey = (scope = 'global') =>
+  `broadcast:queue:backpressure:${String(scope || 'global').trim() || 'global'}`;
+
 const initializeBroadcastChunkProgress = async (broadcastId, totalChunks) => {
   const keys = getBroadcastChunkProgressKeys(broadcastId);
   const ttlSeconds = 60 * 60 * 24;
@@ -299,6 +306,20 @@ const enqueueBroadcastSend = async ({
     };
   }
 
+  if (BROADCAST_QUEUE_SOFT_LIMIT > 0) {
+    const counts = await getBroadcastQueueCounts();
+    const backlog =
+      Math.max(0, Number(counts?.waiting || 0) || 0) +
+      Math.max(0, Number(counts?.delayed || 0) || 0);
+    if (backlog >= BROADCAST_QUEUE_SOFT_LIMIT) {
+      return {
+        success: false,
+        error:
+          'Broadcast queue is temporarily busy. Please retry after the current backlog clears.'
+      };
+    }
+  }
+
   const job = await broadcastQueue.add(
     'plan-broadcast',
     {
@@ -378,5 +399,6 @@ module.exports = {
   markBroadcastChunkState,
   getBroadcastChunkProgressSummary,
   clearBroadcastChunkProgress,
-  getBroadcastChunkProgressKeys
+  getBroadcastChunkProgressKeys,
+  getBroadcastQueueBackpressureKey
 };

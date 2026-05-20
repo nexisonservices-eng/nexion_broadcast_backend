@@ -34,6 +34,7 @@ const {
   upsertConversationSummaries,
   upsertConversationSummary
 } = require('../services/conversationSummaryService');
+const Contact = require('../models/Contact');
 const ConversationSummary = require('../models/ConversationSummary');
 const { buildInboxSearchPlan } = require('../utils/inboxSearchPlan');
 
@@ -60,6 +61,60 @@ const buildCompanyWideMessageFilters = (req, extra = {}) => {
     ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
     ...extra
   };
+};
+
+const hydrateConversationContact = async (conversation = {}, req) => {
+  const contactId = String(conversation?.contactId || '').trim();
+  if (!contactId) return conversation;
+
+  const contact = await Contact.findOne({
+    _id: contactId,
+    userId: req.user.id,
+    companyId: req.companyId
+  })
+    .select(
+      '_id name phone email tags status stage leadScore whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt notes nextFollowUpAt sourceType ownerId customFields'
+    )
+    .lean();
+
+  return {
+    ...conversation,
+    contactId: contact || conversation.contactId || null
+  };
+};
+
+const hydrateConversationContacts = async (conversations = [], req) => {
+  const list = Array.isArray(conversations) ? conversations : [];
+  const contactIds = Array.from(
+    new Set(
+      list
+        .map((conversation) => String(conversation?.contactId || '').trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (!contactIds.length) return list;
+
+  const contacts = await Contact.find({
+    _id: { $in: contactIds },
+    userId: req.user.id,
+    companyId: req.companyId
+  })
+    .select('_id name phone email tags status stage leadScore')
+    .lean();
+
+  const contactsById = new Map(
+    contacts.map((contact) => [String(contact?._id || '').trim(), contact])
+  );
+
+  return list.map((conversation) => {
+    const contactId = String(conversation?.contactId || '').trim();
+    if (!contactId) return conversation;
+    return {
+      ...conversation,
+      contactId: contactsById.get(contactId) || conversation.contactId || null
+    };
+  });
 };
 
 const registerLegacyCoreRoutes = (app, deps) => {
@@ -452,12 +507,14 @@ const registerLegacyCoreRoutes = (app, deps) => {
             ...baseFilters,
             _id: { $in: summaryConversationIds }
           };
-          const conversations = await Conversation.find(conversationFilters)
-            .populate('contactId', 'name phone email tags')
-            .lean();
+          const conversations = await Conversation.find(conversationFilters).lean();
+          const hydratedConversations = await hydrateConversationContacts(conversations, req);
 
           const conversationById = new Map(
-            conversations.map((conversation) => [String(conversation?._id || '').trim(), conversation])
+            hydratedConversations.map((conversation) => [
+              String(conversation?._id || '').trim(),
+              conversation
+            ])
           );
 
           const orderedFromSummary = summaryConversationIds
@@ -481,12 +538,15 @@ const registerLegacyCoreRoutes = (app, deps) => {
               _id: { $nin: summaryConversationIds }
             };
             const fallbackConversations = await Conversation.find(fallbackFilters)
-              .populate('contactId', 'name phone email tags')
               .sort({ lastMessageTime: -1 })
               .limit(remainingLimit)
               .lean();
-            const enrichedFallback = await enrichConversationsWithLatestAgentStatus(
+            const hydratedFallbackConversations = await hydrateConversationContacts(
               fallbackConversations,
+              req
+            );
+            const enrichedFallback = await enrichConversationsWithLatestAgentStatus(
+              hydratedFallbackConversations,
               req
             );
             const combined = [...enrichedFromSummary, ...enrichedFallback].sort((a, b) => {
@@ -507,12 +567,15 @@ const registerLegacyCoreRoutes = (app, deps) => {
             ...searchPlan.fallbackClause
           };
           const fallbackConversations = await Conversation.find(fallbackFilters)
-            .populate('contactId', 'name phone email tags')
             .sort({ lastMessageTime: -1 })
             .limit(100)
             .lean();
-          const enrichedFallback = await enrichConversationsWithLatestAgentStatus(
+          const hydratedFallbackConversations = await hydrateConversationContacts(
             fallbackConversations,
+            req
+          );
+          const enrichedFallback = await enrichConversationsWithLatestAgentStatus(
+            hydratedFallbackConversations,
             req
           );
           return res.json(enrichedFallback);
@@ -520,12 +583,12 @@ const registerLegacyCoreRoutes = (app, deps) => {
       }
 
       const conversations = await Conversation.find(baseFilters)
-        .populate('contactId', 'name phone email tags')
         .sort({ lastMessageTime: -1 })
         .limit(100)
         .lean();
+      const hydratedConversations = await hydrateConversationContacts(conversations, req);
       const enrichedConversations = await enrichConversationsWithLatestAgentStatus(
-        conversations,
+        hydratedConversations,
         req
       );
       res.json(dedupeConversationsByIdentity(enrichedConversations));
@@ -580,12 +643,14 @@ const registerLegacyCoreRoutes = (app, deps) => {
         userId: req.user.id,
         companyId: req.companyId
       })
-        .populate('contactId', 'name phone email tags')
+        .select(
+          '_id userId companyId contactId contactPhone contactName status assignedTo lastMessageTime lastMessage lastMessageMediaType lastMessageAttachmentName lastMessageAttachmentPages lastMessageFrom lastMessageWhatsappMessageId lastMessageStatus unreadCount notes createdAt updatedAt resolvedAt'
+        )
         .lean();
       if (!conversation) {
         return res.status(404).json({ error: 'Conversation not found' });
       }
-      return res.json(conversation);
+      return res.json(await hydrateConversationContact(conversation, req));
     } catch (error) {
       return res.status(500).json({ error: error.message });
     }

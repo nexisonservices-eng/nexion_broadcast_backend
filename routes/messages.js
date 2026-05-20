@@ -192,16 +192,11 @@ router.get('/conversation/:id', threadReadRateLimit, async (req, res) => {
         return res.json(cachedResponse);
       }
 
-      const totalMessagesForConversation = await Message.countDocuments({ conversationId });
-      if (totalMessagesForConversation > 0) {
-        await invalidateInboxConversation({
-          companyId: normalizedCompanyId,
-          userId: req.user?.id || '',
-          conversationId
-        });
-      } else {
-        return res.json(cachedResponse);
-      }
+      await invalidateInboxConversation({
+        companyId: normalizedCompanyId,
+        userId: req.user?.id || '',
+        conversationId
+      });
     }
 
     const messages = await loadScopedMessages();

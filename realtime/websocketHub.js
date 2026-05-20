@@ -18,6 +18,8 @@ const createWebSocketHub = ({ wss }) => {
   const roomMembers = new Map();
   const clientMeta = new Map();
   const crmSubscriptions = new Map();
+  const lastPresenceBroadcastByUser = new Map();
+  const lastTypingBroadcastByConversationUser = new Map();
 
   const getRoomKey = (kind, value) => `${kind}:${String(value || '').trim()}`;
   const getClientKey = (ws, fallbackUserId = '') =>
@@ -75,6 +77,13 @@ const createWebSocketHub = ({ wss }) => {
     if (ws.joinedRooms instanceof Set) {
       ws.joinedRooms.clear();
     }
+
+    lastPresenceBroadcastByUser.delete(normalizedUserId);
+    Array.from(lastTypingBroadcastByConversationUser.keys()).forEach((key) => {
+      if (String(key || '').endsWith(`:${normalizedUserId}`)) {
+        lastTypingBroadcastByConversationUser.delete(key);
+      }
+    });
   };
 
   const getRoomSet = (roomId) => {
@@ -360,6 +369,22 @@ const createWebSocketHub = ({ wss }) => {
         activeConversationId: String(activeConversationId || '').trim() || null
       }
     };
+
+    const signature = JSON.stringify({
+      companyId: payload.companyId || '',
+      online: payload.data.online,
+      socketCount: payload.data.socketCount,
+      activeConversationId: payload.data.activeConversationId || ''
+    });
+    const lastPresence = lastPresenceBroadcastByUser.get(normalizedUserId);
+    if (lastPresence && lastPresence.signature === signature) {
+      return payload;
+    }
+    lastPresenceBroadcastByUser.set(normalizedUserId, {
+      signature,
+      updatedAt: Date.now()
+    });
+
     if (payload.companyId) {
       sendToLocalRoom(getRoomKey('company', payload.companyId), payload.data);
     } else {
@@ -391,6 +416,22 @@ const createWebSocketHub = ({ wss }) => {
         displayName: String(displayName || '').trim() || null
       }
     };
+
+    const signature = JSON.stringify({
+      companyId: payload.companyId || '',
+      isTyping: payload.data.isTyping,
+      displayName: payload.data.displayName || ''
+    });
+    const typingKey = `${normalizedConversationId}:${normalizedUserId}`;
+    const lastTyping = lastTypingBroadcastByConversationUser.get(typingKey);
+    if (lastTyping && lastTyping.signature === signature) {
+      return payload;
+    }
+    lastTypingBroadcastByConversationUser.set(typingKey, {
+      signature,
+      updatedAt: Date.now()
+    });
+
     if (payload.conversationId) {
       sendToLocalRoom(getRoomKey('conversation', payload.conversationId), payload.data);
     }

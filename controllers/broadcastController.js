@@ -497,6 +497,40 @@ class BroadcastController {
     }
   }
 
+  async getOverviewSummary(req, res) {
+    try {
+      const normalizedRole = normalizeRole(
+        req.user?.normalizedRole || req.user?.companyRole || req.user?.role,
+      );
+      const tenantWideAccess = isTenantWideRole(normalizedRole);
+      const filters = {};
+
+      if (!tenantWideAccess) {
+        filters.createdById = req.user.id;
+      }
+      if (req.companyId) {
+        filters.companyId = req.companyId;
+      }
+      if (req.query.status) {
+        filters.status = req.query.status;
+      }
+      if (req.query.dateFrom) {
+        filters.createdFrom = req.query.dateFrom;
+      }
+      if (req.query.dateTo) {
+        filters.createdTo = req.query.dateTo;
+      }
+
+      const result = await broadcastService.getOverviewSummary(filters);
+      if (result.success) {
+        return res.json(result);
+      }
+      return res.status(400).json(result);
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
   async retryFailedRecipients(req, res) {
     try {
       const { id } = req.params;

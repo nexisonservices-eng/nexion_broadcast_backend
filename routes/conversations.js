@@ -73,6 +73,9 @@ router.get('/contacts', (req, res) => conversationController.getContacts(req, re
 // Get unique contacts from conversations (for broadcast)
 router.get('/contacts/unique', (req, res) => conversationController.getConversationContacts(req, res));
 
+// Get unread conversation count for hub badges
+router.get('/unread-count', (req, res) => conversationController.getUnreadConversationCount(req, res));
+
 // Create a new contact
 router.post('/contacts', (req, res) => conversationController.createContact(req, res));
 
@@ -126,24 +129,11 @@ router.get('/:id/messages', inboxThreadRateLimit, async (req, res) => {
         .select(
           '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
         )
-        .populate(
-          'replyTo',
-          '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
-        )
         .sort({ timestamp: -1, _id: -1 })
         .limit(limit + 1)
         .lean();
 
     const loadScopedMessages = async () => {
-      if (process.env.NODE_ENV !== 'production') {
-        console.log('[conversations] thread filters', {
-          conversationId,
-          reqCompanyId: req.companyId || null,
-          reqUserCompanyId: req.user?.companyId || null,
-          normalizedCompanyId,
-          queryFilters
-        });
-      }
       const scopedMessages = await loadMessages({
         ...queryFilters,
         ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {})
@@ -173,6 +163,19 @@ router.get('/:id/messages', inboxThreadRateLimit, async (req, res) => {
       });
     };
 
+    const hydrateReplyContext = async (messages = []) => {
+      if (!Array.isArray(messages) || !messages.some((message) => String(message?.replyTo || '').trim())) {
+        return messages;
+      }
+
+      await Message.populate(messages, {
+        path: 'replyTo',
+        select: '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
+      });
+
+      return messages;
+    };
+
     const cachedResponse = threadScope
       ? await getOrSetCachedJson({
           namespace: 'messages',
@@ -181,7 +184,7 @@ router.get('/:id/messages', inboxThreadRateLimit, async (req, res) => {
           keyParts: [String(limit), String(req.query?.cursor || '').trim()],
           ttlSeconds: CACHE_TTL_SECONDS.messages,
           loader: async () => {
-            const messages = await loadScopedMessages();
+            const messages = await hydrateReplyContext(await loadScopedMessages());
 
             const page = buildChronologicalPage({
               documents: messages,
@@ -207,19 +210,14 @@ router.get('/:id/messages', inboxThreadRateLimit, async (req, res) => {
         return res.json(cachedResponse);
       }
 
-      const totalMessagesForConversation = await Message.countDocuments({ conversationId });
-      if (totalMessagesForConversation > 0) {
-        await invalidateInboxConversation({
-          companyId: req.companyId || '',
-          userId: req.user?.id || '',
-          conversationId
-        });
-      } else {
-        return res.json(cachedResponse);
-      }
+      await invalidateInboxConversation({
+        companyId: req.companyId || '',
+        userId: req.user?.id || '',
+        conversationId
+      });
     }
 
-    const messages = await loadScopedMessages();
+    const messages = await hydrateReplyContext(await loadScopedMessages());
 
     const page = buildChronologicalPage({
       documents: messages,
