@@ -50,9 +50,46 @@ const buildLocalTemplateContentFromMeta = (components = []) => {
   };
 };
 
+const prepareMetaTemplateText = (value = '') => {
+  const lines = String(value || '')
+    .replace(/\r\n/g, '\n')
+    .trim()
+    .split('\n')
+    .map((line) => line.trim());
+
+  const collapsedLines = [];
+  let previousWasBlank = false;
+
+  lines.forEach((line) => {
+    const isBlank = line === '';
+    if (isBlank && previousWasBlank) return;
+    collapsedLines.push(line);
+    previousWasBlank = isBlank;
+  });
+  const normalized = collapsedLines.join('\n').trim();
+  if (!normalized) return { text: '', examples: [] };
+
+  const explicitPlaceholderMatch = /\{\{\d+\}\}/.test(normalized);
+  if (explicitPlaceholderMatch) {
+    return { text: normalized, examples: [] };
+  }
+
+  const placeholderExamples = [];
+  let placeholderIndex = 1;
+  const metaBodyPattern = /(?:https?:\/\/[^\s]+|www\.[^\s]+|\+?\d[\d\s().-]{7,}\d)/g;
+  const text = normalized.replace(metaBodyPattern, (match) => {
+    placeholderExamples.push(match.trim());
+    const placeholder = `{{${placeholderIndex}}}`;
+    placeholderIndex += 1;
+    return placeholder;
+  });
+
+  return { text, examples: placeholderExamples };
+};
+
 class TemplateController {
     // Helper function to extract variables from template text
-    extractVariables(text) {
+  extractVariables(text) {
         if (!text) return [];
         
         const variablePattern = /\{\{(\d+)\}\}/g;
@@ -70,21 +107,8 @@ class TemplateController {
         return variables;
     }
 
-  hasStandaloneVariableLine(text) {
-    if (!text) return false;
-    return String(text)
-      .split(/\r?\n/)
-      .some((line) => /^\s*\{\{\d+\}\}\s*$/.test(line));
-  }
-
   buildMetaSafeText(text) {
-    const lines = String(text || '')
-      .replace(/\r\n/g, '\n')
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean);
-
-    return lines.join(' ').replace(/\s+/g, ' ').trim();
+    return prepareMetaTemplateText(text).text;
   }
   async getAllTemplates(req, res) {
     try {
@@ -169,16 +193,13 @@ class TemplateController {
         });
       }
 
-      if (this.hasStandaloneVariableLine(templateContent?.body || bodyText)) {
-        return res.status(400).json({
-          success: false,
-          error: 'Variables cannot be alone on a line. Put text before or after the variable.'
-        });
-      }
-
-      const bodyForVariables = templateContent?.body || bodyText;
-      const variables = this.extractVariables(bodyForVariables);
-      const metaSafeBody = this.buildMetaSafeText(bodyForVariables);
+      const preparedBody = prepareMetaTemplateText(templateContent?.body || bodyText);
+      const bodyForVariables = preparedBody.text;
+      const variables = this.extractVariables(bodyForVariables).map((variable, index) => ({
+        ...variable,
+        example: preparedBody.examples[index] || variable.example
+      }));
+      const preservedBody = bodyForVariables;
 
       const templateData = {
         userId: req.user.id,
@@ -202,7 +223,7 @@ class TemplateController {
               if (!componentType) return null;
 
               if (componentType === 'BODY') {
-                const bodyTextForMeta = this.buildMetaSafeText(component?.text || bodyForVariables);
+                const bodyTextForMeta = prepareMetaTemplateText(component?.text || bodyForVariables).text;
                 if (!bodyTextForMeta) return null;
 
                 return {
@@ -248,7 +269,14 @@ class TemplateController {
               : []),
             {
               type: 'BODY',
-              text: metaSafeBody
+              text: preservedBody,
+              ...(preparedBody.examples.length > 0
+                ? {
+                    example: {
+                      body_text: [preparedBody.examples]
+                    }
+                  }
+                : {})
             },
             ...(templateContent?.footer
               ? [{
@@ -304,14 +332,6 @@ class TemplateController {
         }
       }
 
-      if (!metaResult.success && !existingMetaTemplate) {
-        return res.status(400).json({
-          success: false,
-          error: metaResult.error || 'Failed to submit template to Meta',
-          details: metaResult.details || null
-        });
-      }
-
       if (existingMetaTemplate) {
         templateData.category = existingMetaTemplate.category || templateData.category;
         templateData.language = existingMetaTemplate.language || templateData.language;
@@ -321,7 +341,7 @@ class TemplateController {
         templateData.variables = this.extractVariables(templateData.content?.body || '');
       }
 
-      // Save locally only after Meta creation is successful.
+      // Save locally even when Meta rejects the payload so the draft is not lost.
       const savedTemplate = await Template.findOneAndUpdate(
         { userId: req.user.id, companyId: req.companyId, name: normalizedName },
         {
@@ -331,13 +351,28 @@ class TemplateController {
         { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
       );
 
+      if (!metaResult.success && !existingMetaTemplate) {
+        return res.status(201).json({
+          success: true,
+          data: savedTemplate,
+          message: 'Template saved locally, but Meta submission failed',
+          metaSubmission: {
+            success: false,
+            error: metaResult.error || 'Failed to submit template to Meta',
+            details: metaResult.details || null
+          }
+        });
+      }
+
       res.status(201).json({
         success: true,
         data: savedTemplate,
-        message: 'Template saved locally, but Meta submission failed',
+        message: existingMetaTemplate
+          ? 'Template matched an existing Meta template and was saved locally'
+          : 'Template created successfully',
         metaSubmission: {
-          success: false,
-          error: metaResult.error || 'Failed to submit template to Meta',
+          success: true,
+          error: null,
           details: metaResult.details || null
         }
       });
@@ -358,9 +393,17 @@ class TemplateController {
 
   async updateTemplate(req, res) {
     try {
+      const updateData = { ...req.body };
+      if (updateData.content && typeof updateData.content === 'object') {
+        updateData.content = {
+          ...updateData.content,
+          body: prepareMetaTemplateText(updateData.content.body || '').text,
+          footer: prepareMetaTemplateText(updateData.content.footer || '').text
+        };
+      }
       const template = await Template.findOneAndUpdate(
         { _id: req.params.id, userId: req.user.id, companyId: req.companyId },
-        req.body,
+        updateData,
         { new: true, runValidators: true }
       );
       if (!template) {
