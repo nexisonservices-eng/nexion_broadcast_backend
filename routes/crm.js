@@ -4698,9 +4698,13 @@ router.get('/metrics', async (req, res) => {
 
 router.get('/ops/owner-dashboard', async (req, res) => {
   try {
+    const ownerLimit = Math.min(Math.max(Number(req.query?.limit) || 0, 0), 200) || null;
+    const ownerOffset = Math.min(Math.max(Number(req.query?.offset) || 0, 0), 1000) || null;
     const dashboard = await getCrmOwnerDashboard({
       userId: req.user?.id || null,
-      companyId: req.companyId || null
+      companyId: req.companyId || null,
+      ownerLimit,
+      ownerOffset
     });
 
     res.json({ success: true, data: dashboard });

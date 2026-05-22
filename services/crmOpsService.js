@@ -331,7 +331,12 @@ const aggregateOwnerTasks = async (scope = {}, now = new Date()) => {
   ]);
 };
 
-const getCrmOwnerDashboard = async ({ userId = null, companyId = null } = {}) => {
+const getCrmOwnerDashboard = async ({
+  userId = null,
+  companyId = null,
+  ownerLimit = null,
+  ownerOffset = null
+} = {}) => {
   const now = new Date();
   const { startOfDay, endOfDay } = getDayRange(now);
   const replySlaHours = DEFAULT_REPLY_SLA_HOURS;
@@ -461,6 +466,16 @@ const getCrmOwnerDashboard = async ({ userId = null, companyId = null } = {}) =>
       return scoreRight - scoreLeft;
     });
 
+  const normalizedOwnerOffset = Number(ownerOffset);
+  const normalizedOwnerLimit = Number(ownerLimit);
+  const sliceStart = Number.isFinite(normalizedOwnerOffset) && normalizedOwnerOffset > 0
+    ? Math.floor(normalizedOwnerOffset)
+    : 0;
+  const visibleOwners =
+    Number.isFinite(normalizedOwnerLimit) && normalizedOwnerLimit > 0
+      ? owners.slice(sliceStart, sliceStart + Math.floor(normalizedOwnerLimit))
+      : owners.slice(sliceStart);
+
   return {
     summary: {
       myLeads: Number(myLeads || 0),
@@ -474,7 +489,7 @@ const getCrmOwnerDashboard = async ({ userId = null, companyId = null } = {}) =>
       dueTodayTasks: Number(dueTodayTasks || 0),
       openDeals: Number(openDeals || 0)
     },
-    owners,
+    owners: visibleOwners,
     slaHours: replySlaHours,
     generatedAt: now.toISOString()
   };
