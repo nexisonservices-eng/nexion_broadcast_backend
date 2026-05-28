@@ -24,6 +24,9 @@ const {
 const {
   recordConversationInboundUnread
 } = require('../utils/conversationReadStateCache');
+const {
+  forwardIvrNotificationStatus
+} = require('../services/ivrNotificationStatusBridge');
 
 const truncateMediaDebugValue = (value, max = 120) => {
   const raw = String(value || '').trim();
@@ -799,6 +802,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         conversationStatus: statusData.conversation?.id,
         error: statusError || undefined
       });
+
+      await forwardIvrNotificationStatus(statusData);
 
       let message = null;
       if (companyId) {
