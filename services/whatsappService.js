@@ -497,6 +497,23 @@ class WhatsAppService {
               const providedBodyTextCount =
                 countTextParameters(normalizedProvidedComponents, 'BODY') || variables.length;
 
+              if (
+                normalizedProvidedComponents.length === 0 &&
+                !headerRequirements.requiresMedia &&
+                headerRequirements.variableCount === 0 &&
+                variables.length > requiredBodyVariables
+              ) {
+                return this.sendTemplateMessage(
+                  to,
+                  candidate.name || normalizedTemplateName,
+                  candidate.language || language,
+                  variables.slice(0, requiredBodyVariables),
+                  credentials,
+                  false,
+                  null
+                );
+              }
+
               if (headerRequirements.requiresMedia && !providedHeaderMedia) {
                 return {
                   success: false,
