@@ -1,5 +1,6 @@
 const Contact = require('../../models/Contact');
 const Conversation = require('../../models/Conversation');
+const { normalizeRole, isTenantWideRole } = require('../../utils/accessControl');
 const {
   buildConversationPhoneLookupFilter,
   buildPhoneCandidates,
@@ -24,15 +25,18 @@ const resolveConversationForOutboundSend = async ({
   userId,
   companyId,
   conversationId,
-  to
+  to,
+  isTenantWide = false
 }) => {
   if (!userId || !conversationId) return null;
 
-  const baseIdQuery = { _id: conversationId, userId };
-  const byScope = await Conversation.findOne({
-    ...baseIdQuery,
+  const baseIdQuery = {
+    _id: conversationId,
     ...buildCompanyScopeFilter(companyId)
-  });
+  };
+  const byScope = await Conversation.findOne(
+    isTenantWide ? baseIdQuery : { ...baseIdQuery, userId }
+  );
   if (byScope) return byScope;
 
   const phoneCandidates = buildPhoneCandidates(to);
@@ -40,11 +44,18 @@ const resolveConversationForOutboundSend = async ({
   if (!phoneCandidates.length && !phoneLookupFilter) return null;
 
   return maybeApplySort(
-    Conversation.findOne({
-      userId,
-      ...buildCompanyScopeFilter(companyId),
-      ...(phoneLookupFilter || { contactPhone: { $in: phoneCandidates } })
-    }),
+    Conversation.findOne(
+      isTenantWide
+        ? {
+            ...buildCompanyScopeFilter(companyId),
+            ...(phoneLookupFilter || { contactPhone: { $in: phoneCandidates } })
+          }
+        : {
+            userId,
+            ...buildCompanyScopeFilter(companyId),
+            ...(phoneLookupFilter || { contactPhone: { $in: phoneCandidates } })
+          }
+    ),
     { lastMessageTime: -1, updatedAt: -1, createdAt: -1 }
   );
 };
@@ -109,13 +120,15 @@ const resolveOrCreateConversationForTemplateSend = async ({
   conversationId,
   contactId,
   to,
-  contactName = ''
+  contactName = '',
+  isTenantWide = false
 }) => {
   const existingConversation = await resolveConversationForOutboundSend({
     userId,
     companyId,
     conversationId,
-    to
+    to,
+    isTenantWide
   });
 
   if (existingConversation) {
@@ -175,6 +188,7 @@ const resolveOrCreateConversationForTemplateSend = async ({
       contactId: contact._id,
       contactPhone: String(contact?.phone || to || '').trim(),
       contactName: String(contact?.name || contactName || to || '').trim(),
+      channel: 'whatsapp',
       status: 'active',
       lastMessageTime: new Date(),
       lastMessage: '',

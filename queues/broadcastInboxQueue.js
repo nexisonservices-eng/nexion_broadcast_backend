@@ -33,6 +33,52 @@ const createNoopQueueEvents = () => ({
   close: async () => undefined
 });
 
+const localFallbackJobs = new Map();
+
+const scheduleLocalFallbackJob = async ({ jobId, delayMs = 0, run }) => {
+  const existing = localFallbackJobs.get(jobId);
+  if (existing) {
+    return existing.job;
+  }
+
+  const job = {
+    id: jobId,
+    data: {}
+  };
+
+  localFallbackJobs.set(jobId, { job });
+
+  if (Math.max(0, Math.trunc(Number(delayMs) || 0)) <= 0) {
+    try {
+      if (typeof run === 'function') {
+        await run();
+      }
+    } catch (error) {
+      console.error('Local broadcast inbox fallback job failed:', error?.message || error);
+    } finally {
+      localFallbackJobs.delete(jobId);
+    }
+    return job;
+  }
+
+  const timer = setTimeout(async () => {
+    try {
+      if (typeof run === 'function') {
+        await run();
+      }
+    } catch (error) {
+      console.error('Local broadcast inbox fallback job failed:', error?.message || error);
+    } finally {
+      localFallbackJobs.delete(jobId);
+    }
+  }, Math.max(0, Math.trunc(Number(delayMs) || 0)));
+
+  timer.unref?.();
+  localFallbackJobs.set(jobId, { job, timer });
+
+  return job;
+};
+
 const broadcastInboxQueue = isRedisDisabled
   ? createNoopQueue()
   : new Queue(queueName, {
@@ -58,13 +104,6 @@ const broadcastInboxQueueEvents = isRedisDisabled
   : new QueueEvents(queueName, { connection });
 
 const enqueueBroadcastInboxWrite = async (payload = {}) => {
-  if (isRedisDisabled) {
-    return {
-      success: false,
-      error: `${getRedisDisabledReason()}. Configure REDIS_URL or REDIS_HOST/REDIS_PORT to enable broadcast inbox writes.`
-    };
-  }
-
   const {
     broadcastId,
     userId,
@@ -75,11 +114,30 @@ const enqueueBroadcastInboxWrite = async (payload = {}) => {
     broadcastDispatchKey = '',
     templateCategory = '',
     contactId = '',
-    skipActivityLog = false
+    skipActivityLog = false,
+    fallbackProcess = null
   } = payload;
 
   if (!broadcastId || !userId || !phoneNumber) {
     return { success: false, error: 'Missing broadcast inbox queue payload' };
+  }
+
+  if (isRedisDisabled) {
+    if (typeof fallbackProcess !== 'function') {
+      return {
+        success: false,
+        error: `${getRedisDisabledReason()}. Configure REDIS_URL or REDIS_HOST/REDIS_PORT to enable broadcast inbox writes.`
+      };
+    }
+
+    const jobId = `broadcast-inbox:${String(broadcastDispatchKey || `${broadcastId}:${phoneNumber}`)}`;
+    const job = await scheduleLocalFallbackJob({
+      jobId,
+      delayMs: 0,
+      run: fallbackProcess
+    });
+
+    return { success: true, data: { jobId: job.id, localFallback: true } };
   }
 
   const job = await broadcastInboxQueue.add(

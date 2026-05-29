@@ -63,8 +63,16 @@ const ContactSchema = new mongoose.Schema(
   {
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, default: null },
     companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'company', index: true, default: null },
+    createdBy: { type: String, default: null, index: true },
+    assignedTo: { type: String, default: null, index: true },
     stage: { type: String, default: 'new', index: true },
     status: { type: String, default: 'new', index: true },
+    leadStatus: {
+      type: String,
+      enum: ['new_lead', 'interested', 'follow_up', 'proposal_sent', 'converted', 'closed'],
+      default: 'new_lead',
+      index: true
+    },
     lastStageChangedAt: { type: Date, default: null },
     name: { type: String, default: '' },
     nameLower: { type: String, default: '', index: true },
@@ -72,8 +80,20 @@ const ContactSchema = new mongoose.Schema(
     phoneDigits: { type: String, default: '', index: true },
     email: String,
     tags: [{ type: String }],
+    assignedAgent: { type: String, default: null, index: true },
+    followupDate: { type: Date, default: null, index: true },
     customFields: mongoose.Schema.Types.Mixed,
     notes: String,
+    internalNotes: {
+      type: [
+        {
+          text: { type: String, required: true, trim: true, maxlength: 2000 },
+          createdBy: { type: String, default: null },
+          createdAt: { type: Date, default: Date.now }
+        }
+      ],
+      default: []
+    },
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now },
     lastContact: Date,
@@ -106,6 +126,8 @@ ContactSchema.pre('insertMany', function(next, docs) {
 });
 
 ContactSchema.index({ companyId: 1, userId: 1, phone: 1 });
+ContactSchema.index({ companyId: 1, createdBy: 1, assignedTo: 1, leadStatus: 1, followupDate: 1, createdAt: -1, _id: -1 });
+ContactSchema.index({ companyId: 1, userId: 1, assignedAgent: 1, leadStatus: 1, followupDate: 1, createdAt: -1, _id: -1 });
 ContactSchema.index({ companyId: 1, userId: 1, nameLower: 1, lastContact: -1, createdAt: -1, _id: -1 });
 ContactSchema.index({ companyId: 1, userId: 1, phoneDigits: 1, lastContact: -1, createdAt: -1, _id: -1 });
 ContactSchema.index({

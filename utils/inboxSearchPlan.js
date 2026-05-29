@@ -60,6 +60,15 @@ const buildInboxSearchPlan = (search = '') => {
     };
   }
 
+  const indexedSummaryClause = {
+    $or: [
+      { contactNameLower: buildPrefixRange(normalizedSearchLower) },
+      ...(isDigitsOnlySearch(normalizedSearchPhone)
+        ? [{ contactPhoneDigits: buildPrefixRange(normalizedSearchPhone) }]
+        : [])
+    ]
+  };
+
   const regexClause = {
     $or: [
       { contactName: { $regex: normalizedSearch, $options: 'i' } },
@@ -70,9 +79,9 @@ const buildInboxSearchPlan = (search = '') => {
 
   return {
     mode: 'generic',
-    summaryClause: regexClause,
+    summaryClause: indexedSummaryClause,
     fallbackClause: regexClause,
-    hint: null
+    hint: { companyId: 1, userId: 1, contactNameLower: 1, lastMessageTime: -1, _id: -1 }
   };
 };
 

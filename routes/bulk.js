@@ -6,7 +6,6 @@ const auth = require("../middleware/auth");
 const requirePlanFeature = require("../middleware/planGuard");
 const requireWhatsAppCredentials = require("../middleware/requireWhatsAppCredentials");
 const broadcastService = require("../services/broadcastService");
-const { enqueueBroadcastSend } = require("../queues/broadcastQueue");
 const {
   enqueueCsvImport,
   cancelCsvImportQueueJob,
@@ -605,34 +604,26 @@ router.post(
         });
       }
 
-      const queueResult = await enqueueBroadcastSend({
-        broadcastId: created.data._id,
-        userId: req.user.id,
-        companyId: req.companyId || null,
-        delayMs: 0,
-        reason: "bulk_send",
-        fallbackProcess: () =>
-          broadcastService.sendBroadcast(
-            created.data._id,
-            null,
-            req.whatsappCredentials || null,
-          ),
-      });
+      const sendResult = await broadcastService.sendBroadcast(
+        created.data._id,
+        null,
+        req.whatsappCredentials || null,
+      );
 
-      if (!queueResult?.success) {
-        return res.status(400).json(queueResult);
+      if (!sendResult?.success) {
+        return res.status(400).json(sendResult);
       }
 
-      return res.status(202).json({
+      return res.status(200).json({
         success: true,
-        queued: true,
+        queued: false,
         broadcastId: created.data._id,
-        jobId: queueResult.data.jobId,
         total_sent: resolvedRecipients.length,
-        successful: 0,
-        failed: 0,
-        results: [],
-        message: "Broadcast queued. Sending will continue in the background.",
+        successful: Number(sendResult?.data?.successful || 0),
+        failed: Number(sendResult?.data?.failed || 0),
+        results: sendResult?.data?.results || [],
+        data: sendResult.data,
+        message: "Broadcast sent. Inbox updates were written immediately.",
       });
     } catch (error) {
       return res.status(500).json({

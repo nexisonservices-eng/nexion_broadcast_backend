@@ -29,9 +29,9 @@ const { buildContactSearchPlan } = require('../utils/contactSearchPlan');
 
 const TEAM_INBOX_CONTACT_LIST_FIELDS = '_id name leadScore';
 const TEAM_INBOX_CONTACT_DETAIL_FIELDS =
-  '_id name phone tags status stage leadScore leadScoreBreakdown isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt';
+  '_id name phone tags status stage leadStatus assignedAgent followupDate internalNotes leadScore leadScoreBreakdown isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt';
 const CONTACT_LIST_FIELDS =
-  '_id name phone email tags stage status source ownerId sourceType lastContact lastContactAt nextFollowUpAt isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata whatsappMarketingWindowStartedAt whatsappMarketingSendCount whatsappMarketingLastSentAt whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt leadScore createdAt updatedAt';
+  '_id name phone email tags stage status leadStatus source ownerId assignedAgent sourceType lastContact lastContactAt nextFollowUpAt followupDate isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata whatsappMarketingWindowStartedAt whatsappMarketingSendCount whatsappMarketingLastSentAt whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt leadScore internalNotes createdAt updatedAt';
 
 const encodeContactCursor = (contact = {}) => {
   const payload = {
@@ -117,8 +117,11 @@ const TEAM_INBOX_CONVERSATION_FIELDS = [
   'contactId',
   'contactPhone',
   'contactName',
+  'channel',
   'status',
+  'leadStatus',
   'assignedTo',
+  'assignedAgent',
   'lastMessageTime',
   'lastMessage',
   'lastMessageMediaType',
@@ -128,6 +131,11 @@ const TEAM_INBOX_CONVERSATION_FIELDS = [
   'lastMessageWhatsappMessageId',
   'lastMessageStatus',
   'unreadCount',
+  'important',
+  'followupAt',
+  'notes',
+  'internalNotes',
+  'resolvedAt',
   'createdAt',
   'updatedAt'
 ].join(' ');
@@ -195,18 +203,24 @@ const decodeConversationCursor = (cursor = '') => {
   }
 };
 
-const buildConversationCursorFilter = (cursor) => {
+const buildConversationCursorFilter = (cursor, direction = 'next') => {
   if (!cursor?.lastMessageTime) return {};
 
   const cursorTime = new Date(cursor.lastMessageTime);
   if (Number.isNaN(cursorTime.getTime())) return {};
 
+  const normalizedDirection = String(direction || 'next').trim().toLowerCase();
+  const isPreviousPage = normalizedDirection === 'prev';
+  const comparisonOperator = isPreviousPage ? '$gt' : '$lt';
+
   return {
     $or: [
-      { lastMessageTime: { $lt: cursorTime } },
+      { lastMessageTime: { [comparisonOperator]: cursorTime } },
       {
         lastMessageTime: cursorTime,
-        _id: cursor.id ? { $lt: new mongoose.Types.ObjectId(cursor.id) } : { $exists: true }
+        _id: cursor.id
+          ? { [comparisonOperator]: new mongoose.Types.ObjectId(cursor.id) }
+          : { $exists: true }
       }
     ]
   };
@@ -268,10 +282,18 @@ const attachContactSnapshotsToConversations = async (
   });
 };
 
-const loadConversationSummaryRows = async ({ finalFilters, limit, queryHint = null }) => {
+const loadConversationSummaryRows = async ({
+  finalFilters,
+  limit,
+  queryHint = null,
+  cursorDirection = 'next'
+}) => {
+  const normalizedDirection = String(cursorDirection || 'next').trim().toLowerCase();
+  const isPreviousPage = normalizedDirection === 'prev';
+  const cursorSort = isPreviousPage ? 1 : -1;
   let query = ConversationSummary.find(finalFilters)
     .select(TEAM_INBOX_CONVERSATION_FIELDS)
-    .sort({ lastMessageTime: -1, _id: -1 })
+    .sort({ lastMessageTime: cursorSort, _id: cursorSort })
     .lean();
 
   if (queryHint) {
@@ -300,7 +322,7 @@ const loadConversationSummaryRows = async ({ finalFilters, limit, queryHint = nu
 
     let fallbackQuery = ConversationSummary.find(finalFilters)
       .select(TEAM_INBOX_CONVERSATION_FIELDS)
-      .sort({ lastMessageTime: -1, _id: -1 })
+      .sort({ lastMessageTime: cursorSort, _id: cursorSort })
       .lean();
 
     if (limit > 0) {
@@ -313,19 +335,23 @@ const loadConversationSummaryRows = async ({ finalFilters, limit, queryHint = nu
   let hasMore = false;
   if (limit > 0 && conversations.length > limit) {
     hasMore = true;
+    const pageConversations = conversations.slice(0, limit);
     return {
-      conversations: conversations.slice(0, limit),
+      conversations: isPreviousPage ? pageConversations.reverse() : pageConversations,
       hasMore,
-      nextCursor: encodeConversationCursor(conversations[limit - 1])
+      nextCursor: encodeConversationCursor(pageConversations[pageConversations.length - 1]),
+      previousCursor: encodeConversationCursor(pageConversations[0])
     };
   }
 
+  const pageConversations = isPreviousPage ? conversations.slice().reverse() : conversations;
   return {
-    conversations,
+    conversations: pageConversations,
     hasMore,
-    nextCursor: conversations.length
-      ? encodeConversationCursor(conversations[conversations.length - 1])
-      : null
+    nextCursor: pageConversations.length
+      ? encodeConversationCursor(pageConversations[pageConversations.length - 1])
+      : null,
+    previousCursor: pageConversations.length ? encodeConversationCursor(pageConversations[0]) : null
   };
 };
 
@@ -353,19 +379,246 @@ const buildConversationUnreadFilterClause = (conversationFilter = 'all') => {
   return null;
 };
 
-const encodeConversationCursorCacheKey = (cursor = null) => {
+const normalizeInboxView = (value = '') => {
+  const normalized = String(value || '').trim().toLowerCase();
+  const allowedViews = new Set([
+    'all',
+    'team',
+    'unassigned',
+    'assigned',
+    'my',
+    'closed',
+    'archived',
+    'whatsapp',
+    'broadcast-replies',
+    'instagram',
+    'facebook',
+    'groups',
+    'important',
+    'followups',
+    'assigned-leads'
+  ]);
+  return allowedViews.has(normalized) ? normalized : 'all';
+};
+
+const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
+  const normalizedView = normalizeInboxView(view);
+  const normalizedUserId = String(userId || '').trim();
+
+  const activeStatuses = ['active', 'pending'];
+  const closedStatuses = ['resolved'];
+
+  switch (normalizedView) {
+    case 'unassigned':
+      return {
+        $or: [
+          { assignedTo: { $in: [null, ''] } },
+          { assignedTo: { $exists: false } },
+          { assignedToId: null },
+          { assignedToId: { $exists: false } }
+        ]
+      };
+    case 'assigned':
+      return {
+        $and: [
+          {
+            $or: [
+              { assignedTo: { $nin: [null, ''] } },
+              { assignedToId: { $ne: null } }
+            ]
+          },
+          { status: { $in: activeStatuses } }
+        ]
+      };
+    case 'my':
+      return normalizedUserId
+        ? {
+            $and: [
+              {
+                $or: [
+                  { assignedTo: normalizedUserId },
+                  { assignedToId: normalizedUserId }
+                ]
+              },
+              { status: { $in: activeStatuses } }
+            ]
+          }
+        : { status: { $in: activeStatuses } };
+    case 'closed':
+      return {
+        $or: [
+          { status: { $in: closedStatuses } },
+          { leadStatus: 'closed' }
+        ]
+      };
+    case 'archived':
+      return { status: 'archived' };
+    case 'whatsapp':
+      return { channel: 'whatsapp' };
+    case 'broadcast-replies':
+      return { channel: 'broadcast_reply' };
+    case 'instagram':
+      return { channel: 'instagram' };
+    case 'facebook':
+      return { channel: 'facebook' };
+    case 'groups':
+      return { channel: 'group' };
+    case 'important':
+      return { important: true };
+      case 'followups':
+        return { followupAt: { $ne: null } };
+    case 'assigned-leads':
+      return normalizedUserId
+        ? {
+            $or: [
+              { assignedTo: normalizedUserId },
+              { assignedToId: normalizedUserId }
+            ]
+          }
+        : { assignedTo: { $nin: [null, ''] } };
+    case 'team':
+      return { status: { $in: activeStatuses } };
+    case 'all':
+    default:
+      return {};
+  }
+};
+
+const buildConversationViewFilters = (req, extra = {}) => {
+  const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+  const isAgent = !isTenantWideRole(normalizedRole);
+  const normalizedView = normalizeInboxView(req?.query?.view || req?.query?.inboxView || extra?.view);
+  const normalizedUserId = String(req?.user?.id || '').trim();
+  const baseFilters = {
+    companyId: req.companyId,
+    ...extra
+  };
+  delete baseFilters.view;
+  delete baseFilters.inboxView;
+
+  const viewFilter = buildConversationStatusFilter(
+    isAgent ? (normalizedView === 'all' ? 'my' : normalizedView) : normalizedView,
+    { userId: normalizedUserId }
+  );
+
+  if (isAgent) {
+    const ownershipFilter = normalizedUserId
+      ? {
+          $or: [
+            { assignedTo: normalizedUserId },
+            { assignedToId: normalizedUserId }
+          ]
+        }
+      : {};
+
+    return {
+      ...baseFilters,
+      ...(Object.keys(ownershipFilter).length ? { $and: [ownershipFilter, viewFilter].filter(Boolean) } : {}),
+      ...(Object.keys(ownershipFilter).length === 0 ? viewFilter : {})
+    };
+  }
+
+  return {
+    ...baseFilters,
+    ...viewFilter
+  };
+};
+
+const buildContactViewFilters = (req, extra = {}) => {
+  const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+  const isAgent = !isTenantWideRole(normalizedRole);
+  const normalizedView = normalizeInboxView(req?.query?.view || req?.query?.inboxView || extra?.view);
+  const normalizedUserId = String(req?.user?.id || '').trim();
+  const baseFilters = {
+    companyId: req.companyId,
+    ...extra
+  };
+  delete baseFilters.view;
+  delete baseFilters.inboxView;
+
+  const leadStatusFilter = (() => {
+    switch (isAgent ? (normalizedView === 'all' ? 'my' : normalizedView) : normalizedView) {
+      case 'closed':
+        return { leadStatus: 'closed' };
+      case 'followups':
+        return {
+          $or: [
+            { followupDate: { $ne: null } },
+            { nextFollowUpAt: { $ne: null } }
+          ]
+        };
+      case 'important':
+        return { important: true };
+      case 'assigned':
+      case 'assigned-leads':
+      case 'my':
+        return normalizedUserId
+          ? {
+              $or: [
+                { assignedTo: normalizedUserId },
+                { assignedToId: normalizedUserId }
+              ]
+            }
+          : { assignedTo: { $ne: null } };
+      case 'unassigned':
+        return {
+          $or: [
+            { assignedTo: { $in: [null, ''] } },
+            { assignedTo: { $exists: false } },
+            { assignedToId: null },
+            { assignedToId: { $exists: false } }
+          ]
+        };
+      default:
+        return {};
+    }
+  })();
+
+  if (isAgent) {
+    const ownershipFilter = normalizedUserId
+      ? {
+          $or: [
+            { assignedTo: normalizedUserId },
+            { assignedToId: normalizedUserId }
+          ]
+        }
+      : {};
+    return {
+      ...baseFilters,
+      ...(Object.keys(ownershipFilter).length
+        ? { $and: [ownershipFilter, leadStatusFilter].filter(Boolean) }
+        : {}),
+      ...(Object.keys(ownershipFilter).length === 0 ? leadStatusFilter : {})
+    };
+  }
+
+  return {
+    ...baseFilters,
+    ...leadStatusFilter
+  };
+};
+
+const encodeConversationCursorCacheKey = (cursor = null, direction = 'next') => {
   if (!cursor?.lastMessageTime) return '';
 
   const lastMessageTime = new Date(cursor.lastMessageTime);
   if (Number.isNaN(lastMessageTime.getTime())) return '';
 
-  return `${lastMessageTime.toISOString()}::${String(cursor.id || '').trim()}`;
+  return `${String(direction || 'next').trim().toLowerCase()}::${lastMessageTime.toISOString()}::${String(cursor.id || '').trim()}`;
 };
 
-const loadConversationFallbackRows = async ({ finalFilters, limit, skip = 0 }) => {
+const loadConversationFallbackRows = async ({
+  finalFilters,
+  limit,
+  skip = 0,
+  cursorDirection = 'next'
+}) => {
+  const normalizedDirection = String(cursorDirection || 'next').trim().toLowerCase();
+  const isPreviousPage = normalizedDirection === 'prev';
+  const cursorSort = isPreviousPage ? 1 : -1;
   let query = Conversation.find(finalFilters)
     .select(TEAM_INBOX_CONVERSATION_FIELDS)
-    .sort({ lastMessageTime: -1, _id: -1 })
+    .sort({ lastMessageTime: cursorSort, _id: cursorSort })
     .lean();
 
   if (skip > 0) {
@@ -389,9 +642,10 @@ const loadConversationFallbackRows = async ({ finalFilters, limit, skip = 0 }) =
   }
 
   return {
-    conversations: rawItems,
+    conversations: isPreviousPage ? rawItems.reverse() : rawItems,
     hasMore,
-    nextCursor: hasMore ? encodeConversationCursor(rawItems[rawItems.length - 1]) : null
+    nextCursor: hasMore ? encodeConversationCursor(rawItems[rawItems.length - 1]) : null,
+    previousCursor: rawItems.length ? encodeConversationCursor(rawItems[0]) : null
   };
 };
 
@@ -402,9 +656,11 @@ const loadConversationSummaryPage = async ({
   req,
   scope,
   cacheKeyParts,
-  queryHint = null
+  queryHint = null,
+  cursorDirection = 'next'
 }) => {
   const fetchLimit = limit > 0 ? Math.max(limit + 1, limit) : 0;
+  const normalizedDirection = String(cursorDirection || 'next').trim().toLowerCase();
   const mergeConversationRows = (primaryRows = [], secondaryRows = []) => {
     const mergedById = new Map();
 
@@ -428,17 +684,18 @@ const loadConversationSummaryPage = async ({
     const summaryRows = await loadConversationSummaryRows({
       finalFilters: summaryFilters,
       limit: fetchLimit,
-      queryHint
+      queryHint,
+      cursorDirection: normalizedDirection
     });
 
     const shouldLoadFallback =
-      Boolean(summaryRows?.hasMore) ||
-      (limit > 0 && Array.isArray(summaryRows?.conversations) && summaryRows.conversations.length < limit);
+      !Array.isArray(summaryRows?.conversations) || summaryRows.conversations.length === 0;
 
     const fallbackRows = shouldLoadFallback
       ? await loadConversationFallbackRows({
           finalFilters: fallbackFilters,
           limit: fetchLimit,
+          cursorDirection: normalizedDirection
         })
       : { conversations: [], hasMore: false, nextCursor: null };
 
@@ -460,7 +717,10 @@ const loadConversationSummaryPage = async ({
       (conversationId) => !summaryConversationIds.has(conversationId)
     );
 
-    if (shouldBackfillSummaries) {
+    if (
+      shouldBackfillSummaries &&
+      String(process.env.INBOX_BACKFILL_SUMMARIES_ON_READ || '').trim().toLowerCase() === 'true'
+    ) {
       void upsertConversationSummaries(fallbackRows.conversations).catch((error) => {
         console.error('Failed to backfill conversation summaries from merged page:', error);
       });
@@ -477,7 +737,9 @@ const loadConversationSummaryPage = async ({
       nextCursor:
         pageHasMore && pagedConversations.length > 0
           ? encodeConversationCursor(pagedConversations[pagedConversations.length - 1])
-          : null
+          : null,
+      previousCursor:
+        pagedConversations.length > 0 ? encodeConversationCursor(pagedConversations[0]) : null
     };
   };
 
@@ -504,6 +766,92 @@ const loadConversationSummaryPage = async ({
   };
 };
 
+const loadInboxOverviewSnapshot = async (req, { isAgent = false, filters = {}, scope = '' } = {}) => {
+  const viewKeys = isAgent
+    ? ['my', 'assigned-leads', 'followups', 'closed', 'archived', 'whatsapp']
+    : [
+        'all',
+        'unassigned',
+        'assigned',
+        'closed',
+        'archived',
+        'my',
+        'team',
+        'important',
+        'followups',
+        'assigned-leads',
+        'whatsapp',
+        'broadcast-replies',
+        'instagram',
+        'facebook',
+        'groups'
+      ];
+
+  const normalizeCount = (aggregation = {}, key = '') =>
+    Number(aggregation?.[key]?.[0]?.count || 0);
+
+  const getSnapshot = async () => {
+    const facets = viewKeys.reduce((acc, view) => {
+      acc[view] = [
+        { $match: buildConversationViewFilters(req, { view }) },
+        { $count: 'count' }
+      ];
+      return acc;
+    }, {});
+
+    facets.unread = [
+      { $match: { ...filters, unreadCount: { $gt: 0 } } },
+      { $count: 'count' }
+    ];
+
+    const [aggregation = {}] = await ConversationSummary.aggregate([{ $facet: facets }]).allowDiskUse(true);
+
+    if (isAgent) {
+      return {
+        myChats: normalizeCount(aggregation, 'my'),
+        assignedLeads: normalizeCount(aggregation, 'assigned-leads'),
+        followups: normalizeCount(aggregation, 'followups'),
+        closedChats: normalizeCount(aggregation, 'closed'),
+        archivedChats: normalizeCount(aggregation, 'archived'),
+        whatsappChats: normalizeCount(aggregation, 'whatsapp'),
+        unreadConversations: normalizeCount(aggregation, 'unread')
+      };
+    }
+
+    return {
+      allChats: normalizeCount(aggregation, 'all'),
+      unassignedChats: normalizeCount(aggregation, 'unassigned'),
+      assignedChats: normalizeCount(aggregation, 'assigned'),
+      closedChats: normalizeCount(aggregation, 'closed'),
+      archivedChats: normalizeCount(aggregation, 'archived'),
+      myChats: normalizeCount(aggregation, 'my'),
+      teamInbox: normalizeCount(aggregation, 'team'),
+      importantChats: normalizeCount(aggregation, 'important'),
+      followups: normalizeCount(aggregation, 'followups'),
+      assignedLeads: normalizeCount(aggregation, 'assigned-leads'),
+      whatsappChats: normalizeCount(aggregation, 'whatsapp'),
+      broadcastRepliesChats: normalizeCount(aggregation, 'broadcast-replies'),
+      instagramChats: normalizeCount(aggregation, 'instagram'),
+      facebookChats: normalizeCount(aggregation, 'facebook'),
+      groupChats: normalizeCount(aggregation, 'groups'),
+      unreadConversations: normalizeCount(aggregation, 'unread')
+    };
+  };
+
+  if (!scope) {
+    return getSnapshot();
+  }
+
+  return getOrSetCachedJson({
+    namespace: 'conversations',
+    scope,
+    versionGroup: 'overviewSnapshot',
+    keyParts: ['overview-snapshot', String(isAgent), JSON.stringify(filters)],
+    ttlSeconds: CACHE_TTL_SECONDS.summaryPages,
+    loader: getSnapshot
+  });
+};
+
 class ConversationController {
   async getConversations(req, res) {
     try {
@@ -511,31 +859,39 @@ class ConversationController {
       const conversationFilter = normalizeConversationFilter(
         req.query?.filter || req.query?.conversationFilter || ''
       );
-      const filters = buildScopedFilters(req, {}, { scope: req.query?.scope });
+      const filters = buildConversationViewFilters(req, {});
       const scopeVariants = getInboxScopeVariants({
         companyId: filters.companyId,
-        userId: filters.userId || ''
+        userId: req.user?.id || ''
       });
-      const scope = filters.userId
-        ? scopeVariants[scopeVariants.length - 1]
-        : scopeVariants[0];
+      const scope = isTenantWideRole(
+        normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+      )
+        ? scopeVariants[0]
+        : scopeVariants[scopeVariants.length - 1];
 
-      if (status) filters.status = status;
+      if (status) filters.status = String(status).trim().toLowerCase();
       if (assignedTo) filters.assignedTo = assignedTo;
 
       const parsedLimit = Number(req.query?.limit);
       const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 200)) : 0;
       const cursor = decodeConversationCursor(req.query?.cursor);
+      const cursorDirection = String(req.query?.cursorDirection || req.query?.direction || 'next')
+        .trim()
+        .toLowerCase() === 'prev'
+        ? 'prev'
+        : 'next';
       const normalizedSearch = String(search || '').trim();
       const normalizedSearchLower = normalizedSearch.toLowerCase();
       const searchPlan = buildInboxSearchPlan(normalizedSearch);
       const cacheKeyParts = [
+        String(req.query?.view || req.query?.inboxView || '').trim(),
         String(status || '').trim(),
         String(assignedTo || '').trim(),
         conversationFilter,
         normalizedSearchLower,
         String(limit || 0),
-        encodeConversationCursorCacheKey(cursor)
+        encodeConversationCursorCacheKey(cursor, cursorDirection)
       ];
       const summaryFilters = { ...filters };
       const fallbackFilters = { ...filters };
@@ -544,7 +900,7 @@ class ConversationController {
       const queryHint = searchPlan.hint;
       const unreadFilterClause = buildConversationUnreadFilterClause(conversationFilter);
       if (cursor) {
-        const cursorFilter = buildConversationCursorFilter(cursor);
+        const cursorFilter = buildConversationCursorFilter(cursor, cursorDirection);
         summaryFilterClauses.push(cursorFilter);
         fallbackFilterClauses.push(cursorFilter);
       }
@@ -582,7 +938,8 @@ class ConversationController {
                 req,
                 scope,
                 cacheKeyParts,
-                queryHint
+                queryHint,
+                cursorDirection
               });
 
               return {
@@ -591,7 +948,8 @@ class ConversationController {
                 meta: {
                   limit: limit || null,
                   hasMore: summaryPage.hasMore,
-                  nextCursor: summaryPage.nextCursor
+                  nextCursor: summaryPage.nextCursor,
+                  previousCursor: summaryPage.previousCursor || null
                 }
               };
             }
@@ -618,7 +976,8 @@ class ConversationController {
               meta: cachedResponse.meta || {
                 limit: limit || null,
                 hasMore: false,
-                nextCursor: null
+                nextCursor: null,
+                previousCursor: null
               }
             };
           }
@@ -633,7 +992,8 @@ class ConversationController {
         meta: {
           limit: limit || null,
           hasMore: false,
-          nextCursor: null
+          nextCursor: null,
+          previousCursor: null
         }
       });
     } catch (error) {
@@ -654,7 +1014,7 @@ class ConversationController {
       const requestedSourceType = toCleanString(req.query?.sourceType || '').toLowerCase();
       const limit = Math.max(1, Math.min(500, Number(req.query?.limit || 100)));
       const cursor = decodeContactCursor(req.query?.cursor);
-      const filters = buildScopedFilters(req, {}, { scope: req.query?.scope });
+      const filters = buildContactViewFilters(req, {});
       const searchPlan = buildContactSearchPlan(search);
 
       if (searchPlan.summaryClause) {
@@ -744,32 +1104,34 @@ class ConversationController {
 
   async getConversationContacts(req, res) {
     try {
-      // Get all unique contacts from conversations
-      const conversations = await Conversation.find({
-        ...buildScopedFilters(req, {}, { scope: req.query?.scope }),
+      // Read from the summary model so contact lookups stay index-friendly and compact.
+      const conversations = await ConversationSummary.find({
+        ...buildConversationViewFilters(req, {}),
         status: { $in: ['active', 'pending'] }
       })
         .select('contactPhone contactName lastMessageTime lastMessage status')
         .sort({ lastMessageTime: -1 })
         .lean();
-      
-      // Extract unique contacts
+
       const uniqueContacts = [];
       const seenPhones = new Set();
-      
-      conversations.forEach(conv => {
-        if (!seenPhones.has(conv.contactPhone)) {
-          uniqueContacts.push({
-            phone: conv.contactPhone,
-            name: conv.contactName || conv.contactPhone,
-            lastMessageTime: conv.lastMessageTime,
-            lastMessage: conv.lastMessage,
-            status: conv.status
-          });
-          seenPhones.add(conv.contactPhone);
+
+      conversations.forEach((conv) => {
+        const phone = String(conv?.contactPhone || '').trim();
+        if (!phone || seenPhones.has(phone)) {
+          return;
         }
+
+        uniqueContacts.push({
+          phone,
+          name: conv.contactName || phone,
+          lastMessageTime: conv.lastMessageTime,
+          lastMessage: conv.lastMessage,
+          status: conv.status
+        });
+        seenPhones.add(phone);
       });
-      
+
       res.json({ success: true, data: uniqueContacts });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
@@ -778,21 +1140,64 @@ class ConversationController {
 
   async getUnreadConversationCount(req, res) {
     try {
-      const filters = buildScopedFilters(req, {}, { scope: req.query?.scope });
+      const filters = buildConversationViewFilters(req, {});
       const summaryFilters = {
         ...filters,
         unreadCount: { $gt: 0 },
       };
+      const scopeVariants = getInboxScopeVariants({
+        companyId: filters.companyId,
+        userId: req.user?.id || ''
+      });
+      const scope = isTenantWideRole(
+        normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+      )
+        ? scopeVariants[0]
+        : scopeVariants[scopeVariants.length - 1];
 
-      const unreadConversationCount = await ConversationSummary.countDocuments(
-        summaryFilters,
-      );
+      const unreadConversationCount = scope
+        ? await getOrSetCachedJson({
+            namespace: 'conversations',
+            scope,
+            versionGroup: 'unreadCount',
+            keyParts: ['unreadCount', JSON.stringify(summaryFilters)],
+            ttlSeconds: CACHE_TTL_SECONDS.summaryPages,
+            loader: async () => ConversationSummary.countDocuments(summaryFilters)
+          })
+        : await ConversationSummary.countDocuments(summaryFilters);
 
       res.json({
         success: true,
         data: {
-          unreadConversationCount,
+          unreadConversationCount: Number(unreadConversationCount || 0),
         },
+      });
+    } catch (error) {
+      res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async getInboxOverview(req, res) {
+    try {
+      const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+      const isAgent = !isTenantWideRole(normalizedRole);
+      const filters = buildConversationViewFilters(req, {});
+      const scopeVariants = getInboxScopeVariants({
+        companyId: filters.companyId,
+        userId: req.user?.id || ''
+      });
+      const scope = isTenantWideRole(normalizedRole)
+        ? scopeVariants[0]
+        : scopeVariants[scopeVariants.length - 1];
+      const data = await loadInboxOverviewSnapshot(req, {
+        isAgent,
+        filters,
+        scope
+      });
+
+      res.json({
+        success: true,
+        data
       });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });

@@ -141,31 +141,22 @@ class BroadcastController {
         }
       }
 
-      const result = await enqueueBroadcastSend({
-        broadcastId: req.params.id,
-        userId: req.user.id,
-        companyId: req.companyId || null,
-        delayMs: 0,
-        reason: "manual_http_send",
-        fallbackProcess: () =>
-          broadcastService.sendBroadcast(
-            req.params.id,
-            broadcaster,
-            req.whatsappCredentials || null,
-          ),
-      });
+      const result = await broadcastService.sendBroadcast(
+        req.params.id,
+        broadcaster,
+        req.whatsappCredentials || null,
+      );
 
       if (!result.success) {
         return res.status(400).json(result);
       }
 
-      res.status(202).json({
+      res.status(200).json({
         success: true,
-        queued: true,
+        queued: false,
         broadcastId: req.params.id,
-        jobId: result.data.jobId,
-        queueStatus: result.data.status,
-        message: "Broadcast queued. Sending will continue in the background.",
+        message: "Broadcast sent. Inbox updates were written immediately.",
+        data: result.data,
       });
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
@@ -181,6 +172,7 @@ class BroadcastController {
       const filters = {};
       if (req.query.status) filters.status = req.query.status;
       if (req.query.createdBy) filters.createdBy = req.query.createdBy;
+      if (req.query.createdById) filters.createdById = req.query.createdById;
       if (req.query.search) filters.search = req.query.search;
       if (req.query.cursor) filters.cursor = req.query.cursor;
       if (req.query.limit) filters.limit = req.query.limit;

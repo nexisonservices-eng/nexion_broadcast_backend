@@ -19,8 +19,13 @@ const { logConsentEvent } = require('../services/whatsappConsentLogService');
 const broadcastService = require('../services/broadcastService');
 const { invalidateInboxConversation } = require('../utils/teamInboxCache');
 const {
-  syncConversationSummaryFromConversation
+  syncConversationSummaryFromConversation,
+  upsertConversationSummaries
 } = require('../services/conversationSummaryService');
+const ConversationSummary = require('../models/ConversationSummary');
+const {
+  resolveRelatedConversationIds
+} = require('../utils/conversationThreadLookup');
 const {
   recordConversationInboundUnread
 } = require('../utils/conversationReadStateCache');
@@ -168,6 +173,11 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       if (normalized) return normalized;
     }
     return '';
+  };
+
+  const resolveConversationChannel = ({ broadcast = null } = {}) => {
+    if (broadcast?._id) return 'broadcast_reply';
+    return 'whatsapp';
   };
 
   const normalizeKeywordText = (value = '') =>
@@ -610,6 +620,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           contactId: contact._id,
           contactPhone: from,
           contactName: contact.name,
+          channel: 'whatsapp',
           lastMessageTime: inboundActivityAt,
           lastMessage: text,
           lastMessageMediaType: String(mediaType || '').trim(),
@@ -670,7 +681,64 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         whatsappTimestamp: new Date(messageData.timestamp * 1000),
         timestamp: new Date()
       });
-      await message.populate('replyTo', '_id text sender whatsappMessageId mediaType mediaCaption timestamp');
+      await message.populate('replyTo', '_id text sender senderRole senderName senderId whatsappMessageId mediaType mediaCaption timestamp');
+
+      let relatedConversationIds = [String(conversation._id)];
+      try {
+        relatedConversationIds = await resolveRelatedConversationIds({
+          Conversation,
+          ConversationSummary,
+          req: {
+            companyId,
+            user: {
+              id: userId,
+              companyId,
+              role: 'admin'
+            }
+          },
+          conversation,
+          includeAllIdentityMatches: true
+        });
+      } catch (lookupError) {
+        if (ENABLE_DEBUG_LOGS) {
+          console.warn('Failed to resolve related inbound conversations:', lookupError?.message || lookupError);
+        }
+      }
+      relatedConversationIds = Array.from(
+        new Set([String(conversation._id), ...relatedConversationIds].map((id) => String(id || '').trim()).filter(Boolean))
+      );
+
+      if (!isReactionMessage && relatedConversationIds.length > 1) {
+        const inboundThreadUpdate = {
+          lastMessageTime: inboundActivityAt,
+          lastMessage: text,
+          lastMessageMediaType: String(mediaType || '').trim(),
+          lastMessageAttachmentName:
+            String(mediaType || '').trim().toLowerCase() === 'document'
+              ? String(storedIncomingAttachment?.originalFileName || '').trim()
+              : '',
+          lastMessageAttachmentPages:
+            String(mediaType || '').trim().toLowerCase() === 'document'
+              ? Number(storedIncomingAttachment?.pages || 0) || null
+              : null,
+          lastMessageFrom: 'contact'
+        };
+        await Conversation.updateMany(
+          {
+            _id: { $in: relatedConversationIds },
+            ...(companyId ? { companyId } : {})
+          },
+          { $set: inboundThreadUpdate }
+        );
+        const updatedThreadConversations = await Conversation.find({
+          _id: { $in: relatedConversationIds },
+          ...(companyId ? { companyId } : {})
+        }).lean();
+        if (updatedThreadConversations.length) {
+          await upsertConversationSummaries(updatedThreadConversations);
+        }
+      }
+
       await recordConversationInboundUnread({
         userId,
         companyId,
@@ -679,16 +747,21 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         messageAt: inboundActivityAt,
         unreadCount: Number(conversation.unreadCount || 1)
       });
-      await invalidateInboxConversation({
-        userId,
-        companyId,
-        conversationId: conversation._id
-      });
+      await Promise.all(
+        relatedConversationIds.map((relatedConversationId) =>
+          invalidateInboxConversation({
+            userId,
+            companyId,
+            conversationId: relatedConversationId
+          })
+        )
+      );
 
       emitRealtimeEvent(userId, {
         type: 'crm_changed',
         contactId: String(contact._id),
         conversationId: String(conversation._id),
+        relatedConversationIds,
         reason: 'whatsapp_inbound_message',
         lastInboundMessageAt: inboundActivityAt.toISOString(),
         serviceWindowClosesAt: serviceWindowClosesAt.toISOString()
@@ -761,11 +834,23 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
             `Updated replied count for broadcast "${broadcast.name}": ${updatedBroadcast.stats.replied} (${updatedBroadcast.repliedPercentage}% of sent)`
           );
         }
+
+        if (String(conversation.channel || '').trim() !== 'broadcast_reply') {
+          conversation.channel = resolveConversationChannel({ broadcast });
+          await conversation.save();
+          await syncConversationSummaryFromConversation(conversation);
+          await invalidateInboxConversation({
+            userId,
+            companyId,
+            conversationId: conversation._id
+          });
+        }
       }
 
       emitRealtimeEvent(userId, {
         type: 'new_message',
         conversation: conversation.toObject(),
+        relatedConversationIds,
         message: message.toObject()
       });
 

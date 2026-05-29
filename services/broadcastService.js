@@ -25,6 +25,7 @@ const {
 const {
   CACHE_TTL_SECONDS,
   getOrSetCachedJson,
+  invalidateInboxConversation,
 } = require("../utils/teamInboxCache");
 const {
   toCleanString,
@@ -1494,14 +1495,25 @@ class BroadcastService {
     try {
       const companyId = filters?.companyId || null;
       const createdById = filters?.createdById || null;
+      const createdBy = String(filters?.createdBy || "").trim();
       const statusFilter = String(filters?.status || "").trim();
       const search = String(filters?.search || "").trim();
       const limit = Math.max(1, Math.min(50, Number(filters?.limit || 20)));
       const cursor = this.decodePaginationCursor(filters?.cursor || "");
 
       const query = {};
+      const queryClauses = [];
       if (companyId) query.companyId = companyId;
-      if (createdById) query.createdById = createdById;
+      if (createdById) {
+        query.createdById = createdById;
+      } else if (createdBy) {
+        queryClauses.push({
+          $or: [
+            { createdBy: { $regex: createdBy, $options: "i" } },
+            { createdByEmail: { $regex: createdBy, $options: "i" } },
+          ],
+        });
+      }
 
       if (statusFilter) {
         const statuses = statusFilter
@@ -2317,6 +2329,58 @@ class BroadcastService {
                   broadcastDispatchKey,
                   templateCategory,
                   contactId: contact?._id || "",
+                  fallbackProcess: async () => {
+                    const fallbackResult = await this.updateConversation(
+                      phoneNumber,
+                      messageTextForInbox,
+                      result.data,
+                      broadcast._id,
+                      broadcast.createdById,
+                      broadcast.companyId,
+                      broadcastDispatchKey,
+                    );
+
+                    if (
+                      broadcast.templateName &&
+                      templateCategory === "marketing" &&
+                      contact
+                    ) {
+                      applyMarketingTemplateSent(contact, { now: new Date() });
+                      await contact.save();
+                    }
+
+                    if (
+                      contact &&
+                      fallbackResult?.conversation &&
+                      fallbackResult?.message
+                    ) {
+                      await this.logBroadcastContactActivity({
+                        broadcast,
+                        contact,
+                        conversation: fallbackResult.conversation,
+                        messageText: messageTextForInbox,
+                        templateCategory,
+                      });
+                    }
+
+                    if (
+                      typeof broadcaster === "function" &&
+                      fallbackResult?.conversation &&
+                      fallbackResult?.message
+                    ) {
+                      broadcaster({
+                        type: "message_sent",
+                        conversation: fallbackResult.conversation.toObject
+                          ? fallbackResult.conversation.toObject()
+                          : fallbackResult.conversation,
+                        message: fallbackResult.message.toObject
+                          ? fallbackResult.message.toObject()
+                          : fallbackResult.message,
+                      });
+                    }
+
+                    return fallbackResult;
+                  },
                 });
               } else {
                 // Keep the legacy synchronous path for direct/manual sends.
@@ -2530,6 +2594,14 @@ class BroadcastService {
     try {
       const whatsappMessageId = whatsappResponse?.messages?.[0]?.id;
       let contact = await Contact.findOne({ userId, companyId, phone });
+      const exactPhone = String(phone || "").trim();
+      const exactPhoneDigits = this.normalizePhoneNumber(exactPhone);
+      const resolvedAssignee = String(
+        contact?.assignedTo ||
+          contact?.assignedAgent ||
+          userId ||
+          "",
+      ).trim() || null;
       if (!contact) {
         contact = await Contact.create({
           userId,
@@ -2537,21 +2609,57 @@ class BroadcastService {
           phone,
           name: "",
           sourceType: "incoming_message",
+          createdBy: String(userId || "").trim() || null,
+          assignedTo: String(userId || "").trim() || null,
+          assignedAgent: String(userId || "").trim() || null,
         });
       } else if (broadcastId && contact.sourceType !== "incoming_message") {
         // If this contact is being used in broadcast message flow, mark source as message-origin.
         contact.sourceType = "incoming_message";
+        if (!contact.assignedTo && !contact.assignedAgent) {
+          contact.assignedTo = String(userId || "").trim() || null;
+          contact.assignedAgent = String(userId || "").trim() || null;
+        }
+        await contact.save();
+      } else if (!contact.assignedTo && !contact.assignedAgent && userId) {
+        contact.assignedTo = String(userId || "").trim() || null;
+        contact.assignedAgent = String(userId || "").trim() || null;
         await contact.save();
       }
 
-      const conversationLookupFilter =
-        buildConversationPhoneLookupFilter(phone);
-      let conversation = await Conversation.findOne({
+      const exactConversationFilter = {
         userId,
         companyId,
         status: { $in: ["active", "pending"] },
-        ...(conversationLookupFilter || { contactPhone: phone }),
-      }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
+        $or: [
+          ...(exactPhone
+            ? [{ contactPhone: exactPhone }, { phone: exactPhone }]
+            : []),
+          ...(exactPhoneDigits
+            ? [
+                { contactPhoneDigits: exactPhoneDigits },
+                { phoneDigits: exactPhoneDigits },
+              ]
+            : []),
+        ],
+      };
+
+      let conversation = await Conversation.findOne(exactConversationFilter).sort(
+        { lastMessageTime: -1, updatedAt: -1, createdAt: -1 },
+      );
+
+      const shouldTryLegacyFuzzyLookup = exactPhoneDigits.length > 10;
+
+      if (!conversation && shouldTryLegacyFuzzyLookup) {
+        const conversationLookupFilter =
+          buildConversationPhoneLookupFilter(phone);
+        conversation = await Conversation.findOne({
+          userId,
+          companyId,
+          status: { $in: ["active", "pending"] },
+          ...(conversationLookupFilter || { contactPhone: phone }),
+        }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
+      }
       if (!conversation) {
         conversation = await Conversation.create({
           userId,
@@ -2559,6 +2667,11 @@ class BroadcastService {
           contactId: contact._id,
           contactPhone: phone,
           contactName: contact.name,
+          channel: "whatsapp",
+          broadcastId: broadcastId || null,
+          assignedTo: resolvedAssignee,
+          assignedAgent: resolvedAssignee,
+          assignedToId: resolvedAssignee || null,
           lastMessage: message,
           lastMessageTime: new Date(),
           lastMessageMediaType: "",
@@ -2575,15 +2688,36 @@ class BroadcastService {
         conversation.lastMessageAttachmentPages = null;
         conversation.lastMessageFrom = "agent";
         conversation.lastMessageWhatsappMessageId = whatsappMessageId || "";
+        if (broadcastId) {
+          conversation.broadcastId = broadcastId;
+        }
+        if (!conversation.assignedTo && resolvedAssignee) {
+          conversation.assignedTo = resolvedAssignee;
+        }
+        if (!conversation.assignedAgent && resolvedAssignee) {
+          conversation.assignedAgent = resolvedAssignee;
+        }
+        if (!conversation.assignedToId && resolvedAssignee) {
+          conversation.assignedToId = resolvedAssignee;
+        }
         await conversation.save();
       }
       await syncConversationSummaryFromConversation(conversation);
+
+      await invalidateInboxConversation({
+        companyId,
+        userId,
+        conversationId: String(conversation?._id || "").trim(),
+      });
 
       const savedMessage = await Message.create({
         userId,
         companyId,
         conversationId: conversation._id,
         sender: "agent",
+        senderId: toQueryObjectId(userId) || undefined,
+        senderRole: "agent",
+        senderName: String(userId || "").trim() || "Agent",
         text: message,
         whatsappMessageId,
         status: "sent",
@@ -2991,6 +3125,7 @@ class BroadcastService {
     try {
       const companyId = filters?.companyId || null;
       const createdById = filters?.createdById || null;
+      const createdBy = String(filters?.createdBy || "").trim();
       const statusFilter = String(filters?.status || "").trim();
       const search = String(filters?.search || "").trim();
       const hasPagination =
@@ -3001,8 +3136,18 @@ class BroadcastService {
         : null;
 
       const query = {};
+      const queryClauses = [];
       if (companyId) query.companyId = companyId;
-      if (createdById) query.createdById = createdById;
+      if (createdById) {
+        query.createdById = createdById;
+      } else if (createdBy) {
+        queryClauses.push({
+          $or: [
+            { createdBy: { $regex: createdBy, $options: "i" } },
+            { createdByEmail: { $regex: createdBy, $options: "i" } },
+          ],
+        });
+      }
 
       if (statusFilter) {
         const statuses = statusFilter
@@ -3023,15 +3168,30 @@ class BroadcastService {
       if (hasPagination && cursor?.createdAt && cursor?.id) {
         const createdAt = new Date(cursor.createdAt);
         if (!Number.isNaN(createdAt.getTime())) {
-          query.$or = [
-            { createdAt: { $lt: createdAt } },
-            { createdAt, _id: { $lt: cursor.id } },
-          ];
+          queryClauses.push({
+            $or: [
+              { createdAt: { $lt: createdAt } },
+              { createdAt, _id: { $lt: cursor.id } },
+            ],
+          });
+        }
+      }
+
+      if (queryClauses.length > 0) {
+        if (queryClauses.length === 1) {
+          const onlyClause = queryClauses[0];
+          if (onlyClause && typeof onlyClause === "object" && onlyClause.$or) {
+            query.$and = [onlyClause];
+          } else {
+            Object.assign(query, onlyClause);
+          }
+        } else {
+          query.$and = queryClauses;
         }
       }
 
       const projection =
-        "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource";
+        "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource createdBy createdById createdByEmail";
 
       if (hasPagination) {
         const rows = await Broadcast.find(query)

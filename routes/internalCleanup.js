@@ -5,6 +5,7 @@ const {
   archiveOldMessages,
   archiveOldBroadcastDispatches
 } = require('../services/dataRetentionService');
+const { getRealtimeOutboxHealth } = require('../services/realtimeOutboxService');
 
 const router = express.Router();
 
@@ -60,6 +61,25 @@ router.post('/broadcast-dispatch/archive', requireInternalApiKey, async (_req, r
     return res.status(Number(error?.status || 500)).json({
       success: false,
       error: error?.message || 'Broadcast dispatch archive failed'
+    });
+  }
+});
+
+router.get('/realtime-outbox/health', requireInternalApiKey, async (req, res) => {
+  try {
+    const lockTtlMs = Number(req.query.lockTtlMs || process.env.REALTIME_OUTBOX_LOCK_TTL_MS || 45_000);
+    const publishedRetentionDays = Number(
+      req.query.publishedRetentionDays || process.env.REALTIME_OUTBOX_RETENTION_DAYS || 3
+    );
+    const result = await getRealtimeOutboxHealth({
+      lockTtlMs,
+      publishedRetentionDays
+    });
+    return res.json({ success: true, data: result });
+  } catch (error) {
+    return res.status(Number(error?.status || 500)).json({
+      success: false,
+      error: error?.message || 'Realtime outbox health check failed'
     });
   }
 });

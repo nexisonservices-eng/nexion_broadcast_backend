@@ -28,6 +28,7 @@ const LeadTaskSchema = new mongoose.Schema({
   conversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', default: null, index: true },
   title: { type: String, required: true, trim: true, maxlength: 200 },
   description: { type: String, default: '', trim: true, maxlength: 2000 },
+  dueDate: { type: Date, default: null, index: true },
   taskType: {
     type: String,
     enum: ['follow_up', 'call', 'whatsapp', 'email', 'meeting', 'demo', 'other'],
@@ -53,6 +54,16 @@ const LeadTaskSchema = new mongoose.Schema({
   completedBy: { type: String, default: null }
 }, {
   timestamps: true
+});
+
+LeadTaskSchema.pre('save', function(next) {
+  if (this.dueDate && !this.dueAt) {
+    this.dueAt = this.dueDate;
+  } else if (this.dueAt && !this.dueDate) {
+    this.dueDate = this.dueAt;
+  }
+
+  next();
 });
 
 LeadTaskSchema.index({ companyId: 1, userId: 1, status: 1, dueAt: 1 });

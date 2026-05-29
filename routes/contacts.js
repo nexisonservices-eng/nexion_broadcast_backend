@@ -140,12 +140,19 @@ const CONTACT_LIST_FIELDS = [
   'tags',
   'stage',
   'status',
+  'leadStatus',
   'source',
+  'createdBy',
   'ownerId',
+  'assignedTo',
+  'assignedAgent',
   'sourceType',
   'lastContact',
   'lastContactAt',
   'nextFollowUpAt',
+  'followupDate',
+  'notes',
+  'internalNotes',
   'isBlocked',
   'whatsappOptInStatus',
   'whatsappOptInAt',
@@ -195,6 +202,60 @@ const getPhoneLookupCandidates = (value) => {
     values.push(normalized.slice(-10));
   }
   return Array.from(new Set(values));
+};
+
+const isTenantWideContactRole = (role) => {
+  const normalizedRole = normalizeRole(role);
+  return ['superadmin', 'admin', 'manager'].includes(normalizedRole);
+};
+
+const getContactAgentScope = (req) => {
+  const normalizedUserId = toCleanString(req?.user?.id);
+  if (!normalizedUserId) return {};
+
+  return {
+    $or: [
+      { assignedTo: normalizedUserId },
+      { assignedAgent: normalizedUserId }
+    ]
+  };
+};
+
+const shouldAllowLegacyContactFallback = (req) => {
+  const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+  return isTenantWideContactRole(normalizedRole) && Boolean(req?.companyId);
+};
+
+const buildLegacyContactFallbackFilter = (req, { searchPlan, tags } = {}) => {
+  if (!shouldAllowLegacyContactFallback(req)) return null;
+
+  const legacyConditions = [
+    {
+      $or: [
+        { userId: { $exists: false } },
+        { userId: null },
+        { userId: '' }
+      ]
+    }
+  ];
+
+  legacyConditions.push({
+    $or: [
+      { companyId: req.companyId },
+      { companyId: { $exists: false } },
+      { companyId: null }
+    ]
+  });
+
+  if (searchPlan?.fallbackClause) {
+    legacyConditions.push(searchPlan.fallbackClause);
+  }
+
+  if (tags) {
+    legacyConditions.push({ tags: { $in: parseTagList(tags) } });
+  }
+
+  return legacyConditions.length === 1 ? legacyConditions[0] : { $and: legacyConditions };
 };
 
 const buildPhoneMatchFilter = (value) => {
@@ -329,24 +390,19 @@ const buildLastActiveFilterClause = (value = '') => {
 
 const buildScopeCondition = (req) => {
   const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
-  const tenantWide = isTenantWideRole(normalizedRole);
-  const scopeCandidates = [];
+  const tenantWide = isTenantWideContactRole(normalizedRole);
 
-  if (req.companyId) {
-    // Tenant-wide roles can see the full workspace for their company.
-    if (tenantWide) return { companyId: req.companyId };
-    scopeCandidates.push({ companyId: req.companyId });
+  if (tenantWide) {
+    if (req.companyId) {
+      return { companyId: req.companyId };
+    }
+    return {};
   }
 
-  if (req?.user?.id && !tenantWide) {
-    scopeCandidates.push({ userId: req.user.id });
-  }
+  const agentScope = getContactAgentScope(req);
+  if (!Object.keys(agentScope).length) return {};
 
-  // Tenant-wide role without company scope: keep unscoped (legacy superadmin contexts).
-  if (tenantWide && !req.companyId) return {};
-
-  if (!scopeCandidates.length) return {};
-  return scopeCandidates.length === 1 ? scopeCandidates[0] : { $or: scopeCandidates };
+  return req.companyId ? { $and: [{ companyId: req.companyId }, agentScope] } : agentScope;
 };
 
 const buildScopedContactFilter = (req, extra = {}) => {
@@ -511,6 +567,41 @@ const normalizeContactInput = (payload = {}, fallbackSourceType = 'manual') => {
     ? requestedSourceType
     : fallbackSourceType;
   return next;
+};
+
+const resolveContactOwnership = (req, payload = {}) => {
+  const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+  const currentUserId = toCleanString(req?.user?.id);
+  const requestedAssignedTo = toCleanString(payload?.assignedTo || payload?.ownerId || payload?.assignedAgent);
+  const requestedCreatedBy = toCleanString(payload?.createdBy);
+  const requestedOwnerId = toCleanString(payload?.ownerId);
+  const adminCanAssign = isTenantWideContactRole(normalizedRole);
+
+  if (!currentUserId) {
+    return {
+      createdBy: requestedCreatedBy || null,
+      assignedTo: requestedAssignedTo || null,
+      ownerId: requestedOwnerId || requestedAssignedTo || null,
+      assignedAgent: requestedAssignedTo || requestedOwnerId || null
+    };
+  }
+
+  if (!adminCanAssign) {
+    return {
+      createdBy: currentUserId,
+      assignedTo: currentUserId,
+      ownerId: currentUserId,
+      assignedAgent: currentUserId
+    };
+  }
+
+  const assignedTo = requestedAssignedTo || null;
+  return {
+    createdBy: requestedCreatedBy || currentUserId,
+    assignedTo,
+    ownerId: requestedOwnerId || assignedTo || null,
+    assignedAgent: assignedTo || requestedOwnerId || null
+  };
 };
 
 const normalizeOptInScope = (value = '') => {
@@ -691,6 +782,7 @@ router.get('/', async (req, res) => {
     const requestedLastActiveFilter = String(
       req.query.activeFilter || req.query.lastActiveFilter || ''
     ).trim().toLowerCase();
+    const requestedLeadStatus = String(req.query.leadStatus || '').trim().toLowerCase();
     const requestedSortOption = String(req.query.sort || req.query.sortOption || '')
       .trim()
       .toLowerCase();
@@ -738,6 +830,21 @@ router.get('/', async (req, res) => {
       if (lastActiveClause) {
         queryConditions.push(lastActiveClause);
       }
+    }
+
+    if (requestedLeadStatus && requestedLeadStatus !== 'all') {
+      const normalizedLeadStatuses = new Set([
+        'new_lead',
+        'interested',
+        'follow_up',
+        'proposal_sent',
+        'converted',
+        'closed'
+      ]);
+      if (!normalizedLeadStatuses.has(requestedLeadStatus)) {
+        return res.status(400).json({ error: 'Invalid lead status filter' });
+      }
+      queryConditions.push({ leadStatus: requestedLeadStatus });
     }
 
     if (marketingEligibleOnly) {
@@ -809,69 +916,16 @@ router.get('/', async (req, res) => {
       });
 
       if (!pageResult.contacts.length) {
-        const legacyConditions = [
-          {
-            $or: [
-              { userId: { $exists: false } },
-              { userId: null },
-              { userId: '' }
-            ]
-          }
-        ];
-
-        if (req.companyId) {
-          legacyConditions.push({
-            $or: [
-              { companyId: req.companyId },
-              { companyId: { $exists: false } },
-              { companyId: null },
-              { companyId: '' }
-            ]
+        const legacyFilters = buildLegacyContactFallbackFilter(req, { searchPlan, tags });
+        if (legacyFilters) {
+          pageResult = await fetchContactsPage({
+            queryFilters: legacyFilters,
+            countFilters: legacyFilters,
+            sortClause,
+            requestedPage: page,
+            requestedPageSize: pageSize
           });
         }
-
-        if (searchPlan.fallbackClause) {
-          legacyConditions.push(searchPlan.fallbackClause);
-        }
-
-        if (tags) {
-          legacyConditions.push({ tags: { $in: parseTagList(tags) } });
-        }
-
-        const legacyFilters =
-          legacyConditions.length === 1 ? legacyConditions[0] : { $and: legacyConditions };
-
-        pageResult = await fetchContactsPage({
-          queryFilters: legacyFilters,
-          countFilters: legacyFilters,
-          sortClause,
-          requestedPage: page,
-          requestedPageSize: pageSize
-        });
-      }
-
-      if (!pageResult.contacts.length) {
-        const globalConditions = [];
-        if (searchPlan.fallbackClause) {
-          globalConditions.push(searchPlan.fallbackClause);
-        }
-        if (tags) {
-          globalConditions.push({ tags: { $in: parseTagList(tags) } });
-        }
-        const globalFilters =
-          globalConditions.length === 0
-            ? {}
-            : globalConditions.length === 1
-              ? globalConditions[0]
-              : { $and: globalConditions };
-
-        pageResult = await fetchContactsPage({
-          queryFilters: globalFilters,
-          countFilters: globalFilters,
-          sortClause,
-          requestedPage: page,
-          requestedPageSize: pageSize
-        });
       }
 
       const contacts = pageResult.contacts.map(normalizeContactConsentForResponse);
@@ -913,78 +967,19 @@ router.get('/', async (req, res) => {
         contacts = contacts.slice(0, pageSize);
       }
 
-      // Backward compatibility: older contacts were saved without user/company scope.
-      // If scoped query returns nothing, surface legacy contacts so existing data doesn't disappear.
       if (!contacts.length) {
-        const legacyConditions = [
-          {
-            $or: [
-              { userId: { $exists: false } },
-              { userId: null },
-              { userId: '' }
-            ]
+        const legacyFilters = buildLegacyContactFallbackFilter(req, { searchPlan, tags });
+        if (legacyFilters) {
+          contacts = await Contact.find(legacyFilters)
+            .select(CONTACT_LIST_FIELDS)
+            .sort(defaultSortClause)
+            .limit(pageSize + 1)
+            .lean();
+          totalCount = await Contact.countDocuments(legacyFilters);
+          if (contacts.length > pageSize) {
+            hasMore = true;
+            contacts = contacts.slice(0, pageSize);
           }
-        ];
-
-        if (req.companyId) {
-          legacyConditions.push({
-            $or: [
-              { companyId: req.companyId },
-              { companyId: { $exists: false } },
-              { companyId: null },
-              { companyId: '' }
-            ]
-          });
-        }
-
-        if (searchPlan.fallbackClause) {
-          legacyConditions.push(searchPlan.fallbackClause);
-        }
-
-        if (tags) {
-          legacyConditions.push({ tags: { $in: parseTagList(tags) } });
-        }
-
-        const legacyFilters =
-          legacyConditions.length === 1 ? legacyConditions[0] : { $and: legacyConditions };
-
-        contacts = await Contact.find(legacyFilters)
-          .select(CONTACT_LIST_FIELDS)
-          .sort(defaultSortClause)
-          .limit(pageSize + 1)
-          .lean();
-        totalCount = await Contact.countDocuments(legacyFilters);
-        if (contacts.length > pageSize) {
-          hasMore = true;
-          contacts = contacts.slice(0, pageSize);
-        }
-      }
-
-      // Final recovery fallback for legacy datasets with inconsistent scope metadata.
-      // Keeps search/tags behavior but removes scope constraints so contacts don't vanish.
-      if (!contacts.length) {
-        const globalConditions = [];
-        if (searchPlan.fallbackClause) {
-          globalConditions.push(searchPlan.fallbackClause);
-        }
-        if (tags) {
-          globalConditions.push({ tags: { $in: parseTagList(tags) } });
-        }
-        const globalFilters =
-          globalConditions.length === 0
-            ? {}
-            : globalConditions.length === 1
-              ? globalConditions[0]
-              : { $and: globalConditions };
-        contacts = await Contact.find(globalFilters)
-          .select(CONTACT_LIST_FIELDS)
-          .sort(defaultSortClause)
-          .limit(pageSize + 1)
-          .lean();
-        totalCount = await Contact.countDocuments(globalFilters);
-        if (contacts.length > pageSize) {
-          hasMore = true;
-          contacts = contacts.slice(0, pageSize);
         }
       }
 
@@ -1013,69 +1008,15 @@ router.get('/', async (req, res) => {
     let contacts = await contactQuery.lean();
     let totalCount = await Contact.countDocuments(filters);
 
-    // Backward compatibility: older contacts were saved without user/company scope.
-    // If scoped query returns nothing, surface legacy contacts so existing data doesn't disappear.
     if (!contacts.length) {
-      const legacyConditions = [
-        {
-          $or: [
-            { userId: { $exists: false } },
-            { userId: null },
-            { userId: '' }
-          ]
-        }
-      ];
-
-      if (req.companyId) {
-        legacyConditions.push({
-          $or: [
-            { companyId: req.companyId },
-            { companyId: { $exists: false } },
-            { companyId: null },
-            { companyId: '' }
-          ]
-        });
+      const legacyFilters = buildLegacyContactFallbackFilter(req, { searchPlan, tags });
+      if (legacyFilters) {
+        contacts = await Contact.find(legacyFilters)
+          .select(CONTACT_LIST_FIELDS)
+          .sort(defaultSortClause)
+          .lean();
+        totalCount = await Contact.countDocuments(legacyFilters);
       }
-
-      if (searchPlan.fallbackClause) {
-        legacyConditions.push(searchPlan.fallbackClause);
-      }
-
-      if (tags) {
-        legacyConditions.push({ tags: { $in: parseTagList(tags) } });
-      }
-
-      const legacyFilters =
-        legacyConditions.length === 1 ? legacyConditions[0] : { $and: legacyConditions };
-
-      contacts = await Contact.find(legacyFilters)
-        .select(CONTACT_LIST_FIELDS)
-        .sort(defaultSortClause)
-        .lean();
-      totalCount = await Contact.countDocuments(legacyFilters);
-    }
-
-    // Final recovery fallback for legacy datasets with inconsistent scope metadata.
-    // Keeps search/tags behavior but removes scope constraints so contacts don't vanish.
-    if (!contacts.length) {
-      const globalConditions = [];
-      if (searchPlan.fallbackClause) {
-        globalConditions.push(searchPlan.fallbackClause);
-      }
-      if (tags) {
-        globalConditions.push({ tags: { $in: parseTagList(tags) } });
-      }
-      const globalFilters =
-        globalConditions.length === 0
-          ? {}
-          : globalConditions.length === 1
-            ? globalConditions[0]
-            : { $and: globalConditions };
-      contacts = await Contact.find(globalFilters)
-        .select(CONTACT_LIST_FIELDS)
-        .sort(defaultSortClause)
-        .lean();
-      totalCount = await Contact.countDocuments(globalFilters);
     }
 
     contacts = contacts.map(normalizeContactConsentForResponse);
@@ -1422,6 +1363,9 @@ router.post('/', async (req, res) => {
       ...normalizedPayload,
       userId: req.user.id,
       companyId: req.companyId || null,
+      ...resolveContactOwnership(req, normalizedPayload),
+      leadStatus: toCleanString(normalizedPayload.leadStatus).toLowerCase() || 'new_lead',
+      followupDate: normalizedPayload.followupDate ? new Date(normalizedPayload.followupDate) : null,
       sourceType: normalizedPayload.sourceType || 'manual'
     });
     emitCrmRealtimeEvent(req, {
@@ -1546,6 +1490,11 @@ router.post('/import', async (req, res) => {
           if (existingContact) {
             const mergedTags = getMergedTags(existingContact.tags, entry.normalized.tags);
             const updatedName = toCleanString(entry.normalized.name) || toCleanString(existingContact.name);
+            const ownership = resolveContactOwnership(req, {
+              assignedTo: existingContact.assignedTo || existingContact.ownerId || existingContact.assignedAgent,
+              ownerId: existingContact.ownerId,
+              createdBy: existingContact.createdBy
+            });
 
             operations.push({
               updateOne: {
@@ -1554,12 +1503,15 @@ router.post('/import', async (req, res) => {
                   $set: {
                     userId: req.user.id,
                     companyId: req.companyId || null,
+                    ...ownership,
                     name: updatedName,
                     nameLower: updatedName.toLowerCase(),
                     phone: entry.normalizedPhone,
                     phoneDigits: entry.phoneDigits,
                     email: toCleanString(entry.normalized.email) || toCleanString(existingContact.email),
                     tags: mergedTags,
+                    leadStatus: toCleanString(existingContact.leadStatus).toLowerCase() || 'new_lead',
+                    followupDate: existingContact.followupDate || null,
                     sourceType: existingContact.sourceType || 'imported',
                     isBlocked: false,
                     lastContact: existingContact.lastContact || new Date(),
@@ -1578,12 +1530,16 @@ router.post('/import', async (req, res) => {
             const newContactDoc = {
               userId: req.user.id,
               companyId: req.companyId || null,
+              ...resolveContactOwnership(req, {
+                leadStatus: 'new_lead'
+              }),
               name: toCleanString(entry.normalized.name) || '',
               nameLower: toCleanString(entry.normalized.name).toLowerCase(),
               phone: entry.normalizedPhone,
               phoneDigits: entry.phoneDigits,
               email: toCleanString(entry.normalized.email) || '',
               tags: Array.isArray(entry.normalized.tags) ? entry.normalized.tags : [],
+              leadStatus: 'new_lead',
               isBlocked: false,
               sourceType: 'imported',
               lastContact: new Date(),
@@ -1775,17 +1731,21 @@ router.post('/scan-card', (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     const normalizedPayload = normalizeContactInput(req.body, 'manual');
-    const existingContact = await Contact.findOne({
-      _id: req.params.id,
-      userId: req.user.id,
-      ...(req.companyId ? { companyId: req.companyId } : {})
-    });
+    const existingContact = await Contact.findOne(
+      buildScopedContactFilter(req, { _id: req.params.id })
+    );
 
     if (!existingContact) {
       return res.status(404).json({ error: 'Contact not found' });
     }
 
     const updatePayload = { ...normalizedPayload };
+    if (!isTenantWideContactRole(normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role))) {
+      delete updatePayload.ownerId;
+      delete updatePayload.assignedTo;
+      delete updatePayload.assignedAgent;
+      delete updatePayload.createdBy;
+    }
     const normalizedPhone = getPreferredPhoneValue(normalizedPayload);
     if (normalizedPayload.phone !== undefined && !normalizedPhone) {
       return res.status(400).json({ error: 'Phone number is required' });
@@ -1875,7 +1835,22 @@ router.put('/:id', async (req, res) => {
 
     const contact = await Contact.findOneAndUpdate(
       buildScopedContactFilter(req, { _id: req.params.id }),
-      updatePayload,
+      {
+        ...updatePayload,
+        ...(isTenantWideContactRole(normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role))
+          ? {
+              ...(req.body?.leadStatus !== undefined
+                ? { leadStatus: toCleanString(req.body.leadStatus).toLowerCase() || 'new_lead' }
+                : {}),
+              ...(req.body?.followupDate !== undefined
+                ? { followupDate: req.body.followupDate ? new Date(req.body.followupDate) : null }
+                : {}),
+              ...(req.body?.assignedTo !== undefined || req.body?.ownerId !== undefined
+                ? resolveContactOwnership(req, req.body)
+                : {})
+            }
+          : {})
+      },
       { new: true, runValidators: true }
     );
 
@@ -1916,11 +1891,9 @@ router.put('/:id', async (req, res) => {
 // Delete contact
 router.delete('/:id', async (req, res) => {
   try {
-    const contact = await Contact.findOneAndDelete({
-      _id: req.params.id,
-      userId: req.user.id,
-      ...(req.companyId ? { companyId: req.companyId } : {})
-    });
+    const contact = await Contact.findOneAndDelete(
+      buildScopedContactFilter(req, { _id: req.params.id })
+    );
     
     if (!contact) {
       return res.status(404).json({ error: 'Contact not found' });

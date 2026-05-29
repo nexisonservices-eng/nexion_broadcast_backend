@@ -20,6 +20,10 @@ const createWebSocketHub = ({ wss }) => {
   const crmSubscriptions = new Map();
   const lastPresenceBroadcastByUser = new Map();
   const lastTypingBroadcastByConversationUser = new Map();
+  const outboundBatchQueues = new Map();
+  const outboundBatchTimers = new Map();
+  const OUTBOUND_BATCH_WINDOW_MS = Number(process.env.WS_OUTBOUND_BATCH_WINDOW_MS || 30);
+  const OUTBOUND_BATCH_MAX_SIZE = Number(process.env.WS_OUTBOUND_BATCH_MAX_SIZE || 40);
 
   const getRoomKey = (kind, value) => `${kind}:${String(value || '').trim()}`;
   const getClientKey = (ws, fallbackUserId = '') =>
@@ -40,6 +44,26 @@ const createWebSocketHub = ({ wss }) => {
         data?.payload?.conversationId ||
         ''
     ).trim();
+  const resolveDataConversationIds = (data = {}, fallbackId = '') =>
+    Array.from(
+      new Set(
+        [
+          fallbackId,
+          data?.conversationId,
+          data?.conversation?._id,
+          data?.conversation?.id,
+          data?.message?.conversationId,
+          data?.payload?.conversationId,
+          ...(Array.isArray(data?.relatedConversationIds) ? data.relatedConversationIds : []),
+          ...(Array.isArray(data?.message?.relatedConversationIds) ? data.message.relatedConversationIds : []),
+          ...(Array.isArray(data?.conversation?.relatedConversationIds)
+            ? data.conversation.relatedConversationIds
+            : [])
+        ]
+          .map((id) => String(id || '').trim())
+          .filter(Boolean)
+      )
+    );
 
   const getSocketSet = (userId) => {
     const normalizedUserId = String(userId || '').trim();
@@ -72,6 +96,12 @@ const createWebSocketHub = ({ wss }) => {
       roomSet.delete(ws);
       if (roomSet.size === 0) {
         roomMembers.delete(roomId);
+        outboundBatchQueues.delete(roomId);
+        const timer = outboundBatchTimers.get(roomId);
+        if (timer) {
+          clearTimeout(timer);
+          outboundBatchTimers.delete(roomId);
+        }
       }
     });
     if (ws.joinedRooms instanceof Set) {
@@ -126,20 +156,90 @@ const createWebSocketHub = ({ wss }) => {
     }
     if (socketSet.size === 0) {
       roomMembers.delete(normalizedRoomId);
+      outboundBatchQueues.delete(normalizedRoomId);
+      const timer = outboundBatchTimers.get(normalizedRoomId);
+      if (timer) {
+        clearTimeout(timer);
+        outboundBatchTimers.delete(normalizedRoomId);
+      }
     }
     return true;
   };
 
-  const sendToLocalRoom = (roomId, data) => {
-    const socketSet = roomMembers.get(String(roomId || '').trim());
-    if (!socketSet || socketSet.size === 0) return;
+  const flushOutboundBatch = async (roomId) => {
+    const normalizedRoomId = String(roomId || '').trim();
+    if (!normalizedRoomId) return false;
 
-    const message = JSON.stringify(data);
+    const timer = outboundBatchTimers.get(normalizedRoomId);
+    if (timer) {
+      clearTimeout(timer);
+      outboundBatchTimers.delete(normalizedRoomId);
+    }
+
+    const socketSet = roomMembers.get(normalizedRoomId);
+    const queue = outboundBatchQueues.get(normalizedRoomId);
+    if (!socketSet || socketSet.size === 0 || !queue || queue.length === 0) {
+      outboundBatchQueues.delete(normalizedRoomId);
+      return false;
+    }
+
+    const events = queue.splice(0, queue.length);
+    const payload =
+      events.length === 1
+        ? events[0]
+        : {
+            type: 'realtime_batch',
+            room: normalizedRoomId,
+            events,
+            timestamp: new Date().toISOString()
+          };
+    const message = JSON.stringify(payload);
+
     socketSet.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(message);
       }
     });
+
+    if (queue.length === 0) {
+      outboundBatchQueues.delete(normalizedRoomId);
+    }
+    return true;
+  };
+
+  const sendToLocalRoom = (roomId, data) => {
+    const normalizedRoomId = String(roomId || '').trim();
+    const socketSet = roomMembers.get(normalizedRoomId);
+    if (!socketSet || socketSet.size === 0) return;
+
+    let queue = outboundBatchQueues.get(normalizedRoomId);
+    if (!queue) {
+      queue = [];
+      outboundBatchQueues.set(normalizedRoomId, queue);
+    }
+
+    queue.push(data);
+    if (queue.length >= OUTBOUND_BATCH_MAX_SIZE) {
+      void flushOutboundBatch(normalizedRoomId).catch((error) => {
+        console.error('Failed to flush outbound websocket batch:', error?.message || error);
+      });
+      return;
+    }
+
+    if (!outboundBatchTimers.has(normalizedRoomId)) {
+      const timer = setTimeout(() => {
+        outboundBatchTimers.delete(normalizedRoomId);
+        void flushOutboundBatch(normalizedRoomId).catch((error) => {
+          console.error('Failed to flush outbound websocket batch:', error?.message || error);
+        });
+      }, OUTBOUND_BATCH_WINDOW_MS);
+
+      if (typeof timer.unref === 'function') {
+        timer.unref();
+      }
+
+      outboundBatchTimers.set(normalizedRoomId, timer);
+    }
   };
 
   const sendJson = (ws, data) => {
@@ -211,14 +311,13 @@ const createWebSocketHub = ({ wss }) => {
       if (targetUserId) {
         sendToLocalUser(targetUserId, event.data || {});
       }
-      const targetCompanyId = resolveDataCompanyId(event?.data || {});
+      const targetCompanyId = String(event?.companyId || resolveDataCompanyId(event?.data || {})).trim();
       if (targetCompanyId) {
         sendToLocalRoom(getRoomKey('company', targetCompanyId), event.data || {});
       }
-      const targetConversationId = resolveDataConversationId(event?.data || {});
-      if (targetConversationId) {
-        sendToLocalRoom(getRoomKey('conversation', targetConversationId), event.data || {});
-      }
+      resolveDataConversationIds(event?.data || {}, event?.conversationId).forEach((conversationId) => {
+        sendToLocalRoom(getRoomKey('conversation', conversationId), event.data || {});
+      });
       return;
     }
 
@@ -231,10 +330,9 @@ const createWebSocketHub = ({ wss }) => {
     }
 
     if (scope === 'conversation') {
-      const targetConversationId = String(event?.conversationId || resolveDataConversationId(event?.data || {})).trim();
-      if (targetConversationId) {
-        sendToLocalRoom(getRoomKey('conversation', targetConversationId), event.data || {});
-      }
+      resolveDataConversationIds(event?.data || {}, event?.conversationId).forEach((conversationId) => {
+        sendToLocalRoom(getRoomKey('conversation', conversationId), event.data || {});
+      });
       return;
     }
 
@@ -280,23 +378,22 @@ const createWebSocketHub = ({ wss }) => {
     if (!normalizedUserId) return;
 
     const companyId = resolveDataCompanyId(data || {});
-    if (companyId) {
-      const payload = {
-        scope: 'company',
-        companyId,
-        data
-      };
-      sendToLocalRoom(getRoomKey('company', companyId), data);
-      await publishRealtimeEvent(payload);
-      return;
-    }
-
+    const conversationId = resolveDataConversationId(data || {});
     const payload = {
       scope: 'user',
       userId: normalizedUserId,
+      companyId: companyId || null,
+      conversationId: conversationId || null,
       data
     };
+
     sendToLocalUser(normalizedUserId, data);
+    if (companyId) {
+      sendToLocalRoom(getRoomKey('company', companyId), data);
+    }
+    resolveDataConversationIds(data || {}, conversationId).forEach((targetConversationId) => {
+      sendToLocalRoom(getRoomKey('conversation', targetConversationId), data);
+    });
     await publishRealtimeEvent(payload);
   };
 

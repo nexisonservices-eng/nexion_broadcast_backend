@@ -334,6 +334,7 @@ async function updateConversationForMissedCallAutomation({
       contactId: contact._id,
       contactPhone: phone,
       contactName: contact.name,
+      channel: 'voice',
       lastMessage: messageText,
       lastMessageTime: new Date(),
       lastMessageMediaType: '',

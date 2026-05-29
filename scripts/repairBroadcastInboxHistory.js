@@ -47,6 +47,7 @@ const summaryPayload = (c) => ({
   contactId: c?.contactId,
   contactPhone: c?.contactPhone,
   contactName: c?.contactName,
+  channel: c?.channel || 'whatsapp',
   status: c?.status,
   assignedTo: c?.assignedTo,
   assignedToId: c?.assignedToId,
@@ -94,7 +95,7 @@ async function repairOne(d, dryRun, stats) {
   let conv = await Conversation.findOne({ userId: d.userId, companyId: d.companyId, contactPhone: phone, status: { $in: ['active', 'pending'] } });
   const ts = d.sentAt || d.updatedAt || d.createdAt || new Date();
   if (!conv) {
-    conv = dryRun ? { _id: new mongoose.Types.ObjectId(), userId: d.userId, companyId: d.companyId, contactId: contact._id, contactPhone: phone, contactName: String(contact.name || '').trim(), lastMessage: text, lastMessageTime: ts, lastMessageMediaType: '', lastMessageAttachmentName: '', lastMessageAttachmentPages: null, lastMessageFrom: 'agent', lastMessageWhatsappMessageId: d.whatsappMessageId || '', unreadCount: 0, status: 'active' } : await Conversation.create({ userId: d.userId, companyId: d.companyId, contactId: contact._id, contactPhone: phone, contactName: String(contact.name || '').trim(), lastMessage: text, lastMessageTime: ts, lastMessageMediaType: '', lastMessageAttachmentName: '', lastMessageAttachmentPages: null, lastMessageFrom: 'agent', lastMessageWhatsappMessageId: d.whatsappMessageId || '' });
+    conv = dryRun ? { _id: new mongoose.Types.ObjectId(), userId: d.userId, companyId: d.companyId, contactId: contact._id, contactPhone: phone, contactName: String(contact.name || '').trim(), channel: 'whatsapp', lastMessage: text, lastMessageTime: ts, lastMessageMediaType: '', lastMessageAttachmentName: '', lastMessageAttachmentPages: null, lastMessageFrom: 'agent', lastMessageWhatsappMessageId: d.whatsappMessageId || '', unreadCount: 0, status: 'active' } : await Conversation.create({ userId: d.userId, companyId: d.companyId, contactId: contact._id, contactPhone: phone, contactName: String(contact.name || '').trim(), channel: 'whatsapp', lastMessage: text, lastMessageTime: ts, lastMessageMediaType: '', lastMessageAttachmentName: '', lastMessageAttachmentPages: null, lastMessageFrom: 'agent', lastMessageWhatsappMessageId: d.whatsappMessageId || '' });
   } else if (!dryRun) {
     conv.lastMessage = text; conv.lastMessageTime = ts; conv.lastMessageMediaType = ''; conv.lastMessageAttachmentName = ''; conv.lastMessageAttachmentPages = null; conv.lastMessageFrom = 'agent'; conv.lastMessageWhatsappMessageId = d.whatsappMessageId || ''; await conv.save();
   }

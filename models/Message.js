@@ -10,9 +10,11 @@ const MessageSchema = new mongoose.Schema({
     index: true
   },
   sender: { type: String, enum: ['contact', 'agent', 'bot', 'system'], required: true },
+  senderRole: { type: String, enum: ['admin', 'agent', 'bot', 'system', 'contact'], default: 'agent' },
   senderName: String,
   senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   text: String,
+  attachments: { type: [mongoose.Schema.Types.Mixed], default: [] },
   mediaUrl: String,
   mediaType: { type: String, enum: ['image', 'video', 'audio', 'document', 'sticker'] },
   mediaCaption: String,
@@ -45,8 +47,11 @@ const MessageSchema = new mongoose.Schema({
     default: 'sent',
     index: true
   },
+  deliveredTo: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   whatsappMessageId: { type: String, unique: true, sparse: true },
   whatsappTimestamp: Date,
+  createdAt: { type: Date, default: Date.now, index: true },
   errorMessage: String,
   errorCode: String,
   broadcastId: { type: mongoose.Schema.Types.ObjectId, ref: 'Broadcast', index: true },
@@ -86,5 +91,8 @@ MessageSchema.index({ companyId: 1, broadcastId: 1, status: 1 });
 MessageSchema.index({ companyId: 1, userId: 1, 'attachment.publicId': 1 });
 MessageSchema.index({ companyId: 1, userId: 1, mediaType: 1, timestamp: -1 });
 MessageSchema.index({ companyId: 1, broadcastId: 1, timestamp: -1, _id: -1 });
+MessageSchema.index({ conversationId: 1, createdAt: -1 });
+MessageSchema.index({ conversationId: 1, _id: -1 });
+MessageSchema.index({ senderId: 1 });
 
 module.exports = mongoose.model('Message', MessageSchema);

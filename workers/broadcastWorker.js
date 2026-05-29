@@ -4,6 +4,7 @@ const { Worker } = require('bullmq');
 const Broadcast = require('../models/Broadcast');
 const LeadActivity = require('../models/LeadActivity');
 const broadcastService = require('../services/broadcastService');
+const { isRedisDisabled, getRedisDisabledReason } = require('../config/redis');
 const {
   connection,
   broadcastQueue,
@@ -35,6 +36,7 @@ const workerMode = String(workerModeArg ? workerModeArg.split('=')[1] : 'all')
   .toLowerCase();
 const enableBroadcastDispatchWorker = workerMode === 'all' || workerMode === 'dispatch';
 const enableBroadcastInboxWorker = workerMode === 'all' || workerMode === 'inbox';
+const canStartBullWorkers = !isRedisDisabled;
 
 const splitRecipients = (recipients, size) => {
   const chunks = [];
@@ -317,7 +319,7 @@ const finalizeBroadcastIfReady = async (broadcastId, userId) => {
 };
 
 let broadcastWorker = null;
-if (enableBroadcastDispatchWorker) {
+if (enableBroadcastDispatchWorker && canStartBullWorkers) {
   broadcastWorker = new Worker(
     'broadcast-send',
     async (job) => {
@@ -530,7 +532,7 @@ if (enableBroadcastDispatchWorker) {
 }
 
 let broadcastInboxWorker = null;
-if (enableBroadcastInboxWorker) {
+if (enableBroadcastInboxWorker && canStartBullWorkers) {
   broadcastInboxWorker = new Worker(
     broadcastInboxQueueName,
     async (job) => {
@@ -627,6 +629,10 @@ if (enableBroadcastInboxWorker) {
       concurrency: Math.max(2, Math.min(12, Number(process.env.BROADCAST_INBOX_WORKER_CONCURRENCY || 6)))
     }
   );
+}
+
+if (!canStartBullWorkers) {
+  console.warn(`Broadcast worker disabled: ${getRedisDisabledReason()}. Inbox writes will use the local fallback path.`);
 }
 
 if (broadcastWorker) {

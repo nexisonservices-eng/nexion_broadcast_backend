@@ -5,15 +5,20 @@ const multer = require('multer');
 const axios = require('axios');
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
+const ConversationSummary = require('../models/ConversationSummary');
 const Contact = require('../models/Contact');
 const Template = require('../models/Template');
 const whatsappService = require('../services/whatsappService');
 const {
   buildChronologicalPage,
+  buildThreadPageResponse,
   buildMessageCursorFilter,
+  buildMessageIdCursorFilter,
   decodeMessageCursor,
+  decodeMessageIdCursor,
   encodeAttachmentCursor,
   encodeMessageCursor,
+  encodeMessageIdCursor,
   normalizePageLimit
 } = require('../utils/threadPagination');
 const {
@@ -28,6 +33,14 @@ const {
   isTenantWideRole
 } = require('../utils/accessControl');
 const { createRedisRateLimiter } = require('../middleware/redisRateLimit');
+
+const setInboxNoCacheHeaders = (res) => {
+  res.set({
+    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0, private',
+    Pragma: 'no-cache',
+    Expires: '0'
+  });
+};
 
 const threadReadRateLimit = createRedisRateLimiter({
   namespace: 'thread-message-read',
@@ -53,6 +66,9 @@ const {
   upsertConversationSummary
 } = require('../services/conversationSummaryService');
 const {
+  enqueueRealtimeOutboxEvent
+} = require('../services/realtimeOutboxService');
+const {
   resolveInboxStorageUsername,
   uploadInboxAttachment,
   generateSignedAttachmentUrl,
@@ -60,6 +76,7 @@ const {
   isAttachmentPathOwned,
   deleteInboxAttachment
 } = require('../services/inboxMediaService');
+const { resolveOutboundSenderMeta } = require('../utils/messageSenderMeta');
 const auth = require('../middleware/auth');
 const { requireTenantPolicy } = require('../middleware/tenantPolicy');
 const requireWhatsAppCredentials = require('../middleware/requireWhatsAppCredentials');
@@ -71,6 +88,9 @@ const {
   markOutboundTemplateContactActivity,
   cleanupCreatedTemplateOutreachTarget
 } = require('../services/whatsappOutreach/conversationResolver');
+const {
+  resolveRelatedConversationIds
+} = require('../utils/conversationThreadLookup');
 const {
   validateFreeformOutboundSend,
   validateTemplateOutboundSend,
@@ -92,6 +112,7 @@ router.use(
 // Compatibility endpoint for Team Inbox message history when conversation routes are unavailable.
 router.get('/conversation/:id', threadReadRateLimit, async (req, res) => {
   try {
+    setInboxNoCacheHeaders(res);
     const conversationId = String(req.params.id || '').trim();
     if (!conversationId) {
       return res.status(400).json({
@@ -108,16 +129,30 @@ router.get('/conversation/:id', threadReadRateLimit, async (req, res) => {
       userId: req.user?.id || ''
     });
     const scope = scopeVariants[scopeVariants.length - 1] || scopeVariants[0] || '';
-    const threadScope = scope ? `${scope}:${conversationId}` : '';
-    const baseFilters = buildScopedMessageFilters(req, {
-      conversationId,
-      ...(cursor ? buildMessageCursorFilter(cursor) : {})
+    const conversationRecord = await Conversation.findOne({
+      _id: conversationId,
+      ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {})
+    })
+      .select('_id contactPhone contactId assignedTo assignedToId assignedAgent')
+      .lean();
+    const relatedConversationIds = await resolveRelatedConversationIds({
+      Conversation,
+      ConversationSummary,
+      req,
+      conversation: conversationRecord || { _id: conversationId },
+      includeAllIdentityMatches: true
     });
+    const familyScopeKey = relatedConversationIds
+      .map((id) => String(id || '').trim())
+      .filter(Boolean)
+      .sort()
+      .join('|');
+    const threadScope = scope ? `${scope}:${conversationId}:${familyScopeKey}` : '';
 
     const loadMessages = async (filters) =>
       Message.find(filters)
         .select(
-          '_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
+          '_id conversationId sender senderRole senderName senderId text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
         )
         .sort({ timestamp: -1, _id: -1 })
         .limit(limit + 1)
@@ -125,8 +160,10 @@ router.get('/conversation/:id', threadReadRateLimit, async (req, res) => {
 
     const loadScopedMessages = async () => {
       const scopedMessages = await loadMessages({
-        ...baseFilters,
-        ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {})
+        ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
+        ...(relatedConversationIds.length > 0
+          ? { conversationId: { $in: relatedConversationIds } }
+          : { conversationId })
       });
 
       if (scopedMessages.length > 0 || !normalizedCompanyId) {
@@ -134,9 +171,11 @@ router.get('/conversation/:id', threadReadRateLimit, async (req, res) => {
       }
 
       const companyWideMessages = await loadMessages({
-        conversationId,
-        ...(cursor ? buildMessageCursorFilter(cursor) : {}),
-        companyId: normalizedCompanyId
+        ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
+        ...(relatedConversationIds.length > 0
+          ? { conversationId: { $in: relatedConversationIds } }
+          : { conversationId }),
+        ...(cursor ? buildMessageCursorFilter(cursor) : {})
       });
 
       if (companyWideMessages.length > 0) {
@@ -144,7 +183,9 @@ router.get('/conversation/:id', threadReadRateLimit, async (req, res) => {
       }
 
       return loadMessages({
-        conversationId,
+        ...(relatedConversationIds.length > 0
+          ? { conversationId: { $in: relatedConversationIds } }
+          : { conversationId }),
         ...(cursor ? buildMessageCursorFilter(cursor) : {}),
         $or: [
           { companyId: { $exists: false } },
@@ -165,7 +206,7 @@ router.get('/conversation/:id', threadReadRateLimit, async (req, res) => {
             if (messages.some((message) => String(message?.replyTo || '').trim())) {
               await Message.populate(messages, {
                 path: 'replyTo',
-                select: '_id text sender whatsappMessageId mediaType mediaCaption timestamp attachment'
+                select: '_id text sender senderRole senderName senderId whatsappMessageId mediaType mediaCaption timestamp attachment'
               });
             }
             const page = buildChronologicalPage({
@@ -235,13 +276,16 @@ const resolveReplyReferenceForOutboundSend = async ({
   userId,
   companyId,
   replyToMessageId,
-  whatsappContextMessageId
+  whatsappContextMessageId,
+  isTenantWide = false
 }) => {
   const normalizedReplyToMessageId = String(replyToMessageId || '').trim();
   if (normalizedReplyToMessageId && isValidObjectId(normalizedReplyToMessageId)) {
-    const baseIdFilter = { _id: normalizedReplyToMessageId, userId };
+    const baseIdFilter = { _id: normalizedReplyToMessageId };
     const byScopeReply = await Message.findOne(
-      companyId ? { ...baseIdFilter, companyId } : baseIdFilter
+      companyId
+        ? { ...baseIdFilter, companyId, ...(isTenantWide ? {} : { userId }) }
+        : { ...baseIdFilter, ...(isTenantWide ? {} : { userId }) }
     )
       .select('_id whatsappMessageId')
       .lean();
@@ -251,8 +295,12 @@ const resolveReplyReferenceForOutboundSend = async ({
   const normalizedContextId = String(whatsappContextMessageId || '').trim();
   if (!normalizedContextId) return null;
 
-  const baseContextFilter = { userId, whatsappMessageId: normalizedContextId };
-  return Message.findOne(companyId ? { ...baseContextFilter, companyId } : baseContextFilter)
+  const baseContextFilter = { whatsappMessageId: normalizedContextId };
+  return Message.findOne(
+    companyId
+      ? { ...baseContextFilter, companyId, ...(isTenantWide ? {} : { userId }) }
+      : { ...baseContextFilter, ...(isTenantWide ? {} : { userId }) }
+  )
     .select('_id whatsappMessageId')
     .lean();
 };
@@ -262,11 +310,12 @@ const resolveReactionTargetForOutboundSend = async ({
   companyId,
   conversationId,
   targetMessageId,
-  targetWhatsAppMessageId
+  targetWhatsAppMessageId,
+  isTenantWide = false
 }) => {
   const baseFilters = {
-    userId,
-    conversationId
+    conversationId,
+    ...(isTenantWide ? {} : { userId })
   };
 
   const normalizedTargetMessageId = String(targetMessageId || '').trim();
@@ -353,15 +402,182 @@ const syncConversationSummary = async (conversation = {}, updates = {}) => {
   });
 };
 
-const resolveContactForConversation = async ({ userId, companyId, conversation }) => {
-  if (!conversation?._id || !userId) return null;
+const writeConversationThreadState = async ({
+  conversation,
+  conversationUpdate = {},
+  summaryUpdate = {},
+  companyId = '',
+  userId = '',
+  relatedConversationIds = []
+}) => {
+  if (!conversation?._id) return null;
+
+  await Conversation.updateOne({ _id: conversation._id }, conversationUpdate);
+  await syncConversationSummary(conversation, summaryUpdate);
+  await invalidateInboxConversation({
+    companyId: companyId || '',
+    userId: userId || '',
+    conversationId: conversation._id,
+    conversationIds: relatedConversationIds
+  });
+
+  return true;
+};
+
+const enqueueUserRealtimeEvent = async ({
+  userId,
+  companyId,
+  conversationId,
+  eventType,
+  data,
+  dedupeKey
+}) => {
+  const normalizedUserId = String(userId || '').trim();
+  const payload = {
+    scope: 'user',
+    userId: normalizedUserId || null,
+    companyId: String(companyId || '').trim() || null,
+    conversationId: String(conversationId || '').trim() || null,
+    data
+  };
+
+  try {
+    const queued = await enqueueRealtimeOutboxEvent({
+      eventType: eventType || String(data?.type || 'realtime_event').trim(),
+      scope: 'user',
+      userId: normalizedUserId,
+      companyId,
+      conversationId,
+      payload,
+      dedupeKey:
+        String(dedupeKey || '').trim() ||
+        `${eventType || String(data?.type || 'realtime_event').trim()}:${String(
+          conversationId || normalizedUserId || crypto.randomUUID()
+        ).trim()}`
+    });
+    return Boolean(queued);
+  } catch (error) {
+    console.error(`Failed to enqueue ${eventType || 'realtime'} user event:`, error?.message || error);
+    return false;
+  }
+};
+
+const buildMessageSentRealtimeData = ({ companyId, conversationId, message, conversation = null, relatedConversationIds = [] }) => ({
+  type: 'message_sent',
+  companyId: String(companyId || '').trim() || null,
+  conversationId: String(conversationId || message?.conversationId || '').trim() || null,
+  ...(conversation ? { conversation } : {}),
+  relatedConversationIds: Array.isArray(relatedConversationIds)
+    ? relatedConversationIds.map((id) => String(id || '').trim()).filter(Boolean)
+    : [],
+  message: message?.toObject ? message.toObject() : message
+});
+
+const collectRealtimeRecipientUserIds = async ({ userId = '', companyId = '', relatedConversationIds = [] } = {}) => {
+  const recipientIds = new Set([String(userId || '').trim()].filter(Boolean));
+  const conversationIds = Array.from(
+    new Set(
+      (Array.isArray(relatedConversationIds) ? relatedConversationIds : [])
+        .map((id) => String(id || '').trim())
+        .filter(Boolean)
+    )
+  );
+
+  if (conversationIds.length === 0) {
+    return Array.from(recipientIds);
+  }
+
+  const relatedConversations = await Conversation.find({
+    _id: { $in: conversationIds },
+    ...(companyId ? { companyId } : {})
+  })
+    .select('userId assignedTo assignedToId assignedAgent')
+    .lean();
+
+  relatedConversations.forEach((conversation) => {
+    [
+      conversation?.userId,
+      conversation?.assignedTo,
+      conversation?.assignedToId,
+      conversation?.assignedAgent
+    ].forEach((candidateId) => {
+      const normalizedId = String(candidateId || '').trim();
+      if (normalizedId) recipientIds.add(normalizedId);
+    });
+  });
+
+  return Array.from(recipientIds);
+};
+
+const fanoutMessageSentRealtime = async ({
+  req,
+  companyId,
+  conversationId,
+  message,
+  conversation = null,
+  relatedConversationIds = []
+}) => {
+  const sendToUser = req?.app?.locals?.sendToUser;
+  if (typeof sendToUser !== 'function') {
+    return false;
+  }
+
+  const payload = buildMessageSentRealtimeData({
+    companyId,
+    conversationId,
+    message,
+    conversation,
+    relatedConversationIds
+  });
+  const recipientUserIds = await collectRealtimeRecipientUserIds({
+    userId: req?.user?.id,
+    companyId,
+    relatedConversationIds: [conversationId, ...relatedConversationIds]
+  });
+
+  await Promise.all(
+    recipientUserIds.map((recipientUserId) => sendToUser(String(recipientUserId), payload))
+  );
+  return true;
+};
+
+const enqueueMessageSentEvent = async ({ userId, companyId, conversationId, message, conversation = null, relatedConversationIds = [] }) =>
+  enqueueUserRealtimeEvent({
+    userId,
+    companyId,
+    conversationId,
+    eventType: 'message_sent',
+    data: buildMessageSentRealtimeData({
+      companyId,
+      conversationId,
+      message,
+      conversation,
+      relatedConversationIds
+    }),
+    dedupeKey: `message_sent:${String(message?._id || message?.whatsappMessageId || crypto.randomUUID()).trim()}`
+  });
+
+const resolveContactForConversation = async ({
+  userId,
+  companyId,
+  conversation,
+  isTenantWide = false
+}) => {
+  if (!conversation?._id || (!userId && !isTenantWide)) return null;
 
   if (conversation.contactId) {
-    const contactById = await Contact.findOne({
-      _id: conversation.contactId,
-      userId,
-      ...(companyId ? { companyId } : {})
-    });
+    const contactById = await Contact.findOne(
+      isTenantWide
+        ? {
+            _id: conversation.contactId,
+            ...(companyId ? { companyId } : {})
+          }
+        : {
+            _id: conversation.contactId,
+            userId,
+            ...(companyId ? { companyId } : {})
+          }
+    );
 
     if (contactById) return contactById;
   }
@@ -369,11 +585,18 @@ const resolveContactForConversation = async ({ userId, companyId, conversation }
   const phoneCandidates = buildPhoneCandidates(conversation.contactPhone || '');
   if (!phoneCandidates.length) return null;
 
-  return Contact.findOne({
-    userId,
-    ...(companyId ? { companyId } : {}),
-    phone: { $in: phoneCandidates }
-  });
+  return Contact.findOne(
+    isTenantWide
+      ? {
+          ...(companyId ? { companyId } : {}),
+          phone: { $in: phoneCandidates }
+        }
+      : {
+          userId,
+          ...(companyId ? { companyId } : {}),
+          phone: { $in: phoneCandidates }
+        }
+  );
 };
 
 const resolveAttachmentMessageFilters = ({ req, messageId }) => {
@@ -384,9 +607,39 @@ const resolveAttachmentMessageFilters = ({ req, messageId }) => {
   return filters;
 };
 
-const resolveLatestInboundConversationActivity = async ({ req, conversationId }) => {
+const resolveLatestInboundConversationActivity = async ({ req, conversationId, conversation }) => {
+  const relatedConversationIds = new Set();
+  const normalizedConversationId = String(conversationId || conversation?._id || '').trim();
+  if (normalizedConversationId) {
+    relatedConversationIds.add(normalizedConversationId);
+  }
+
+  if (conversation) {
+    try {
+      const resolvedIds = await resolveRelatedConversationIds({
+        Conversation,
+        ConversationSummary,
+        req,
+        conversation,
+        includeAllIdentityMatches: true
+      });
+      resolvedIds.forEach((id) => {
+        const normalizedId = String(id || '').trim();
+        if (normalizedId) relatedConversationIds.add(normalizedId);
+      });
+    } catch (lookupError) {
+      console.warn(
+        'Failed to resolve related inbound conversations for send policy:',
+        lookupError?.message || lookupError
+      );
+    }
+  }
+
   const filters = buildScopedMessageFilters(req, {
-    conversationId,
+    conversationId:
+      relatedConversationIds.size > 1
+        ? { $in: Array.from(relatedConversationIds) }
+        : normalizedConversationId,
     sender: 'contact'
   });
   return Message.findOne(filters)
@@ -571,17 +824,19 @@ const runTemplateHeaderUpload = (req, res) =>
     });
   });
 
-const buildScopedMessageFilters = (req, extra = {}) => {
+const buildScopedMessageFilters = (req, extra = {}, options = {}) => {
   const normalizedRole = normalizeRole(
     req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role
   );
   const normalizedCompanyId = String(req?.companyId || req?.user?.companyId || '').trim();
+  const normalizedScope = String(options?.scope || '').trim().toLowerCase();
+  const shouldSkipUserScope = normalizedScope === 'team';
   const filters = {
     ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
     ...extra
   };
 
-  if (!isTenantWideRole(normalizedRole)) {
+  if (!shouldSkipUserScope && !isTenantWideRole(normalizedRole)) {
     filters.userId = req.user.id;
   }
 
@@ -628,7 +883,7 @@ router.post(
 router.post(
   '/react',
   sendMessageRateLimit,
-  requirePlanFeature('broadcastMessaging'),
+  requirePlanFeature('teamInbox'),
   requireWhatsAppCredentials,
   async (req, res) => {
     try {
@@ -655,7 +910,10 @@ router.post(
         userId: req.user.id,
         companyId: req.companyId || null,
         conversationId,
-        to
+        to,
+        isTenantWide: isTenantWideRole(
+          normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+        )
       });
       if (!conversation) {
         return res.status(400).json({
@@ -670,7 +928,10 @@ router.post(
         companyId: messageCompanyId,
         conversationId: conversation._id,
         targetMessageId,
-        targetWhatsAppMessageId
+        targetWhatsAppMessageId,
+        isTenantWide: isTenantWideRole(
+          normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+        )
       });
 
       if (!reactionTarget?._id || !String(reactionTarget?.whatsappMessageId || '').trim()) {
@@ -721,25 +982,47 @@ router.post(
       const whatsappMessageId =
         sendResult?.data?.messages?.[0]?.id || sendResult?.data?.messageId || null;
       const reactionText = normalizedEmoji ? `Reacted with ${normalizedEmoji}` : '[Reaction removed]';
+      const threadTimestamp = new Date();
 
       const message = await Message.create({
         userId: req.user.id,
         companyId: messageCompanyId,
         conversationId: conversation._id,
         sender: 'agent',
+        ...resolveOutboundSenderMeta(req.user),
         text: reactionText,
         rawMessageType: 'reaction',
         reactionEmoji: normalizedEmoji || undefined,
         whatsappContextMessageId: reactionTarget.whatsappMessageId,
         whatsappMessageId,
         status: 'sent',
-        timestamp: new Date()
+        timestamp: threadTimestamp
+      });
+      const relatedConversationIds = await resolveRelatedConversationIds({
+        Conversation,
+        ConversationSummary,
+        req,
+        conversation,
+        includeAllIdentityMatches: true
       });
 
-      await Conversation.updateOne(
-        { _id: conversation._id },
-        {
-          lastMessageTime: new Date(),
+      await writeConversationThreadState({
+        conversation,
+        companyId: messageCompanyId || '',
+        userId: req.user.id || '',
+        relatedConversationIds,
+        conversationUpdate: {
+          lastMessageTime: threadTimestamp,
+          lastMessage: reactionText,
+          lastMessageMediaType: '',
+          lastMessageAttachmentName: '',
+          lastMessageAttachmentPages: null,
+          lastMessageFrom: 'agent',
+          lastMessageWhatsappMessageId: whatsappMessageId || '',
+          lastMessageStatus: 'sent'
+        },
+        summaryUpdate: {
+          lastMessageTime: threadTimestamp,
           lastMessage: reactionText,
           lastMessageMediaType: '',
           lastMessageAttachmentName: '',
@@ -748,30 +1031,28 @@ router.post(
           lastMessageWhatsappMessageId: whatsappMessageId || '',
           lastMessageStatus: 'sent'
         }
-      );
-      await syncConversationSummary(conversation, {
-        lastMessageTime: new Date(),
-        lastMessage: reactionText,
-        lastMessageMediaType: '',
-        lastMessageAttachmentName: '',
-        lastMessageAttachmentPages: null,
-        lastMessageFrom: 'agent',
-        lastMessageWhatsappMessageId: whatsappMessageId || '',
-        lastMessageStatus: 'sent'
       });
 
-      await invalidateInboxConversation({
-        companyId: messageCompanyId || '',
-        userId: req.user.id || '',
-        conversationId: conversation._id
+      const queuedRealtimeEvent = await enqueueMessageSentEvent({
+        userId: req.user.id,
+        companyId: messageCompanyId,
+        conversationId: conversation._id,
+        message,
+        conversation: conversation?.toObject ? conversation.toObject() : conversation,
+        relatedConversationIds
       });
-
-      const sendToUser = req.app?.locals?.sendToUser;
-      if (typeof sendToUser === 'function') {
-        sendToUser(String(req.user.id), {
-          type: 'message_sent',
-          message: message.toObject()
-        });
+      const realtimeSent = await fanoutMessageSentRealtime({
+        req,
+        companyId: messageCompanyId,
+        conversationId: conversation._id,
+        message,
+        conversation: conversation?.toObject ? conversation.toObject() : conversation,
+        relatedConversationIds
+      });
+      if (!realtimeSent && !queuedRealtimeEvent) {
+        console.warn('message_sent realtime event was not queued and no websocket sender is available.');
+      } else if (!queuedRealtimeEvent) {
+        console.warn('message_sent realtime event was not queued; direct websocket fanout was used.');
       }
 
       return res.json({ success: true, message });
@@ -825,7 +1106,7 @@ router.post(
 router.post(
   '/send-template',
   sendMessageRateLimit,
-  requirePlanFeature('broadcastMessaging'),
+  requirePlanFeature('teamInbox'),
   requireWhatsAppCredentials,
   async (req, res) => {
     try {
@@ -859,7 +1140,10 @@ router.post(
         conversationId,
         contactId,
         contactName,
-        to
+        to,
+        isTenantWide: isTenantWideRole(
+          normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+        )
       });
       const {
         conversation,
@@ -932,6 +1216,7 @@ router.post(
         companyId: messageCompanyId,
         conversationId: conversation._id,
         sender: 'agent',
+        ...resolveOutboundSenderMeta(req.user),
         text: previewText,
         whatsappMessageId,
         status: 'sent',
@@ -942,15 +1227,25 @@ router.post(
         contact,
         contactName
       });
+      const relatedConversationIds = await resolveRelatedConversationIds({
+        Conversation,
+        ConversationSummary,
+        req,
+        conversation,
+        includeAllIdentityMatches: true
+      });
 
       if (normalizedTemplateCategory === 'marketing' && contact) {
         applyMarketingTemplateSent(contact, { now: messageTimestamp });
         await contact.save();
       }
 
-      await Conversation.updateOne(
-        { _id: conversation._id },
-        {
+      await writeConversationThreadState({
+        conversation,
+        companyId: messageCompanyId || '',
+        userId: req.user.id || '',
+        relatedConversationIds,
+        conversationUpdate: {
           lastMessageTime: messageTimestamp,
           lastMessage: previewText,
           lastMessageMediaType: '',
@@ -962,34 +1257,42 @@ router.post(
           contactName:
             String(contact?.name || conversation.contactName || contactName || '').trim() ||
             conversation.contactName
+        },
+        summaryUpdate: {
+          contactName:
+            String(contact?.name || conversation.contactName || contactName || '').trim() ||
+            conversation.contactName,
+          lastMessageTime: messageTimestamp,
+          lastMessage: previewText,
+          lastMessageMediaType: '',
+          lastMessageAttachmentName: '',
+          lastMessageAttachmentPages: null,
+          lastMessageFrom: 'agent',
+          lastMessageWhatsappMessageId: whatsappMessageId || '',
+          lastMessageStatus: 'sent'
         }
-      );
-      await syncConversationSummary(conversation, {
-        contactName:
-          String(contact?.name || conversation.contactName || contactName || '').trim() ||
-          conversation.contactName,
-        lastMessageTime: messageTimestamp,
-        lastMessage: previewText,
-        lastMessageMediaType: '',
-        lastMessageAttachmentName: '',
-        lastMessageAttachmentPages: null,
-        lastMessageFrom: 'agent',
-        lastMessageWhatsappMessageId: whatsappMessageId || '',
-        lastMessageStatus: 'sent'
       });
 
-      await invalidateInboxConversation({
-        companyId: messageCompanyId || '',
-        userId: req.user.id || '',
-        conversationId: conversation._id
+      const queuedRealtimeEvent = await enqueueMessageSentEvent({
+        userId: req.user.id,
+        companyId: messageCompanyId,
+        conversationId: conversation._id,
+        message,
+        conversation: conversation?.toObject ? conversation.toObject() : conversation,
+        relatedConversationIds
       });
-
-      const sendToUser = req.app?.locals?.sendToUser;
-      if (typeof sendToUser === 'function') {
-        sendToUser(String(req.user.id), {
-          type: 'message_sent',
-          message: message.toObject()
-        });
+      const realtimeSent = await fanoutMessageSentRealtime({
+        req,
+        companyId: messageCompanyId,
+        conversationId: conversation._id,
+        message,
+        conversation: conversation?.toObject ? conversation.toObject() : conversation,
+        relatedConversationIds
+      });
+      if (!realtimeSent && !queuedRealtimeEvent) {
+        console.warn('message_sent realtime event was not queued and no websocket sender is available.');
+      } else if (!queuedRealtimeEvent) {
+        console.warn('message_sent realtime event was not queued; direct websocket fanout was used.');
       }
 
       return res.json({
@@ -1010,7 +1313,7 @@ router.post(
 router.post(
   '/send-attachment',
   attachmentRateLimit,
-  requirePlanFeature('broadcastMessaging'),
+  requirePlanFeature('teamInbox'),
   requireWhatsAppCredentials,
   async (req, res) => {
     try {
@@ -1046,7 +1349,10 @@ router.post(
         userId: req.user.id,
         companyId: req.companyId || null,
         conversationId,
-        to
+        to,
+        isTenantWide: isTenantWideRole(
+          normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+        )
       });
       if (!conversation) {
         return res.status(400).json({
@@ -1059,7 +1365,10 @@ router.post(
       const outboundContact = await resolveContactForConversation({
         userId: req.user.id,
         companyId: conversation.companyId || req.companyId || null,
-        conversation
+        conversation,
+        isTenantWide: isTenantWideRole(
+          normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+        )
       });
       const parsedConversationLastInboundMessageAt = new Date(
         String(conversationLastInboundMessageAt || '').trim()
@@ -1080,7 +1389,8 @@ router.post(
       if (!freeformValidation.ok && outboundContact) {
         const latestInboundActivity = await resolveLatestInboundConversationActivity({
           req,
-          conversationId: conversation._id
+          conversationId: conversation._id,
+          conversation
         });
         if (latestInboundActivity) {
           const fallbackPolicy = getWhatsAppMessagingPolicy(outboundContact, {
@@ -1111,7 +1421,10 @@ router.post(
         userId: req.user.id,
         companyId: messageCompanyId,
         replyToMessageId,
-        whatsappContextMessageId
+        whatsappContextMessageId,
+        isTenantWide: isTenantWideRole(
+          normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+        )
       });
       const resolvedReplyContextMessageId =
         String(whatsappContextMessageId || replyReference?.whatsappMessageId || '').trim();
@@ -1242,12 +1555,14 @@ router.post(
       const whatsappMessageId =
         sendResult?.data?.messages?.[0]?.id || sendResult?.data?.messageId || null;
       const messageText = normalizedCaption || buildAttachmentLabel(mediaType);
+      const messageTimestamp = new Date();
 
       const message = await Message.create({
         userId: req.user.id,
         companyId: messageCompanyId,
         conversationId: conversation._id,
         sender: 'agent',
+        ...resolveOutboundSenderMeta(req.user),
         text: messageText,
         mediaUrl: attachment.secureUrl,
         mediaType,
@@ -1258,14 +1573,39 @@ router.post(
         whatsappContextMessageId: resolvedReplyContextMessageId || undefined,
         whatsappMessageId,
         status: 'sent',
-        timestamp: new Date()
+        timestamp: messageTimestamp
       });
-      await message.populate('replyTo', '_id text sender whatsappMessageId mediaType mediaCaption timestamp');
+      await message.populate(
+        'replyTo',
+        '_id text sender senderRole senderName senderId whatsappMessageId mediaType mediaCaption timestamp'
+      );
+      const relatedConversationIds = await resolveRelatedConversationIds({
+        Conversation,
+        ConversationSummary,
+        req,
+        conversation,
+        includeAllIdentityMatches: true
+      });
 
-      await Conversation.updateOne(
-        { _id: conversation._id },
-        {
-          lastMessageTime: new Date(),
+      await writeConversationThreadState({
+        conversation,
+        companyId: messageCompanyId || '',
+        userId: req.user.id || '',
+        relatedConversationIds,
+        conversationUpdate: {
+          lastMessageTime: messageTimestamp,
+          lastMessage: messageText,
+          lastMessageMediaType: mediaType,
+          lastMessageAttachmentName:
+            mediaType === 'document' ? String(attachment?.originalFileName || '').trim() : '',
+          lastMessageAttachmentPages:
+            mediaType === 'document' ? Number(attachment?.pages || 0) || null : null,
+          lastMessageFrom: 'agent',
+          lastMessageWhatsappMessageId: whatsappMessageId || '',
+          lastMessageStatus: 'sent'
+        },
+        summaryUpdate: {
+          lastMessageTime: messageTimestamp,
           lastMessage: messageText,
           lastMessageMediaType: mediaType,
           lastMessageAttachmentName:
@@ -1276,32 +1616,28 @@ router.post(
           lastMessageWhatsappMessageId: whatsappMessageId || '',
           lastMessageStatus: 'sent'
         }
-      );
-      await syncConversationSummary(conversation, {
-        lastMessageTime: new Date(),
-        lastMessage: messageText,
-        lastMessageMediaType: mediaType,
-        lastMessageAttachmentName:
-          mediaType === 'document' ? String(attachment?.originalFileName || '').trim() : '',
-        lastMessageAttachmentPages:
-          mediaType === 'document' ? Number(attachment?.pages || 0) || null : null,
-        lastMessageFrom: 'agent',
-        lastMessageWhatsappMessageId: whatsappMessageId || '',
-        lastMessageStatus: 'sent'
       });
 
-      await invalidateInboxConversation({
-        companyId: messageCompanyId || '',
-        userId: req.user.id || '',
-        conversationId: conversation._id
+      const queuedRealtimeEvent = await enqueueMessageSentEvent({
+        userId: req.user.id,
+        companyId: messageCompanyId,
+        conversationId: conversation._id,
+        message,
+        conversation: conversation?.toObject ? conversation.toObject() : conversation,
+        relatedConversationIds
       });
-
-      const sendToUser = req.app?.locals?.sendToUser;
-      if (typeof sendToUser === 'function') {
-        sendToUser(String(req.user.id), {
-          type: 'message_sent',
-          message: message.toObject()
-        });
+      const realtimeSent = await fanoutMessageSentRealtime({
+        req,
+        companyId: messageCompanyId,
+        conversationId: conversation._id,
+        message,
+        conversation: conversation?.toObject ? conversation.toObject() : conversation,
+        relatedConversationIds
+      });
+      if (!realtimeSent && !queuedRealtimeEvent) {
+        console.warn('message_sent realtime event was not queued and no websocket sender is available.');
+      } else if (!queuedRealtimeEvent) {
+        console.warn('message_sent realtime event was not queued; direct websocket fanout was used.');
       }
 
       return res.json({
@@ -1368,7 +1704,7 @@ router.get('/attachments', async (req, res) => {
       .sort({ timestamp: -1, _id: -1 })
       .limit(limit + 1)
       .select(
-        '_id conversationId sender senderName text mediaType mediaCaption mediaUrl status timestamp attachment'
+        '_id conversationId sender senderRole senderName senderId text mediaType mediaCaption mediaUrl status timestamp attachment'
       )
       .lean();
 
@@ -1548,7 +1884,20 @@ router.delete('/attachments/:messageId', async (req, res) => {
     });
 
     const sendToUser = req.app?.locals?.sendToUser;
-    if (typeof sendToUser === 'function') {
+    const queuedRealtimeEvent = await enqueueUserRealtimeEvent({
+      userId: req.user.id,
+      companyId: req.companyId || message.companyId || '',
+      conversationId: message.conversationId,
+      eventType: 'message_attachment_deleted',
+      data: {
+        type: 'message_attachment_deleted',
+        messageId: String(message._id),
+        conversationId: String(message.conversationId || ''),
+        mediaPipelineRequestId: mediaPipelineRequestId || null
+      },
+      dedupeKey: `message_attachment_deleted:${String(message._id || '')}:${mediaPipelineRequestId || 'no-request'}`
+    });
+    if (!queuedRealtimeEvent && typeof sendToUser === 'function') {
       sendToUser(String(req.user.id), {
         type: 'message_attachment_deleted',
         messageId: String(message._id),
@@ -1617,6 +1966,90 @@ router.delete('/delete-selected', async (req, res) => {
   } catch (error) {
     console.error('Error deleting messages:', error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
+  try {
+    setInboxNoCacheHeaders(res);
+
+    const conversationId = String(req.params.conversationId || '').trim();
+    if (!conversationId) {
+      return res.status(400).json({
+        success: false,
+        error: 'conversationId is required'
+      });
+    }
+
+    const rawCursor = String(req.query?.cursor || '').trim();
+    const cursor = rawCursor ? decodeMessageIdCursor(rawCursor) : null;
+    if (rawCursor && !cursor) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid cursor value'
+      });
+    }
+
+    const limit = normalizePageLimit(req.query?.limit, {
+      fallback: 20,
+      max: 20
+    });
+    const normalizedScope = String(req.query?.scope || 'team').trim().toLowerCase() || 'team';
+    const normalizedCompanyId = String(req.companyId || req.user?.companyId || '').trim();
+    const normalizedUserId = String(req.user?.id || '').trim();
+    const scopeVariants = getInboxScopeVariants({
+      companyId: normalizedCompanyId,
+      userId: normalizedUserId
+    });
+    const cacheScope = scopeVariants[0] || scopeVariants[1] || '';
+    const cacheKeyScope = cacheScope ? `${cacheScope}:${conversationId}` : '';
+    const cursorFilter = cursor ? buildMessageIdCursorFilter(cursor) : {};
+
+    const loadMessagePage = async () => {
+      const filters = buildScopedMessageFilters(
+        req,
+        {
+          conversationId
+        },
+        {
+          scope: normalizedScope
+        }
+      );
+
+      Object.assign(filters, cursorFilter);
+
+      const messages = await Message.find(filters)
+        .sort({ _id: -1 })
+        .limit(limit + 1)
+        .select(
+          '_id conversationId sender senderRole senderName senderId text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment attachments replyTo replyToMessageId errorMessage deliveredTo readBy'
+        )
+        .lean();
+
+      return buildThreadPageResponse({
+        documents: Array.isArray(messages) ? messages : [],
+        limit,
+        encodeCursor: encodeMessageIdCursor
+      });
+    };
+
+    const response = cacheKeyScope
+      ? await getOrSetCachedJson({
+          namespace: 'messages',
+          scope: cacheKeyScope,
+          versionGroup: 'thread',
+          keyParts: [String(limit), String(rawCursor || ''), normalizedScope],
+          ttlSeconds: CACHE_TTL_SECONDS.messages,
+          loader: loadMessagePage
+        })
+      : await loadMessagePage();
+
+    return res.json(response);
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error?.message || 'Failed to fetch conversation messages'
+    });
   }
 });
 

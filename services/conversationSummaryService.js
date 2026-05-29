@@ -55,14 +55,24 @@ const normalizeSummaryPayload = (payload = {}) => {
       payload?.contactName === undefined ? undefined : toCleanString(payload?.contactName),
     contactNameLower:
       payload?.contactName === undefined ? undefined : toLowerCleanString(payload?.contactName),
+    channel:
+      payload?.channel === undefined ? undefined : toCleanString(payload?.channel).toLowerCase(),
     status: hasStatus ? (normalizedStatus || 'active') : undefined,
+    leadStatus:
+      payload?.leadStatus === undefined ? undefined : toCleanString(payload?.leadStatus) || undefined,
     assignedTo: payload?.assignedTo === undefined ? undefined : (toCleanString(payload?.assignedTo) || null),
     assignedToId:
       payload?.assignedToId === undefined ? undefined : toObjectIdValue(payload?.assignedToId),
+    assignedAgent:
+      payload?.assignedAgent === undefined ? undefined : (toCleanString(payload?.assignedAgent) || null),
     tags: Array.isArray(payload?.tags)
       ? Array.from(new Set(payload.tags.map((tag) => toCleanString(tag)).filter(Boolean)))
       : undefined,
+    important:
+      payload?.important === undefined ? undefined : Boolean(payload?.important),
     priority: payload?.priority === undefined ? undefined : (toCleanString(payload?.priority) || undefined),
+    followupAt:
+      payload?.followupAt === undefined ? undefined : toDateValue(payload?.followupAt),
     lastMessageTime: hasLastMessageTime ? toDateValue(payload?.lastMessageTime) : undefined,
     lastMessage:
       payload?.lastMessage === undefined ? undefined : toCleanString(payload?.lastMessage),
@@ -91,6 +101,8 @@ const normalizeSummaryPayload = (payload = {}) => {
     unreadCount:
       payload?.unreadCount === undefined ? undefined : Math.max(0, toNumberValue(payload?.unreadCount, 0)),
     notes: payload?.notes === undefined ? undefined : toCleanString(payload?.notes),
+    internalNotes:
+      payload?.internalNotes === undefined ? undefined : (Array.isArray(payload?.internalNotes) ? payload.internalNotes : []),
     resolvedAt: resolvedResolvedAt
   };
 };
@@ -132,11 +144,16 @@ const buildSummaryUpdate = (payload = {}) => {
     'contactName',
     'contactPhoneDigits',
     'contactNameLower',
+    'channel',
     'status',
+    'leadStatus',
     'assignedTo',
     'assignedToId',
+    'assignedAgent',
     'tags',
+    'important',
     'priority',
+    'followupAt',
     'lastMessageTime',
     'lastMessage',
     'lastMessageMediaType',
@@ -147,6 +164,7 @@ const buildSummaryUpdate = (payload = {}) => {
     'lastMessageStatus',
     'unreadCount',
     'notes',
+    'internalNotes',
     'resolvedAt'
   ];
 

@@ -33,6 +33,7 @@ const {
   getCrmOwnerDashboard,
   runCrmFollowUpAutomation
 } = require('../services/crmOpsService');
+const { upsertConversationSummary } = require('../services/conversationSummaryService');
 const {
   getCrmReportsSummary,
   getCrmFunnelReport,
@@ -41,6 +42,7 @@ const {
 } = require('../services/crmReportsService');
 const { getLeadScoringSettings } = require('../services/leadScoringService');
 const { encryptGoogleToken, decryptGoogleToken } = require('../utils/googleTokenCrypto');
+const { normalizeRole } = require('../utils/accessControl');
 
 const router = express.Router();
 router.use(auth);
@@ -76,13 +78,18 @@ const CRM_CONTACT_LIST_FIELDS = [
   'tags',
   'stage',
   'status',
+  'leadStatus',
   'source',
   'sourceType',
+  'createdBy',
   'ownerId',
+  'assignedTo',
+  'assignedAgent',
   'temperature',
   'dealValue',
   'lostReason',
   'nextFollowUpAt',
+  'followupDate',
   'lastContact',
   'lastContactAt',
   'lastStageChangedAt',
@@ -90,6 +97,8 @@ const CRM_CONTACT_LIST_FIELDS = [
   'leadScoreBreakdown',
   'archivedAt',
   'archivedBy',
+  'notes',
+  'internalNotes',
   'isBlocked',
   'whatsappOptInStatus',
   'whatsappOptInAt',
@@ -260,6 +269,71 @@ const loadPipelineStages = async (req) => {
     ...normalizePipelineStageResponse(stage),
     order: Number.isFinite(Number(stage?.order)) ? Number(stage.order) : index
   }));
+};
+
+const syncLeadConversationAssignments = async ({
+  req,
+  contactIds = [],
+  ownerId = null,
+  patchLabel = 'owner_changed'
+} = {}) => {
+  const normalizedContactIds = Array.from(
+    new Set(
+      (Array.isArray(contactIds) ? contactIds : [])
+        .map((contactId) => toCleanString(contactId))
+        .filter(Boolean)
+    )
+  ).filter((contactId) => toObjectIdIfValid(contactId));
+
+  if (!normalizedContactIds.length) return [];
+
+  const conversationUpdates = await Conversation.find(
+    buildScopedFilter(req, {
+      contactId: { $in: normalizedContactIds }
+    })
+  )
+    .select('_id contactId userId companyId status leadStatus assignedTo assignedToId assignedAgent')
+    .lean();
+
+  if (!conversationUpdates.length) return [];
+
+  const nextAssignedTo = ownerId ? toCleanString(ownerId) : null;
+  await Conversation.updateMany(
+    buildScopedFilter(req, {
+      contactId: { $in: normalizedContactIds }
+    }),
+    {
+      $set: {
+        assignedTo: nextAssignedTo,
+        assignedAgent: nextAssignedTo,
+        assignedToId: toObjectIdIfValid(nextAssignedTo) || null
+      }
+    }
+  );
+
+  const refreshedConversations = await Conversation.find(
+    buildScopedFilter(req, {
+      contactId: { $in: normalizedContactIds }
+    })
+  )
+    .select('_id userId companyId contactId contactPhone contactName status assignedTo assignedToId assignedAgent leadStatus lastMessageTime lastMessage unreadCount tags priority resolvedAt createdAt updatedAt')
+    .lean();
+
+  await Promise.all(
+    refreshedConversations.map((conversation) =>
+      upsertConversationSummary(conversation).catch(() => null)
+    )
+  );
+
+  emitCrmRealtimeEvent(req, {
+    entity: 'conversation',
+    action: patchLabel,
+    contactIds: normalizedContactIds,
+    assignedTo: nextAssignedTo,
+    count: refreshedConversations.length
+  });
+
+  return refreshedConversations;
 };
 
 const loadPipelineStageMap = async (req) => {
@@ -448,26 +522,36 @@ const normalizeDealLifecycle = ({
 
 const buildScopedFilter = (req, extra = {}) => {
   const conditions = [];
-  const scopeCandidates = [];
+  const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+  const isAdminLikeRole = ['superadmin', 'admin', 'manager'].includes(normalizedRole);
   const normalizedCompanyId = toObjectIdIfValid(req?.companyId);
-  const normalizedUserId = toObjectIdIfValid(req?.user?.id);
+  const normalizedUserId = toCleanString(req?.user?.id);
 
-  if (normalizedCompanyId) {
-    scopeCandidates.push({ companyId: normalizedCompanyId });
-  } else if (req?.companyId) {
-    scopeCandidates.push({ companyId: req.companyId });
-  }
+  if (isAdminLikeRole) {
+    if (normalizedCompanyId) {
+      conditions.push({ companyId: normalizedCompanyId });
+    } else if (req?.companyId) {
+      conditions.push({ companyId: req.companyId });
+    }
+  } else {
+    const agentScope = normalizedUserId
+      ? {
+          $or: [
+            { userId: normalizedUserId },
+            { ownerId: normalizedUserId },
+            { assignedTo: normalizedUserId },
+            { assignedAgent: normalizedUserId },
+            { createdBy: normalizedUserId }
+          ]
+        }
+      : null;
 
-  if (normalizedUserId) {
-    scopeCandidates.push({ userId: normalizedUserId });
-  } else if (req?.user?.id) {
-    scopeCandidates.push({ userId: req.user.id });
-  }
-
-  if (scopeCandidates.length === 1) {
-    conditions.push(scopeCandidates[0]);
-  } else if (scopeCandidates.length > 1) {
-    conditions.push({ $or: scopeCandidates });
+    if (req?.companyId) {
+      conditions.push({ companyId: req.companyId });
+    }
+    if (agentScope) {
+      conditions.push(agentScope);
+    }
   }
 
   if (extra && Object.keys(extra).length > 0) {
@@ -841,6 +925,58 @@ const buildTaskBucketFilter = (bucket) => {
     default:
       return null;
   }
+};
+
+const buildTaskBulkScopedFilter = async (req, criteria = {}) => {
+  const normalizedCriteria = criteria && typeof criteria === 'object' ? criteria : {};
+  const filters = [];
+
+  const bucket = toCleanString(normalizedCriteria.bucket).toLowerCase();
+  if (bucket && bucket !== 'all') {
+    const bucketFilter = buildTaskBucketFilter(bucket);
+    if (!bucketFilter) return null;
+    filters.push(bucketFilter);
+  }
+
+  const normalizedAssignedTo = toCleanString(normalizedCriteria.assignedTo);
+  if (normalizedAssignedTo === '__unassigned__') {
+    filters.push({
+      $or: [
+        { assignedTo: { $in: [null, ''] } },
+        { assignedTo: { $exists: false } }
+      ]
+    });
+  } else if (normalizedAssignedTo) {
+    filters.push({ assignedTo: normalizedAssignedTo });
+  }
+
+  const normalizedStatus = toCleanString(normalizedCriteria.status).toLowerCase();
+  if (normalizedStatus && normalizedStatus !== 'all') {
+    if (!TASK_STATUSES.includes(normalizedStatus)) return null;
+    filters.push({ status: normalizedStatus });
+  }
+
+  const normalizedPriority = toCleanString(normalizedCriteria.priority).toLowerCase();
+  if (normalizedPriority && normalizedPriority !== 'all') {
+    if (!Object.prototype.hasOwnProperty.call(TASK_PRIORITY_RANK, normalizedPriority)) return null;
+    filters.push({ priority: normalizedPriority });
+  }
+
+  const normalizedTaskType = toCleanString(normalizedCriteria.taskType).toLowerCase();
+  if (normalizedTaskType && normalizedTaskType !== 'all') {
+    if (!TASK_TYPES.includes(normalizedTaskType)) return null;
+    filters.push({ taskType: normalizedTaskType });
+  }
+
+  const normalizedSearch = toCleanString(normalizedCriteria.search);
+  if (normalizedSearch) {
+    const searchFilter = await buildTaskSearchFilter(req, normalizedSearch);
+    if (searchFilter && Object.keys(searchFilter).length > 0) {
+      filters.push(searchFilter);
+    }
+  }
+
+  return mergeFiltersWithAnd(...filters);
 };
 
 const buildTaskSearchFilter = async (req, search) => {
@@ -2237,19 +2373,29 @@ router.get('/contacts', async (req, res) => {
 router.post('/contacts/bulk', async (req, res) => {
   try {
     const action = toCleanString(req.body?.action).toLowerCase();
+    const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+    const isAdminLikeRole = ['superadmin', 'admin', 'manager'].includes(normalizedRole);
+    const matchAll = Boolean(req.body?.matchAll);
+    const criteria = req.body?.criteria && typeof req.body.criteria === 'object' ? req.body.criteria : req.body?.filters;
     const validContactIds = Array.isArray(req.body?.contactIds)
       ? req.body.contactIds.filter((contactId) => toObjectIdIfValid(contactId))
       : [];
     if (!['assign', 'add_tags', 'remove_tags', 'archive', 'unarchive', 'export', 'delete'].includes(action)) {
       return res.status(400).json({ success: false, error: 'Invalid bulk action' });
     }
-    if (!validContactIds.length) {
+    if (!validContactIds.length && !matchAll) {
       return res.status(400).json({ success: false, error: 'Choose at least one lead.' });
     }
 
-    const filter = buildScopedFilter(req, {
-      _id: { $in: validContactIds.map((contactId) => new mongoose.Types.ObjectId(contactId)) }
-    });
+    if (!isAdminLikeRole && ['assign', 'delete', 'export'].includes(action)) {
+      return res.status(403).json({ success: false, error: 'Admin access required for this bulk action.' });
+    }
+
+    const filter = matchAll
+      ? await buildCrmContactScopedFilter(req, criteria || {}, { includeStage: false })
+      : buildScopedFilter(req, {
+          _id: { $in: validContactIds.map((contactId) => new mongoose.Types.ObjectId(contactId)) }
+        });
     const contacts = await Contact.find(filter).select(CRM_CONTACT_LIST_FIELDS).lean();
     if (!contacts.length) {
       return res.status(404).json({ success: false, error: 'No leads found for bulk action' });
@@ -2302,6 +2448,7 @@ router.post('/contacts/bulk', async (req, res) => {
 
     const now = new Date();
     const actorId = toCleanString(req.user?.id);
+    const bulkReason = toCleanString(req.body?.reason || req.body?.note || req.body?.comment);
     const update = {};
     if (action === 'assign') {
       update.$set = { ownerId: toCleanString(req.body?.ownerId) || null };
@@ -2319,6 +2466,14 @@ router.post('/contacts/bulk', async (req, res) => {
 
     const result = await Contact.updateMany(filter, update);
     const activityType = action === 'assign' ? 'owner_changed' : 'contact_updated';
+    if (action === 'assign') {
+      await syncLeadConversationAssignments({
+        req,
+        contactIds: contacts.map((contact) => contact._id),
+        ownerId: toCleanString(req.body?.ownerId) || null,
+        patchLabel: 'bulk_owner_updated'
+      });
+    }
     await Promise.all(
       contacts.map((contact) =>
         logLeadActivity({
@@ -2328,6 +2483,7 @@ router.post('/contacts/bulk', async (req, res) => {
           meta: {
             bulkAction: action,
             ownerId: action === 'assign' ? toCleanString(req.body?.ownerId) || null : undefined,
+            reason: action === 'assign' && bulkReason ? bulkReason : undefined,
             tags: ['add_tags', 'remove_tags'].includes(action) ? toCleanStringArray(req.body?.tags) : undefined
           },
           createdBy: actorId
@@ -2415,10 +2571,108 @@ router.get('/contacts/summary', async (req, res) => {
       return acc;
     }, {});
 
+    const normalizedTotalCount = Number(total?.count || 0);
+    if (normalizedTotalCount === 0) {
+      const hasExplicitQueryFilters =
+        ['search', 'stage', 'status', 'ownerId', 'queue', 'minScore', 'maxScore', 'hasFollowUp', 'archive']
+          .some((key) => req.query?.[key] !== undefined);
+      const tenantScopedFilter =
+        req.companyId
+          ? { companyId: req.companyId }
+          : req.user?.id
+            ? { userId: req.user.id }
+            : {};
+      if (!hasExplicitQueryFilters && Object.keys(tenantScopedFilter).length > 0) {
+        const fallbackContacts = await Contact.find(tenantScopedFilter)
+          .select('stage status leadScore dealValue')
+          .lean();
+        if (fallbackContacts.length > 0) {
+          const fallbackByStage = fallbackContacts.reduce((acc, contact) => {
+            const stageKey = toCleanString(contact?.stage).toLowerCase() || 'new';
+            acc[stageKey] = acc[stageKey] || { count: 0, value: 0, averageLeadScore: 0, scoreTotal: 0 };
+            acc[stageKey].count += 1;
+            acc[stageKey].value += Number(contact?.dealValue || 0);
+            acc[stageKey].scoreTotal += Number(contact?.leadScore || 0);
+            return acc;
+          }, {});
+          Object.keys(fallbackByStage).forEach((key) => {
+            const stageBucket = fallbackByStage[key];
+            stageBucket.averageLeadScore = Number(
+              (stageBucket.scoreTotal / Math.max(stageBucket.count, 1)).toFixed(2)
+            );
+            delete stageBucket.scoreTotal;
+          });
+
+          return res.json({
+            success: true,
+            data: {
+              total: fallbackContacts.length,
+              value: fallbackContacts.reduce((sum, contact) => sum + Number(contact?.dealValue || 0), 0),
+              qualified: fallbackContacts.reduce((sum, contact) => {
+                const stage = toCleanString(contact?.stage).toLowerCase();
+                const status = toCleanString(contact?.status).toLowerCase();
+                return sum + (status === 'qualified' || stage === 'qualified' ? 1 : 0);
+              }, 0),
+              averageLeadScore: Number(
+                (
+                  fallbackContacts.reduce((sum, contact) => sum + Number(contact?.leadScore || 0), 0) /
+                  Math.max(fallbackContacts.length, 1)
+                ).toFixed(2)
+              ),
+              byStage: fallbackByStage,
+              generatedAt: new Date().toISOString()
+            }
+          });
+        }
+      }
+
+      const fallbackContacts = await Contact.find(scopedFilter)
+        .select('stage status leadScore dealValue')
+        .lean();
+      if (fallbackContacts.length > 0) {
+        const fallbackByStage = fallbackContacts.reduce((acc, contact) => {
+          const stageKey = toCleanString(contact?.stage).toLowerCase() || 'new';
+          acc[stageKey] = acc[stageKey] || { count: 0, value: 0, averageLeadScore: 0, scoreTotal: 0 };
+          acc[stageKey].count += 1;
+          acc[stageKey].value += Number(contact?.dealValue || 0);
+          acc[stageKey].scoreTotal += Number(contact?.leadScore || 0);
+          return acc;
+        }, {});
+        Object.keys(fallbackByStage).forEach((key) => {
+          const stageBucket = fallbackByStage[key];
+          stageBucket.averageLeadScore = Number(
+            (stageBucket.scoreTotal / Math.max(stageBucket.count, 1)).toFixed(2)
+          );
+          delete stageBucket.scoreTotal;
+        });
+
+        return res.json({
+          success: true,
+          data: {
+            total: fallbackContacts.length,
+            value: fallbackContacts.reduce((sum, contact) => sum + Number(contact?.dealValue || 0), 0),
+            qualified: fallbackContacts.reduce((sum, contact) => {
+              const stage = toCleanString(contact?.stage).toLowerCase();
+              const status = toCleanString(contact?.status).toLowerCase();
+              return sum + (status === 'qualified' || stage === 'qualified' ? 1 : 0);
+            }, 0),
+            averageLeadScore: Number(
+              (
+                fallbackContacts.reduce((sum, contact) => sum + Number(contact?.leadScore || 0), 0) /
+                Math.max(fallbackContacts.length, 1)
+              ).toFixed(2)
+            ),
+            byStage: fallbackByStage,
+            generatedAt: new Date().toISOString()
+          }
+        });
+      }
+    }
+
     res.json({
       success: true,
       data: {
-        total: Number(total?.count || 0),
+        total: normalizedTotalCount,
         value: Number(total?.value || 0),
         qualified: Number(total?.qualified || 0),
         averageLeadScore: Number(Number(total?.averageLeadScore || 0).toFixed(2)),
@@ -2735,6 +2989,11 @@ router.patch('/contacts/:id/owner', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid contact id' });
     }
 
+    const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+    if (!['superadmin', 'admin', 'manager'].includes(normalizedRole)) {
+      return res.status(403).json({ success: false, error: 'Admin access required to reassign leads.' });
+    }
+
     const contact = await Contact.findOne(buildScopedFilter(req, { _id: id }));
     if (!contact) {
       return res.status(404).json({ success: false, error: 'Contact not found' });
@@ -2744,6 +3003,13 @@ router.patch('/contacts/:id/owner', async (req, res) => {
     const nextOwner = toCleanString(req.body?.ownerId) || null;
     contact.ownerId = nextOwner;
     await contact.save();
+
+    await syncLeadConversationAssignments({
+      req,
+      contactIds: [contact._id],
+      ownerId: nextOwner,
+      patchLabel: 'owner_updated'
+    });
 
     await logLeadActivity({
       req,
@@ -2823,7 +3089,50 @@ router.post('/contacts/:id/notes', async (req, res) => {
 
 router.get('/contacts/:id/documents', async (req, res) => {
   try {
-    const contact = await loadAuthorizedContact(req, req.params.id);
+    let contact = null;
+    try {
+      contact = await loadAuthorizedContact(req, req.params.id);
+    } catch (error) {
+      const conversationId = String(req.query?.conversationId || '').trim();
+      const normalizedStatus = Number(error?.status || 500);
+      if (normalizedStatus !== 404 || !toObjectIdIfValid(conversationId)) {
+        throw error;
+      }
+
+      const conversation = await Conversation.findOne({
+        _id: conversationId,
+        ...(req.companyId ? { companyId: req.companyId } : {})
+      })
+        .select('_id contactId assignedTo assignedToId assignedAgent')
+        .lean();
+
+      if (!conversation?.contactId) {
+        throw error;
+      }
+
+      try {
+        contact = await loadAuthorizedContact(req, conversation.contactId);
+      } catch (contactError) {
+        const status = Number(contactError?.status || 500);
+        if (status !== 404) {
+          throw contactError;
+        }
+
+        const fallbackContact = await Contact.findOne({
+          _id: conversation.contactId,
+          ...(req.companyId ? { companyId: req.companyId } : {})
+        })
+          .select('_id')
+          .lean();
+
+        if (!fallbackContact?._id) {
+          throw error;
+        }
+
+        contact = fallbackContact;
+      }
+    }
+
     const documents = await ContactDocument.find(
       buildScopedFilter(req, {
         contactId: contact._id,
@@ -2840,7 +3149,19 @@ router.get('/contacts/:id/documents', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(getCrmRouteErrorStatus(error)).json({ success: false, error: error.message });
+    const status = getCrmRouteErrorStatus(error);
+    if (status === 404 && String(req.query?.conversationId || '').trim()) {
+      return res.json({
+        success: true,
+        data: [],
+        meta: {
+          documentTypes: CONTACT_DOCUMENT_TYPES,
+          verificationStatuses: CONTACT_DOCUMENT_VERIFICATION_STATUSES
+        }
+      });
+    }
+
+    res.status(status).json({ success: false, error: error.message });
   }
 });
 
@@ -3907,11 +4228,13 @@ router.post('/tasks/:id/comments', async (req, res) => {
 
 router.post('/tasks/bulk', async (req, res) => {
   try {
+    const matchAll = Boolean(req.body?.matchAll);
+    const criteria = req.body?.criteria && typeof req.body.criteria === 'object' ? req.body.criteria : req.body?.filters;
     const taskIds = Array.isArray(req.body?.taskIds) ? req.body.taskIds : [];
     const action = toCleanString(req.body?.action).toLowerCase();
     const validTaskIds = taskIds.filter((taskId) => toObjectIdIfValid(taskId));
 
-    if (validTaskIds.length === 0) {
+    if (validTaskIds.length === 0 && !matchAll) {
       return res.status(400).json({ success: false, error: 'At least one valid task id is required' });
     }
 
@@ -3919,9 +4242,14 @@ router.post('/tasks/bulk', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid bulk action' });
     }
 
-    const tasks = await LeadTask.find(
-      buildScopedFilter(req, { _id: { $in: validTaskIds } })
-    );
+    const bulkFilter = matchAll
+      ? await buildTaskBulkScopedFilter(req, criteria || {})
+      : buildScopedFilter(req, { _id: { $in: validTaskIds } });
+    if (bulkFilter === null) {
+      return res.status(400).json({ success: false, error: 'Invalid bulk filter criteria' });
+    }
+
+    const tasks = await LeadTask.find(bulkFilter ? buildScopedFilter(req, bulkFilter) : buildScopedFilter(req, { _id: { $in: validTaskIds } }));
 
     if (!tasks.length) {
       return res.status(404).json({ success: false, error: 'No tasks found for bulk action' });
