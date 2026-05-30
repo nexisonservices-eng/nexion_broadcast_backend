@@ -6,6 +6,7 @@ const BroadcastDispatch = require("../models/BroadcastDispatch");
 const LeadActivity = require("../models/LeadActivity");
 const Template = require("../models/Template");
 const whatsappService = require("./whatsappService");
+const User = require("../models/User");
 const {
   syncConversationSummaryFromConversation,
 } = require("./conversationSummaryService");
@@ -23,6 +24,15 @@ const {
   buildConversationPhoneLookupFilter,
 } = require("../utils/conversationIdentity");
 const {
+  buildContactPhoneLookupFilter,
+  buildContactIdentityScopeFilter,
+  mergeFilters,
+} = require("../utils/contactIdentity");
+const {
+  buildConversationAssignmentPatch,
+  collectConversationParticipantUserIds,
+} = require("../utils/conversationAssignment");
+const {
   CACHE_TTL_SECONDS,
   getOrSetCachedJson,
   invalidateInboxConversation,
@@ -33,6 +43,7 @@ const {
   validateFreeformOutboundSend,
   applyMarketingTemplateSent,
 } = require("./whatsappOutreach/policy");
+const { resolveOutboundSenderMeta } = require("../utils/messageSenderMeta");
 const axios = require("axios");
 const { createRedisConnection, isRedisDisabled } = require("../config/redis");
 const mongoose = require("mongoose");
@@ -105,6 +116,92 @@ class BroadcastService {
     }
   }
 
+  async resolveBroadcastSenderMeta({ broadcast = null, userId = null } = {}) {
+    const resolvedUserId = String(userId || broadcast?.createdById || "").trim();
+    const fallbackUser = {
+      id: resolvedUserId,
+      _id: resolvedUserId,
+      userId: resolvedUserId,
+      name: String(broadcast?.createdBy || "").trim(),
+      email: String(broadcast?.createdByEmail || "").trim(),
+      role: "",
+    };
+    const persistedWorkspaceRole = String(
+      broadcast?.createdByWorkspaceRole ||
+        broadcast?.createdByCompanyRole ||
+        broadcast?.createdByNormalizedRole ||
+        "",
+    ).trim();
+
+    if (!resolvedUserId) {
+      return resolveOutboundSenderMeta(
+        persistedWorkspaceRole
+          ? {
+              ...fallbackUser,
+              normalizedRole: persistedWorkspaceRole,
+              companyRole: persistedWorkspaceRole,
+              role: persistedWorkspaceRole,
+            }
+          : fallbackUser,
+      );
+    }
+
+    if (persistedWorkspaceRole) {
+      return resolveOutboundSenderMeta({
+        ...fallbackUser,
+        normalizedRole: persistedWorkspaceRole,
+        companyRole: persistedWorkspaceRole,
+        role: persistedWorkspaceRole,
+      });
+    }
+
+    if (!this.broadcastSenderMetaCache) {
+      this.broadcastSenderMetaCache = new Map();
+    }
+    if (this.broadcastSenderMetaCache.has(resolvedUserId)) {
+      return this.broadcastSenderMetaCache.get(resolvedUserId);
+    }
+
+    try {
+      const user = await User.findById(resolvedUserId)
+        .select("_id name email role")
+        .lean();
+      const senderMeta = resolveOutboundSenderMeta(
+        user
+          ? {
+              ...user,
+              id: String(user._id || resolvedUserId),
+              normalizedRole: persistedWorkspaceRole || user?.normalizedRole || "",
+              companyRole: persistedWorkspaceRole || user?.companyRole || "",
+            }
+          : {
+              ...fallbackUser,
+              normalizedRole: persistedWorkspaceRole || "",
+              companyRole: persistedWorkspaceRole || "",
+            },
+      );
+      this.broadcastSenderMetaCache.set(resolvedUserId, senderMeta);
+      return senderMeta;
+    } catch (error) {
+      console.warn(
+        "Broadcast sender meta resolution failed:",
+        error?.message || error,
+      );
+      const senderMeta = resolveOutboundSenderMeta(
+        persistedWorkspaceRole
+          ? {
+              ...fallbackUser,
+              normalizedRole: persistedWorkspaceRole,
+              companyRole: persistedWorkspaceRole,
+              role: persistedWorkspaceRole,
+            }
+          : fallbackUser,
+      );
+      this.broadcastSenderMetaCache.set(resolvedUserId, senderMeta);
+      return senderMeta;
+    }
+  }
+
   async logBroadcastContactActivity({
     broadcast,
     contact,
@@ -144,14 +241,15 @@ class BroadcastService {
   async resolveContactForRecipient({ userId, companyId, phone }) {
     if (!userId) return null;
 
-    const phoneFilter = buildPhoneLookupFilters(phone);
+    const phoneFilter = buildContactPhoneLookupFilter(phone) || buildPhoneLookupFilters(phone);
     if (!phoneFilter) return null;
 
-    return Contact.findOne({
-      userId,
-      ...(companyId ? { companyId } : {}),
-      ...phoneFilter,
-    });
+    return Contact.findOne(
+      mergeFilters(
+        buildContactIdentityScopeFilter({ companyId, userId }),
+        phoneFilter,
+      ),
+    ).sort({ createdAt: 1, updatedAt: 1 });
   }
 
   async resolveBroadcastAudienceRecipients({
@@ -415,6 +513,43 @@ class BroadcastService {
   }
   normalizePhoneNumber(phone) {
     return String(phone || "").replace(/\D/g, "");
+  }
+
+  async resolveBroadcastContact({ userId, companyId, phone }) {
+    const phoneLookupFilter = buildContactPhoneLookupFilter(phone) || buildPhoneLookupFilters(phone);
+    const fallbackPhone = String(phone || "").trim();
+    if (!phoneLookupFilter && !fallbackPhone) return null;
+
+    return Contact.findOne(
+      mergeFilters(
+        buildContactIdentityScopeFilter({ companyId, userId }),
+        phoneLookupFilter || { phone: fallbackPhone },
+      ),
+    ).sort({ createdAt: 1, updatedAt: 1 });
+  }
+
+  async resolveBroadcastConversation({ companyId, phone, contactId = "" }) {
+    const phoneLookupFilter = buildConversationPhoneLookupFilter(phone);
+    const fallbackPhone = String(phone || "").trim();
+    const identityClauses = [];
+    const normalizedContactId = String(contactId || "").trim();
+
+    if (normalizedContactId && mongoose.Types.ObjectId.isValid(normalizedContactId)) {
+      identityClauses.push({ contactId: normalizedContactId });
+    }
+    if (phoneLookupFilter) {
+      identityClauses.push(phoneLookupFilter);
+    } else if (fallbackPhone) {
+      identityClauses.push({ contactPhone: fallbackPhone });
+    }
+
+    if (!identityClauses.length) return null;
+
+    return Conversation.findOne({
+      companyId,
+      status: { $in: ["active", "pending"] },
+      $or: identityClauses,
+    }).sort({ createdAt: 1, updatedAt: 1, lastMessageTime: 1, _id: 1 });
   }
 
   normalizeRetryPolicy(policy = {}) {
@@ -1027,14 +1162,24 @@ class BroadcastService {
       const contactPhoneRegex = missingNamePhones.map(
         (phone) => new RegExp(`${phone}$`),
       );
-      const contacts = await Contact.find({
-        userId: broadcast.createdById,
-        companyId: broadcast.companyId,
-        $or: [
-          { phone: { $in: missingNamePhones } },
-          ...contactPhoneRegex.map((phoneRegex) => ({ phone: phoneRegex })),
-        ],
-      })
+      const contacts = await Contact.find(
+        mergeFilters(
+          buildContactIdentityScopeFilter({
+            companyId: broadcast.companyId,
+            userId: broadcast.createdById,
+          }),
+          {
+            $or: [
+              { phone: { $in: missingNamePhones } },
+              { phoneDigits: { $in: missingNamePhones } },
+              ...contactPhoneRegex.flatMap((phoneRegex) => [
+                { phone: phoneRegex },
+                { phoneDigits: phoneRegex },
+              ]),
+            ],
+          },
+        ),
+      )
         .select("phone name")
         .lean();
 
@@ -1876,6 +2021,10 @@ class BroadcastService {
         };
       }
 
+      const broadcastSenderMeta = await this.resolveBroadcastSenderMeta({
+        broadcast,
+      });
+
       console.log("🔍 Broadcast data being processed:", {
         _id: broadcast._id,
         name: broadcast.name,
@@ -2338,6 +2487,7 @@ class BroadcastService {
                       broadcast.createdById,
                       broadcast.companyId,
                       broadcastDispatchKey,
+                      broadcastSenderMeta,
                     );
 
                     if (
@@ -2392,6 +2542,7 @@ class BroadcastService {
                   broadcast.createdById,
                   broadcast.companyId,
                   broadcastDispatchKey,
+                  broadcastSenderMeta,
                 );
 
                 if (
@@ -2590,16 +2741,20 @@ class BroadcastService {
     userId,
     companyId,
     broadcastDispatchKey = "",
+    senderMeta = null,
   ) {
     try {
       const whatsappMessageId = whatsappResponse?.messages?.[0]?.id;
-      let contact = await Contact.findOne({ userId, companyId, phone });
       const exactPhone = String(phone || "").trim();
       const exactPhoneDigits = this.normalizePhoneNumber(exactPhone);
+      let contact = await this.resolveBroadcastContact({
+        userId,
+        companyId,
+        phone: exactPhone,
+      });
       const resolvedAssignee = String(
         contact?.assignedTo ||
           contact?.assignedAgent ||
-          userId ||
           "",
       ).trim() || null;
       if (!contact) {
@@ -2610,68 +2765,33 @@ class BroadcastService {
           name: "",
           sourceType: "incoming_message",
           createdBy: String(userId || "").trim() || null,
-          assignedTo: String(userId || "").trim() || null,
-          assignedAgent: String(userId || "").trim() || null,
         });
-      } else if (broadcastId && contact.sourceType !== "incoming_message") {
-        // If this contact is being used in broadcast message flow, mark source as message-origin.
-        contact.sourceType = "incoming_message";
-        if (!contact.assignedTo && !contact.assignedAgent) {
-          contact.assignedTo = String(userId || "").trim() || null;
-          contact.assignedAgent = String(userId || "").trim() || null;
-        }
-        await contact.save();
-      } else if (!contact.assignedTo && !contact.assignedAgent && userId) {
-        contact.assignedTo = String(userId || "").trim() || null;
-        contact.assignedAgent = String(userId || "").trim() || null;
-        await contact.save();
       }
 
-      const exactConversationFilter = {
-        userId,
+      let conversation = await this.resolveBroadcastConversation({
         companyId,
-        status: { $in: ["active", "pending"] },
-        $or: [
-          ...(exactPhone
-            ? [{ contactPhone: exactPhone }, { phone: exactPhone }]
-            : []),
-          ...(exactPhoneDigits
-            ? [
-                { contactPhoneDigits: exactPhoneDigits },
-                { phoneDigits: exactPhoneDigits },
-              ]
-            : []),
-        ],
-      };
-
-      let conversation = await Conversation.findOne(exactConversationFilter).sort(
-        { lastMessageTime: -1, updatedAt: -1, createdAt: -1 },
-      );
-
-      const shouldTryLegacyFuzzyLookup = exactPhoneDigits.length > 10;
-
-      if (!conversation && shouldTryLegacyFuzzyLookup) {
-        const conversationLookupFilter =
-          buildConversationPhoneLookupFilter(phone);
-        conversation = await Conversation.findOne({
-          userId,
-          companyId,
-          status: { $in: ["active", "pending"] },
-          ...(conversationLookupFilter || { contactPhone: phone }),
-        }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
-      }
+        phone: exactPhone,
+        contactId: contact?._id,
+      });
       if (!conversation) {
+        const assignmentPatch = buildConversationAssignmentPatch({
+          contact,
+          actorUserId: userId,
+          preferActorForOwnerless: false,
+          allowActorFallback: false,
+        });
         conversation = await Conversation.create({
           userId,
           companyId,
           contactId: contact._id,
           contactPhone: phone,
+          contactPhoneDigits: exactPhoneDigits,
           contactName: contact.name,
           channel: "whatsapp",
           broadcastId: broadcastId || null,
-          assignedTo: resolvedAssignee,
-          assignedAgent: resolvedAssignee,
-          assignedToId: resolvedAssignee || null,
+          assignedTo: assignmentPatch.assignedTo || resolvedAssignee,
+          assignedAgent: assignmentPatch.assignedAgent || resolvedAssignee,
+          assignedToId: assignmentPatch.assignedToId || resolvedAssignee || null,
           lastMessage: message,
           lastMessageTime: new Date(),
           lastMessageMediaType: "",
@@ -2681,6 +2801,13 @@ class BroadcastService {
           lastMessageWhatsappMessageId: whatsappMessageId || "",
         });
       } else {
+        const assignmentPatch = buildConversationAssignmentPatch({
+          conversation,
+          contact,
+          actorUserId: userId,
+          preferActorForOwnerless: false,
+          allowActorFallback: false,
+        });
         conversation.lastMessage = message;
         conversation.lastMessageTime = new Date();
         conversation.lastMessageMediaType = "";
@@ -2691,6 +2818,16 @@ class BroadcastService {
         if (broadcastId) {
           conversation.broadcastId = broadcastId;
         }
+        if (contact?._id) {
+          conversation.contactId = contact._id;
+        }
+        if (contact?.name && !String(conversation.contactName || "").trim()) {
+          conversation.contactName = contact.name;
+        }
+        if (!String(conversation.contactPhone || "").trim() && phone) {
+          conversation.contactPhone = phone;
+        }
+        Object.assign(conversation, assignmentPatch);
         if (!conversation.assignedTo && resolvedAssignee) {
           conversation.assignedTo = resolvedAssignee;
         }
@@ -2704,26 +2841,46 @@ class BroadcastService {
       }
       await syncConversationSummaryFromConversation(conversation);
 
-      await invalidateInboxConversation({
-        companyId,
-        userId,
-        conversationId: String(conversation?._id || "").trim(),
-      });
+      const resolvedSenderMeta =
+        senderMeta && typeof senderMeta === "object"
+          ? senderMeta
+          : await this.resolveBroadcastSenderMeta({ userId });
+      const normalizedSenderRole =
+        String(resolvedSenderMeta?.senderRole || "").trim().toLowerCase() ===
+        "admin"
+          ? "admin"
+          : "agent";
+      const normalizedSenderName =
+        String(resolvedSenderMeta?.senderName || "").trim() ||
+        (normalizedSenderRole === "admin" ? "Admin" : "Agent");
+      const normalizedSenderId =
+        toQueryObjectId(resolvedSenderMeta?.senderId || userId) || undefined;
 
       const savedMessage = await Message.create({
         userId,
         companyId,
         conversationId: conversation._id,
         sender: "agent",
-        senderId: toQueryObjectId(userId) || undefined,
-        senderRole: "agent",
-        senderName: String(userId || "").trim() || "Agent",
+        senderId: normalizedSenderId,
+        senderRole: normalizedSenderRole,
+        senderName: normalizedSenderName,
         text: message,
         whatsappMessageId,
         status: "sent",
         ...(broadcastDispatchKey ? { broadcastDispatchKey } : {}),
         ...(broadcastId ? { broadcastId } : {}),
       });
+
+      const conversationId = String(conversation?._id || "").trim();
+      await Promise.all(
+        collectConversationParticipantUserIds(conversation, userId).map((participantUserId) =>
+          invalidateInboxConversation({
+            companyId,
+            userId: participantUserId,
+            conversationId,
+          })
+        )
+      );
 
       return { conversation, message: savedMessage };
     } catch (error) {
@@ -2978,6 +3135,10 @@ class BroadcastService {
       dispatch.userId,
       dispatch.companyId,
       dispatch.broadcastDispatchKey,
+      await this.resolveBroadcastSenderMeta({
+        broadcast,
+        userId: dispatch.userId,
+      }),
     );
 
     if (!updateResult?.message?._id) {
@@ -3191,7 +3352,7 @@ class BroadcastService {
       }
 
       const projection =
-        "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource createdBy createdById createdByEmail";
+        "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource createdBy createdById createdByEmail retryPolicy deliveryPolicy compliancePolicy analytics";
 
       if (hasPagination) {
         const rows = await Broadcast.find(query)

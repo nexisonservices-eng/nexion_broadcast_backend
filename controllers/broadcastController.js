@@ -66,6 +66,8 @@ class BroadcastController {
         createdById: req.user.id,
         createdBy: req.user.username || req.user.email || req.user.id,
         createdByEmail: req.user.email,
+        createdByWorkspaceRole:
+          req.user?.normalizedRole || req.user?.companyRole || req.user?.role || "",
         authHeaderSnapshot: req.headers.authorization || null,
         credentialsSnapshot: creds
           ? {

@@ -142,6 +142,28 @@ const mergeConversationRecords = (existing = {}, incoming = {}) => {
     existing?.lastMessageTime,
     incoming?.lastMessageTime
   ) || incoming?.lastMessageTime || existing?.lastMessageTime;
+  const getTime = (value) => {
+    const date = value ? new Date(value) : null;
+    return date instanceof Date && !Number.isNaN(date.getTime()) ? date.getTime() : 0;
+  };
+  const latestMessageSource =
+    getTime(incoming?.lastMessageTime || incoming?.updatedAt || incoming?.createdAt) >=
+    getTime(existing?.lastMessageTime || existing?.updatedAt || existing?.createdAt)
+      ? incoming
+      : existing;
+  [
+    'lastMessage',
+    'lastMessageMediaType',
+    'lastMessageAttachmentName',
+    'lastMessageAttachmentPages',
+    'lastMessageFrom',
+    'lastMessageWhatsappMessageId',
+    'lastMessageStatus'
+  ].forEach((key) => {
+    if (latestMessageSource?.[key] !== undefined && latestMessageSource?.[key] !== null) {
+      merged[key] = latestMessageSource[key];
+    }
+  });
   merged.updatedAt = chooseLatestDate(existing?.updatedAt, incoming?.updatedAt) || merged.lastMessageTime;
   merged.createdAt = chooseEarliestDate(existing?.createdAt, incoming?.createdAt) || existing?.createdAt || incoming?.createdAt;
 

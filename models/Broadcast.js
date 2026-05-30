@@ -58,6 +58,7 @@ const BroadcastSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now },
   createdBy: String,
   createdById: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  createdByWorkspaceRole: { type: String, default: '' },
   credentialsSnapshot: {
     accessToken: String,
     businessAccountId: String,

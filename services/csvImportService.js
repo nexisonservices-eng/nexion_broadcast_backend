@@ -4,6 +4,13 @@ const Contact = require("../models/Contact");
 const {
   buildPhoneCandidates,
 } = require("./whatsappOutreach/conversationResolver");
+const {
+  buildContactPhoneCandidates,
+  buildContactPhoneLookupFilter,
+  buildContactIdentityScopeFilter,
+  mergeFilters,
+  normalizePhoneKey,
+} = require("../utils/contactIdentity");
 
 const normalizePhoneDigits = (value = "") =>
   String(value || "").replace(/\D/g, "");
@@ -79,6 +86,7 @@ const normalizeImportedRow = (row = {}, rowNumber = null) => {
   return {
     phone,
     phoneDigits: normalizePhoneDigits(phone),
+    phoneKey: normalizePhoneKey(phone),
     name,
     email,
     sourceType,
@@ -90,28 +98,41 @@ const normalizeImportedRow = (row = {}, rowNumber = null) => {
 
 const buildContactUpsert = (
   contact = {},
-  { userId, companyId, consentReferenceId = "", importJobId = "" } = {},
+  { userId, companyId, consentReferenceId = "", importJobId = "", existingContact = null } = {},
 ) => {
   const now = new Date();
   const phone = String(contact?.phone || "").trim();
   const phoneDigits =
     String(contact?.phoneDigits || "").trim() || normalizePhoneDigits(phone);
+  const phoneKey = String(contact?.phoneKey || "").trim() || normalizePhoneKey(phoneDigits || phone);
   const tags = Array.isArray(contact?.tags) ? contact.tags : [];
   const name = String(contact?.name || "").trim();
   const email = String(contact?.email || "").trim();
   const sourceType =
     String(contact?.sourceType || "imported").trim() || "imported";
+  const existingId = String(existingContact?._id || "").trim();
+  const mergedTags = Array.from(
+    new Set(
+      [
+        ...(Array.isArray(existingContact?.tags) ? existingContact.tags : []),
+        ...tags,
+      ]
+        .map((tag) => String(tag || "").trim())
+        .filter(Boolean),
+    ),
+  );
   const upsertData = {
-    userId,
-    companyId: companyId || null,
-    name,
-    nameLower: name.toLowerCase(),
-    phone,
-    phoneDigits,
-    email,
-    tags,
-    sourceType,
-    source: "csv_import",
+    userId: existingContact?.userId || userId,
+    companyId: existingContact?.companyId || companyId || null,
+    name: name || String(existingContact?.name || "").trim(),
+    nameLower: (name || String(existingContact?.name || "").trim()).toLowerCase(),
+    phone: String(existingContact?.phone || "").trim() || phone,
+    phoneDigits: String(existingContact?.phoneDigits || "").trim() || phoneDigits,
+    phoneKey: String(existingContact?.phoneKey || "").trim() || phoneKey,
+    email: email || String(existingContact?.email || "").trim(),
+    tags: mergedTags,
+    sourceType: existingContact?.sourceType || sourceType,
+    source: existingContact?.source || (existingId ? "" : "csv_import"),
     isBlocked: false,
     lastContact: now,
     lastContactAt: now,
@@ -126,21 +147,25 @@ const buildContactUpsert = (
     updatedAt: now,
   };
 
-  return {
-    updateOne: {
-      filter: {
-        userId,
-        companyId: companyId || null,
-        phoneDigits,
-      },
-      update: {
-        $set: upsertData,
-        $setOnInsert: {
-          createdAt: now,
-          importJobId: String(importJobId || "").trim() || null,
+  if (existingId) {
+    return {
+      updateOne: {
+        filter: { _id: existingId },
+        update: {
+          $set: upsertData,
         },
+        upsert: false,
       },
-      upsert: true,
+    };
+  }
+
+  return {
+    insertOne: {
+      document: {
+        ...upsertData,
+        createdAt: now,
+        importJobId: String(importJobId || "").trim() || null,
+      },
     },
   };
 };
@@ -148,6 +173,7 @@ const buildContactUpsert = (
 const bulkUpsertImportedContacts = async (rows = [], scope = {}) => {
   const operations = [];
   const normalizedRows = Array.isArray(rows) ? rows : [];
+  const validContacts = [];
   const seenPhones = new Set();
   let skipped = 0;
   let duplicateCount = 0;
@@ -166,14 +192,69 @@ const bulkUpsertImportedContacts = async (rows = [], scope = {}) => {
       continue;
     }
 
-    const dedupeKey = normalized.phoneDigits || normalized.phone;
+    const dedupeKey = normalized.phoneKey || normalized.phoneDigits || normalized.phone;
     if (seenPhones.has(dedupeKey)) {
       skipped += 1;
       duplicateCount += 1;
       continue;
     }
     seenPhones.add(dedupeKey);
-    operations.push(buildContactUpsert(normalized, scope));
+    validContacts.push(normalized);
+  }
+
+  const identityFilters = validContacts
+    .map((contact) => buildContactPhoneLookupFilter(contact.phone))
+    .filter(Boolean);
+  const existingContacts = identityFilters.length
+    ? await Contact.find(
+        mergeFilters(
+          buildContactIdentityScopeFilter(scope),
+          { $or: identityFilters },
+        ),
+      )
+        .select("_id userId companyId name phone phoneDigits phoneKey email tags source sourceType")
+        .sort({ createdAt: 1, updatedAt: 1 })
+        .lean()
+    : [];
+
+  const existingMap = new Map();
+  for (const existingContact of existingContacts) {
+    const candidates = buildContactPhoneCandidates(existingContact?.phone || "");
+    candidates.forEach((candidate) => {
+      if (!existingMap.has(candidate)) {
+        existingMap.set(candidate, existingContact);
+      }
+    });
+    const phoneDigits = String(existingContact?.phoneDigits || "").trim();
+    if (phoneDigits && !existingMap.has(phoneDigits)) {
+      existingMap.set(phoneDigits, existingContact);
+    }
+    if (phoneDigits.length > 10) {
+      const suffix = phoneDigits.slice(-10);
+      if (suffix && !existingMap.has(suffix)) {
+        existingMap.set(suffix, existingContact);
+      }
+    }
+    const phoneKey = String(existingContact?.phoneKey || "").trim();
+    if (phoneKey && !existingMap.has(phoneKey)) {
+      existingMap.set(phoneKey, existingContact);
+    }
+  }
+
+  for (const normalized of validContacts) {
+    const candidateExisting =
+      existingMap.get(normalized.phoneKey) ||
+      existingMap.get(normalized.phoneDigits) ||
+      buildContactPhoneCandidates(normalized.phone)
+        .map((candidate) => existingMap.get(candidate))
+        .find(Boolean) ||
+      null;
+    operations.push(
+      buildContactUpsert(normalized, {
+        ...scope,
+        existingContact: candidateExisting,
+      }),
+    );
   }
 
   if (!operations.length) {
@@ -189,7 +270,7 @@ const bulkUpsertImportedContacts = async (rows = [], scope = {}) => {
   }
 
   const result = await Contact.bulkWrite(operations, { ordered: false });
-  const insertedCount = Number(result?.upsertedCount || 0);
+  const insertedCount = Number(result?.insertedCount || result?.nInserted || result?.upsertedCount || 0);
   const modifiedCount = Number(result?.modifiedCount || 0);
   const matchedCount = Number(result?.matchedCount || 0);
 

@@ -18,6 +18,11 @@ const hasFlag = (names = []) => names.some((name) => process.argv.includes(name)
 const toCleanString = (value = '') => String(value || '').trim();
 const toLowerCleanString = (value = '') => toCleanString(value).toLowerCase();
 const toDigitsString = (value = '') => toCleanString(value).replace(/\D/g, '');
+const toPhoneKey = (value = '') => {
+  const digits = toDigitsString(value);
+  if (!digits) return '';
+  return digits.length > 10 ? digits.slice(-10) : digits;
+};
 
 const parseObjectId = (value, label) => {
   const normalized = toCleanString(value);
@@ -42,7 +47,7 @@ const run = async () => {
   if (userId) filter.userId = userId;
 
   const cursor = Contact.find(filter)
-    .select('_id name phone companyId userId nameLower phoneDigits')
+    .select('_id name phone companyId userId nameLower phoneDigits phoneKey')
     .sort({ _id: 1 })
     .lean()
     .cursor();
@@ -66,10 +71,12 @@ const run = async () => {
     scanned += 1;
     const nameLower = toLowerCleanString(contact?.name);
     const phoneDigits = toDigitsString(contact?.phone);
+    const phoneKey = toPhoneKey(phoneDigits || contact?.phone);
 
     if (
       String(contact?.nameLower || '') === nameLower &&
-      String(contact?.phoneDigits || '') === phoneDigits
+      String(contact?.phoneDigits || '') === phoneDigits &&
+      String(contact?.phoneKey || '') === phoneKey
     ) {
       if (limit && scanned >= limit) break;
       continue;
@@ -82,6 +89,7 @@ const run = async () => {
           $set: {
             nameLower,
             phoneDigits,
+            phoneKey,
             updatedAt: new Date()
           }
         }

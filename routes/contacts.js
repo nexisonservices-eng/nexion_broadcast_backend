@@ -18,6 +18,12 @@ const { logConsentEvent } = require('../services/whatsappConsentLogService');
 const { invalidateInboxScope } = require('../utils/teamInboxCache');
 const { buildContactSearchPlan } = require('../utils/contactSearchPlan');
 const { buildPhoneCandidates } = require('../services/whatsappOutreach/conversationResolver');
+const {
+  buildContactPhoneLookupFilter,
+  buildContactIdentityScopeFilter,
+  mergeFilters,
+  normalizePhoneKey
+} = require('../utils/contactIdentity');
 const { extractBusinessCardFields } = require('../utils/businessCardParser');
 
 const router = express.Router();
@@ -233,8 +239,7 @@ const buildLegacyContactFallbackFilter = (req, { searchPlan, tags } = {}) => {
     {
       $or: [
         { userId: { $exists: false } },
-        { userId: null },
-        { userId: '' }
+        { userId: null }
       ]
     }
   ];
@@ -259,9 +264,32 @@ const buildLegacyContactFallbackFilter = (req, { searchPlan, tags } = {}) => {
 };
 
 const buildPhoneMatchFilter = (value) => {
-  const values = getPhoneLookupCandidates(value);
-  if (!values.length) return null;
-  return { phone: { $in: values } };
+  return buildContactPhoneLookupFilter(value);
+};
+
+const buildTenantContactIdentityFilter = (req, extra = {}) =>
+  mergeFilters(
+    buildContactIdentityScopeFilter({
+      companyId: req?.companyId,
+      userId: req?.user?.id
+    }),
+    extra
+  );
+
+const canCurrentUserAccessContact = (req, contact = {}) => {
+  const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+  if (isTenantWideContactRole(normalizedRole)) return true;
+
+  const currentUserId = toCleanString(req?.user?.id);
+  if (!currentUserId) return false;
+
+  return [
+    contact?.userId,
+    contact?.createdBy,
+    contact?.ownerId,
+    contact?.assignedTo,
+    contact?.assignedAgent
+  ].some((value) => toCleanString(value) === currentUserId);
 };
 
 const buildBulkPhoneMatchFilter = (phones = []) => {
@@ -1311,16 +1339,22 @@ router.post('/', async (req, res) => {
     }
 
     const existingContact = await Contact.findOne(
-      buildScopedContactFilter(req, buildPhoneMatchFilter(normalizedPayload.phone) || {})
+      buildTenantContactIdentityFilter(req, buildPhoneMatchFilter(normalizedPayload.phone) || {})
     );
 
     if (existingContact) {
+      if (!canCurrentUserAccessContact(req, existingContact)) {
+        return res.status(409).json({
+          error: 'Contact already exists in this workspace and is assigned to another agent'
+        });
+      }
+
       const mergedTags = getMergedTags(existingContact.tags, normalizedPayload.tags);
       const nextName = toCleanString(normalizedPayload.name) || existingContact.name;
       const nextEmail = toCleanString(normalizedPayload.email) || existingContact.email;
       const nextCompanyName = toCleanString(normalizedPayload.companyName) || existingContact.companyName;
       const nextDesignation = toCleanString(normalizedPayload.designation) || existingContact.designation;
-      const nextSource = toCleanString(normalizedPayload.source) || existingContact.source;
+      const nextSource = toCleanString(existingContact.source) || toCleanString(normalizedPayload.source);
 
       existingContact.name = nextName;
       existingContact.email = nextEmail;
@@ -1329,13 +1363,7 @@ router.post('/', async (req, res) => {
       existingContact.tags = mergedTags;
       existingContact.source = nextSource;
       existingContact.phone = getPreferredPhoneValue(normalizedPayload) || existingContact.phone;
-      if (
-        normalizedPayload.sourceType &&
-        existingContact.sourceType === 'manual' &&
-        normalizedPayload.sourceType !== 'manual'
-      ) {
-        existingContact.sourceType = normalizedPayload.sourceType;
-      }
+      existingContact.sourceType = existingContact.sourceType || normalizedPayload.sourceType || 'manual';
 
       if (
         normalizedPayload.customFields &&
@@ -1409,6 +1437,7 @@ router.post('/import', async (req, res) => {
         .filter((entry) => entry.normalized);
 
       const validRows = [];
+      const seenBatchPhoneKeys = new Set();
       for (const entry of normalizedBatch) {
         const normalizedPhone = getPreferredPhoneValue(entry.normalized);
         if (!normalizedPhone) {
@@ -1431,10 +1460,25 @@ router.post('/import', async (req, res) => {
           continue;
         }
 
+        const phoneKey = normalizePhoneKey(normalizedPhone);
+        if (phoneKey && seenBatchPhoneKeys.has(phoneKey)) {
+          results.failed++;
+          results.errors.push({
+            line: entry.lineNumber || 'Unknown',
+            error: 'Duplicate phone number in import batch',
+            data: entry.normalized
+          });
+          continue;
+        }
+        if (phoneKey) {
+          seenBatchPhoneKeys.add(phoneKey);
+        }
+
         validRows.push({
           ...entry,
           normalizedPhone,
-          phoneDigits: normalizePhoneNumber(normalizedPhone)
+          phoneDigits: normalizePhoneNumber(normalizedPhone),
+          phoneKey
         });
       }
 
@@ -1448,17 +1492,25 @@ router.post('/import', async (req, res) => {
       const lookupPhoneDigits = Array.from(
         new Set(validRows.map((entry) => entry.phoneDigits).filter(Boolean))
       );
+      const lookupPhoneKeys = Array.from(
+        new Set(validRows.map((entry) => entry.phoneKey).filter(Boolean))
+      );
+      const lookupIdentityFilters = validRows
+        .map((entry) => buildPhoneMatchFilter(entry.normalizedPhone))
+        .filter(Boolean);
 
-      const existingContacts = lookupPhones.length || lookupPhoneDigits.length
+      const existingContacts = lookupIdentityFilters.length || lookupPhones.length || lookupPhoneDigits.length || lookupPhoneKeys.length
         ? await Contact.find(
-            buildScopedContactFilter(req, {
+            buildTenantContactIdentityFilter(req, {
               $or: [
+                ...lookupIdentityFilters,
                 lookupPhones.length ? { phone: { $in: lookupPhones } } : null,
-                lookupPhoneDigits.length ? { phoneDigits: { $in: lookupPhoneDigits } } : null
+                lookupPhoneDigits.length ? { phoneDigits: { $in: lookupPhoneDigits } } : null,
+                lookupPhoneKeys.length ? { phoneKey: { $in: lookupPhoneKeys } } : null
               ].filter(Boolean)
             })
           )
-            .select('_id phone phoneDigits tags name email sourceType lastContact whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata isBlocked')
+            .select('_id userId companyId createdBy ownerId assignedTo assignedAgent phone phoneDigits phoneKey tags name email source sourceType leadStatus followupDate lastContact whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptInProofType whatsappOptInProofId whatsappOptInProofUrl whatsappOptInCapturedBy whatsappOptInPageUrl whatsappOptInIp whatsappOptInUserAgent whatsappOptInMetadata isBlocked')
             .lean()
         : [];
 
@@ -1473,6 +1525,9 @@ router.post('/import', async (req, res) => {
         if (contact?.phoneDigits && !existingMap.has(contact.phoneDigits)) {
           existingMap.set(contact.phoneDigits, contact);
         }
+        if (contact?.phoneKey && !existingMap.has(contact.phoneKey)) {
+          existingMap.set(contact.phoneKey, contact);
+        }
       }
 
       const operations = [];
@@ -1483,11 +1538,22 @@ router.post('/import', async (req, res) => {
             entry.lineNumber
           );
           const existingContact =
+            existingMap.get(entry.phoneKey) ||
             existingMap.get(entry.phoneDigits) ||
             buildPhoneCandidates(entry.normalizedPhone).map((candidate) => existingMap.get(candidate)).find(Boolean) ||
             null;
 
           if (existingContact) {
+            if (!canCurrentUserAccessContact(req, existingContact)) {
+              results.failed++;
+              results.errors.push({
+                line: entry.lineNumber || 'Unknown',
+                error: 'Contact already exists in this workspace and is assigned to another agent',
+                data: entry.normalized
+              });
+              continue;
+            }
+
             const mergedTags = getMergedTags(existingContact.tags, entry.normalized.tags);
             const updatedName = toCleanString(entry.normalized.name) || toCleanString(existingContact.name);
             const ownership = resolveContactOwnership(req, {
@@ -1501,17 +1567,19 @@ router.post('/import', async (req, res) => {
                 filter: { _id: existingContact._id },
                 update: {
                   $set: {
-                    userId: req.user.id,
-                    companyId: req.companyId || null,
+                    userId: existingContact.userId || req.user.id,
+                    companyId: existingContact.companyId || req.companyId || null,
                     ...ownership,
                     name: updatedName,
                     nameLower: updatedName.toLowerCase(),
-                    phone: entry.normalizedPhone,
-                    phoneDigits: entry.phoneDigits,
+                    phone: existingContact.phone || entry.normalizedPhone,
+                    phoneDigits: existingContact.phoneDigits || entry.phoneDigits,
+                    phoneKey: existingContact.phoneKey || entry.phoneKey,
                     email: toCleanString(entry.normalized.email) || toCleanString(existingContact.email),
                     tags: mergedTags,
                     leadStatus: toCleanString(existingContact.leadStatus).toLowerCase() || 'new_lead',
                     followupDate: existingContact.followupDate || null,
+                    source: toCleanString(existingContact.source),
                     sourceType: existingContact.sourceType || 'imported',
                     isBlocked: false,
                     lastContact: existingContact.lastContact || new Date(),
@@ -1537,6 +1605,7 @@ router.post('/import', async (req, res) => {
               nameLower: toCleanString(entry.normalized.name).toLowerCase(),
               phone: entry.normalizedPhone,
               phoneDigits: entry.phoneDigits,
+              phoneKey: entry.phoneKey,
               email: toCleanString(entry.normalized.email) || '',
               tags: Array.isArray(entry.normalized.tags) ? entry.normalized.tags : [],
               leadStatus: 'new_lead',
@@ -1646,7 +1715,7 @@ const findScanDuplicateContacts = async (req, extractedContact = {}) => {
   }
 
   const duplicateContacts = await Contact.find(
-    buildScopedContactFilter(req, lookupFilter)
+    buildTenantContactIdentityFilter(req, lookupFilter)
   )
     .select('_id name phone email companyName designation tags stage status sourceType createdAt updatedAt')
     .lean();
@@ -1746,6 +1815,9 @@ router.put('/:id', async (req, res) => {
       delete updatePayload.assignedAgent;
       delete updatePayload.createdBy;
     }
+    if (req.body?.sourceType === undefined || existingContact.sourceType) {
+      delete updatePayload.sourceType;
+    }
     const normalizedPhone = getPreferredPhoneValue(normalizedPayload);
     if (normalizedPayload.phone !== undefined && !normalizedPhone) {
       return res.status(400).json({ error: 'Phone number is required' });
@@ -1756,7 +1828,7 @@ router.put('/:id', async (req, res) => {
       });
     }
     if (normalizedPhone) {
-      const duplicateFilter = buildScopedContactFilter(req, {
+      const duplicateFilter = buildTenantContactIdentityFilter(req, {
         _id: { $ne: req.params.id },
         ...(buildPhoneMatchFilter(normalizedPhone) || {})
       });

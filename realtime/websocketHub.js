@@ -406,7 +406,31 @@ const createWebSocketHub = ({ wss }) => {
   };
 
   const broadcastUserList = () => {
-    const userList = Array.from(clients.keys());
+    const seen = new Map();
+
+    clientMeta.forEach((meta, clientKey) => {
+      const userId = String(meta?.userId || clientKey || '').trim();
+      if (!userId) return;
+
+      const previous = seen.get(userId) || {};
+      const displayName = String(meta?.displayName || previous.displayName || '').trim();
+      const email = String(meta?.email || previous.email || '').trim();
+      const companyId = String(meta?.companyId || previous.companyId || '').trim();
+
+      seen.set(userId, {
+        userId,
+        id: userId,
+        _id: userId,
+        displayName: displayName || previous.displayName || '',
+        name: displayName || previous.name || '',
+        email,
+        companyId,
+        connected: true,
+        lastSeenAt: meta?.lastSeenAt || previous.lastSeenAt || null
+      });
+    });
+
+    const userList = Array.from(seen.values());
     broadcastLocal({ type: 'user_list', users: userList });
   };
 
@@ -544,12 +568,20 @@ const createWebSocketHub = ({ wss }) => {
         const nextSocketSet = getSocketSet(nextUserId);
         if (!nextSocketSet) return;
 
+        const nextDisplayName = String(data.displayName || data.name || data.userName || '').trim();
+        const nextEmail = String(data.email || '').trim();
+        const nextRole = String(data.role || data.companyRole || '').trim();
+
         nextSocketSet.add(ws);
         ws.userId = nextUserId;
         clientMeta.set(getClientKey(ws, nextUserId), {
           ws,
           userId: nextUserId,
-          companyId: String(data.companyId || ws.companyId || '').trim()
+          companyId: String(data.companyId || ws.companyId || '').trim(),
+          displayName: nextDisplayName || null,
+          email: nextEmail || null,
+          role: nextRole || null,
+          lastSeenAt: new Date().toISOString()
         });
         joinRoom(getRoomKey('user', nextUserId), ws);
         syncCompanyRoom(ws, data.companyId || ws.companyId || '');

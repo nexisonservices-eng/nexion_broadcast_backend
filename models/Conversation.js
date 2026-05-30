@@ -6,6 +6,7 @@ const ConversationSchema = new mongoose.Schema({
   companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'company', index: true },
   contactId: { type: mongoose.Schema.Types.ObjectId, ref: 'Contact', required: true },
   contactPhone: { type: String, required: true, index: true },
+  contactPhoneDigits: { type: String, default: '', index: true },
   contactName: String,
   channel: {
     type: String,
@@ -59,13 +60,44 @@ const ConversationSchema = new mongoose.Schema({
 
 ConversationSchema.pre('save', function(next) {
   this.updatedAt = Date.now();
+  this.contactPhoneDigits = String(this.contactPhone || '').replace(/\D/g, '');
   if (this.status === 'resolved' && !this.resolvedAt) {
     this.resolvedAt = Date.now();
   }
   next();
 });
 
+ConversationSchema.pre(['findOneAndUpdate', 'updateOne', 'updateMany', 'replaceOne'], function(next) {
+  const update = this.getUpdate() || {};
+  const operatorKeys = Object.keys(update).filter((key) => key.startsWith('$'));
+  const isReplacementUpdate = operatorKeys.length === 0;
+
+  if (isReplacementUpdate) {
+    if (update.contactPhone !== undefined) {
+      update.contactPhoneDigits = String(update.contactPhone || '').replace(/\D/g, '');
+    }
+    update.updatedAt = Date.now();
+    this.setUpdate(update);
+    next();
+    return;
+  }
+
+  const $set = { ...(update.$set || {}) };
+  if (update.contactPhone !== undefined && $set.contactPhone === undefined) {
+    $set.contactPhone = update.contactPhone;
+    delete update.contactPhone;
+  }
+  if ($set.contactPhone !== undefined) {
+    $set.contactPhoneDigits = String($set.contactPhone || '').replace(/\D/g, '');
+  }
+  $set.updatedAt = Date.now();
+  update.$set = $set;
+  this.setUpdate(update);
+  next();
+});
+
 ConversationSchema.index({ companyId: 1, userId: 1, contactPhone: 1, status: 1 });
+ConversationSchema.index({ companyId: 1, userId: 1, contactPhoneDigits: 1, status: 1 });
 ConversationSchema.index({ companyId: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, status: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, assignedAgent: 1, lastMessageTime: -1, _id: -1 });
@@ -74,6 +106,7 @@ ConversationSchema.index({ companyId: 1, unreadCount: 1, lastMessageTime: -1, _i
 ConversationSchema.index({ companyId: 1, important: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, followupAt: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, contactPhone: 1, lastMessageTime: -1, _id: -1 });
+ConversationSchema.index({ companyId: 1, contactPhoneDigits: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, contactName: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, userId: 1, channel: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, userId: 1, contactId: 1 });
@@ -84,5 +117,6 @@ ConversationSchema.index({ companyId: 1, userId: 1, followupAt: 1, lastMessageTi
 ConversationSchema.index({ companyId: 1, userId: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, userId: 1, status: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, userId: 1, unreadCount: 1, lastMessageTime: -1, _id: -1 });
+ConversationSchema.index({ companyId: 1, userId: 1, contactPhoneDigits: 1, lastMessageTime: -1, _id: -1 });
 
 module.exports = mongoose.model('Conversation', ConversationSchema);

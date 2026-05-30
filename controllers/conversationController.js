@@ -27,7 +27,8 @@ const {
 const { buildInboxSearchPlan } = require('../utils/inboxSearchPlan');
 const { buildContactSearchPlan } = require('../utils/contactSearchPlan');
 
-const TEAM_INBOX_CONTACT_LIST_FIELDS = '_id name leadScore';
+const TEAM_INBOX_CONTACT_LIST_FIELDS =
+  '_id name ownerId assignedTo assignedAgent assignedToName assignedAgentName assigneeName ownerName leadScore';
 const TEAM_INBOX_CONTACT_DETAIL_FIELDS =
   '_id name phone tags status stage leadStatus assignedAgent followupDate internalNotes leadScore leadScoreBreakdown isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt';
 const CONTACT_LIST_FIELDS =
@@ -122,6 +123,10 @@ const TEAM_INBOX_CONVERSATION_FIELDS = [
   'leadStatus',
   'assignedTo',
   'assignedAgent',
+  'assignedToName',
+  'assignedAgentName',
+  'assigneeName',
+  'ownerName',
   'lastMessageTime',
   'lastMessage',
   'lastMessageMediaType',
@@ -242,6 +247,13 @@ const buildScopedFilters = (req, extra = {}, options = {}) => {
   return filters;
 };
 
+const toObjectIdIfValid = (value = '') => {
+  const normalizedValue = toCleanString(value);
+  return mongoose.Types.ObjectId.isValid(normalizedValue)
+    ? new mongoose.Types.ObjectId(normalizedValue)
+    : null;
+};
+
 const attachContactSnapshotsToConversations = async (
   conversations = [],
   req,
@@ -271,9 +283,19 @@ const attachContactSnapshotsToConversations = async (
     contacts.map((contact) => [String(contact?._id || '').trim(), contact])
   );
 
+  const normalizeContactOwnershipSnapshot = (contact = null) => {
+    if (!contact || typeof contact !== 'object') return contact;
+
+    const normalizedContact = { ...contact };
+    ['ownerId', 'assignedTo', 'assignedAgent'].forEach((field) => {
+      normalizedContact[field] = String(normalizedContact[field] || '').trim() || null;
+    });
+    return normalizedContact;
+  };
+
   return safeConversations.map((conversation) => {
     const contactId = String(conversation?.contactId || '').trim();
-    const contact = contactById.get(contactId);
+    const contact = normalizeContactOwnershipSnapshot(contactById.get(contactId));
     return {
       ...conversation,
       contactId: contact || conversation?.contactId || null,
@@ -404,6 +426,8 @@ const normalizeInboxView = (value = '') => {
 const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
   const normalizedView = normalizeInboxView(view);
   const normalizedUserId = String(userId || '').trim();
+  const normalizedUserObjectId = toObjectIdIfValid(normalizedUserId);
+  const userIdentifier = normalizedUserObjectId || normalizedUserId;
 
   const activeStatuses = ['active', 'pending'];
   const closedStatuses = ['resolved'];
@@ -436,8 +460,10 @@ const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
             $and: [
               {
                 $or: [
+                  { userId: userIdentifier },
                   { assignedTo: normalizedUserId },
-                  { assignedToId: normalizedUserId }
+                  { assignedToId: userIdentifier },
+                  { assignedAgent: normalizedUserId }
                 ]
               },
               { status: { $in: activeStatuses } }
@@ -471,8 +497,10 @@ const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
       return normalizedUserId
         ? {
             $or: [
+              { userId: userIdentifier },
               { assignedTo: normalizedUserId },
-              { assignedToId: normalizedUserId }
+              { assignedToId: userIdentifier },
+              { assignedAgent: normalizedUserId }
             ]
           }
         : { assignedTo: { $nin: [null, ''] } };
@@ -487,10 +515,13 @@ const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
 const buildConversationViewFilters = (req, extra = {}) => {
   const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
   const isAgent = !isTenantWideRole(normalizedRole);
-  const normalizedView = normalizeInboxView(req?.query?.view || req?.query?.inboxView || extra?.view);
+  const normalizedView = normalizeInboxView(extra?.view || req?.query?.view || req?.query?.inboxView);
   const normalizedUserId = String(req?.user?.id || '').trim();
+  const normalizedUserObjectId = toObjectIdIfValid(normalizedUserId);
+  const normalizedCompanyId = toObjectIdIfValid(req?.companyId || req?.user?.companyId);
+  const userIdentifier = normalizedUserObjectId || normalizedUserId;
   const baseFilters = {
-    companyId: req.companyId,
+    ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
     ...extra
   };
   delete baseFilters.view;
@@ -498,15 +529,17 @@ const buildConversationViewFilters = (req, extra = {}) => {
 
   const viewFilter = buildConversationStatusFilter(
     isAgent ? (normalizedView === 'all' ? 'my' : normalizedView) : normalizedView,
-    { userId: normalizedUserId }
+    { userId: userIdentifier }
   );
 
   if (isAgent) {
-    const ownershipFilter = normalizedUserId
+    const ownershipFilter = userIdentifier
       ? {
           $or: [
+            { userId: userIdentifier },
             { assignedTo: normalizedUserId },
-            { assignedToId: normalizedUserId }
+            { assignedToId: userIdentifier },
+            { assignedAgent: normalizedUserId }
           ]
         }
       : {};
@@ -527,10 +560,13 @@ const buildConversationViewFilters = (req, extra = {}) => {
 const buildContactViewFilters = (req, extra = {}) => {
   const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
   const isAgent = !isTenantWideRole(normalizedRole);
-  const normalizedView = normalizeInboxView(req?.query?.view || req?.query?.inboxView || extra?.view);
+  const normalizedView = normalizeInboxView(extra?.view || req?.query?.view || req?.query?.inboxView);
   const normalizedUserId = String(req?.user?.id || '').trim();
+  const normalizedUserObjectId = toObjectIdIfValid(normalizedUserId);
+  const normalizedCompanyId = toObjectIdIfValid(req?.companyId || req?.user?.companyId);
+  const userIdentifier = normalizedUserObjectId || normalizedUserId;
   const baseFilters = {
-    companyId: req.companyId,
+    ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
     ...extra
   };
   delete baseFilters.view;
@@ -552,11 +588,13 @@ const buildContactViewFilters = (req, extra = {}) => {
       case 'assigned':
       case 'assigned-leads':
       case 'my':
-        return normalizedUserId
+        return userIdentifier
           ? {
               $or: [
                 { assignedTo: normalizedUserId },
-                { assignedToId: normalizedUserId }
+                { assignedToId: userIdentifier },
+                { assignedAgent: normalizedUserId },
+                { userId: userIdentifier }
               ]
             }
           : { assignedTo: { $ne: null } };
@@ -575,11 +613,13 @@ const buildContactViewFilters = (req, extra = {}) => {
   })();
 
   if (isAgent) {
-    const ownershipFilter = normalizedUserId
+    const ownershipFilter = userIdentifier
       ? {
           $or: [
+            { userId: userIdentifier },
             { assignedTo: normalizedUserId },
-            { assignedToId: normalizedUserId }
+            { assignedToId: userIdentifier },
+            { assignedAgent: normalizedUserId }
           ]
         }
       : {};
@@ -1181,7 +1221,9 @@ class ConversationController {
     try {
       const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
       const isAgent = !isTenantWideRole(normalizedRole);
-      const filters = buildConversationViewFilters(req, {});
+      const filters = buildConversationViewFilters(req, {
+        view: isAgent ? 'my' : 'all'
+      });
       const scopeVariants = getInboxScopeVariants({
         companyId: filters.companyId,
         userId: req.user?.id || ''

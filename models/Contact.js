@@ -3,10 +3,16 @@ const mongoose = require('mongoose');
 const toCleanString = (value = '') => String(value || '').trim();
 const toLowerCleanString = (value = '') => toCleanString(value).toLowerCase();
 const toDigitsString = (value = '') => toCleanString(value).replace(/\D/g, '');
+const toPhoneKey = (value = '') => {
+  const digits = toDigitsString(value);
+  if (!digits) return '';
+  return digits.length > 10 ? digits.slice(-10) : digits;
+};
 
 const applyDerivedContactSearchFields = (doc = {}) => {
   doc.nameLower = toLowerCleanString(doc.name);
   doc.phoneDigits = toDigitsString(doc.phone);
+  doc.phoneKey = toPhoneKey(doc.phoneDigits || doc.phone);
   return doc;
 };
 
@@ -21,6 +27,7 @@ const applyDerivedContactSearchFieldsToUpdate = (update = {}) => {
     }
     if (nextUpdate.phone !== undefined) {
       nextUpdate.phoneDigits = toDigitsString(nextUpdate.phone);
+      nextUpdate.phoneKey = toPhoneKey(nextUpdate.phone);
     }
     return nextUpdate;
   }
@@ -47,6 +54,7 @@ const applyDerivedContactSearchFieldsToUpdate = (update = {}) => {
   }
   if (phoneProvided) {
     $set.phoneDigits = $unset.phone !== undefined ? '' : toDigitsString($set.phone ?? '');
+    $set.phoneKey = $unset.phone !== undefined ? '' : toPhoneKey($set.phoneDigits || $set.phone || '');
   }
 
   nextUpdate.$set = $set;
@@ -78,6 +86,7 @@ const ContactSchema = new mongoose.Schema(
     nameLower: { type: String, default: '', index: true },
     phone: { type: String, required: true, index: true },
     phoneDigits: { type: String, default: '', index: true },
+    phoneKey: { type: String, default: '', index: true },
     email: String,
     tags: [{ type: String }],
     assignedAgent: { type: String, default: null, index: true },
@@ -126,6 +135,19 @@ ContactSchema.pre('insertMany', function(next, docs) {
 });
 
 ContactSchema.index({ companyId: 1, userId: 1, phone: 1 });
+ContactSchema.index({ companyId: 1, phone: 1, createdAt: 1 });
+ContactSchema.index({ companyId: 1, phoneDigits: 1, createdAt: 1 });
+ContactSchema.index({ companyId: 1, phoneKey: 1, createdAt: 1 });
+ContactSchema.index(
+  { companyId: 1, phoneKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      companyId: { $type: 'objectId' },
+      phoneKey: { $type: 'string' }
+    }
+  }
+);
 ContactSchema.index({ companyId: 1, createdBy: 1, assignedTo: 1, leadStatus: 1, followupDate: 1, createdAt: -1, _id: -1 });
 ContactSchema.index({ companyId: 1, userId: 1, assignedAgent: 1, leadStatus: 1, followupDate: 1, createdAt: -1, _id: -1 });
 ContactSchema.index({ companyId: 1, userId: 1, nameLower: 1, lastContact: -1, createdAt: -1, _id: -1 });

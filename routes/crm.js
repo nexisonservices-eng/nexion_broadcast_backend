@@ -72,8 +72,11 @@ const CONTACT_QUEUES = [
 const DOCUMENT_ACCESS_MODES = ['view', 'download'];
 const CRM_CONTACT_LIST_FIELDS = [
   '_id',
+  'companyId',
   'name',
   'phone',
+  'phoneDigits',
+  'phoneKey',
   'email',
   'tags',
   'stage',
@@ -146,7 +149,7 @@ const CRM_DEAL_LIST_FIELDS = [
 const CRM_MESSAGE_FIELDS =
   '_id sender senderName text mediaType mediaCaption status timestamp broadcastId';
 const CRM_CONVERSATION_FIELDS =
-  '_id status assignedTo lastMessage lastMessageTime lastMessageFrom unreadCount contactPhone contactName';
+  '_id status assignedTo assignedAgent assignedToName assignedAgentName assigneeName ownerName lastMessage lastMessageTime lastMessageFrom unreadCount contactPhone contactName';
 const DEFAULT_LEAD_PIPELINE_STAGES = [
   { key: 'new', label: 'New Lead', color: '#5f8fc3', order: 0 },
   { key: 'contacted', label: 'Contacted', color: '#4a8bbd', order: 1 },
@@ -193,6 +196,104 @@ const buildContactProjection = (fields) => {
   const allowedFields = requestedFields.filter((field) => CRM_CONTACT_FIELD_WHITELIST.has(field));
   if (!allowedFields.includes('_id')) allowedFields.unshift('_id');
   return allowedFields.length ? allowedFields.join(' ') : CRM_CONTACT_LIST_FIELDS;
+};
+
+const normalizeContactPhoneKey = (contact = {}) => {
+  const phoneDigits = toCleanString(contact?.phoneDigits || contact?.phone || '').replace(/\D/g, '');
+  const phoneKeyValue = toCleanString(contact?.phoneKey || phoneDigits || contact?.phone || '').replace(/\D/g, '');
+  return phoneKeyValue.length > 10 ? phoneKeyValue.slice(-10) : phoneKeyValue || phoneDigits;
+};
+
+const getContactDedupeKey = (contact = {}) => {
+  const companyKey = toCleanString(contact?.companyId);
+  const phoneKey = normalizeContactPhoneKey(contact);
+  const fallbackPhone = toCleanString(contact?.phone).replace(/\D/g, '');
+  return [companyKey || 'no-company', phoneKey || fallbackPhone || String(contact?._id || '')].join(':');
+};
+
+const chooseCanonicalContact = (members = []) => {
+  const sorted = members.slice().sort((left, right) => {
+    const leftCreated = new Date(left?.createdAt || 0).getTime() || 0;
+    const rightCreated = new Date(right?.createdAt || 0).getTime() || 0;
+    const leftUpdated = new Date(left?.updatedAt || 0).getTime() || 0;
+    const rightUpdated = new Date(right?.updatedAt || 0).getTime() || 0;
+    return leftCreated - rightCreated || leftUpdated - rightUpdated || String(left?._id || '').localeCompare(String(right?._id || ''));
+  });
+  return sorted[0] || null;
+};
+
+const mergeContactForList = (members = []) => {
+  const keeper = chooseCanonicalContact(members);
+  if (!keeper) return null;
+
+  const mergedTags = Array.from(
+    new Set(
+      members
+        .flatMap((member) => (Array.isArray(member?.tags) ? member.tags : []))
+        .map((tag) => toCleanString(tag))
+        .filter(Boolean)
+    )
+  );
+
+  const latestValue = (field) =>
+    members
+      .slice()
+      .sort((left, right) => {
+        const leftTime = new Date(left?.updatedAt || left?.lastContact || left?.createdAt || 0).getTime() || 0;
+        const rightTime = new Date(right?.updatedAt || right?.lastContact || right?.createdAt || 0).getTime() || 0;
+        return rightTime - leftTime;
+      })
+      .map((member) => member?.[field])
+      .find((value) => value !== undefined && value !== null && String(value).trim() !== '');
+
+  return {
+    ...keeper,
+    name: String(latestValue('name') || keeper.name || '').trim(),
+    email: String(latestValue('email') || keeper.email || '').trim(),
+    companyName: String(latestValue('companyName') || keeper.companyName || '').trim(),
+    designation: String(latestValue('designation') || keeper.designation || '').trim(),
+    phone: String(keeper.phone || latestValue('phone') || '').trim(),
+    phoneDigits: String(keeper.phoneDigits || keeper.phone || latestValue('phoneDigits') || '').replace(/\D/g, ''),
+    phoneKey: normalizeContactPhoneKey(keeper),
+    tags: mergedTags,
+    stage: String(latestValue('stage') || keeper.stage || '').trim(),
+    status: String(latestValue('status') || keeper.status || '').trim(),
+    leadStatus: String(latestValue('leadStatus') || keeper.leadStatus || '').trim(),
+    source: String(latestValue('source') || keeper.source || '').trim(),
+    sourceType: String(latestValue('sourceType') || keeper.sourceType || '').trim(),
+    ownerId: String(latestValue('ownerId') || keeper.ownerId || '').trim(),
+    assignedTo: String(latestValue('assignedTo') || keeper.assignedTo || '').trim(),
+    assignedAgent: String(latestValue('assignedAgent') || keeper.assignedAgent || '').trim(),
+    lastContact: latestValue('lastContact') || keeper.lastContact || null,
+    lastContactAt: latestValue('lastContactAt') || keeper.lastContactAt || null,
+    nextFollowUpAt: latestValue('nextFollowUpAt') || keeper.nextFollowUpAt || null,
+    followupDate: latestValue('followupDate') || keeper.followupDate || null,
+    lastInboundMessageAt: latestValue('lastInboundMessageAt') || keeper.lastInboundMessageAt || null,
+    whatsappOptInStatus: String(latestValue('whatsappOptInStatus') || keeper.whatsappOptInStatus || '').trim(),
+    whatsappOptInAt: latestValue('whatsappOptInAt') || keeper.whatsappOptInAt || null,
+    whatsappOptInSource: String(latestValue('whatsappOptInSource') || keeper.whatsappOptInSource || '').trim(),
+    whatsappOptInScope: String(latestValue('whatsappOptInScope') || keeper.whatsappOptInScope || '').trim(),
+    updatedAt: members.reduce((latest, member) => {
+      const time = new Date(member?.updatedAt || 0).getTime() || 0;
+      return time > new Date(latest || 0).getTime() ? member.updatedAt : latest;
+    }, keeper.updatedAt || null),
+    createdAt: keeper.createdAt || null
+  };
+};
+
+const dedupeContactsForList = (contacts = []) => {
+  const grouped = new Map();
+  (Array.isArray(contacts) ? contacts : []).forEach((contact) => {
+    const key = getContactDedupeKey(contact);
+    if (!grouped.has(key)) {
+      grouped.set(key, []);
+    }
+    grouped.get(key).push(contact);
+  });
+
+  return Array.from(grouped.values())
+    .map((members) => mergeContactForList(members))
+    .filter(Boolean);
 };
 const slugifyPipelineStageKey = (value) =>
   toCleanString(value)
@@ -2343,10 +2444,11 @@ router.get('/contacts', async (req, res) => {
         .lean(),
       Contact.countDocuments(totalFilter)
     ]);
-    const pageContacts = useCursor ? contacts.slice(0, pageSize) : contacts;
+    const uniqueContacts = dedupeContactsForList(useCursor ? contacts.slice(0, pageSize + 1) : contacts);
+    const pageContacts = useCursor ? uniqueContacts.slice(0, pageSize) : uniqueContacts;
     const lastContact = pageContacts[pageContacts.length - 1] || null;
     const nextCursor =
-      useCursor && contacts.length > pageSize && lastContact
+      useCursor && uniqueContacts.length > pageSize && lastContact
         ? encodeCursor({
             createdAt: lastContact.createdAt || new Date(0).toISOString(),
             _id: String(lastContact._id || '')
@@ -2357,7 +2459,7 @@ router.get('/contacts', async (req, res) => {
       success: true,
       data: pageContacts,
       nextCursor,
-      hasMore: useCursor ? contacts.length > pageSize : pageNumber < Math.max(Math.ceil(total / pageSize), 1),
+      hasMore: useCursor ? uniqueContacts.length > pageSize : pageNumber < Math.max(Math.ceil(total / pageSize), 1),
       pagination: {
         page: pageNumber,
         limit: pageSize,

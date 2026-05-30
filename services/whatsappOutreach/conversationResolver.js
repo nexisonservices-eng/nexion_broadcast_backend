@@ -8,10 +8,55 @@ const {
 } = require('../../utils/conversationIdentity');
 const buildPhoneLookupFilters = buildConversationPhoneLookupFilter;
 const {
+  buildContactPhoneLookupFilter,
+  buildContactIdentityScopeFilter,
+  mergeFilters
+} = require('../../utils/contactIdentity');
+const {
+  buildConversationAssignmentPatch,
+  isConversationAssignedToDifferentAgent
+} = require('../../utils/conversationAssignment');
+const {
   syncConversationSummaryFromConversation
 } = require('../../services/conversationSummaryService');
 
 const buildCompanyScopeFilter = (companyId) => (companyId ? { companyId } : {});
+
+const buildActorConversationAccessFilter = ({ userId = '', companyId = '' } = {}) => ({
+  ...buildCompanyScopeFilter(companyId),
+  $or: [
+    { userId },
+    { assignedTo: userId },
+    { assignedToId: userId },
+    { assignedAgent: userId }
+  ]
+});
+
+const saveAssignmentForActor = async ({ conversation, contact = null, actorUserId = '' } = {}) => {
+  if (!conversation?._id) return conversation;
+  const resolvedContact =
+    contact ||
+    (conversation.contactId
+      ? await Contact.findOne({
+          _id: conversation.contactId,
+          ...(conversation.companyId ? { companyId: conversation.companyId } : {})
+        }).lean()
+      : null);
+  const patch = buildConversationAssignmentPatch({
+    conversation,
+    contact: resolvedContact,
+    actorUserId,
+    preferActorForOwnerless: false,
+    allowActorFallback: false
+  });
+  if (!Object.keys(patch).length) {
+    return conversation;
+  }
+  Object.assign(conversation, patch);
+  await conversation.save();
+  await syncConversationSummaryFromConversation(conversation);
+  return conversation;
+};
 
 const maybeApplySort = async (queryLike, sortSpec) => {
   if (!queryLike) return null;
@@ -35,29 +80,35 @@ const resolveConversationForOutboundSend = async ({
     ...buildCompanyScopeFilter(companyId)
   };
   const byScope = await Conversation.findOne(
-    isTenantWide ? baseIdQuery : { ...baseIdQuery, userId }
+    isTenantWide ? baseIdQuery : { ...baseIdQuery, ...buildActorConversationAccessFilter({ userId, companyId }) }
   );
-  if (byScope) return byScope;
+  if (byScope) {
+    return saveAssignmentForActor({ conversation: byScope, actorUserId: userId });
+  }
 
   const phoneCandidates = buildPhoneCandidates(to);
   const phoneLookupFilter = buildConversationPhoneLookupFilter(to);
   if (!phoneCandidates.length && !phoneLookupFilter) return null;
 
-  return maybeApplySort(
+  const byPhone = await maybeApplySort(
     Conversation.findOne(
-      isTenantWide
-        ? {
-            ...buildCompanyScopeFilter(companyId),
-            ...(phoneLookupFilter || { contactPhone: { $in: phoneCandidates } })
-          }
-        : {
-            userId,
-            ...buildCompanyScopeFilter(companyId),
-            ...(phoneLookupFilter || { contactPhone: { $in: phoneCandidates } })
-          }
+      {
+        ...buildCompanyScopeFilter(companyId),
+        ...(phoneLookupFilter || { contactPhone: { $in: phoneCandidates } })
+      }
     ),
-    { lastMessageTime: -1, updatedAt: -1, createdAt: -1 }
+    { createdAt: 1, updatedAt: 1, lastMessageTime: 1, _id: 1 }
   );
+
+  if (
+    byPhone &&
+    !isTenantWide &&
+    isConversationAssignedToDifferentAgent({ conversation: byPhone, actorUserId: userId })
+  ) {
+    return null;
+  }
+
+  return saveAssignmentForActor({ conversation: byPhone, actorUserId: userId });
 };
 
 const resolveContactForTemplateSend = async ({
@@ -79,19 +130,21 @@ const resolveContactForTemplateSend = async ({
   let contact = null;
 
   if (contactId) {
-    contact = await Contact.findOne({
-      _id: contactId,
-      userId,
-      ...buildCompanyScopeFilter(companyId)
-    });
+    contact = await Contact.findOne(
+      mergeFilters(
+        buildContactIdentityScopeFilter({ companyId, userId }),
+        { _id: contactId }
+      )
+    );
   }
 
   if (!contact && phoneLookupFilter) {
-    contact = await Contact.findOne({
-      userId,
-      ...buildCompanyScopeFilter(companyId),
-      ...phoneLookupFilter
-    });
+    contact = await Contact.findOne(
+      mergeFilters(
+        buildContactIdentityScopeFilter({ companyId, userId }),
+        buildContactPhoneLookupFilter(to) || phoneLookupFilter
+      )
+    ).sort({ createdAt: 1, updatedAt: 1 });
   }
 
   if (contact) {
@@ -140,8 +193,14 @@ const resolveOrCreateConversationForTemplateSend = async ({
       contactName: existingConversation.contactName || contactName
     });
 
-    return {
+    const assignedConversation = await saveAssignmentForActor({
       conversation: existingConversation,
+      contact: contactLookup.contact,
+      actorUserId: userId
+    });
+
+    return {
+      conversation: assignedConversation,
       contact: contactLookup.contact,
       createdContact: false,
       createdConversation: false
@@ -159,7 +218,6 @@ const resolveOrCreateConversationForTemplateSend = async ({
   const phoneCandidates = buildPhoneCandidates(contact?.phone || to);
   const conversationPhoneLookupFilter = buildConversationPhoneLookupFilter(contact?.phone || to);
   const conversationMatchConditions = [
-    { userId },
     buildCompanyScopeFilter(companyId),
     contact?._id
       ? {
@@ -177,11 +235,30 @@ const resolveOrCreateConversationForTemplateSend = async ({
         ? conversationMatchConditions[0]
         : { $and: conversationMatchConditions }
     ),
-    { lastMessageTime: -1, updatedAt: -1, createdAt: -1 }
+    { createdAt: 1, updatedAt: 1, lastMessageTime: 1, _id: 1 }
   );
 
   let createdConversation = false;
+  if (
+    conversation &&
+    !isTenantWide &&
+    isConversationAssignedToDifferentAgent({ conversation, contact, actorUserId: userId })
+  ) {
+    return {
+      conversation: null,
+      contact,
+      createdContact,
+      createdConversation: false
+    };
+  }
+
   if (!conversation) {
+    const assignmentPatch = buildConversationAssignmentPatch({
+      contact,
+      actorUserId: userId,
+      preferActorForOwnerless: false,
+      allowActorFallback: false
+    });
     conversation = await Conversation.create({
       userId,
       companyId: companyId || null,
@@ -190,6 +267,7 @@ const resolveOrCreateConversationForTemplateSend = async ({
       contactName: String(contact?.name || contactName || to || '').trim(),
       channel: 'whatsapp',
       status: 'active',
+      ...assignmentPatch,
       lastMessageTime: new Date(),
       lastMessage: '',
       lastMessageMediaType: '',
@@ -201,6 +279,22 @@ const resolveOrCreateConversationForTemplateSend = async ({
     });
     createdConversation = true;
     await syncConversationSummaryFromConversation(conversation);
+  } else if (
+    !isTenantWide ||
+    Object.keys(
+      buildConversationAssignmentPatch({
+        conversation,
+        contact,
+        actorUserId: userId,
+        allowActorFallback: false
+      })
+    ).length
+  ) {
+    conversation = await saveAssignmentForActor({
+      conversation,
+      contact,
+      actorUserId: userId
+    });
   }
 
   return {

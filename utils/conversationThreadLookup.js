@@ -22,6 +22,7 @@ const buildThreadAccessFilter = (req = {}) => {
 
   const ownershipClauses = [];
   if (userId) {
+    ownershipClauses.push({ userId });
     ownershipClauses.push({ assignedTo: userId });
     ownershipClauses.push({ assignedToId: userId });
     ownershipClauses.push({ assignedAgent: userId });

@@ -13,6 +13,7 @@ const {
   upsertConversationSummary
 } = require('../services/conversationSummaryService');
 const {
+  buildConversationPhoneLookupFilter,
   getConversationIdentityTokens,
   mergeConversationRecords
 } = require('../utils/conversationIdentity');
@@ -60,14 +61,16 @@ const buildScopeFilter = ({ companyId = null, userId = null } = {}) => {
   return filter;
 };
 
-const buildScopeKey = (conversation = {}) =>
-  `${String(conversation?.companyId || '').trim()}::${String(conversation?.userId || '').trim()}`;
+const buildScopeKey = (conversation = {}, { companyWide = false } = {}) =>
+  `${String(conversation?.companyId || '').trim()}::${
+    companyWide ? '*' : String(conversation?.userId || '').trim()
+  }`;
 
 const parseScopeKey = (scopeKey = '') => {
   const [companyId = '', userId = ''] = String(scopeKey || '').split('::');
   return {
     companyId: companyId.trim(),
-    userId: userId.trim()
+    userId: userId.trim() === '*' ? '' : userId.trim()
   };
 };
 
@@ -237,17 +240,33 @@ const run = async () => {
   const limit = parsePositiveInt(readArg(['--limit']), 0);
   const companyId = parseObjectId(readArg(['--company-id', '--companyId']), 'companyId');
   const userId = parseObjectId(readArg(['--user-id', '--userId']), 'userId');
+  const phone = readArg(['--phone']);
+  const keepStrategy = String(readArg(['--keep']) || 'latest').trim().toLowerCase();
+  const companyWide = hasFlag(['--company-wide', '--companyWide']);
   const apply = hasFlag(['--apply']);
   const dryRun = !apply || hasFlag(['--dry-run', '--dryRun']);
 
   await connectDB();
 
-  const filters = buildScopeFilter({ companyId, userId });
+  const scopeFilters = buildScopeFilter({ companyId, userId });
+  const phoneFilter = buildConversationPhoneLookupFilter(phone);
+  const filters = phoneFilter
+    ? {
+        $and: [
+          scopeFilters,
+          phoneFilter
+        ].filter((item) => item && Object.keys(item).length > 0)
+      }
+    : scopeFilters;
+  const conversationSort =
+    keepStrategy === 'earliest'
+      ? { createdAt: 1, updatedAt: 1, lastMessageTime: 1, _id: 1 }
+      : { lastMessageTime: -1, updatedAt: -1, createdAt: -1, _id: -1 };
   const cursor = Conversation.find(filters)
     .select(
       '_id userId companyId contactId contactPhone contactPhoneDigits contactName status assignedTo assignedToId assignedAgent tags priority lastMessageTime lastMessage lastMessageMediaType lastMessageAttachmentName lastMessageAttachmentPages lastMessageFrom lastMessageWhatsappMessageId lastMessageStatus unreadCount notes resolvedAt createdAt updatedAt'
     )
-    .sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1, _id: -1 })
+    .sort(conversationSort)
     .lean()
     .cursor({ batchSize });
 
@@ -291,7 +310,7 @@ const run = async () => {
     stats.scanned += 1;
     if (limit > 0 && stats.scanned > limit) break;
 
-    const scopeKey = buildScopeKey(conversation);
+    const scopeKey = buildScopeKey(conversation, { companyWide });
     const tokens = getConversationIdentityTokens(conversation).map((token) => `${scopeKey}::${token}`);
     if (!tokens.length) continue;
 

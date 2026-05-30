@@ -6,6 +6,7 @@ const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const ConversationSummary = require('../models/ConversationSummary');
 const Contact = require('../models/Contact');
+const User = require('../models/User');
 const LeadTask = require('../models/LeadTask');
 const { upsertConversationSummary } = require('../services/conversationSummaryService');
 const auth = require('../middleware/auth');
@@ -55,6 +56,45 @@ const inboxThreadRateLimit = createRedisRateLimiter({
   message: 'Thread history is being requested too quickly.'
 });
 
+const TEAM_INBOX_MUTATION_FIELDS = [
+  '_id',
+  'conversationId',
+  'userId',
+  'companyId',
+  'contactId',
+  'contactPhone',
+  'contactName',
+  'channel',
+  'status',
+  'leadStatus',
+  'assignedTo',
+  'assignedToId',
+  'assignedAgent',
+  'assignedToName',
+  'assignedAgentName',
+  'assigneeName',
+  'ownerName',
+  'lastMessageTime',
+  'lastMessage',
+  'lastMessageMediaType',
+  'lastMessageAttachmentName',
+  'lastMessageAttachmentPages',
+  'lastMessageFrom',
+  'lastMessageWhatsappMessageId',
+  'lastMessageStatus',
+  'unreadCount',
+  'important',
+  'followupAt',
+  'notes',
+  'internalNotes',
+  'resolvedAt',
+  'createdAt',
+  'updatedAt'
+].join(' ');
+
+const TEAM_INBOX_CONTACT_SNAPSHOT_FIELDS =
+  '_id name ownerId assignedTo assignedAgent assignedToName assignedAgentName assigneeName ownerName leadScore';
+
 const buildScopedMessageFilters = (req, extra = {}, options = {}) => {
   const normalizedRole = normalizeRole(
     req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role
@@ -76,6 +116,86 @@ const buildScopedMessageFilters = (req, extra = {}, options = {}) => {
 
 const toCleanString = (value = '') => String(value || '').trim();
 const toObjectIdIfValid = (value) => (mongoose.Types.ObjectId.isValid(String(value || '').trim()) ? String(value).trim() : null);
+const resolveAssigneeDisplayName = async (assignedTo = '') => {
+  const normalizedAssignedTo = toCleanString(assignedTo);
+  if (!normalizedAssignedTo) return '';
+
+  try {
+    const user = await User.findById(normalizedAssignedTo).select('_id name displayName fullName email').lean();
+    return toCleanString(user?.name || user?.displayName || user?.fullName || user?.email || normalizedAssignedTo);
+  } catch {
+    return normalizedAssignedTo;
+  }
+};
+
+const buildAssigneeNamePatch = async (assignedTo = '') => {
+  const normalizedAssignedTo = toCleanString(assignedTo);
+  if (!normalizedAssignedTo) {
+    return {
+      assignedToName: null,
+      assignedAgentName: null,
+      assigneeName: null,
+      ownerName: null
+    };
+  }
+
+  const displayName = await resolveAssigneeDisplayName(normalizedAssignedTo);
+  return {
+    assignedToName: displayName || normalizedAssignedTo,
+    assignedAgentName: displayName || normalizedAssignedTo,
+    assigneeName: displayName || normalizedAssignedTo,
+    ownerName: displayName || normalizedAssignedTo
+  };
+};
+
+const attachConversationContactSnapshot = async (conversation = {}, req = {}) => {
+  const contactId = toCleanString(conversation?.contactId);
+  if (!contactId || !mongoose.Types.ObjectId.isValid(contactId)) {
+    return conversation;
+  }
+
+  const contact = await Contact.findOne({
+    _id: contactId,
+    ...(req?.companyId ? { companyId: req.companyId } : {})
+  })
+    .select(TEAM_INBOX_CONTACT_SNAPSHOT_FIELDS)
+    .lean();
+
+  if (!contact) {
+    return conversation;
+  }
+
+  return {
+    ...conversation,
+    contactId: contact
+  };
+};
+
+const invalidateConversationForUsers = async ({
+  companyId = '',
+  conversationId = '',
+  userIds = []
+} = {}) => {
+  const normalizedUserIds = Array.from(
+    new Set(
+      (Array.isArray(userIds) ? userIds : [userIds])
+        .map((userId) => toCleanString(userId))
+        .filter(Boolean)
+    )
+  );
+
+  if (!normalizedUserIds.length) return;
+
+  await Promise.all(
+    normalizedUserIds.map((userId) =>
+      invalidateInboxConversation({
+        companyId,
+        userId,
+        conversationId
+      })
+    )
+  );
+};
 
 const getInboxRole = (req) =>
   normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
@@ -87,6 +207,7 @@ const buildConversationOwnershipFilter = (req) => {
   if (!userId) return {};
   return {
     $or: [
+      { userId },
       { assignedTo: userId },
       { assignedToId: userId },
       { assignedAgent: userId }
@@ -210,6 +331,10 @@ const loadConversationRecordForMutation = async (req, conversationId) => {
     'assignedTo',
     'assignedToId',
     'assignedAgent',
+    'assignedToName',
+    'assignedAgentName',
+    'assigneeName',
+    'ownerName',
     'lastMessageTime',
     'lastMessage',
     'lastMessageMediaType',
@@ -228,7 +353,10 @@ const loadConversationRecordForMutation = async (req, conversationId) => {
     'updatedAt'
   ].join(' ')).lean();
   if (conversation) {
-    return { conversation, source: 'conversation' };
+    return {
+      conversation: await attachConversationContactSnapshot(conversation, req),
+      source: 'conversation'
+    };
   }
 
   const summaryConversation = await ConversationSummary.findOne(filter).select([
@@ -245,6 +373,10 @@ const loadConversationRecordForMutation = async (req, conversationId) => {
     'assignedTo',
     'assignedToId',
     'assignedAgent',
+    'assignedToName',
+    'assignedAgentName',
+    'assigneeName',
+    'ownerName',
     'lastMessageTime',
     'lastMessage',
     'lastMessageMediaType',
@@ -263,7 +395,10 @@ const loadConversationRecordForMutation = async (req, conversationId) => {
     'updatedAt'
   ].join(' ')).lean();
   if (summaryConversation) {
-    return { conversation: summaryConversation, source: 'summary' };
+    return {
+      conversation: await attachConversationContactSnapshot(summaryConversation, req),
+      source: 'summary'
+    };
   }
 
   return null;
@@ -305,34 +440,38 @@ const syncConversationAndContact = async ({ req, conversation, patch = {} }) => 
   let updatedContact = null;
 
   if (contactId) {
-    const contact = await Contact.findOne({
-      _id: contactId,
-      ...(req.companyId ? { companyId: req.companyId } : {})
-    });
+    try {
+      const contact = await Contact.findOne({
+        _id: contactId,
+        ...(req.companyId ? { companyId: req.companyId } : {})
+      });
 
-    if (contact) {
-      if (patch.assignedTo !== undefined) {
-        contact.assignedTo = patch.assignedTo || null;
-        contact.assignedAgent = patch.assignedTo || null;
+      if (contact) {
+        if (patch.assignedTo !== undefined) {
+          contact.assignedTo = patch.assignedTo || null;
+          contact.assignedAgent = patch.assignedTo || null;
+        }
+        if (patch.leadStatus !== undefined) {
+          contact.leadStatus = patch.leadStatus || 'new_lead';
+          contact.status = patch.leadStatus || contact.status || 'new';
+        }
+        if (patch.followupAt !== undefined) {
+          contact.followupDate = patch.followupAt || null;
+        }
+        if (Array.isArray(patch.tags)) {
+          contact.tags = patch.tags;
+        }
+        if (patch.notes !== undefined) {
+          contact.notes = patch.notes || '';
+        }
+        if (Array.isArray(patch.internalNotes)) {
+          contact.internalNotes = patch.internalNotes;
+        }
+        await contact.save();
+        updatedContact = contact;
       }
-      if (patch.leadStatus !== undefined) {
-        contact.leadStatus = patch.leadStatus || 'new_lead';
-        contact.status = patch.leadStatus || contact.status || 'new';
-      }
-      if (patch.followupAt !== undefined) {
-        contact.followupDate = patch.followupAt || null;
-      }
-      if (Array.isArray(patch.tags)) {
-        contact.tags = patch.tags;
-      }
-      if (patch.notes !== undefined) {
-        contact.notes = patch.notes || '';
-      }
-      if (Array.isArray(patch.internalNotes)) {
-        contact.internalNotes = patch.internalNotes;
-      }
-      await contact.save();
-      updatedContact = contact;
+    } catch (contactError) {
+      console.error('Conversation contact sync skipped:', contactError?.message || contactError);
     }
   }
 
@@ -351,7 +490,8 @@ const syncConversationAndContact = async ({ req, conversation, patch = {} }) => 
       ? {
           assignedTo: nextPatch.assignedTo,
           assignedAgent: nextPatch.assignedAgent || nextPatch.assignedTo,
-          assignedToId: toObjectIdIfValid(nextPatch.assignedTo) || null
+          assignedToId: toObjectIdIfValid(nextPatch.assignedTo) || null,
+          ...(await buildAssigneeNamePatch(nextPatch.assignedTo))
         }
       : {}),
     ...(nextPatch.leadStatus !== undefined ? { leadStatus: nextPatch.leadStatus } : {}),
@@ -372,26 +512,145 @@ const syncConversationAndContact = async ({ req, conversation, patch = {} }) => 
     ...(Array.isArray(nextPatch.tags) ? { tags: nextPatch.tags } : {})
   };
 
-  let updatedConversation = await Conversation.findOneAndUpdate(mutationFilter, mutationPatch, {
-    new: true,
-    runValidators: true
-  }).lean();
+  let updatedConversation = null;
+  let updateError = null;
 
-  if (!updatedConversation) {
-    updatedConversation = await ConversationSummary.findOneAndUpdate(mutationFilter, mutationPatch, {
+  try {
+    updatedConversation = await Conversation.findOneAndUpdate(mutationFilter, mutationPatch, {
       new: true,
       runValidators: true
     }).lean();
+  } catch (error) {
+    updateError = error;
   }
 
-  if (updatedConversation) {
+  if (!updatedConversation) {
+    try {
+      const conversationUpdateResult = await Conversation.updateOne(mutationFilter, mutationPatch, {
+        runValidators: false
+      });
+      if (conversationUpdateResult?.matchedCount > 0 || conversationUpdateResult?.modifiedCount > 0) {
+        updatedConversation = await Conversation.findOne(mutationFilter).lean();
+      }
+    } catch (error) {
+      updateError = error;
+    }
+  }
+
+  if (!updatedConversation) {
+    try {
+      updatedConversation = await ConversationSummary.findOneAndUpdate(mutationFilter, mutationPatch, {
+        new: true,
+        runValidators: true
+      }).lean();
+    } catch (error) {
+      updateError = error;
+    }
+  }
+
+  if (!updatedConversation) {
+    try {
+      const summaryUpdateResult = await ConversationSummary.updateOne(mutationFilter, mutationPatch, {
+        runValidators: false
+      });
+      if (summaryUpdateResult?.matchedCount > 0 || summaryUpdateResult?.modifiedCount > 0) {
+        updatedConversation = await ConversationSummary.findOne(mutationFilter).lean();
+      }
+    } catch (error) {
+      updateError = error;
+    }
+  }
+
+  if (!updatedConversation) {
+    throw updateError || new Error('Failed to update conversation');
+  }
+
+  try {
     await upsertConversationSummary(updatedConversation);
+  } catch (summaryError) {
+    console.error('Conversation summary sync skipped:', summaryError?.message || summaryError);
   }
 
   return {
     conversation: updatedConversation,
     contact: updatedContact
   };
+};
+
+const applyConversationMutationSafely = async ({ req, conversation, patch = {} }) => {
+  if (!conversation?._id) {
+    throw new Error('Failed to update conversation');
+  }
+
+  const mutationFilter = {
+    _id: conversation._id,
+    ...(req.companyId ? { companyId: req.companyId } : {})
+  };
+
+  const mutationPatch = {
+    ...(patch.assignedTo !== undefined
+      ? {
+          assignedTo: patch.assignedTo || null,
+          assignedAgent: patch.assignedAgent || patch.assignedTo || null,
+          assignedToId: toObjectIdIfValid(patch.assignedTo) || null
+        }
+      : {}),
+    ...(patch.assignedTo !== undefined ? await buildAssigneeNamePatch(patch.assignedTo) : {}),
+    ...(patch.important !== undefined ? { important: Boolean(patch.important) } : {}),
+    ...(patch.status !== undefined
+      ? {
+          status: patch.status,
+          ...(patch.status === 'resolved'
+            ? { resolvedAt: new Date() }
+            : patch.status === 'active'
+              ? { resolvedAt: null }
+              : {})
+        }
+      : {}),
+    ...(patch.leadStatus !== undefined ? { leadStatus: patch.leadStatus || 'new_lead' } : {}),
+    ...(patch.followupAt !== undefined ? { followupAt: patch.followupAt || null } : {}),
+    updatedAt: new Date()
+  };
+
+  let updatedConversation = null;
+
+  try {
+    await Conversation.updateOne(mutationFilter, { $set: mutationPatch }, { runValidators: false });
+  } catch (error) {
+    console.error('Conversation direct update failed:', error?.message || error);
+  }
+
+  try {
+    await ConversationSummary.updateOne(mutationFilter, { $set: mutationPatch }, { runValidators: false });
+  } catch (error) {
+    console.error('Conversation summary direct update failed:', error?.message || error);
+  }
+
+  try {
+    updatedConversation = await Conversation.findOne(mutationFilter).lean();
+  } catch (error) {
+    console.error('Conversation refetch failed:', error?.message || error);
+  }
+
+  if (!updatedConversation) {
+    try {
+      updatedConversation = await ConversationSummary.findOne(mutationFilter).lean();
+    } catch (error) {
+      console.error('Conversation summary refetch failed:', error?.message || error);
+    }
+  }
+
+  if (!updatedConversation) {
+    throw new Error('Failed to update conversation');
+  }
+
+  try {
+    await upsertConversationSummary(updatedConversation);
+  } catch (summaryError) {
+    console.error('Conversation summary sync skipped:', summaryError?.message || summaryError);
+  }
+
+  return { conversation: updatedConversation };
 };
 
 router.use(auth);
@@ -477,6 +736,7 @@ router.post('/bulk-assign', async (req, res) => {
 
     const updatedConversations = [];
     const missingConversationIds = [];
+    const assigneeNamePatch = await buildAssigneeNamePatch(nextAssignedTo);
 
     for (const conversationId of conversationIds) {
       const lookup = await loadConversationRecordForMutation(req, conversationId);
@@ -492,7 +752,8 @@ router.post('/bulk-assign', async (req, res) => {
         patch: {
           assignedTo: nextAssignedTo,
           assignedAgent: nextAssignedTo,
-          assignedToId: toObjectIdIfValid(nextAssignedTo) || null
+          assignedToId: toObjectIdIfValid(nextAssignedTo) || null,
+          ...assigneeNamePatch
         }
       });
 
@@ -512,10 +773,16 @@ router.post('/bulk-assign', async (req, res) => {
         nextAssignedTo
       );
 
-      await invalidateInboxConversation({
+      await invalidateConversationForUsers({
         companyId: req.companyId || '',
-        userId: req.user?.id || '',
-        conversationId
+        conversationId,
+        userIds: [
+          req.user?.id,
+          nextAssignedTo,
+          conversation?.assignedTo,
+          conversation?.assignedToId,
+          conversation?.assignedAgent
+        ]
       });
     }
 
@@ -738,13 +1005,15 @@ router.patch('/:id/assign', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Conversation not found' });
     }
 
+    const assigneeNamePatch = await buildAssigneeNamePatch(nextAssignedTo);
     const result = await syncConversationAndContact({
       req,
       conversation,
       patch: {
         assignedTo: nextAssignedTo,
         assignedAgent: nextAssignedTo,
-        assignedToId: toObjectIdIfValid(nextAssignedTo) || null
+        assignedToId: toObjectIdIfValid(nextAssignedTo) || null,
+        ...assigneeNamePatch
       }
     });
 
@@ -759,6 +1028,18 @@ router.patch('/:id/assign', async (req, res) => {
       },
       nextAssignedTo
     );
+
+    await invalidateConversationForUsers({
+      companyId: req.companyId || '',
+      conversationId,
+      userIds: [
+        req.user?.id,
+        nextAssignedTo,
+        conversation?.assignedTo,
+        conversation?.assignedToId,
+        conversation?.assignedAgent
+      ]
+    });
 
     return res.json({ success: true, data: result?.conversation || conversation });
   } catch (error) {
@@ -826,7 +1107,7 @@ router.patch('/:id/close', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Conversation not found' });
     }
 
-    const result = await syncConversationAndContact({
+    const result = await applyConversationMutationSafely({
       req,
       conversation,
       patch: {
@@ -898,7 +1179,7 @@ router.patch('/:id/important', async (req, res) => {
     }
 
     const important = Boolean(req.body?.important);
-    const result = await syncConversationAndContact({
+    const result = await applyConversationMutationSafely({
       req,
       conversation,
       patch: { important }

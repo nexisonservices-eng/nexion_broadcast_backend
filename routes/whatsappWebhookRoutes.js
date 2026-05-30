@@ -15,6 +15,15 @@ const {
 const {
   buildConversationPhoneLookupFilter,
 } = require('../utils/conversationIdentity');
+const {
+  buildConversationAssignmentPatch,
+  collectConversationParticipantUserIds
+} = require('../utils/conversationAssignment');
+const {
+  buildContactPhoneLookupFilter,
+  buildContactIdentityScopeFilter,
+  mergeFilters
+} = require('../utils/contactIdentity');
 const { logConsentEvent } = require('../services/whatsappConsentLogService');
 const broadcastService = require('../services/broadcastService');
 const { invalidateInboxConversation } = require('../utils/teamInboxCache');
@@ -514,11 +523,12 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       const inboundActivityAt = new Date();
       const serviceWindowClosesAt = new Date(inboundActivityAt.getTime() + 24 * 60 * 60 * 1000);
 
-      let contact = await Contact.findOne({
-        userId,
-        companyId,
-        phone: { $in: phoneCandidates }
-      });
+      let contact = await Contact.findOne(
+        mergeFilters(
+          buildContactIdentityScopeFilter({ companyId, userId }),
+          buildContactPhoneLookupFilter(from) || { phone: { $in: phoneCandidates } }
+        )
+      ).sort({ createdAt: 1, updatedAt: 1 });
       const leadScoringSettings =
         typeof getLeadScoringSettings === 'function'
           ? await getLeadScoringSettings({ userId, companyId })
@@ -608,12 +618,17 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
 
       const conversationLookupFilter = buildConversationPhoneLookupFilter(from);
       let conversation = await Conversation.findOne({
-        userId,
         companyId,
         status: { $in: ['active', 'pending'] },
         ...(conversationLookupFilter || { contactPhone: from })
-      }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
+      }).sort({ createdAt: 1, updatedAt: 1, lastMessageTime: 1, _id: 1 });
       if (!conversation) {
+        const assignmentPatch = buildConversationAssignmentPatch({
+          contact,
+          actorUserId: userId,
+          preferActorForOwnerless: false,
+          allowActorFallback: false
+        });
         conversation = await Conversation.create({
           userId,
           companyId,
@@ -621,6 +636,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           contactPhone: from,
           contactName: contact.name,
           channel: 'whatsapp',
+          ...assignmentPatch,
           lastMessageTime: inboundActivityAt,
           lastMessage: text,
           lastMessageMediaType: String(mediaType || '').trim(),
@@ -636,6 +652,20 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           unreadCount: 1
         });
       } else {
+        const assignmentPatch = buildConversationAssignmentPatch({
+          conversation,
+          contact,
+          actorUserId: userId,
+          preferActorForOwnerless: false,
+          allowActorFallback: false
+        });
+        if (contact?._id) {
+          conversation.contactId = contact._id;
+        }
+        if (contact?.name && !String(conversation.contactName || '').trim()) {
+          conversation.contactName = contact.name;
+        }
+        Object.assign(conversation, assignmentPatch);
         if (!isReactionMessage) {
           conversation.lastMessageTime = inboundActivityAt;
           conversation.lastMessage = text;
@@ -748,12 +778,14 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         unreadCount: Number(conversation.unreadCount || 1)
       });
       await Promise.all(
-        relatedConversationIds.map((relatedConversationId) =>
-          invalidateInboxConversation({
-            userId,
-            companyId,
-            conversationId: relatedConversationId
-          })
+        collectConversationParticipantUserIds(conversation, userId).flatMap((participantUserId) =>
+          relatedConversationIds.map((relatedConversationId) =>
+            invalidateInboxConversation({
+              userId: participantUserId,
+              companyId,
+              conversationId: relatedConversationId
+            })
+          )
         )
       );
 

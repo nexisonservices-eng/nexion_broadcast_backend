@@ -92,6 +92,9 @@ const {
   resolveRelatedConversationIds
 } = require('../utils/conversationThreadLookup');
 const {
+  buildContactPhoneLookupFilter
+} = require('../utils/contactIdentity');
+const {
   validateFreeformOutboundSend,
   validateTemplateOutboundSend,
   applyMarketingTemplateSent,
@@ -275,18 +278,18 @@ const isValidObjectId = (value = '') => /^[a-f\d]{24}$/i.test(String(value || ''
 const resolveReplyReferenceForOutboundSend = async ({
   userId,
   companyId,
+  conversationId,
   replyToMessageId,
   whatsappContextMessageId,
   isTenantWide = false
 }) => {
   const normalizedReplyToMessageId = String(replyToMessageId || '').trim();
   if (normalizedReplyToMessageId && isValidObjectId(normalizedReplyToMessageId)) {
-    const baseIdFilter = { _id: normalizedReplyToMessageId };
-    const byScopeReply = await Message.findOne(
-      companyId
-        ? { ...baseIdFilter, companyId, ...(isTenantWide ? {} : { userId }) }
-        : { ...baseIdFilter, ...(isTenantWide ? {} : { userId }) }
-    )
+    const byScopeReply = await Message.findOne({
+      _id: normalizedReplyToMessageId,
+      ...(companyId ? { companyId } : {}),
+      ...(String(conversationId || '').trim() ? { conversationId: String(conversationId || '').trim() } : {})
+    })
       .select('_id whatsappMessageId')
       .lean();
     if (byScopeReply) return byScopeReply;
@@ -295,12 +298,11 @@ const resolveReplyReferenceForOutboundSend = async ({
   const normalizedContextId = String(whatsappContextMessageId || '').trim();
   if (!normalizedContextId) return null;
 
-  const baseContextFilter = { whatsappMessageId: normalizedContextId };
-  return Message.findOne(
-    companyId
-      ? { ...baseContextFilter, companyId, ...(isTenantWide ? {} : { userId }) }
-      : { ...baseContextFilter, ...(isTenantWide ? {} : { userId }) }
-  )
+  return Message.findOne({
+    whatsappMessageId: normalizedContextId,
+    ...(companyId ? { companyId } : {}),
+    ...(String(conversationId || '').trim() ? { conversationId: String(conversationId || '').trim() } : {})
+  })
     .select('_id whatsappMessageId')
     .lean();
 };
@@ -385,6 +387,7 @@ const syncConversationSummary = async (conversation = {}, updates = {}) => {
     status: base.status,
     assignedTo: base.assignedTo,
     assignedToId: base.assignedToId,
+    assignedAgent: base.assignedAgent,
     tags: base.tags,
     priority: base.priority,
     lastMessageTime: base.lastMessageTime,
@@ -414,12 +417,21 @@ const writeConversationThreadState = async ({
 
   await Conversation.updateOne({ _id: conversation._id }, conversationUpdate);
   await syncConversationSummary(conversation, summaryUpdate);
-  await invalidateInboxConversation({
-    companyId: companyId || '',
-    userId: userId || '',
-    conversationId: conversation._id,
-    conversationIds: relatedConversationIds
+  const cacheRecipientUserIds = await collectRealtimeRecipientUserIds({
+    userId,
+    companyId,
+    relatedConversationIds: relatedConversationIds.length ? relatedConversationIds : [conversation._id]
   });
+  await Promise.all(
+    cacheRecipientUserIds.map((recipientUserId) =>
+      invalidateInboxConversation({
+        companyId: companyId || '',
+        userId: recipientUserId || '',
+        conversationId: conversation._id,
+        conversationIds: relatedConversationIds
+      })
+    )
+  );
 
   return true;
 };
@@ -566,37 +578,22 @@ const resolveContactForConversation = async ({
   if (!conversation?._id || (!userId && !isTenantWide)) return null;
 
   if (conversation.contactId) {
-    const contactById = await Contact.findOne(
-      isTenantWide
-        ? {
-            _id: conversation.contactId,
-            ...(companyId ? { companyId } : {})
-          }
-        : {
-            _id: conversation.contactId,
-            userId,
-            ...(companyId ? { companyId } : {})
-          }
-    );
+    const contactById = await Contact.findOne({
+      _id: conversation.contactId,
+      ...(companyId ? { companyId } : {})
+    });
 
     if (contactById) return contactById;
   }
 
   const phoneCandidates = buildPhoneCandidates(conversation.contactPhone || '');
-  if (!phoneCandidates.length) return null;
+  const phoneLookupFilter = buildContactPhoneLookupFilter(conversation.contactPhone || '');
+  if (!phoneCandidates.length && !phoneLookupFilter) return null;
 
-  return Contact.findOne(
-    isTenantWide
-      ? {
-          ...(companyId ? { companyId } : {}),
-          phone: { $in: phoneCandidates }
-        }
-      : {
-          userId,
-          ...(companyId ? { companyId } : {}),
-          phone: { $in: phoneCandidates }
-        }
-  );
+  return Contact.findOne({
+    ...(companyId ? { companyId } : {}),
+    ...(phoneLookupFilter || { phone: { $in: phoneCandidates } })
+  }).sort({ createdAt: 1, updatedAt: 1 });
 };
 
 const resolveAttachmentMessageFilters = ({ req, messageId }) => {
@@ -1420,6 +1417,7 @@ router.post(
       const replyReference = await resolveReplyReferenceForOutboundSend({
         userId: req.user.id,
         companyId: messageCompanyId,
+        conversationId: conversation._id,
         replyToMessageId,
         whatsappContextMessageId,
         isTenantWide: isTenantWideRole(

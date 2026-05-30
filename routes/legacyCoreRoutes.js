@@ -35,6 +35,13 @@ const {
   dedupeConversationsByIdentity
 } = require('../utils/conversationIdentity');
 const {
+  buildContactPhoneLookupFilter
+} = require('../utils/contactIdentity');
+const {
+  buildConversationAssignmentPatch,
+  isConversationAssignedToDifferentAgent
+} = require('../utils/conversationAssignment');
+const {
   resolveRelatedConversationIds
 } = require('../utils/conversationThreadLookup');
 const {
@@ -195,17 +202,17 @@ const registerLegacyCoreRoutes = (app, deps) => {
   const resolveReplyReferenceForOutboundSend = async ({
     userId,
     companyId,
+    conversationId,
     replyToMessageId,
     whatsappContextMessageId,
     isTenantWide = false
   }) => {
     const normalizedReplyToMessageId = String(replyToMessageId || '').trim();
     if (normalizedReplyToMessageId && isValidObjectId(normalizedReplyToMessageId)) {
-      const baseIdFilter = { _id: normalizedReplyToMessageId };
       const byScopeReply = await Message.findOne({
-        ...baseIdFilter,
         ...buildCompanyScopeFilter(companyId),
-        ...(isTenantWide ? {} : { userId })
+        _id: normalizedReplyToMessageId,
+        ...(String(conversationId || '').trim() ? { conversationId: String(conversationId || '').trim() } : {})
       })
         .select('_id whatsappMessageId')
         .lean();
@@ -215,11 +222,10 @@ const registerLegacyCoreRoutes = (app, deps) => {
     const normalizedContextId = String(whatsappContextMessageId || '').trim();
     if (!normalizedContextId) return null;
 
-    const baseContextFilter = { whatsappMessageId: normalizedContextId };
     return Message.findOne({
-      ...baseContextFilter,
       ...buildCompanyScopeFilter(companyId),
-      ...(isTenantWide ? {} : { userId })
+      whatsappMessageId: normalizedContextId,
+      ...(String(conversationId || '').trim() ? { conversationId: String(conversationId || '').trim() } : {})
     })
       .select('_id whatsappMessageId')
       .lean();
@@ -239,25 +245,67 @@ const registerLegacyCoreRoutes = (app, deps) => {
       ...buildCompanyScopeFilter(req.companyId)
     };
     const byScopeConversation = await Conversation.findOne(
-      isTenantWide ? baseIdQuery : { ...baseIdQuery, userId }
+      isTenantWide
+        ? baseIdQuery
+        : {
+            ...baseIdQuery,
+            $or: [
+              { userId },
+              { assignedTo: userId },
+              { assignedToId: userId },
+              { assignedAgent: userId }
+            ]
+          }
     );
-    if (byScopeConversation) return byScopeConversation;
+    if (byScopeConversation) {
+      const assignmentPatch = buildConversationAssignmentPatch({
+        conversation: byScopeConversation,
+        actorUserId: userId,
+        preferActorForOwnerless: false,
+        allowActorFallback: false
+      });
+      if (Object.keys(assignmentPatch).length) {
+        Object.assign(byScopeConversation, assignmentPatch);
+        await byScopeConversation.save();
+        await syncConversationSummaryFromConversation(byScopeConversation);
+      }
+      return byScopeConversation;
+    }
 
     const phoneLookupFilter = buildConversationPhoneLookupFilter(to);
     if (!phoneLookupFilter) return null;
 
-    return Conversation.findOne(
-      isTenantWide
-        ? {
-            ...buildCompanyScopeFilter(req.companyId),
-            ...phoneLookupFilter
-          }
-        : {
-            userId,
-            ...buildCompanyScopeFilter(req.companyId),
-            ...phoneLookupFilter
-          }
-    ).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
+    const byPhoneConversation = await Conversation.findOne({
+      ...buildCompanyScopeFilter(req.companyId),
+      ...phoneLookupFilter
+    }).sort({ createdAt: 1, updatedAt: 1, lastMessageTime: 1, _id: 1 });
+
+    if (
+      byPhoneConversation &&
+      !isTenantWide &&
+      isConversationAssignedToDifferentAgent({
+        conversation: byPhoneConversation,
+        actorUserId: userId
+      })
+    ) {
+      return null;
+    }
+
+    if (byPhoneConversation) {
+      const assignmentPatch = buildConversationAssignmentPatch({
+        conversation: byPhoneConversation,
+        actorUserId: userId,
+        preferActorForOwnerless: false,
+        allowActorFallback: false
+      });
+      if (Object.keys(assignmentPatch).length) {
+        Object.assign(byPhoneConversation, assignmentPatch);
+        await byPhoneConversation.save();
+        await syncConversationSummaryFromConversation(byPhoneConversation);
+      }
+    }
+
+    return byPhoneConversation;
   };
 
   const resolveContactForConversation = async ({
@@ -269,18 +317,10 @@ const registerLegacyCoreRoutes = (app, deps) => {
     if (!conversation?._id || (!userId && !isTenantWide)) return null;
 
     if (conversation.contactId) {
-      const contactById = await Contact.findOne(
-        isTenantWide
-          ? {
-              _id: conversation.contactId,
-              ...buildCompanyScopeFilter(companyId)
-            }
-          : {
-              _id: conversation.contactId,
-              userId,
-              ...buildCompanyScopeFilter(companyId)
-            }
-      );
+      const contactById = await Contact.findOne({
+        _id: conversation.contactId,
+        ...buildCompanyScopeFilter(companyId)
+      });
 
       if (contactById) return contactById;
     }
@@ -299,18 +339,11 @@ const registerLegacyCoreRoutes = (app, deps) => {
       )
     );
 
-    return Contact.findOne(
-      isTenantWide
-        ? {
-            ...buildCompanyScopeFilter(companyId),
-            phone: { $in: phoneCandidates }
-          }
-        : {
-            userId,
-            ...buildCompanyScopeFilter(companyId),
-            phone: { $in: phoneCandidates }
-          }
-    );
+    const phoneLookupFilter = buildContactPhoneLookupFilter(conversation.contactPhone || '');
+    return Contact.findOne({
+      ...buildCompanyScopeFilter(companyId),
+      ...(phoneLookupFilter || { phone: { $in: phoneCandidates } })
+    }).sort({ createdAt: 1, updatedAt: 1 });
   };
 
   const hydrateContactWithLatestInboundActivity = async ({
@@ -464,6 +497,7 @@ const registerLegacyCoreRoutes = (app, deps) => {
         const replyReference = await resolveReplyReferenceForOutboundSend({
           userId: req.user.id,
           companyId: messageCompanyId,
+          conversationId: conversation._id,
           replyToMessageId,
           whatsappContextMessageId,
           isTenantWide: isTenantWideRole(
@@ -579,13 +613,20 @@ const registerLegacyCoreRoutes = (app, deps) => {
             ...conversationThreadUpdate
           };
 
+        const cacheRecipientUserIds = await collectRealtimeRecipientUserIds({
+          userId: req.user.id,
+          companyId: messageCompanyId,
+          relatedConversationIds: relatedConversationIdList
+        });
         await Promise.all(
-          relatedConversationIdList.map((relatedConversationId) =>
-            invalidateInboxConversation({
-              companyId: messageCompanyId || '',
-              userId: req.user.id || '',
-              conversationId: relatedConversationId
-            })
+          cacheRecipientUserIds.flatMap((recipientUserId) =>
+            relatedConversationIdList.map((relatedConversationId) =>
+              invalidateInboxConversation({
+                companyId: messageCompanyId || '',
+                userId: recipientUserId || '',
+                conversationId: relatedConversationId
+              })
+            )
           )
         );
 
@@ -599,6 +640,7 @@ const registerLegacyCoreRoutes = (app, deps) => {
           status: conversation.status,
           assignedTo: conversation.assignedTo,
           assignedToId: conversation.assignedToId,
+          assignedAgent: conversation.assignedAgent,
           tags: conversation.tags,
           priority: conversation.priority,
           ...conversationThreadUpdate,
@@ -641,13 +683,8 @@ const registerLegacyCoreRoutes = (app, deps) => {
         if (!queuedRealtimeEvent && ENABLE_DEBUG_LOGS) {
           console.warn('Legacy message_sent realtime event was not queued; publishing directly.');
         }
-        const realtimeRecipientUserIds = await collectRealtimeRecipientUserIds({
-          userId: req.user.id,
-          companyId: messageCompanyId,
-          relatedConversationIds: relatedConversationIdList
-        });
         await Promise.all(
-          realtimeRecipientUserIds.map((recipientUserId) =>
+          cacheRecipientUserIds.map((recipientUserId) =>
             emitRealtimeEvent(recipientUserId, payload.data)
           )
         );
