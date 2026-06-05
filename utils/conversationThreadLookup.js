@@ -22,7 +22,10 @@ const buildThreadAccessFilter = (req = {}) => {
 
   const ownershipClauses = [];
   if (userId) {
+<<<<<<< Updated upstream
     ownershipClauses.push({ userId });
+=======
+>>>>>>> Stashed changes
     ownershipClauses.push({ assignedTo: userId });
     ownershipClauses.push({ assignedToId: userId });
     ownershipClauses.push({ assignedAgent: userId });

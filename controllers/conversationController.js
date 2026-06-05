@@ -123,10 +123,13 @@ const TEAM_INBOX_CONVERSATION_FIELDS = [
   'leadStatus',
   'assignedTo',
   'assignedAgent',
+<<<<<<< Updated upstream
   'assignedToName',
   'assignedAgentName',
   'assigneeName',
   'ownerName',
+=======
+>>>>>>> Stashed changes
   'lastMessageTime',
   'lastMessage',
   'lastMessageMediaType',
@@ -426,8 +429,11 @@ const normalizeInboxView = (value = '') => {
 const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
   const normalizedView = normalizeInboxView(view);
   const normalizedUserId = String(userId || '').trim();
+<<<<<<< Updated upstream
   const normalizedUserObjectId = toObjectIdIfValid(normalizedUserId);
   const userIdentifier = normalizedUserObjectId || normalizedUserId;
+=======
+>>>>>>> Stashed changes
 
   const activeStatuses = ['active', 'pending'];
   const closedStatuses = ['resolved'];
@@ -460,10 +466,15 @@ const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
             $and: [
               {
                 $or: [
+<<<<<<< Updated upstream
                   { userId: userIdentifier },
                   { assignedTo: normalizedUserId },
                   { assignedToId: userIdentifier },
                   { assignedAgent: normalizedUserId }
+=======
+                  { assignedTo: normalizedUserId },
+                  { assignedToId: normalizedUserId }
+>>>>>>> Stashed changes
                 ]
               },
               { status: { $in: activeStatuses } }
@@ -497,10 +508,15 @@ const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
       return normalizedUserId
         ? {
             $or: [
+<<<<<<< Updated upstream
               { userId: userIdentifier },
               { assignedTo: normalizedUserId },
               { assignedToId: userIdentifier },
               { assignedAgent: normalizedUserId }
+=======
+              { assignedTo: normalizedUserId },
+              { assignedToId: normalizedUserId }
+>>>>>>> Stashed changes
             ]
           }
         : { assignedTo: { $nin: [null, ''] } };
@@ -515,6 +531,7 @@ const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
 const buildConversationViewFilters = (req, extra = {}) => {
   const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
   const isAgent = !isTenantWideRole(normalizedRole);
+<<<<<<< Updated upstream
   const normalizedView = normalizeInboxView(extra?.view || req?.query?.view || req?.query?.inboxView);
   const normalizedUserId = String(req?.user?.id || '').trim();
   const normalizedUserObjectId = toObjectIdIfValid(normalizedUserId);
@@ -522,6 +539,12 @@ const buildConversationViewFilters = (req, extra = {}) => {
   const userIdentifier = normalizedUserObjectId || normalizedUserId;
   const baseFilters = {
     ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
+=======
+  const normalizedView = normalizeInboxView(req?.query?.view || req?.query?.inboxView || extra?.view);
+  const normalizedUserId = String(req?.user?.id || '').trim();
+  const baseFilters = {
+    companyId: req.companyId,
+>>>>>>> Stashed changes
     ...extra
   };
   delete baseFilters.view;
@@ -529,6 +552,7 @@ const buildConversationViewFilters = (req, extra = {}) => {
 
   const viewFilter = buildConversationStatusFilter(
     isAgent ? (normalizedView === 'all' ? 'my' : normalizedView) : normalizedView,
+<<<<<<< Updated upstream
     { userId: userIdentifier }
   );
 
@@ -540,6 +564,17 @@ const buildConversationViewFilters = (req, extra = {}) => {
             { assignedTo: normalizedUserId },
             { assignedToId: userIdentifier },
             { assignedAgent: normalizedUserId }
+=======
+    { userId: normalizedUserId }
+  );
+
+  if (isAgent) {
+    const ownershipFilter = normalizedUserId
+      ? {
+          $or: [
+            { assignedTo: normalizedUserId },
+            { assignedToId: normalizedUserId }
+>>>>>>> Stashed changes
           ]
         }
       : {};
@@ -560,6 +595,7 @@ const buildConversationViewFilters = (req, extra = {}) => {
 const buildContactViewFilters = (req, extra = {}) => {
   const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
   const isAgent = !isTenantWideRole(normalizedRole);
+<<<<<<< Updated upstream
   const normalizedView = normalizeInboxView(extra?.view || req?.query?.view || req?.query?.inboxView);
   const normalizedUserId = String(req?.user?.id || '').trim();
   const normalizedUserObjectId = toObjectIdIfValid(normalizedUserId);
@@ -567,6 +603,12 @@ const buildContactViewFilters = (req, extra = {}) => {
   const userIdentifier = normalizedUserObjectId || normalizedUserId;
   const baseFilters = {
     ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
+=======
+  const normalizedView = normalizeInboxView(req?.query?.view || req?.query?.inboxView || extra?.view);
+  const normalizedUserId = String(req?.user?.id || '').trim();
+  const baseFilters = {
+    companyId: req.companyId,
+>>>>>>> Stashed changes
     ...extra
   };
   delete baseFilters.view;
@@ -588,6 +630,7 @@ const buildContactViewFilters = (req, extra = {}) => {
       case 'assigned':
       case 'assigned-leads':
       case 'my':
+<<<<<<< Updated upstream
         return userIdentifier
           ? {
               $or: [
@@ -595,6 +638,13 @@ const buildContactViewFilters = (req, extra = {}) => {
                 { assignedToId: userIdentifier },
                 { assignedAgent: normalizedUserId },
                 { userId: userIdentifier }
+=======
+        return normalizedUserId
+          ? {
+              $or: [
+                { assignedTo: normalizedUserId },
+                { assignedToId: normalizedUserId }
+>>>>>>> Stashed changes
               ]
             }
           : { assignedTo: { $ne: null } };
@@ -613,6 +663,7 @@ const buildContactViewFilters = (req, extra = {}) => {
   })();
 
   if (isAgent) {
+<<<<<<< Updated upstream
     const ownershipFilter = userIdentifier
       ? {
           $or: [
@@ -620,6 +671,13 @@ const buildContactViewFilters = (req, extra = {}) => {
             { assignedTo: normalizedUserId },
             { assignedToId: userIdentifier },
             { assignedAgent: normalizedUserId }
+=======
+    const ownershipFilter = normalizedUserId
+      ? {
+          $or: [
+            { assignedTo: normalizedUserId },
+            { assignedToId: normalizedUserId }
+>>>>>>> Stashed changes
           ]
         }
       : {};
@@ -1221,9 +1279,13 @@ class ConversationController {
     try {
       const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
       const isAgent = !isTenantWideRole(normalizedRole);
+<<<<<<< Updated upstream
       const filters = buildConversationViewFilters(req, {
         view: isAgent ? 'my' : 'all'
       });
+=======
+      const filters = buildConversationViewFilters(req, {});
+>>>>>>> Stashed changes
       const scopeVariants = getInboxScopeVariants({
         companyId: filters.companyId,
         userId: req.user?.id || ''

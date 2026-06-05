@@ -135,6 +135,7 @@ ContactSchema.pre('insertMany', function(next, docs) {
 });
 
 ContactSchema.index({ companyId: 1, userId: 1, phone: 1 });
+<<<<<<< Updated upstream
 ContactSchema.index({ companyId: 1, phone: 1, createdAt: 1 });
 ContactSchema.index({ companyId: 1, phoneDigits: 1, createdAt: 1 });
 ContactSchema.index({ companyId: 1, phoneKey: 1, createdAt: 1 });
@@ -148,6 +149,8 @@ ContactSchema.index(
     }
   }
 );
+=======
+>>>>>>> Stashed changes
 ContactSchema.index({ companyId: 1, createdBy: 1, assignedTo: 1, leadStatus: 1, followupDate: 1, createdAt: -1, _id: -1 });
 ContactSchema.index({ companyId: 1, userId: 1, assignedAgent: 1, leadStatus: 1, followupDate: 1, createdAt: -1, _id: -1 });
 ContactSchema.index({ companyId: 1, userId: 1, nameLower: 1, lastContact: -1, createdAt: -1, _id: -1 });
