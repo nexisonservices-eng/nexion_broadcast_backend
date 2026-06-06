@@ -6,10 +6,7 @@ const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const ConversationSummary = require('../models/ConversationSummary');
 const Contact = require('../models/Contact');
-<<<<<<< Updated upstream
 const User = require('../models/User');
-=======
->>>>>>> Stashed changes
 const LeadTask = require('../models/LeadTask');
 const { upsertConversationSummary } = require('../services/conversationSummaryService');
 const auth = require('../middleware/auth');
@@ -119,7 +116,6 @@ const buildScopedMessageFilters = (req, extra = {}, options = {}) => {
 
 const toCleanString = (value = '') => String(value || '').trim();
 const toObjectIdIfValid = (value) => (mongoose.Types.ObjectId.isValid(String(value || '').trim()) ? String(value).trim() : null);
-<<<<<<< Updated upstream
 const resolveAssigneeDisplayName = async (assignedTo = '') => {
   const normalizedAssignedTo = toCleanString(assignedTo);
   if (!normalizedAssignedTo) return '';
@@ -200,8 +196,6 @@ const invalidateConversationForUsers = async ({
     )
   );
 };
-=======
->>>>>>> Stashed changes
 
 const getInboxRole = (req) =>
   normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
@@ -213,10 +207,7 @@ const buildConversationOwnershipFilter = (req) => {
   if (!userId) return {};
   return {
     $or: [
-<<<<<<< Updated upstream
       { userId },
-=======
->>>>>>> Stashed changes
       { assignedTo: userId },
       { assignedToId: userId },
       { assignedAgent: userId }
@@ -340,13 +331,10 @@ const loadConversationRecordForMutation = async (req, conversationId) => {
     'assignedTo',
     'assignedToId',
     'assignedAgent',
-<<<<<<< Updated upstream
     'assignedToName',
     'assignedAgentName',
     'assigneeName',
     'ownerName',
-=======
->>>>>>> Stashed changes
     'lastMessageTime',
     'lastMessage',
     'lastMessageMediaType',
@@ -365,14 +353,10 @@ const loadConversationRecordForMutation = async (req, conversationId) => {
     'updatedAt'
   ].join(' ')).lean();
   if (conversation) {
-<<<<<<< Updated upstream
     return {
       conversation: await attachConversationContactSnapshot(conversation, req),
       source: 'conversation'
     };
-=======
-    return { conversation, source: 'conversation' };
->>>>>>> Stashed changes
   }
 
   const summaryConversation = await ConversationSummary.findOne(filter).select([
@@ -389,13 +373,10 @@ const loadConversationRecordForMutation = async (req, conversationId) => {
     'assignedTo',
     'assignedToId',
     'assignedAgent',
-<<<<<<< Updated upstream
     'assignedToName',
     'assignedAgentName',
     'assigneeName',
     'ownerName',
-=======
->>>>>>> Stashed changes
     'lastMessageTime',
     'lastMessage',
     'lastMessageMediaType',
@@ -414,14 +395,10 @@ const loadConversationRecordForMutation = async (req, conversationId) => {
     'updatedAt'
   ].join(' ')).lean();
   if (summaryConversation) {
-<<<<<<< Updated upstream
     return {
       conversation: await attachConversationContactSnapshot(summaryConversation, req),
       source: 'summary'
     };
-=======
-    return { conversation: summaryConversation, source: 'summary' };
->>>>>>> Stashed changes
   }
 
   return null;
@@ -463,7 +440,6 @@ const syncConversationAndContact = async ({ req, conversation, patch = {} }) => 
   let updatedContact = null;
 
   if (contactId) {
-<<<<<<< Updated upstream
     try {
       const contact = await Contact.findOne({
         _id: contactId,
@@ -496,36 +472,6 @@ const syncConversationAndContact = async ({ req, conversation, patch = {} }) => 
       }
     } catch (contactError) {
       console.error('Conversation contact sync skipped:', contactError?.message || contactError);
-=======
-    const contact = await Contact.findOne({
-      _id: contactId,
-      ...(req.companyId ? { companyId: req.companyId } : {})
-    });
-
-    if (contact) {
-      if (patch.assignedTo !== undefined) {
-        contact.assignedTo = patch.assignedTo || null;
-        contact.assignedAgent = patch.assignedTo || null;
-      }
-      if (patch.leadStatus !== undefined) {
-        contact.leadStatus = patch.leadStatus || 'new_lead';
-        contact.status = patch.leadStatus || contact.status || 'new';
-      }
-      if (patch.followupAt !== undefined) {
-        contact.followupDate = patch.followupAt || null;
-      }
-      if (Array.isArray(patch.tags)) {
-        contact.tags = patch.tags;
-      }
-      if (patch.notes !== undefined) {
-        contact.notes = patch.notes || '';
-      }
-      if (Array.isArray(patch.internalNotes)) {
-        contact.internalNotes = patch.internalNotes;
-      }
-      await contact.save();
-      updatedContact = contact;
->>>>>>> Stashed changes
     }
   }
 
@@ -544,12 +490,8 @@ const syncConversationAndContact = async ({ req, conversation, patch = {} }) => 
       ? {
           assignedTo: nextPatch.assignedTo,
           assignedAgent: nextPatch.assignedAgent || nextPatch.assignedTo,
-<<<<<<< Updated upstream
           assignedToId: toObjectIdIfValid(nextPatch.assignedTo) || null,
           ...(await buildAssigneeNamePatch(nextPatch.assignedTo))
-=======
-          assignedToId: toObjectIdIfValid(nextPatch.assignedTo) || null
->>>>>>> Stashed changes
         }
       : {}),
     ...(nextPatch.leadStatus !== undefined ? { leadStatus: nextPatch.leadStatus } : {}),
@@ -570,7 +512,6 @@ const syncConversationAndContact = async ({ req, conversation, patch = {} }) => 
     ...(Array.isArray(nextPatch.tags) ? { tags: nextPatch.tags } : {})
   };
 
-<<<<<<< Updated upstream
   let updatedConversation = null;
   let updateError = null;
 
@@ -628,22 +569,6 @@ const syncConversationAndContact = async ({ req, conversation, patch = {} }) => 
     await upsertConversationSummary(updatedConversation);
   } catch (summaryError) {
     console.error('Conversation summary sync skipped:', summaryError?.message || summaryError);
-=======
-  let updatedConversation = await Conversation.findOneAndUpdate(mutationFilter, mutationPatch, {
-    new: true,
-    runValidators: true
-  }).lean();
-
-  if (!updatedConversation) {
-    updatedConversation = await ConversationSummary.findOneAndUpdate(mutationFilter, mutationPatch, {
-      new: true,
-      runValidators: true
-    }).lean();
-  }
-
-  if (updatedConversation) {
-    await upsertConversationSummary(updatedConversation);
->>>>>>> Stashed changes
   }
 
   return {
@@ -652,7 +577,6 @@ const syncConversationAndContact = async ({ req, conversation, patch = {} }) => 
   };
 };
 
-<<<<<<< Updated upstream
 const applyConversationMutationSafely = async ({ req, conversation, patch = {} }) => {
   if (!conversation?._id) {
     throw new Error('Failed to update conversation');
@@ -729,8 +653,6 @@ const applyConversationMutationSafely = async ({ req, conversation, patch = {} }
   return { conversation: updatedConversation };
 };
 
-=======
->>>>>>> Stashed changes
 router.use(auth);
 router.use(
   requireTenantPolicy({
@@ -814,10 +736,7 @@ router.post('/bulk-assign', async (req, res) => {
 
     const updatedConversations = [];
     const missingConversationIds = [];
-<<<<<<< Updated upstream
     const assigneeNamePatch = await buildAssigneeNamePatch(nextAssignedTo);
-=======
->>>>>>> Stashed changes
 
     for (const conversationId of conversationIds) {
       const lookup = await loadConversationRecordForMutation(req, conversationId);
@@ -833,12 +752,8 @@ router.post('/bulk-assign', async (req, res) => {
         patch: {
           assignedTo: nextAssignedTo,
           assignedAgent: nextAssignedTo,
-<<<<<<< Updated upstream
           assignedToId: toObjectIdIfValid(nextAssignedTo) || null,
           ...assigneeNamePatch
-=======
-          assignedToId: toObjectIdIfValid(nextAssignedTo) || null
->>>>>>> Stashed changes
         }
       });
 
@@ -858,7 +773,6 @@ router.post('/bulk-assign', async (req, res) => {
         nextAssignedTo
       );
 
-<<<<<<< Updated upstream
       await invalidateConversationForUsers({
         companyId: req.companyId || '',
         conversationId,
@@ -869,12 +783,6 @@ router.post('/bulk-assign', async (req, res) => {
           conversation?.assignedToId,
           conversation?.assignedAgent
         ]
-=======
-      await invalidateInboxConversation({
-        companyId: req.companyId || '',
-        userId: req.user?.id || '',
-        conversationId
->>>>>>> Stashed changes
       });
     }
 
@@ -1097,22 +1005,15 @@ router.patch('/:id/assign', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Conversation not found' });
     }
 
-<<<<<<< Updated upstream
     const assigneeNamePatch = await buildAssigneeNamePatch(nextAssignedTo);
-=======
->>>>>>> Stashed changes
     const result = await syncConversationAndContact({
       req,
       conversation,
       patch: {
         assignedTo: nextAssignedTo,
         assignedAgent: nextAssignedTo,
-<<<<<<< Updated upstream
         assignedToId: toObjectIdIfValid(nextAssignedTo) || null,
         ...assigneeNamePatch
-=======
-        assignedToId: toObjectIdIfValid(nextAssignedTo) || null
->>>>>>> Stashed changes
       }
     });
 
@@ -1128,7 +1029,6 @@ router.patch('/:id/assign', async (req, res) => {
       nextAssignedTo
     );
 
-<<<<<<< Updated upstream
     await invalidateConversationForUsers({
       companyId: req.companyId || '',
       conversationId,
@@ -1141,8 +1041,6 @@ router.patch('/:id/assign', async (req, res) => {
       ]
     });
 
-=======
->>>>>>> Stashed changes
     return res.json({ success: true, data: result?.conversation || conversation });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
@@ -1209,11 +1107,7 @@ router.patch('/:id/close', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Conversation not found' });
     }
 
-<<<<<<< Updated upstream
     const result = await applyConversationMutationSafely({
-=======
-    const result = await syncConversationAndContact({
->>>>>>> Stashed changes
       req,
       conversation,
       patch: {
@@ -1285,11 +1179,7 @@ router.patch('/:id/important', async (req, res) => {
     }
 
     const important = Boolean(req.body?.important);
-<<<<<<< Updated upstream
     const result = await applyConversationMutationSafely({
-=======
-    const result = await syncConversationAndContact({
->>>>>>> Stashed changes
       req,
       conversation,
       patch: { important }

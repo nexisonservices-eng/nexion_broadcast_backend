@@ -2487,10 +2487,7 @@ class BroadcastService {
                       broadcast.createdById,
                       broadcast.companyId,
                       broadcastDispatchKey,
-<<<<<<< Updated upstream
                       broadcastSenderMeta,
-=======
->>>>>>> Stashed changes
                     );
 
                     if (
@@ -2748,7 +2745,6 @@ class BroadcastService {
   ) {
     try {
       const whatsappMessageId = whatsappResponse?.messages?.[0]?.id;
-<<<<<<< Updated upstream
       const exactPhone = String(phone || "").trim();
       const exactPhoneDigits = this.normalizePhoneNumber(exactPhone);
       let contact = await this.resolveBroadcastContact({
@@ -2759,15 +2755,7 @@ class BroadcastService {
       const resolvedAssignee = String(
         contact?.assignedTo ||
           contact?.assignedAgent ||
-=======
-      let contact = await Contact.findOne({ userId, companyId, phone });
-      const exactPhone = String(phone || "").trim();
-      const exactPhoneDigits = this.normalizePhoneNumber(exactPhone);
-      const resolvedAssignee = String(
-        contact?.assignedTo ||
-          contact?.assignedAgent ||
           userId ||
->>>>>>> Stashed changes
           "",
       ).trim() || null;
       if (!contact) {
@@ -2778,7 +2766,6 @@ class BroadcastService {
           name: "",
           sourceType: "incoming_message",
           createdBy: String(userId || "").trim() || null,
-<<<<<<< Updated upstream
         });
       }
 
@@ -2787,58 +2774,6 @@ class BroadcastService {
         phone: exactPhone,
         contactId: contact?._id,
       });
-=======
-          assignedTo: String(userId || "").trim() || null,
-          assignedAgent: String(userId || "").trim() || null,
-        });
-      } else if (broadcastId && contact.sourceType !== "incoming_message") {
-        // If this contact is being used in broadcast message flow, mark source as message-origin.
-        contact.sourceType = "incoming_message";
-        if (!contact.assignedTo && !contact.assignedAgent) {
-          contact.assignedTo = String(userId || "").trim() || null;
-          contact.assignedAgent = String(userId || "").trim() || null;
-        }
-        await contact.save();
-      } else if (!contact.assignedTo && !contact.assignedAgent && userId) {
-        contact.assignedTo = String(userId || "").trim() || null;
-        contact.assignedAgent = String(userId || "").trim() || null;
-        await contact.save();
-      }
-
-      const exactConversationFilter = {
-        userId,
-        companyId,
-        status: { $in: ["active", "pending"] },
-        $or: [
-          ...(exactPhone
-            ? [{ contactPhone: exactPhone }, { phone: exactPhone }]
-            : []),
-          ...(exactPhoneDigits
-            ? [
-                { contactPhoneDigits: exactPhoneDigits },
-                { phoneDigits: exactPhoneDigits },
-              ]
-            : []),
-        ],
-      };
-
-      let conversation = await Conversation.findOne(exactConversationFilter).sort(
-        { lastMessageTime: -1, updatedAt: -1, createdAt: -1 },
-      );
-
-      const shouldTryLegacyFuzzyLookup = exactPhoneDigits.length > 10;
-
-      if (!conversation && shouldTryLegacyFuzzyLookup) {
-        const conversationLookupFilter =
-          buildConversationPhoneLookupFilter(phone);
-        conversation = await Conversation.findOne({
-          userId,
-          companyId,
-          status: { $in: ["active", "pending"] },
-          ...(conversationLookupFilter || { contactPhone: phone }),
-        }).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
-      }
->>>>>>> Stashed changes
       if (!conversation) {
         const assignmentPatch = buildConversationAssignmentPatch({
           contact,
@@ -2855,15 +2790,9 @@ class BroadcastService {
           contactName: contact.name,
           channel: "whatsapp",
           broadcastId: broadcastId || null,
-<<<<<<< Updated upstream
           assignedTo: assignmentPatch.assignedTo || resolvedAssignee,
           assignedAgent: assignmentPatch.assignedAgent || resolvedAssignee,
           assignedToId: assignmentPatch.assignedToId || resolvedAssignee || null,
-=======
-          assignedTo: resolvedAssignee,
-          assignedAgent: resolvedAssignee,
-          assignedToId: resolvedAssignee || null,
->>>>>>> Stashed changes
           lastMessage: message,
           lastMessageTime: new Date(),
           lastMessageMediaType: "",
@@ -2890,7 +2819,6 @@ class BroadcastService {
         if (broadcastId) {
           conversation.broadcastId = broadcastId;
         }
-<<<<<<< Updated upstream
         if (contact?._id) {
           conversation.contactId = contact._id;
         }
@@ -2901,8 +2829,6 @@ class BroadcastService {
           conversation.contactPhone = phone;
         }
         Object.assign(conversation, assignmentPatch);
-=======
->>>>>>> Stashed changes
         if (!conversation.assignedTo && resolvedAssignee) {
           conversation.assignedTo = resolvedAssignee;
         }
@@ -2916,7 +2842,6 @@ class BroadcastService {
       }
       await syncConversationSummaryFromConversation(conversation);
 
-<<<<<<< Updated upstream
       const resolvedSenderMeta =
         senderMeta && typeof senderMeta === "object"
           ? senderMeta
@@ -2931,28 +2856,15 @@ class BroadcastService {
         (normalizedSenderRole === "admin" ? "Admin" : "Agent");
       const normalizedSenderId =
         toQueryObjectId(resolvedSenderMeta?.senderId || userId) || undefined;
-=======
-      await invalidateInboxConversation({
-        companyId,
-        userId,
-        conversationId: String(conversation?._id || "").trim(),
-      });
->>>>>>> Stashed changes
 
       const savedMessage = await Message.create({
         userId,
         companyId,
         conversationId: conversation._id,
         sender: "agent",
-<<<<<<< Updated upstream
         senderId: normalizedSenderId,
         senderRole: normalizedSenderRole,
         senderName: normalizedSenderName,
-=======
-        senderId: toQueryObjectId(userId) || undefined,
-        senderRole: "agent",
-        senderName: String(userId || "").trim() || "Agent",
->>>>>>> Stashed changes
         text: message,
         whatsappMessageId,
         status: "sent",
@@ -3441,11 +3353,7 @@ class BroadcastService {
       }
 
       const projection =
-<<<<<<< Updated upstream
         "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource createdBy createdById createdByEmail retryPolicy deliveryPolicy compliancePolicy analytics";
-=======
-        "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource createdBy createdById createdByEmail";
->>>>>>> Stashed changes
 
       if (hasPagination) {
         const rows = await Broadcast.find(query)

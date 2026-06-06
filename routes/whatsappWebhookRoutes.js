@@ -636,10 +636,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           contactPhone: from,
           contactName: contact.name,
           channel: 'whatsapp',
-<<<<<<< Updated upstream
           ...assignmentPatch,
-=======
->>>>>>> Stashed changes
           lastMessageTime: inboundActivityAt,
           lastMessage: text,
           lastMessageMediaType: String(mediaType || '').trim(),
@@ -781,7 +778,6 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         unreadCount: Number(conversation.unreadCount || 1)
       });
       await Promise.all(
-<<<<<<< Updated upstream
         collectConversationParticipantUserIds(conversation, userId).flatMap((participantUserId) =>
           relatedConversationIds.map((relatedConversationId) =>
             invalidateInboxConversation({
@@ -790,14 +786,6 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
               conversationId: relatedConversationId
             })
           )
-=======
-        relatedConversationIds.map((relatedConversationId) =>
-          invalidateInboxConversation({
-            userId,
-            companyId,
-            conversationId: relatedConversationId
-          })
->>>>>>> Stashed changes
         )
       );
 

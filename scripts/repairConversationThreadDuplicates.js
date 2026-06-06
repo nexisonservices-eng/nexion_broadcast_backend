@@ -13,10 +13,7 @@ const {
   upsertConversationSummary
 } = require('../services/conversationSummaryService');
 const {
-<<<<<<< Updated upstream
   buildConversationPhoneLookupFilter,
-=======
->>>>>>> Stashed changes
   getConversationIdentityTokens,
   mergeConversationRecords
 } = require('../utils/conversationIdentity');
@@ -64,25 +61,16 @@ const buildScopeFilter = ({ companyId = null, userId = null } = {}) => {
   return filter;
 };
 
-<<<<<<< Updated upstream
 const buildScopeKey = (conversation = {}, { companyWide = false } = {}) =>
   `${String(conversation?.companyId || '').trim()}::${
     companyWide ? '*' : String(conversation?.userId || '').trim()
   }`;
-=======
-const buildScopeKey = (conversation = {}) =>
-  `${String(conversation?.companyId || '').trim()}::${String(conversation?.userId || '').trim()}`;
->>>>>>> Stashed changes
 
 const parseScopeKey = (scopeKey = '') => {
   const [companyId = '', userId = ''] = String(scopeKey || '').split('::');
   return {
     companyId: companyId.trim(),
-<<<<<<< Updated upstream
     userId: userId.trim() === '*' ? '' : userId.trim()
-=======
-    userId: userId.trim()
->>>>>>> Stashed changes
   };
 };
 
@@ -252,18 +240,14 @@ const run = async () => {
   const limit = parsePositiveInt(readArg(['--limit']), 0);
   const companyId = parseObjectId(readArg(['--company-id', '--companyId']), 'companyId');
   const userId = parseObjectId(readArg(['--user-id', '--userId']), 'userId');
-<<<<<<< Updated upstream
   const phone = readArg(['--phone']);
   const keepStrategy = String(readArg(['--keep']) || 'latest').trim().toLowerCase();
   const companyWide = hasFlag(['--company-wide', '--companyWide']);
-=======
->>>>>>> Stashed changes
   const apply = hasFlag(['--apply']);
   const dryRun = !apply || hasFlag(['--dry-run', '--dryRun']);
 
   await connectDB();
 
-<<<<<<< Updated upstream
   const scopeFilters = buildScopeFilter({ companyId, userId });
   const phoneFilter = buildConversationPhoneLookupFilter(phone);
   const filters = phoneFilter
@@ -278,18 +262,11 @@ const run = async () => {
     keepStrategy === 'earliest'
       ? { createdAt: 1, updatedAt: 1, lastMessageTime: 1, _id: 1 }
       : { lastMessageTime: -1, updatedAt: -1, createdAt: -1, _id: -1 };
-=======
-  const filters = buildScopeFilter({ companyId, userId });
->>>>>>> Stashed changes
   const cursor = Conversation.find(filters)
     .select(
       '_id userId companyId contactId contactPhone contactPhoneDigits contactName status assignedTo assignedToId assignedAgent tags priority lastMessageTime lastMessage lastMessageMediaType lastMessageAttachmentName lastMessageAttachmentPages lastMessageFrom lastMessageWhatsappMessageId lastMessageStatus unreadCount notes resolvedAt createdAt updatedAt'
     )
-<<<<<<< Updated upstream
     .sort(conversationSort)
-=======
-    .sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1, _id: -1 })
->>>>>>> Stashed changes
     .lean()
     .cursor({ batchSize });
 
@@ -333,11 +310,7 @@ const run = async () => {
     stats.scanned += 1;
     if (limit > 0 && stats.scanned > limit) break;
 
-<<<<<<< Updated upstream
     const scopeKey = buildScopeKey(conversation, { companyWide });
-=======
-    const scopeKey = buildScopeKey(conversation);
->>>>>>> Stashed changes
     const tokens = getConversationIdentityTokens(conversation).map((token) => `${scopeKey}::${token}`);
     if (!tokens.length) continue;
 

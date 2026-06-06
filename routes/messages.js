@@ -92,12 +92,9 @@ const {
   resolveRelatedConversationIds
 } = require('../utils/conversationThreadLookup');
 const {
-<<<<<<< Updated upstream
   buildContactPhoneLookupFilter
 } = require('../utils/contactIdentity');
 const {
-=======
->>>>>>> Stashed changes
   validateFreeformOutboundSend,
   validateTemplateOutboundSend,
   applyMarketingTemplateSent,
@@ -288,20 +285,11 @@ const resolveReplyReferenceForOutboundSend = async ({
 }) => {
   const normalizedReplyToMessageId = String(replyToMessageId || '').trim();
   if (normalizedReplyToMessageId && isValidObjectId(normalizedReplyToMessageId)) {
-<<<<<<< Updated upstream
     const byScopeReply = await Message.findOne({
       _id: normalizedReplyToMessageId,
       ...(companyId ? { companyId } : {}),
       ...(String(conversationId || '').trim() ? { conversationId: String(conversationId || '').trim() } : {})
     })
-=======
-    const baseIdFilter = { _id: normalizedReplyToMessageId };
-    const byScopeReply = await Message.findOne(
-      companyId
-        ? { ...baseIdFilter, companyId, ...(isTenantWide ? {} : { userId }) }
-        : { ...baseIdFilter, ...(isTenantWide ? {} : { userId }) }
-    )
->>>>>>> Stashed changes
       .select('_id whatsappMessageId')
       .lean();
     if (byScopeReply) return byScopeReply;
@@ -310,20 +298,11 @@ const resolveReplyReferenceForOutboundSend = async ({
   const normalizedContextId = String(whatsappContextMessageId || '').trim();
   if (!normalizedContextId) return null;
 
-<<<<<<< Updated upstream
   return Message.findOne({
     whatsappMessageId: normalizedContextId,
     ...(companyId ? { companyId } : {}),
     ...(String(conversationId || '').trim() ? { conversationId: String(conversationId || '').trim() } : {})
   })
-=======
-  const baseContextFilter = { whatsappMessageId: normalizedContextId };
-  return Message.findOne(
-    companyId
-      ? { ...baseContextFilter, companyId, ...(isTenantWide ? {} : { userId }) }
-      : { ...baseContextFilter, ...(isTenantWide ? {} : { userId }) }
-  )
->>>>>>> Stashed changes
     .select('_id whatsappMessageId')
     .lean();
 };
@@ -438,7 +417,6 @@ const writeConversationThreadState = async ({
 
   await Conversation.updateOne({ _id: conversation._id }, conversationUpdate);
   await syncConversationSummary(conversation, summaryUpdate);
-<<<<<<< Updated upstream
   const cacheRecipientUserIds = await collectRealtimeRecipientUserIds({
     userId,
     companyId,
@@ -454,14 +432,6 @@ const writeConversationThreadState = async ({
       })
     )
   );
-=======
-  await invalidateInboxConversation({
-    companyId: companyId || '',
-    userId: userId || '',
-    conversationId: conversation._id,
-    conversationIds: relatedConversationIds
-  });
->>>>>>> Stashed changes
 
   return true;
 };
@@ -608,25 +578,10 @@ const resolveContactForConversation = async ({
   if (!conversation?._id || (!userId && !isTenantWide)) return null;
 
   if (conversation.contactId) {
-<<<<<<< Updated upstream
     const contactById = await Contact.findOne({
       _id: conversation.contactId,
       ...(companyId ? { companyId } : {})
     });
-=======
-    const contactById = await Contact.findOne(
-      isTenantWide
-        ? {
-            _id: conversation.contactId,
-            ...(companyId ? { companyId } : {})
-          }
-        : {
-            _id: conversation.contactId,
-            userId,
-            ...(companyId ? { companyId } : {})
-          }
-    );
->>>>>>> Stashed changes
 
     if (contactById) return contactById;
   }
@@ -635,25 +590,10 @@ const resolveContactForConversation = async ({
   const phoneLookupFilter = buildContactPhoneLookupFilter(conversation.contactPhone || '');
   if (!phoneCandidates.length && !phoneLookupFilter) return null;
 
-<<<<<<< Updated upstream
   return Contact.findOne({
     ...(companyId ? { companyId } : {}),
     ...(phoneLookupFilter || { phone: { $in: phoneCandidates } })
   }).sort({ createdAt: 1, updatedAt: 1 });
-=======
-  return Contact.findOne(
-    isTenantWide
-      ? {
-          ...(companyId ? { companyId } : {}),
-          phone: { $in: phoneCandidates }
-        }
-      : {
-          userId,
-          ...(companyId ? { companyId } : {}),
-          phone: { $in: phoneCandidates }
-        }
-  );
->>>>>>> Stashed changes
 };
 
 const resolveAttachmentMessageFilters = ({ req, messageId }) => {

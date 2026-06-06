@@ -35,7 +35,6 @@ const {
   dedupeConversationsByIdentity
 } = require('../utils/conversationIdentity');
 const {
-<<<<<<< Updated upstream
   buildContactPhoneLookupFilter
 } = require('../utils/contactIdentity');
 const {
@@ -43,8 +42,6 @@ const {
   isConversationAssignedToDifferentAgent
 } = require('../utils/conversationAssignment');
 const {
-=======
->>>>>>> Stashed changes
   resolveRelatedConversationIds
 } = require('../utils/conversationThreadLookup');
 const {
@@ -212,18 +209,10 @@ const registerLegacyCoreRoutes = (app, deps) => {
   }) => {
     const normalizedReplyToMessageId = String(replyToMessageId || '').trim();
     if (normalizedReplyToMessageId && isValidObjectId(normalizedReplyToMessageId)) {
-<<<<<<< Updated upstream
       const byScopeReply = await Message.findOne({
         ...buildCompanyScopeFilter(companyId),
         _id: normalizedReplyToMessageId,
         ...(String(conversationId || '').trim() ? { conversationId: String(conversationId || '').trim() } : {})
-=======
-      const baseIdFilter = { _id: normalizedReplyToMessageId };
-      const byScopeReply = await Message.findOne({
-        ...baseIdFilter,
-        ...buildCompanyScopeFilter(companyId),
-        ...(isTenantWide ? {} : { userId })
->>>>>>> Stashed changes
       })
         .select('_id whatsappMessageId')
         .lean();
@@ -233,18 +222,10 @@ const registerLegacyCoreRoutes = (app, deps) => {
     const normalizedContextId = String(whatsappContextMessageId || '').trim();
     if (!normalizedContextId) return null;
 
-<<<<<<< Updated upstream
     return Message.findOne({
       ...buildCompanyScopeFilter(companyId),
       whatsappMessageId: normalizedContextId,
       ...(String(conversationId || '').trim() ? { conversationId: String(conversationId || '').trim() } : {})
-=======
-    const baseContextFilter = { whatsappMessageId: normalizedContextId };
-    return Message.findOne({
-      ...baseContextFilter,
-      ...buildCompanyScopeFilter(companyId),
-      ...(isTenantWide ? {} : { userId })
->>>>>>> Stashed changes
     })
       .select('_id whatsappMessageId')
       .lean();
@@ -264,7 +245,6 @@ const registerLegacyCoreRoutes = (app, deps) => {
       ...buildCompanyScopeFilter(req.companyId)
     };
     const byScopeConversation = await Conversation.findOne(
-<<<<<<< Updated upstream
       isTenantWide
         ? baseIdQuery
         : {
@@ -291,16 +271,10 @@ const registerLegacyCoreRoutes = (app, deps) => {
       }
       return byScopeConversation;
     }
-=======
-      isTenantWide ? baseIdQuery : { ...baseIdQuery, userId }
-    );
-    if (byScopeConversation) return byScopeConversation;
->>>>>>> Stashed changes
 
     const phoneLookupFilter = buildConversationPhoneLookupFilter(to);
     if (!phoneLookupFilter) return null;
 
-<<<<<<< Updated upstream
     const byPhoneConversation = await Conversation.findOne({
       ...buildCompanyScopeFilter(req.companyId),
       ...phoneLookupFilter
@@ -332,20 +306,6 @@ const registerLegacyCoreRoutes = (app, deps) => {
     }
 
     return byPhoneConversation;
-=======
-    return Conversation.findOne(
-      isTenantWide
-        ? {
-            ...buildCompanyScopeFilter(req.companyId),
-            ...phoneLookupFilter
-          }
-        : {
-            userId,
-            ...buildCompanyScopeFilter(req.companyId),
-            ...phoneLookupFilter
-          }
-    ).sort({ lastMessageTime: -1, updatedAt: -1, createdAt: -1 });
->>>>>>> Stashed changes
   };
 
   const resolveContactForConversation = async ({
@@ -357,25 +317,10 @@ const registerLegacyCoreRoutes = (app, deps) => {
     if (!conversation?._id || (!userId && !isTenantWide)) return null;
 
     if (conversation.contactId) {
-<<<<<<< Updated upstream
       const contactById = await Contact.findOne({
         _id: conversation.contactId,
         ...buildCompanyScopeFilter(companyId)
       });
-=======
-      const contactById = await Contact.findOne(
-        isTenantWide
-          ? {
-              _id: conversation.contactId,
-              ...buildCompanyScopeFilter(companyId)
-            }
-          : {
-              _id: conversation.contactId,
-              userId,
-              ...buildCompanyScopeFilter(companyId)
-            }
-      );
->>>>>>> Stashed changes
 
       if (contactById) return contactById;
     }
@@ -394,26 +339,11 @@ const registerLegacyCoreRoutes = (app, deps) => {
       )
     );
 
-<<<<<<< Updated upstream
     const phoneLookupFilter = buildContactPhoneLookupFilter(conversation.contactPhone || '');
     return Contact.findOne({
       ...buildCompanyScopeFilter(companyId),
       ...(phoneLookupFilter || { phone: { $in: phoneCandidates } })
     }).sort({ createdAt: 1, updatedAt: 1 });
-=======
-    return Contact.findOne(
-      isTenantWide
-        ? {
-            ...buildCompanyScopeFilter(companyId),
-            phone: { $in: phoneCandidates }
-          }
-        : {
-            userId,
-            ...buildCompanyScopeFilter(companyId),
-            phone: { $in: phoneCandidates }
-          }
-    );
->>>>>>> Stashed changes
   };
 
   const hydrateContactWithLatestInboundActivity = async ({
@@ -683,7 +613,6 @@ const registerLegacyCoreRoutes = (app, deps) => {
             ...conversationThreadUpdate
           };
 
-<<<<<<< Updated upstream
         const cacheRecipientUserIds = await collectRealtimeRecipientUserIds({
           userId: req.user.id,
           companyId: messageCompanyId,
@@ -698,15 +627,6 @@ const registerLegacyCoreRoutes = (app, deps) => {
                 conversationId: relatedConversationId
               })
             )
-=======
-        await Promise.all(
-          relatedConversationIdList.map((relatedConversationId) =>
-            invalidateInboxConversation({
-              companyId: messageCompanyId || '',
-              userId: req.user.id || '',
-              conversationId: relatedConversationId
-            })
->>>>>>> Stashed changes
           )
         );
 
@@ -763,18 +683,8 @@ const registerLegacyCoreRoutes = (app, deps) => {
         if (!queuedRealtimeEvent && ENABLE_DEBUG_LOGS) {
           console.warn('Legacy message_sent realtime event was not queued; publishing directly.');
         }
-<<<<<<< Updated upstream
         await Promise.all(
           cacheRecipientUserIds.map((recipientUserId) =>
-=======
-        const realtimeRecipientUserIds = await collectRealtimeRecipientUserIds({
-          userId: req.user.id,
-          companyId: messageCompanyId,
-          relatedConversationIds: relatedConversationIdList
-        });
-        await Promise.all(
-          realtimeRecipientUserIds.map((recipientUserId) =>
->>>>>>> Stashed changes
             emitRealtimeEvent(recipientUserId, payload.data)
           )
         );

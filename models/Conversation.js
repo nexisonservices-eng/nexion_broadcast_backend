@@ -97,10 +97,7 @@ ConversationSchema.pre(['findOneAndUpdate', 'updateOne', 'updateMany', 'replaceO
 });
 
 ConversationSchema.index({ companyId: 1, userId: 1, contactPhone: 1, status: 1 });
-<<<<<<< Updated upstream
 ConversationSchema.index({ companyId: 1, userId: 1, contactPhoneDigits: 1, status: 1 });
-=======
->>>>>>> Stashed changes
 ConversationSchema.index({ companyId: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, status: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, assignedAgent: 1, lastMessageTime: -1, _id: -1 });
@@ -109,10 +106,7 @@ ConversationSchema.index({ companyId: 1, unreadCount: 1, lastMessageTime: -1, _i
 ConversationSchema.index({ companyId: 1, important: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, followupAt: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, contactPhone: 1, lastMessageTime: -1, _id: -1 });
-<<<<<<< Updated upstream
 ConversationSchema.index({ companyId: 1, contactPhoneDigits: 1, lastMessageTime: -1, _id: -1 });
-=======
->>>>>>> Stashed changes
 ConversationSchema.index({ companyId: 1, contactName: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, userId: 1, channel: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, userId: 1, contactId: 1 });

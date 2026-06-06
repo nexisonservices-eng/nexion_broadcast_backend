@@ -221,10 +221,6 @@ const getContactAgentScope = (req) => {
 
   return {
     $or: [
-<<<<<<< Updated upstream
-=======
-      { ownerId: normalizedUserId },
->>>>>>> Stashed changes
       { assignedTo: normalizedUserId },
       { assignedAgent: normalizedUserId }
     ]
@@ -243,12 +239,7 @@ const buildLegacyContactFallbackFilter = (req, { searchPlan, tags } = {}) => {
     {
       $or: [
         { userId: { $exists: false } },
-<<<<<<< Updated upstream
         { userId: null }
-=======
-        { userId: null },
-        { userId: '' }
->>>>>>> Stashed changes
       ]
     }
   ];
@@ -1576,13 +1567,8 @@ router.post('/import', async (req, res) => {
                 filter: { _id: existingContact._id },
                 update: {
                   $set: {
-<<<<<<< Updated upstream
                     userId: existingContact.userId || req.user.id,
                     companyId: existingContact.companyId || req.companyId || null,
-=======
-                    userId: req.user.id,
-                    companyId: req.companyId || null,
->>>>>>> Stashed changes
                     ...ownership,
                     name: updatedName,
                     nameLower: updatedName.toLowerCase(),
@@ -1593,10 +1579,7 @@ router.post('/import', async (req, res) => {
                     tags: mergedTags,
                     leadStatus: toCleanString(existingContact.leadStatus).toLowerCase() || 'new_lead',
                     followupDate: existingContact.followupDate || null,
-<<<<<<< Updated upstream
                     source: toCleanString(existingContact.source),
-=======
->>>>>>> Stashed changes
                     sourceType: existingContact.sourceType || 'imported',
                     isBlocked: false,
                     lastContact: existingContact.lastContact || new Date(),
@@ -1832,12 +1815,9 @@ router.put('/:id', async (req, res) => {
       delete updatePayload.assignedAgent;
       delete updatePayload.createdBy;
     }
-<<<<<<< Updated upstream
     if (req.body?.sourceType === undefined || existingContact.sourceType) {
       delete updatePayload.sourceType;
     }
-=======
->>>>>>> Stashed changes
     const normalizedPhone = getPreferredPhoneValue(normalizedPayload);
     if (normalizedPayload.phone !== undefined && !normalizedPhone) {
       return res.status(400).json({ error: 'Phone number is required' });

@@ -80,23 +80,16 @@ const resolveConversationForOutboundSend = async ({
     ...buildCompanyScopeFilter(companyId)
   };
   const byScope = await Conversation.findOne(
-<<<<<<< Updated upstream
     isTenantWide ? baseIdQuery : { ...baseIdQuery, ...buildActorConversationAccessFilter({ userId, companyId }) }
   );
   if (byScope) {
     return saveAssignmentForActor({ conversation: byScope, actorUserId: userId });
   }
-=======
-    isTenantWide ? baseIdQuery : { ...baseIdQuery, userId }
-  );
-  if (byScope) return byScope;
->>>>>>> Stashed changes
 
   const phoneCandidates = buildPhoneCandidates(to);
   const phoneLookupFilter = buildConversationPhoneLookupFilter(to);
   if (!phoneCandidates.length && !phoneLookupFilter) return null;
 
-<<<<<<< Updated upstream
   const byPhone = await maybeApplySort(
     Conversation.findOne(
       {
@@ -105,22 +98,6 @@ const resolveConversationForOutboundSend = async ({
       }
     ),
     { createdAt: 1, updatedAt: 1, lastMessageTime: 1, _id: 1 }
-=======
-  return maybeApplySort(
-    Conversation.findOne(
-      isTenantWide
-        ? {
-            ...buildCompanyScopeFilter(companyId),
-            ...(phoneLookupFilter || { contactPhone: { $in: phoneCandidates } })
-          }
-        : {
-            userId,
-            ...buildCompanyScopeFilter(companyId),
-            ...(phoneLookupFilter || { contactPhone: { $in: phoneCandidates } })
-          }
-    ),
-    { lastMessageTime: -1, updatedAt: -1, createdAt: -1 }
->>>>>>> Stashed changes
   );
 
   if (
