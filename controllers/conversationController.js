@@ -28,7 +28,7 @@ const { buildInboxSearchPlan } = require('../utils/inboxSearchPlan');
 const { buildContactSearchPlan } = require('../utils/contactSearchPlan');
 
 const TEAM_INBOX_CONTACT_LIST_FIELDS =
-  '_id name ownerId assignedTo assignedAgent assignedToName assignedAgentName assigneeName ownerName leadScore';
+  '_id name stage ownerId assignedTo assignedAgent assignedToName assignedAgentName assigneeName ownerName leadScore';
 const TEAM_INBOX_CONTACT_DETAIL_FIELDS =
   '_id name phone tags status stage leadStatus assignedAgent followupDate internalNotes leadScore leadScoreBreakdown isBlocked whatsappOptInStatus whatsappOptInAt whatsappOptInSource whatsappOptInScope whatsappOptInTextSnapshot whatsappOptOutAt lastInboundMessageAt serviceWindowClosesAt';
 const CONTACT_LIST_FIELDS =

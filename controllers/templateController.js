@@ -3,6 +3,15 @@ const whatsappService = require('../services/whatsappService');
 
 const normalizeTemplateLookupValue = (value = '') => String(value || '').trim().toLowerCase();
 
+const normalizeTemplateButtonType = (value = '') => String(value || '').trim().toLowerCase();
+
+const normalizeTemplateButtons = (buttons = []) =>
+  (Array.isArray(buttons) ? buttons : []).map((button) => ({
+    ...button,
+    type: normalizeTemplateButtonType(button?.type),
+    phoneNumber: String(button?.phoneNumber || button?.phone_number || '').trim()
+  }));
+
 const isMetaDuplicateTemplateError = (result = {}) => {
   const message = [
     result.error,
@@ -46,7 +55,7 @@ const buildLocalTemplateContentFromMeta = (components = []) => {
     },
     body: bodyComponent?.text || '',
     footer: footerComponent?.text || '',
-    buttons: buttonsComponent?.buttons || []
+    buttons: normalizeTemplateButtons(buttonsComponent?.buttons || [])
   };
 };
 
@@ -182,8 +191,12 @@ class TemplateController {
           },
           body: bodyText,
           footer: footerComponent?.text || '',
-          buttons: buttonsComponent?.buttons || []
+          buttons: normalizeTemplateButtons(buttonsComponent?.buttons || [])
         };
+      }
+
+      if (templateContent?.buttons) {
+        templateContent.buttons = normalizeTemplateButtons(templateContent.buttons);
       }
 
       if (templateContent?.header && templateContent.header.type === 'image' && !templateContent.header.mediaUrl) {
@@ -398,7 +411,8 @@ class TemplateController {
         updateData.content = {
           ...updateData.content,
           body: prepareMetaTemplateText(updateData.content.body || '').text,
-          footer: prepareMetaTemplateText(updateData.content.footer || '').text
+          footer: prepareMetaTemplateText(updateData.content.footer || '').text,
+          buttons: normalizeTemplateButtons(updateData.content.buttons || [])
         };
       }
       const template = await Template.findOneAndUpdate(

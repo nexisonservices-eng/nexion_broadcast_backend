@@ -93,7 +93,7 @@ const TEAM_INBOX_MUTATION_FIELDS = [
 ].join(' ');
 
 const TEAM_INBOX_CONTACT_SNAPSHOT_FIELDS =
-  '_id name ownerId assignedTo assignedAgent assignedToName assignedAgentName assigneeName ownerName leadScore';
+  '_id name stage ownerId assignedTo assignedAgent assignedToName assignedAgentName assigneeName ownerName leadScore';
 
 const buildScopedMessageFilters = (req, extra = {}, options = {}) => {
   const normalizedRole = normalizeRole(
