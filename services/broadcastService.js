@@ -19,6 +19,9 @@ const {
   buildPhoneCandidates,
   buildPhoneLookupFilters,
 } = require("./whatsappOutreach/conversationResolver");
+const {
+  resolveAudienceRecipients,
+} = require("./broadcastAudienceResolver");
 const { buildContactSearchPlan } = require("../utils/contactSearchPlan");
 const {
   buildConversationPhoneLookupFilter,
@@ -1578,6 +1581,109 @@ class BroadcastService {
   async createBroadcast(broadcastData, broadcaster = null) {
     try {
       broadcastData = this.normalizeBroadcastPolicies(broadcastData || {});
+      const audienceSource =
+        broadcastData?.audienceSource &&
+        typeof broadcastData.audienceSource === "object"
+          ? broadcastData.audienceSource
+          : {};
+      const hasProvidedRecipients = Array.isArray(broadcastData.recipients);
+      const providedRecipients = hasProvidedRecipients
+        ? broadcastData.recipients
+        : [];
+      const hasAudienceSelection =
+        Boolean(String(audienceSource?.mode || "").trim()) ||
+        Boolean(String(audienceSource?.segmentId || "").trim()) ||
+        Boolean(String(audienceSource?.broadcastId || "").trim()) ||
+        Boolean(String(audienceSource?.importJobId || "").trim()) ||
+        Boolean(Array.isArray(audienceSource?.contactIds) && audienceSource.contactIds.length);
+
+      if (!hasProvidedRecipients || providedRecipients.length === 0) {
+        if (hasAudienceSelection) {
+          const resolvedAudience = await resolveAudienceRecipients({
+            companyId: broadcastData.companyId || null,
+            userId: broadcastData.createdById || null,
+            mode: audienceSource.mode || "manual_contacts",
+            segmentId: audienceSource.segmentId || "",
+            broadcastId: audienceSource.broadcastId || "",
+            importJobId: audienceSource.importJobId || "",
+            contacts: Array.isArray(audienceSource.contacts)
+              ? audienceSource.contacts
+              : [],
+            contactIds: Array.isArray(audienceSource.contactIds)
+              ? audienceSource.contactIds
+              : [],
+            filters: {
+              ...(broadcastData.audienceFilters &&
+              typeof broadcastData.audienceFilters === "object"
+                ? broadcastData.audienceFilters
+                : {}),
+              messageType: broadcastData.messageType || "template",
+              templateCategory: broadcastData.templateCategory || "",
+            },
+          });
+
+          broadcastData.recipients = resolvedAudience.recipients;
+          broadcastData.recipientCount = resolvedAudience.recipients.length;
+          broadcastData.audienceSnapshot = {
+            mode: resolvedAudience.mode,
+            sourceId: resolvedAudience.source
+              ? String(resolvedAudience.source._id || resolvedAudience.source.id || "")
+              : "",
+            sourceName: resolvedAudience.source
+              ? String(resolvedAudience.source.name || "")
+              : String(audienceSource.label || ""),
+            sourceType: String(audienceSource.mode || resolvedAudience.mode || ""),
+            summary: resolvedAudience.summary,
+            recipients: resolvedAudience.recipients,
+            invalidRecipients: resolvedAudience.invalidRecipients,
+            resolvedAt: new Date(),
+          };
+          broadcastData.audienceSource = {
+            ...audienceSource,
+            recipientCount: resolvedAudience.recipients.length,
+            selectedContactCount: resolvedAudience.summary.selectedContactCount,
+            hasContactIds: Array.isArray(audienceSource.contactIds)
+              ? audienceSource.contactIds.length > 0
+              : false,
+          };
+        } else {
+          broadcastData.recipients = [];
+          broadcastData.recipientCount = 0;
+        }
+      } else if (
+        !broadcastData.audienceSnapshot ||
+        typeof broadcastData.audienceSnapshot !== "object" ||
+        !Array.isArray(broadcastData.audienceSnapshot.recipients)
+      ) {
+        broadcastData.audienceSnapshot = {
+          mode: String(audienceSource.mode || "manual_contacts"),
+          sourceId: String(
+            audienceSource.segmentId ||
+              audienceSource.broadcastId ||
+              audienceSource.importJobId ||
+              "",
+          ),
+          sourceName: String(audienceSource.label || ""),
+          sourceType: String(audienceSource.mode || "manual_contacts"),
+          summary: {
+            selectedContactCount: broadcastData.recipients.length,
+            validRecipientCount: broadcastData.recipients.length,
+            invalidRecipientCount: 0,
+          },
+          recipients: broadcastData.recipients,
+          invalidRecipients: [],
+          resolvedAt: new Date(),
+        };
+        broadcastData.audienceSource = {
+          ...audienceSource,
+          recipientCount: broadcastData.recipients.length,
+          selectedContactCount: broadcastData.recipients.length,
+          hasContactIds: Array.isArray(audienceSource.contactIds)
+            ? audienceSource.contactIds.length > 0
+            : false,
+        };
+      }
+
       const templateVariables = this.normalizeTemplateVariables(
         broadcastData.variables || broadcastData.templateParameters || [],
       );
@@ -1632,6 +1738,480 @@ class BroadcastService {
       return { success: true, data: broadcast };
     } catch (error) {
       console.error("❌ Error creating broadcast:", error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  async duplicateBroadcastDraft(
+    broadcastId,
+    {
+      createdById = null,
+      createdBy = "",
+      createdByEmail = "",
+      createdByWorkspaceRole = "",
+      name = "",
+      broadcaster = null,
+      credentials = null,
+    } = {},
+  ) {
+    try {
+      const source = await Broadcast.findById(broadcastId).lean();
+      if (!source) {
+        return { success: false, error: "Broadcast not found" };
+      }
+
+      const sourceSnapshot =
+        source?.audienceSnapshot && typeof source.audienceSnapshot === "object"
+          ? source.audienceSnapshot
+          : {};
+      const sourceAudience =
+        source?.audienceSource && typeof source.audienceSource === "object"
+          ? source.audienceSource
+          : {};
+      const sourceRecipients = Array.isArray(source?.recipients)
+        ? source.recipients
+        : Array.isArray(sourceSnapshot?.recipients)
+          ? sourceSnapshot.recipients
+          : [];
+
+      let recipients = sourceRecipients;
+      let audienceSnapshot = {
+        ...sourceSnapshot,
+        resolvedAt: new Date(),
+        sourceBroadcastId: String(source._id || ""),
+        sourceBroadcastName: String(source.name || ""),
+      };
+
+      if (!recipients.length) {
+        const resolvedAudience = await resolveAudienceRecipients({
+          companyId: source.companyId || null,
+          userId: source.createdById || createdById || null,
+          mode:
+            String(sourceAudience.mode || sourceSnapshot?.mode || "past_broadcast")
+              .trim()
+              .toLowerCase() || "past_broadcast",
+          segmentId: sourceAudience.segmentId || "",
+          broadcastId: String(source._id || ""),
+          importJobId: sourceAudience.importJobId || "",
+          contacts: [],
+          contactIds: Array.isArray(sourceAudience.contactIds)
+            ? sourceAudience.contactIds
+            : [],
+          filters: {
+            messageType: source.messageType || "template",
+            templateCategory: source.templateCategory || "",
+          },
+        });
+        recipients = resolvedAudience.recipients;
+        audienceSnapshot = {
+          ...resolvedAudience.source?.audienceSnapshot,
+          ...audienceSnapshot,
+          mode: resolvedAudience.mode,
+          summary: resolvedAudience.summary,
+          recipients: resolvedAudience.recipients,
+          invalidRecipients: resolvedAudience.invalidRecipients,
+        };
+      }
+
+      const cloneName = String(
+        name || `${source.name || "Broadcast"} Copy`,
+      ).trim();
+
+      const payload = {
+        name: cloneName,
+        companyId: source.companyId || null,
+        messageType: source.messageType || "text",
+        message: source.message || "",
+        templateName: source.templateName || "",
+        templateCategory: source.templateCategory || "",
+        templateContent: source.templateContent || "",
+        language: source.language || "en_US",
+        templateId: source.templateId || undefined,
+        mediaUrl: source.mediaUrl || "",
+        mediaType: source.mediaType || "",
+        recipients,
+        recipientCount: recipients.length,
+        audienceSource: {
+          ...sourceAudience,
+          mode: String(
+            sourceAudience.mode ||
+              sourceSnapshot?.mode ||
+              "past_broadcast",
+          )
+            .trim()
+            .toLowerCase() || "past_broadcast",
+          broadcastId: String(source._id || ""),
+          label: String(source.name || ""),
+          sourceName: String(source.name || ""),
+          recipientCount: recipients.length,
+          selectedContactCount:
+            Number(sourceSnapshot?.summary?.selectedContactCount || recipients.length) ||
+            recipients.length,
+          hasContactIds: Array.isArray(sourceAudience.contactIds)
+            ? sourceAudience.contactIds.length > 0
+            : false,
+        },
+        audienceSnapshot: {
+          ...audienceSnapshot,
+          mode: String(
+            audienceSnapshot?.mode ||
+              sourceAudience.mode ||
+              "past_broadcast",
+          )
+            .trim()
+            .toLowerCase() || "past_broadcast",
+          sourceId: String(source._id || ""),
+          sourceName: String(source.name || ""),
+          sourceType: "past_broadcast",
+          summary: {
+            ...(audienceSnapshot?.summary || {}),
+            selectedContactCount: recipients.length,
+            validRecipientCount: recipients.length,
+            invalidRecipientCount: 0,
+          },
+          recipients,
+          invalidRecipients: [],
+          clonedFromBroadcastId: String(source._id || ""),
+          clonedFromBroadcastName: String(source.name || ""),
+          resolvedAt: new Date(),
+        },
+        deliveryPolicy: source.deliveryPolicy || {},
+        retryPolicy: source.retryPolicy || {},
+        compliancePolicy: source.compliancePolicy || {},
+        variables: source.variables || undefined,
+        createdBy,
+        createdById,
+        createdByEmail,
+        createdByWorkspaceRole,
+        authHeaderSnapshot: "",
+        credentialsSnapshot: credentials
+          ? {
+              accessToken: credentials.accessToken || credentials.whatsappToken || null,
+              businessAccountId: credentials.businessAccountId || credentials.whatsappBusiness || null,
+              phoneNumberId: credentials.phoneNumberId || credentials.whatsappId || null,
+              whatsappToken: credentials.whatsappToken || credentials.accessToken || null,
+              whatsappBusiness: credentials.whatsappBusiness || credentials.businessAccountId || null,
+              whatsappId: credentials.whatsappId || credentials.phoneNumberId || null,
+              twilioId: credentials.twilioId || null,
+            }
+          : source.credentialsSnapshot || undefined,
+      };
+
+      const created = await this.createBroadcast(payload, broadcaster);
+      if (!created?.success) {
+        return created;
+      }
+
+      return {
+        success: true,
+        data: created.data,
+      };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async createBroadcastDraftFromSegment(
+    segmentId,
+    {
+      createdById = null,
+      createdBy = "",
+      createdByEmail = "",
+      createdByWorkspaceRole = "",
+      name = "",
+      broadcaster = null,
+      credentials = null,
+    } = {},
+  ) {
+    try {
+      const segment = await AudienceSegment.findById(segmentId).lean();
+      if (!segment) {
+        return { success: false, error: "Audience group not found" };
+      }
+
+      const segmentRecipients = Array.isArray(segment.contacts)
+        ? segment.contacts
+        : [];
+      if (!segmentRecipients.length) {
+        return {
+          success: false,
+          error: "Audience group has no contacts",
+        };
+      }
+
+      const broadcastName = String(
+        name || `${segment.name || "Group"} Broadcast`,
+      ).trim();
+
+      const audienceRecipients = segmentRecipients
+        .map((contact) => ({
+          phone: String(contact?.phone || "").trim(),
+          name: String(contact?.name || "").trim(),
+          contactId: String(contact?.contactId || "").trim(),
+          sourceType:
+            String(contact?.sourceType || "segment").trim() || "segment",
+          whatsappOptInStatus:
+            String(contact?.whatsappOptInStatus || "unknown").trim() ||
+            "unknown",
+          attributes: contact,
+        }))
+        .filter((recipient) => Boolean(recipient.phone));
+
+      const payload = {
+        name: broadcastName,
+        companyId: segment.companyId || null,
+        messageType: "template",
+        message: "",
+        templateName: "",
+        templateCategory: "",
+        templateContent: "",
+        language: "en_US",
+        recipients: audienceRecipients,
+        recipientCount: audienceRecipients.length,
+        audienceSource: {
+          mode: "saved_group",
+          segmentId: String(segment._id || ""),
+          label: String(segment.name || ""),
+          sourceName: String(segment.name || ""),
+          recipientCount: audienceRecipients.length,
+          selectedContactCount: audienceRecipients.length,
+          hasContactIds: audienceRecipients.some((recipient) =>
+            Boolean(String(recipient?.contactId || "").trim()),
+          ),
+        },
+        audienceSnapshot: {
+          mode: "saved_group",
+          sourceId: String(segment._id || ""),
+          sourceName: String(segment.name || ""),
+          sourceType: "saved_group",
+          summary: {
+            selectedContactCount: audienceRecipients.length,
+            validRecipientCount: audienceRecipients.length,
+            invalidRecipientCount: 0,
+          },
+          recipients: audienceRecipients,
+          invalidRecipients: [],
+          resolvedAt: new Date(),
+          sourceSegmentId: String(segment._id || ""),
+          sourceSegmentName: String(segment.name || ""),
+        },
+        deliveryPolicy: {},
+        retryPolicy: {},
+        compliancePolicy: {},
+        createdBy,
+        createdById,
+        createdByEmail,
+        createdByWorkspaceRole,
+        authHeaderSnapshot: "",
+        credentialsSnapshot: credentials
+          ? {
+              accessToken: credentials.accessToken || credentials.whatsappToken || null,
+              businessAccountId:
+                credentials.businessAccountId || credentials.whatsappBusiness || null,
+              phoneNumberId: credentials.phoneNumberId || credentials.whatsappId || null,
+              whatsappToken: credentials.whatsappToken || credentials.accessToken || null,
+              whatsappBusiness:
+                credentials.whatsappBusiness || credentials.businessAccountId || null,
+              whatsappId: credentials.whatsappId || credentials.phoneNumberId || null,
+              twilioId: credentials.twilioId || null,
+            }
+          : undefined,
+      };
+
+      const created = await this.createBroadcast(payload, broadcaster);
+      if (!created?.success) {
+        return created;
+      }
+
+      return {
+        success: true,
+        data: created.data,
+      };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async updateBroadcastDraft(
+    broadcastId,
+    updateData = {},
+    { broadcaster = null, credentials = null } = {},
+  ) {
+    try {
+      const existing = await Broadcast.findById(broadcastId);
+      if (!existing) {
+        return { success: false, error: "Broadcast not found" };
+      }
+
+      const currentStatus = String(existing.status || "").toLowerCase();
+      if (["sending", "completed", "completed_with_errors", "failed"].includes(currentStatus)) {
+        return {
+          success: false,
+          error: "Only draft, scheduled, or paused broadcasts can be edited",
+        };
+      }
+
+      const nextData = {
+        ...existing.toObject ? existing.toObject() : existing,
+        ...(updateData && typeof updateData === "object" ? updateData : {}),
+      };
+
+      delete nextData._id;
+      delete nextData.__v;
+      delete nextData.createdAt;
+      delete nextData.updatedAt;
+      delete nextData.startedAt;
+      delete nextData.completedAt;
+      delete nextData.queueJobId;
+      delete nextData.queueQueuedAt;
+      delete nextData.queueLastError;
+      delete nextData.deliveryResults;
+      delete nextData.stats;
+      delete nextData.retryOfBroadcastId;
+      delete nextData.retryAttempt;
+
+      if (updateData?.status) {
+        nextData.status = String(updateData.status || "draft").trim().toLowerCase();
+      }
+
+      const audienceSource =
+        nextData?.audienceSource && typeof nextData.audienceSource === "object"
+          ? nextData.audienceSource
+          : {};
+      const providedRecipients = Array.isArray(nextData.recipients)
+        ? nextData.recipients
+        : [];
+      const hasAudienceSelection =
+        Boolean(String(audienceSource?.mode || "").trim()) ||
+        Boolean(String(audienceSource?.segmentId || "").trim()) ||
+        Boolean(String(audienceSource?.broadcastId || "").trim()) ||
+        Boolean(String(audienceSource?.importJobId || "").trim()) ||
+        Boolean(Array.isArray(audienceSource?.contactIds) && audienceSource.contactIds.length);
+
+      if (!providedRecipients.length && hasAudienceSelection) {
+        const resolvedAudience = await resolveAudienceRecipients({
+          companyId: nextData.companyId || null,
+          userId: nextData.createdById || existing.createdById || null,
+          mode: audienceSource.mode || "manual_contacts",
+          segmentId: audienceSource.segmentId || "",
+          broadcastId: audienceSource.broadcastId || "",
+          importJobId: audienceSource.importJobId || "",
+          contacts: Array.isArray(audienceSource.contacts)
+            ? audienceSource.contacts
+            : [],
+          contactIds: Array.isArray(audienceSource.contactIds)
+            ? audienceSource.contactIds
+            : [],
+          filters: {
+            ...(nextData.audienceFilters && typeof nextData.audienceFilters === "object"
+              ? nextData.audienceFilters
+              : {}),
+            messageType: nextData.messageType || "template",
+            templateCategory: nextData.templateCategory || "",
+          },
+        });
+
+        nextData.recipients = resolvedAudience.recipients;
+        nextData.recipientCount = resolvedAudience.recipients.length;
+        nextData.audienceSnapshot = {
+          mode: resolvedAudience.mode,
+          sourceId: resolvedAudience.source
+            ? String(resolvedAudience.source._id || resolvedAudience.source.id || "")
+            : String(
+                audienceSource.segmentId ||
+                  audienceSource.broadcastId ||
+                  audienceSource.importJobId ||
+                  "",
+              ),
+          sourceName: resolvedAudience.source
+            ? String(resolvedAudience.source.name || "")
+            : String(audienceSource.label || ""),
+          sourceType: String(audienceSource.mode || resolvedAudience.mode || ""),
+          summary: resolvedAudience.summary,
+          recipients: resolvedAudience.recipients,
+          invalidRecipients: resolvedAudience.invalidRecipients,
+          resolvedAt: new Date(),
+        };
+        nextData.audienceSource = {
+          ...audienceSource,
+          recipientCount: resolvedAudience.recipients.length,
+          selectedContactCount: resolvedAudience.summary.selectedContactCount,
+          hasContactIds: Array.isArray(audienceSource.contactIds)
+            ? audienceSource.contactIds.length > 0
+            : false,
+        };
+      } else if (!nextData.audienceSnapshot || typeof nextData.audienceSnapshot !== "object") {
+        nextData.audienceSnapshot = {
+          mode: String(audienceSource.mode || "manual_contacts"),
+          sourceId: String(
+            audienceSource.segmentId ||
+              audienceSource.broadcastId ||
+              audienceSource.importJobId ||
+              "",
+          ),
+          sourceName: String(audienceSource.label || ""),
+          sourceType: String(audienceSource.mode || "manual_contacts"),
+          summary: {
+            selectedContactCount: nextData.recipients.length,
+            validRecipientCount: nextData.recipients.length,
+            invalidRecipientCount: 0,
+          },
+          recipients: nextData.recipients,
+          invalidRecipients: [],
+          resolvedAt: new Date(),
+        };
+      }
+
+      nextData.audienceSource = {
+        ...audienceSource,
+        recipientCount: nextData.recipients.length,
+        selectedContactCount:
+          Number(nextData.audienceSnapshot?.summary?.selectedContactCount || nextData.recipients.length) ||
+          nextData.recipients.length,
+        hasContactIds: Array.isArray(audienceSource.contactIds)
+          ? audienceSource.contactIds.length > 0
+          : false,
+      };
+
+      const templateVariables = this.normalizeTemplateVariables(
+        nextData.variables || nextData.templateParameters || [],
+      );
+      if (templateVariables.length > 0) {
+        nextData.variables = templateVariables;
+      }
+      delete nextData.templateParameters;
+
+      if (nextData.scheduledAt) {
+        const scheduledDate = new Date(nextData.scheduledAt);
+        if (isNaN(scheduledDate.getTime())) {
+          return { success: false, error: "Invalid scheduled time format" };
+        }
+        if (scheduledDate.getTime() <= Date.now()) {
+          return { success: false, error: "Scheduled time must be in the future" };
+        }
+        nextData.scheduledAt = scheduledDate;
+        nextData.status = "scheduled";
+      }
+
+      nextData.updatedAt = new Date();
+
+      await Broadcast.updateOne(
+        { _id: broadcastId },
+        {
+          $set: nextData,
+        },
+        { runValidators: true },
+      );
+
+      const updated = await Broadcast.findById(broadcastId);
+      this.emitBroadcastRealtimeEvent(broadcaster, {
+        type: "broadcast_updated",
+        action: "updated",
+        broadcast: updated?.toObject ? updated.toObject() : updated,
+      });
+
+      return { success: true, data: updated };
+    } catch (error) {
       return { success: false, error: error.message };
     }
   }
@@ -3551,6 +4131,188 @@ class BroadcastService {
       };
       return { success: true, data };
     } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async getBroadcastAudienceSummary(broadcastId) {
+    try {
+      const broadcast = await Broadcast.findById(broadcastId).lean();
+      if (!broadcast) {
+        return { success: false, error: "Broadcast not found" };
+      }
+
+      const snapshot =
+        broadcast?.audienceSnapshot && typeof broadcast.audienceSnapshot === "object"
+          ? broadcast.audienceSnapshot
+          : {};
+      const audienceSource =
+        broadcast?.audienceSource && typeof broadcast.audienceSource === "object"
+          ? broadcast.audienceSource
+          : {};
+      const recipientDetails = await this.buildRecipientStatusDetails(broadcast);
+      const statusBreakdown = recipientDetails.reduce(
+        (accumulator, item) => {
+          const status = String(item?.status || "pending").toLowerCase();
+          if (!accumulator[status]) {
+            accumulator[status] = 0;
+          }
+          accumulator[status] += 1;
+          return accumulator;
+        },
+        { pending: 0, sent: 0, delivered: 0, read: 0, failed: 0 },
+      );
+
+      return {
+        success: true,
+        data: {
+          broadcastId: String(broadcast._id || ""),
+          name: String(broadcast.name || ""),
+          status: String(broadcast.status || ""),
+          source: {
+            mode: String(audienceSource.mode || snapshot.mode || "manual_contacts"),
+            label: String(audienceSource.label || snapshot.sourceName || ""),
+            sourceId: String(
+              audienceSource.segmentId ||
+                audienceSource.broadcastId ||
+                audienceSource.importJobId ||
+                snapshot.sourceId ||
+                "",
+            ),
+            sourceType: String(snapshot.sourceType || audienceSource.mode || "manual_contacts"),
+          },
+          counts: {
+            recipientCount: Number(broadcast.recipientCount || 0) || 0,
+            selectedContactCount:
+              Number(snapshot?.summary?.selectedContactCount || audienceSource.selectedContactCount || 0) || 0,
+            validRecipientCount:
+              Number(snapshot?.summary?.validRecipientCount || recipientDetails.length || 0) || 0,
+            invalidRecipientCount:
+              Number(snapshot?.summary?.invalidRecipientCount || snapshot?.invalidRecipients?.length || 0) || 0,
+            invalidPhoneCount:
+              Number(snapshot?.summary?.invalidPhoneCount || 0) || 0,
+            optedOutCount:
+              Number(snapshot?.summary?.optedOutCount || 0) || 0,
+            missingMarketingOptInCount:
+              Number(snapshot?.summary?.missingMarketingOptInCount || 0) || 0,
+            freeformWindowClosedCount:
+              Number(snapshot?.summary?.freeformWindowClosedCount || 0) || 0,
+            marketingRateLimitedCount:
+              Number(snapshot?.summary?.marketingRateLimitedCount || 0) || 0,
+          },
+          snapshot: snapshot,
+          statusBreakdown,
+          updatedAt: broadcast.updatedAt || null,
+          createdAt: broadcast.createdAt || null,
+        },
+      };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async saveBroadcastAudienceAsSegment(
+    broadcastId,
+    {
+      name = "",
+      description = "",
+      userId = null,
+      companyId = null,
+      updatedBy = "",
+    } = {},
+  ) {
+    try {
+      const broadcast = await Broadcast.findById(broadcastId).lean();
+      if (!broadcast) {
+        return { success: false, error: "Broadcast not found" };
+      }
+
+      const snapshot =
+        broadcast?.audienceSnapshot && typeof broadcast.audienceSnapshot === "object"
+          ? broadcast.audienceSnapshot
+          : {};
+      const recipients = Array.isArray(snapshot?.recipients)
+        ? snapshot.recipients
+        : Array.isArray(broadcast?.recipients)
+          ? broadcast.recipients
+          : [];
+
+      if (!recipients.length) {
+        return {
+          success: false,
+          error: "No audience recipients available to save as a group",
+        };
+      }
+
+      const segmentName = String(name || `${broadcast.name || "Broadcast"} Audience`).trim();
+      if (!segmentName) {
+        return {
+          success: false,
+          error: "Group name is required",
+        };
+      }
+
+      const contacts = recipients
+        .map((recipient) => ({
+          contactId: String(recipient?.contactId || "").trim(),
+          phone: String(recipient?.phone || "").trim(),
+          name: String(recipient?.name || "").trim(),
+          sourceType: String(recipient?.sourceType || "broadcast").trim() || "broadcast",
+          whatsappOptInStatus: String(
+            recipient?.whatsappOptInStatus || "unknown",
+          ).trim() || "unknown",
+        }))
+        .filter((contact) => Boolean(contact.phone));
+
+      const segmentPayload = {
+        name: segmentName,
+        description: String(description || "").trim(),
+        sourceType: "broadcast_audience",
+        userId: userId || broadcast.createdById || null,
+        companyId: companyId || broadcast.companyId || null,
+        filters: {
+          source: "broadcast",
+          broadcastId: String(broadcast._id || ""),
+          broadcastName: String(broadcast.name || ""),
+          audienceMode: String(snapshot?.mode || broadcast?.audienceSource?.mode || "manual_contacts"),
+        },
+        contacts,
+        recipientCount: contacts.length,
+        updatedBy: String(updatedBy || "").trim(),
+      };
+
+      const savedSegment = await AudienceSegment.findOneAndUpdate(
+        {
+          userId: segmentPayload.userId,
+          ...(segmentPayload.companyId ? { companyId: segmentPayload.companyId } : {}),
+          name: segmentName,
+        },
+        segmentPayload,
+        {
+          upsert: true,
+          new: true,
+          runValidators: true,
+          setDefaultsOnInsert: true,
+        },
+      ).lean();
+
+      return {
+        success: true,
+        data: {
+          segment: savedSegment,
+          broadcastId: String(broadcast._id || ""),
+          broadcastName: String(broadcast.name || ""),
+          recipientCount: contacts.length,
+        },
+      };
+    } catch (error) {
+      if (error?.code === 11000) {
+        return {
+          success: false,
+          error: "An audience group with this name already exists",
+        };
+      }
+
       return { success: false, error: error.message };
     }
   }

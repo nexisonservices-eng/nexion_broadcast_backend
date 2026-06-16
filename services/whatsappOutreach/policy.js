@@ -1,4 +1,5 @@
 const toCleanString = (value = '') => String(value || '').trim();
+const normalizePhoneNumber = (value = '') => String(value || '').replace(/\D/g, '');
 
 const toSafeDate = (value) => {
   if (!value) return null;
@@ -349,7 +350,10 @@ const buildBroadcastAudienceValidation = ({
       continue;
     }
 
-    const matchedContact = contactsByPhone.get(phone) || null;
+    const matchedContact =
+      contactsByPhone.get(phone) ||
+      contactsByPhone.get(normalizePhoneNumber(phone)) ||
+      null;
     const recipientPolicy = getWhatsAppMessagingPolicy(recipient, {
       templateCategory: normalizedTemplateCategory
     });
@@ -443,6 +447,7 @@ const buildBroadcastAudienceValidation = ({
 
 module.exports = {
   toCleanString,
+  normalizePhoneNumber,
   normalizeWhatsAppOptInStatus,
   detectWhatsAppOptOutKeyword,
   getWhatsAppMessagingPolicy,

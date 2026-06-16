@@ -54,6 +54,22 @@ router.get("/analytics/overview", (req, res) =>
 router.get("/analytics/reliability", (req, res) =>
   broadcastController.getReliabilitySummary(req, res),
 );
+router.post("/audience/preview", (req, res) =>
+  broadcastController.previewBroadcastAudience(req, res),
+);
+router.post("/:id/duplicate", (req, res) =>
+  broadcastController.duplicateBroadcast(req, res),
+);
+router.put("/:id", (req, res) => broadcastController.updateBroadcast(req, res));
+router.get("/:id/audience/summary", (req, res) =>
+  broadcastController.getBroadcastAudienceSummary(req, res),
+);
+router.post("/:id/audience/save-as-segment", (req, res) =>
+  broadcastController.saveBroadcastAudienceAsSegment(req, res),
+);
+router.post("/from-segment", (req, res) =>
+  broadcastController.createBroadcastFromSegment(req, res),
+);
 router.get("/:id/audience/recipients", (req, res) =>
   broadcastController.getBroadcastAudienceRecipients(req, res),
 );

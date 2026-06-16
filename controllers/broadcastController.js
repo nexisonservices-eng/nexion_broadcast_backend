@@ -10,6 +10,9 @@ const {
 const { getQueueLagSnapshot } = require("../queues/broadcastQueue");
 const { normalizeRole, isTenantWideRole } = require("../utils/accessControl");
 const { emitAuthAuditLog } = require("../utils/authAuditLogger");
+const {
+  resolveAudienceRecipients,
+} = require("../services/broadcastAudienceResolver");
 
 class BroadcastController {
   async assertOwnership(broadcastId, userId, companyId, role, req = null) {
@@ -95,6 +98,102 @@ class BroadcastController {
       }
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async duplicateBroadcast(req, res) {
+    try {
+      const broadcaster = (payload) => {
+        const sendToUser = req.app?.locals?.sendToUser;
+        if (typeof sendToUser === "function") {
+          sendToUser(String(req.user.id), payload);
+        }
+      };
+
+      const ownership = await this.assertOwnership(
+        req.params.id,
+        req.user.id,
+        req.companyId,
+        req.user?.normalizedRole || req.user?.companyRole || req.user?.role,
+        req,
+      );
+      if (!ownership.ok) {
+        return res.status(ownership.status).json(ownership.body);
+      }
+
+      const result = await broadcastService.duplicateBroadcastDraft(
+        req.params.id,
+        {
+          createdById: req.user.id,
+          createdBy: req.user.username || req.user.email || req.user.id,
+          createdByEmail: req.user.email,
+          createdByWorkspaceRole:
+            req.user?.normalizedRole ||
+            req.user?.companyRole ||
+            req.user?.role ||
+            "",
+          name: String(req.body?.name || "").trim(),
+          broadcaster,
+          credentials: req.whatsappCredentials || null,
+        },
+      );
+
+      if (result.success) {
+        return res.status(201).json(result);
+      }
+
+      return res.status(400).json(result);
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async updateBroadcast(req, res) {
+    try {
+      const broadcaster = (payload) => {
+        const sendToUser = req.app?.locals?.sendToUser;
+        if (typeof sendToUser === "function") {
+          sendToUser(String(req.user.id), payload);
+        }
+      };
+
+      const ownership = await this.assertOwnership(
+        req.params.id,
+        req.user.id,
+        req.companyId,
+        req.user?.normalizedRole || req.user?.companyRole || req.user?.role,
+        req,
+      );
+      if (!ownership.ok) {
+        return res.status(ownership.status).json(ownership.body);
+      }
+
+      const updatePayload = {
+        ...req.body,
+        ...(req.body?.audienceSource && typeof req.body.audienceSource === "object"
+          ? { audienceSource: req.body.audienceSource }
+          : {}),
+        ...(req.body?.audienceFilters && typeof req.body.audienceFilters === "object"
+          ? { audienceFilters: req.body.audienceFilters }
+          : {}),
+      };
+
+      const result = await broadcastService.updateBroadcastDraft(
+        req.params.id,
+        updatePayload,
+        {
+          broadcaster,
+          credentials: req.whatsappCredentials || null,
+        },
+      );
+
+      if (result.success) {
+        return res.status(200).json(result);
+      }
+
+      return res.status(400).json(result);
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
     }
   }
 
@@ -245,6 +344,161 @@ class BroadcastController {
       res.json(result);
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async previewBroadcastAudience(req, res) {
+    try {
+      const normalizedRole = normalizeRole(
+        req.user?.normalizedRole || req.user?.companyRole || req.user?.role,
+      );
+      const tenantWideAccess = isTenantWideRole(normalizedRole);
+      const result = await resolveAudienceRecipients({
+        companyId: req.companyId || null,
+        userId: tenantWideAccess ? null : req.user.id,
+        mode: req.body?.mode || req.query?.mode || "manual_contacts",
+        segmentId: req.body?.segmentId || req.query?.segmentId || "",
+        broadcastId: req.body?.broadcastId || req.query?.broadcastId || "",
+        importJobId: req.body?.importJobId || req.query?.importJobId || "",
+        contacts: Array.isArray(req.body?.contacts) ? req.body.contacts : [],
+        contactIds: Array.isArray(req.body?.contactIds) ? req.body.contactIds : [],
+        filters:
+          req.body?.filters && typeof req.body.filters === "object"
+            ? req.body.filters
+            : {},
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          mode: result.mode,
+          source: result.source
+            ? {
+                id: String(result.source._id || result.source.id || ""),
+                name: String(result.source.name || ""),
+              }
+            : null,
+          summary: result.summary,
+          recipients: result.recipients.slice(0, 20),
+          invalidRecipients: result.invalidRecipients.slice(0, 20),
+        },
+      });
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async getBroadcastAudienceSummary(req, res) {
+    try {
+      const normalizedRole = normalizeRole(
+        req.user?.normalizedRole || req.user?.companyRole || req.user?.role,
+      );
+      const tenantWideAccess = isTenantWideRole(normalizedRole);
+      const ownership = await this.assertOwnership(
+        req.params.id,
+        req.user.id,
+        req.companyId,
+        req.user?.normalizedRole || req.user?.companyRole || req.user?.role,
+        req,
+      );
+      if (!ownership.ok) {
+        return res.status(ownership.status).json(ownership.body);
+      }
+
+      const result = await broadcastService.getBroadcastAudienceSummary(
+        req.params.id,
+      );
+      if (result.success) {
+        return res.json({
+          success: true,
+          data: {
+            ...result.data,
+            access: tenantWideAccess ? "tenant_wide" : "owner_only",
+          },
+        });
+      }
+
+      return res.status(404).json(result);
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async saveBroadcastAudienceAsSegment(req, res) {
+    try {
+      const ownership = await this.assertOwnership(
+        req.params.id,
+        req.user.id,
+        req.companyId,
+        req.user?.normalizedRole || req.user?.companyRole || req.user?.role,
+        req,
+      );
+      if (!ownership.ok) {
+        return res.status(ownership.status).json(ownership.body);
+      }
+
+      const result = await broadcastService.saveBroadcastAudienceAsSegment(
+        req.params.id,
+        {
+          name: String(req.body?.name || "").trim(),
+          description: String(req.body?.description || "").trim(),
+          userId: req.user.id,
+          companyId: req.companyId || null,
+          updatedBy: req.user.username || req.user.email || req.user.id,
+        },
+      );
+
+      if (result.success) {
+        return res.status(201).json(result);
+      }
+
+      return res.status(400).json(result);
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async createBroadcastFromSegment(req, res) {
+    try {
+      const broadcaster = (payload) => {
+        const sendToUser = req.app?.locals?.sendToUser;
+        if (typeof sendToUser === "function") {
+          sendToUser(String(req.user.id), payload);
+        }
+      };
+
+      const segmentId = String(req.body?.segmentId || req.params.segmentId || "").trim();
+      if (!segmentId) {
+        return res.status(400).json({
+          success: false,
+          error: "Group id is required",
+        });
+      }
+
+      const result = await broadcastService.createBroadcastDraftFromSegment(
+        segmentId,
+        {
+          createdById: req.user.id,
+          createdBy: req.user.username || req.user.email || req.user.id,
+          createdByEmail: req.user.email,
+          createdByWorkspaceRole:
+            req.user?.normalizedRole ||
+            req.user?.companyRole ||
+            req.user?.role ||
+            "",
+          name: String(req.body?.name || "").trim(),
+          broadcaster,
+          credentials: req.whatsappCredentials || null,
+        },
+      );
+
+      if (result.success) {
+        return res.status(201).json(result);
+      }
+
+      return res.status(400).json(result);
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
     }
   }
 

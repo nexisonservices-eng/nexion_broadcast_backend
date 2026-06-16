@@ -15,6 +15,7 @@ const AudienceSegmentSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
     description: { type: String, default: '', trim: true },
+    sourceType: { type: String, default: 'manual', trim: true },
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, required: true },
     companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'company', index: true, default: null },
     filters: { type: mongoose.Schema.Types.Mixed, default: {} },
