@@ -145,6 +145,9 @@ const TEAM_INBOX_CONVERSATION_FIELDS = [
   'updatedAt'
 ].join(' ');
 
+const CONTACT_COLLECTION_NAME =
+  Contact.collection?.collectionName || Contact.collection?.name || 'contacts';
+
 const encodeConversationCursor = (conversation = {}) => {
   const payload = {
     lastMessageTime:
@@ -304,54 +307,84 @@ const attachContactSnapshotsToConversations = async (
   });
 };
 
-const loadConversationSummaryRows = async ({
+const loadConversationRowsWithLeadScoreBand = async ({
+  model,
   finalFilters,
   limit,
   queryHint = null,
-  cursorDirection = 'next'
+  cursorDirection = 'next',
+  leadScoreBand = 'all'
 }) => {
   const normalizedDirection = String(cursorDirection || 'next').trim().toLowerCase();
   const isPreviousPage = normalizedDirection === 'prev';
   const cursorSort = isPreviousPage ? 1 : -1;
-  let query = ConversationSummary.find(finalFilters)
-    .select(TEAM_INBOX_CONVERSATION_FIELDS)
-    .sort({ lastMessageTime: cursorSort, _id: cursorSort })
-    .lean();
-
-  if (queryHint) {
-    query = query.hint(queryHint);
-  }
-
-  if (limit > 0) {
-    query = query.limit(limit + 1);
-  }
+  const normalizedLeadScoreBand = normalizeLeadScoreBand(leadScoreBand);
+  const leadScoreMatchClause = buildLeadScoreBandMatchClause(normalizedLeadScoreBand);
 
   let conversations;
-  try {
-    conversations = await query;
-  } catch (error) {
-    const errorMessage = String(error?.message || '').toLowerCase();
-    const isHintError =
-      Boolean(queryHint) &&
-      (error?.code === 2 ||
-        error?.codeName === 'BadValue' ||
-        errorMessage.includes('hint') ||
-        errorMessage.includes('bad value'));
+  if (leadScoreMatchClause) {
+    const pipeline = [
+      { $match: finalFilters },
+      {
+        $lookup: {
+          from: CONTACT_COLLECTION_NAME,
+          localField: 'contactId',
+          foreignField: '_id',
+          as: 'contact'
+        }
+      },
+      { $unwind: { path: '$contact', preserveNullAndEmptyArrays: false } },
+      { $match: leadScoreMatchClause },
+      { $sort: { lastMessageTime: cursorSort, _id: cursorSort } }
+    ];
 
-    if (!isHintError) {
-      throw error;
+    if (limit > 0) {
+      pipeline.push({ $limit: limit + 1 });
     }
 
-    let fallbackQuery = ConversationSummary.find(finalFilters)
+    conversations = await model.aggregate(pipeline).allowDiskUse(true);
+  } else {
+    let query = model
+      .find(finalFilters)
       .select(TEAM_INBOX_CONVERSATION_FIELDS)
       .sort({ lastMessageTime: cursorSort, _id: cursorSort })
       .lean();
 
-    if (limit > 0) {
-      fallbackQuery = fallbackQuery.limit(limit + 1);
+    if (queryHint) {
+      query = query.hint(queryHint);
     }
 
-    conversations = await fallbackQuery;
+    if (limit > 0) {
+      query = query.limit(limit + 1);
+    }
+
+    try {
+      conversations = await query;
+    } catch (error) {
+      const errorMessage = String(error?.message || '').toLowerCase();
+      const isHintError =
+        Boolean(queryHint) &&
+        (error?.code === 2 ||
+          error?.codeName === 'BadValue' ||
+          errorMessage.includes('hint') ||
+          errorMessage.includes('bad value'));
+
+      if (!isHintError) {
+        throw error;
+      }
+
+      let fallbackQuery = model
+        .find(finalFilters)
+        .select(TEAM_INBOX_CONVERSATION_FIELDS)
+        .sort({ lastMessageTime: cursorSort, _id: cursorSort })
+        .lean();
+
+      if (limit > 0) {
+        fallbackQuery = fallbackQuery.limit(limit + 1);
+      }
+
+      conversations = await fallbackQuery;
+    }
   }
 
   let hasMore = false;
@@ -377,12 +410,54 @@ const loadConversationSummaryRows = async ({
   };
 };
 
+const loadConversationSummaryRows = async ({
+  finalFilters,
+  limit,
+  queryHint = null,
+  cursorDirection = 'next',
+  leadScoreBand = 'all'
+}) =>
+  loadConversationRowsWithLeadScoreBand({
+    model: ConversationSummary,
+    finalFilters,
+    limit,
+    queryHint,
+    cursorDirection,
+    leadScoreBand
+  });
+
 const normalizeConversationFilter = (value = '') => {
   const normalizedValue = String(value || '').trim().toLowerCase();
   if (normalizedValue === 'unread' || normalizedValue === 'read') {
     return normalizedValue;
   }
   return 'all';
+};
+
+const VALID_LEAD_SCORE_BANDS = new Set(['all', 'hot', 'warm', 'cold']);
+
+const normalizeLeadScoreBand = (value = 'all') => {
+  const normalizedValue = String(value || '').trim().toLowerCase();
+  return VALID_LEAD_SCORE_BANDS.has(normalizedValue) ? normalizedValue : 'all';
+};
+
+const buildLeadScoreBandMatchClause = (leadScoreBand = 'all') => {
+  const normalizedBand = normalizeLeadScoreBand(leadScoreBand);
+  if (normalizedBand === 'all') {
+    return null;
+  }
+
+  const scoreClause = {};
+  if (normalizedBand === 'hot') {
+    scoreClause.$gte = 80;
+  } else if (normalizedBand === 'warm') {
+    scoreClause.$gte = 40;
+    scoreClause.$lte = 79;
+  } else if (normalizedBand === 'cold') {
+    scoreClause.$lte = 39;
+  }
+
+  return Object.keys(scoreClause).length ? { 'contact.leadScore': scoreClause } : null;
 };
 
 const buildConversationUnreadFilterClause = (conversationFilter = 'all') => {
@@ -651,27 +726,17 @@ const loadConversationFallbackRows = async ({
   finalFilters,
   limit,
   skip = 0,
-  cursorDirection = 'next'
+  cursorDirection = 'next',
+  leadScoreBand = 'all'
 }) => {
-  const normalizedDirection = String(cursorDirection || 'next').trim().toLowerCase();
-  const isPreviousPage = normalizedDirection === 'prev';
-  const cursorSort = isPreviousPage ? 1 : -1;
-  let query = Conversation.find(finalFilters)
-    .select(TEAM_INBOX_CONVERSATION_FIELDS)
-    .sort({ lastMessageTime: cursorSort, _id: cursorSort })
-    .lean();
-
-  if (skip > 0) {
-    query = query.skip(skip);
-  }
-
-  if (limit > 0) {
-    query = query.limit(limit + 1);
-  }
-
-  const rawConversations = await query;
-  const hasMore = limit > 0 && rawConversations.length > limit;
-  const rawItems = hasMore ? rawConversations.slice(0, limit) : rawConversations;
+  const summaryRows = await loadConversationRowsWithLeadScoreBand({
+    model: Conversation,
+    finalFilters,
+    limit,
+    cursorDirection,
+    leadScoreBand
+  });
+  const rawItems = Array.isArray(summaryRows?.conversations) ? summaryRows.conversations : [];
 
   if (rawItems.length) {
     // Keep the response path fast; summary backfill is important but not required
@@ -682,10 +747,10 @@ const loadConversationFallbackRows = async ({
   }
 
   return {
-    conversations: isPreviousPage ? rawItems.reverse() : rawItems,
-    hasMore,
-    nextCursor: hasMore ? encodeConversationCursor(rawItems[rawItems.length - 1]) : null,
-    previousCursor: rawItems.length ? encodeConversationCursor(rawItems[0]) : null
+    conversations: rawItems,
+    hasMore: Boolean(summaryRows?.hasMore),
+    nextCursor: summaryRows?.nextCursor || null,
+    previousCursor: summaryRows?.previousCursor || null
   };
 };
 
@@ -697,7 +762,8 @@ const loadConversationSummaryPage = async ({
   scope,
   cacheKeyParts,
   queryHint = null,
-  cursorDirection = 'next'
+  cursorDirection = 'next',
+  leadScoreBand = 'all'
 }) => {
   const fetchLimit = limit > 0 ? Math.max(limit + 1, limit) : 0;
   const normalizedDirection = String(cursorDirection || 'next').trim().toLowerCase();
@@ -725,7 +791,8 @@ const loadConversationSummaryPage = async ({
       finalFilters: summaryFilters,
       limit: fetchLimit,
       queryHint,
-      cursorDirection: normalizedDirection
+      cursorDirection: normalizedDirection,
+      leadScoreBand
     });
 
     const shouldLoadFallback =
@@ -735,7 +802,8 @@ const loadConversationSummaryPage = async ({
       ? await loadConversationFallbackRows({
           finalFilters: fallbackFilters,
           limit: fetchLimit,
-          cursorDirection: normalizedDirection
+          cursorDirection: normalizedDirection,
+          leadScoreBand
         })
       : { conversations: [], hasMore: false, nextCursor: null };
 
@@ -830,6 +898,35 @@ const loadInboxOverviewSnapshot = async (req, { isAgent = false, filters = {}, s
   const normalizeCount = (aggregation = {}, key = '') =>
     Number(aggregation?.[key]?.[0]?.count || 0);
 
+  const loadLeadScoreBandCounts = async () => {
+    const pipeline = [
+      { $match: buildConversationViewFilters(req, {}) },
+      {
+        $lookup: {
+          from: CONTACT_COLLECTION_NAME,
+          localField: 'contactId',
+          foreignField: '_id',
+          as: 'contact'
+        }
+      },
+      { $unwind: { path: '$contact', preserveNullAndEmptyArrays: false } },
+      {
+        $facet: {
+          hot: [{ $match: { 'contact.leadScore': { $gte: 80 } } }, { $count: 'count' }],
+          warm: [{ $match: { 'contact.leadScore': { $gte: 40, $lte: 79 } } }, { $count: 'count' }],
+          cold: [{ $match: { 'contact.leadScore': { $lte: 39 } } }, { $count: 'count' }]
+        }
+      }
+    ];
+
+    const [aggregation = {}] = await ConversationSummary.aggregate(pipeline).allowDiskUse(true);
+    return {
+      leadScoreHotChats: normalizeCount(aggregation, 'hot'),
+      leadScoreWarmChats: normalizeCount(aggregation, 'warm'),
+      leadScoreColdChats: normalizeCount(aggregation, 'cold')
+    };
+  };
+
   const getSnapshot = async () => {
     const facets = viewKeys.reduce((acc, view) => {
       acc[view] = [
@@ -845,6 +942,7 @@ const loadInboxOverviewSnapshot = async (req, { isAgent = false, filters = {}, s
     ];
 
     const [aggregation = {}] = await ConversationSummary.aggregate([{ $facet: facets }]).allowDiskUse(true);
+    const leadScoreBandCounts = await loadLeadScoreBandCounts();
 
     if (isAgent) {
       return {
@@ -854,7 +952,8 @@ const loadInboxOverviewSnapshot = async (req, { isAgent = false, filters = {}, s
         closedChats: normalizeCount(aggregation, 'closed'),
         archivedChats: normalizeCount(aggregation, 'archived'),
         whatsappChats: normalizeCount(aggregation, 'whatsapp'),
-        unreadConversations: normalizeCount(aggregation, 'unread')
+        unreadConversations: normalizeCount(aggregation, 'unread'),
+        ...leadScoreBandCounts
       };
     }
 
@@ -874,7 +973,8 @@ const loadInboxOverviewSnapshot = async (req, { isAgent = false, filters = {}, s
       instagramChats: normalizeCount(aggregation, 'instagram'),
       facebookChats: normalizeCount(aggregation, 'facebook'),
       groupChats: normalizeCount(aggregation, 'groups'),
-      unreadConversations: normalizeCount(aggregation, 'unread')
+      unreadConversations: normalizeCount(aggregation, 'unread'),
+      ...leadScoreBandCounts
     };
   };
 
@@ -899,6 +999,7 @@ class ConversationController {
       const conversationFilter = normalizeConversationFilter(
         req.query?.filter || req.query?.conversationFilter || ''
       );
+      const leadScoreBand = normalizeLeadScoreBand(req.query?.leadScoreBand || req.query?.scoreBand || 'all');
       const filters = buildConversationViewFilters(req, {});
       const scopeVariants = getInboxScopeVariants({
         companyId: filters.companyId,
@@ -929,6 +1030,7 @@ class ConversationController {
         String(status || '').trim(),
         String(assignedTo || '').trim(),
         conversationFilter,
+        leadScoreBand,
         normalizedSearchLower,
         String(limit || 0),
         encodeConversationCursorCacheKey(cursor, cursorDirection)
@@ -979,7 +1081,8 @@ class ConversationController {
                 scope,
                 cacheKeyParts,
                 queryHint,
-                cursorDirection
+                cursorDirection,
+                leadScoreBand
               });
 
               return {
