@@ -2,10 +2,7 @@ const axios = require('axios');
 
 const ADMIN_API_BASE_URLS = [
   process.env.ADMIN_API_BASE_URL,
-  process.env.ADMIN_BACKEND_URL,
-  'https://nexion-broadcast-backend-s9av.onrender.com',
-  'http://localhost:8000',
-  'http://localhost:5000'
+  process.env.ADMIN_BACKEND_URL
 ]
   .map((url) => (url || '').trim())
   .filter(Boolean)

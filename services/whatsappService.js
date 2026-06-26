@@ -2,14 +2,6 @@
 const FormData = require('form-data');
 const { isDebugLoggingEnabled } = require('../utils/securityConfig');
 const META_REQUEST_TIMEOUT_MS = Number(process.env.WHATSAPP_META_REQUEST_TIMEOUT_MS || 12000);
-const HOSTED_RUNTIME_FLAG = () =>
-  Boolean(
-    process.env.NODE_ENV === 'production' ||
-    process.env.RENDER ||
-    process.env.RENDER_SERVICE_ID ||
-    process.env.RENDER_SERVICE_NAME
-  );
-
 const debugLog = (...args) => {
   if (isDebugLoggingEnabled()) {
     console.log(...args);
@@ -285,13 +277,6 @@ const normalizeMetaSendError = (error, fallback = 'Failed to send WhatsApp messa
 class WhatsAppService {
   constructor() {
     this.apiUrl = 'https://graph.facebook.com/v20.0';
-    const requestedMockMode = process.env.WHATSAPP_MOCK_MODE === 'true';
-    const allowMockInHostedRuntime = process.env.WHATSAPP_ALLOW_MOCK_IN_PROD === 'true';
-    this.mockMode = requestedMockMode && (!HOSTED_RUNTIME_FLAG() || allowMockInHostedRuntime);
-
-    if (requestedMockMode && HOSTED_RUNTIME_FLAG() && !this.mockMode) {
-      console.warn('WHATSAPP_MOCK_MODE was requested but ignored in hosted runtime');
-    }
   }
 
   // Initialize service with user-specific credentials
@@ -315,16 +300,6 @@ class WhatsAppService {
   async sendTextMessage(to, text, credentials = null, options = {}) {
     if (credentials) {
       this.initialize(credentials);
-    }
-    if (this.mockMode) {
-      debugLog(`ðŸ§ª MOCK MODE: Simulating text message to ${to}: "${text}"`);
-      return { 
-        success: true, 
-        data: { 
-          messageId: 'mock_' + Date.now(),
-          status: 'sent'
-        } 
-      };
     }
 
     try {
@@ -352,7 +327,11 @@ class WhatsAppService {
         payload,
         { headers: this.getHeaders() }
       );
-      return { success: true, data: response.data };
+      return {
+        success: true,
+        data: response.data,
+        providerMessageId: String(response.data?.messages?.[0]?.id || response.data?.messageId || '').trim()
+      };
     } catch (error) {
       console.error('Error sending text message:', error.response?.data || error.message);
       return { 
@@ -373,21 +352,6 @@ class WhatsAppService {
   ) {
     if (credentials) {
       this.initialize(credentials);
-    }
-
-    if (this.mockMode) {
-      debugLog('MOCK MODE: Simulating template message send');
-      debugLog('   to:', to);
-      debugLog('   template:', templateName);
-      debugLog('   language:', language);
-      return {
-        success: true,
-        data: {
-          messageId: 'mock_template_' + Date.now(),
-          status: 'sent',
-          template: templateName
-        }
-      };
     }
 
     const normalizedTemplateName = String(templateName || '').trim();
@@ -435,7 +399,11 @@ class WhatsAppService {
         { headers: this.getHeaders() }
       );
 
-      return { success: true, data: response.data };
+      return {
+        success: true,
+        data: response.data,
+        providerMessageId: String(response.data?.messages?.[0]?.id || response.data?.messageId || '').trim()
+      };
     } catch (error) {
       const metaMessage =
         error.response?.data?.error?.message ||
@@ -737,14 +705,6 @@ class WhatsAppService {
     if (credentials) {
       this.initialize(credentials);
     }
-    if (this.mockMode) {
-      return {
-        success: true,
-        data: {
-          id: `mock_media_upload_${Date.now()}`
-        }
-      };
-    }
 
     try {
       if (!file?.buffer) {
@@ -851,15 +811,6 @@ class WhatsAppService {
     if (credentials) {
       this.initialize(credentials);
     }
-    if (this.mockMode) {
-      return {
-        success: true,
-        data: {
-          messageId: 'mock_reaction_' + Date.now(),
-          status: 'sent'
-        }
-      };
-    }
 
     try {
       const normalizedPhone = normalizeWhatsAppPhone(to);
@@ -929,17 +880,6 @@ class WhatsAppService {
   async createTemplate(templateData, credentials = null) {
     if (credentials) {
       this.initialize(credentials);
-    }
-    if (this.mockMode) {
-      debugLog(`ðŸ§ª MOCK MODE: Simulating template creation:`, templateData);
-      return { 
-        success: true, 
-        data: { 
-          id: 'mock_template_' + Date.now(),
-          name: templateData.name,
-          status: 'PENDING'
-        } 
-      };
     }
 
     try {

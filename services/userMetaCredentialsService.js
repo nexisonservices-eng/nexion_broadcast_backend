@@ -2,9 +2,7 @@ const axios = require('axios');
 
 const ADMIN_API_BASE_URLS = [
   process.env.ADMIN_API_BASE_URL,
-  process.env.ADMIN_BACKEND_URL,
-  'http://localhost:8000',
-  'http://localhost:5000'
+  process.env.ADMIN_BACKEND_URL
 ]
   .map((url) => (url || '').trim())
   .filter(Boolean)
@@ -25,6 +23,16 @@ const ADMIN_INTERNAL_API_KEY = [
 ]
   .map((value) => (value || '').trim())
   .find(Boolean) || null;
+
+const getAdminBackendConfig = () => ({
+  baseUrls: ADMIN_API_BASE_URLS,
+  internalApiKey: ADMIN_INTERNAL_API_KEY,
+  configured: ADMIN_API_BASE_URLS.length > 0 && Boolean(ADMIN_INTERNAL_API_KEY),
+  missing: [
+    ADMIN_API_BASE_URLS.length > 0 ? null : 'ADMIN_BACKEND_URL or ADMIN_API_BASE_URL',
+    ADMIN_INTERNAL_API_KEY ? null : 'ADMIN_INTERNAL_API_KEY'
+  ].filter(Boolean)
+});
 
 const normalizeMetaConfig = (data) => {
   if (!data) return null;
@@ -105,5 +113,6 @@ const getMetaConfigByUserId = async (userId) => {
 
 module.exports = {
   getMetaConfigForUser,
-  getMetaConfigByUserId
+  getMetaConfigByUserId,
+  getAdminBackendConfig
 };

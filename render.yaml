@@ -33,6 +33,12 @@ services:
         description: Admin backend base URL used for credential lookups.
       - key: ADMIN_API_BASE_URL
         description: Alternate admin backend base URL used for credential lookups.
+      - key: VOICE_BACKEND_INTERNAL_URL
+        description: Voice backend base URL used for IVR notification status callbacks.
+      - key: IVR_BACKEND_INTERNAL_URL
+        description: Alias for the voice backend base URL used for IVR notification status callbacks.
+      - key: IVR_BACKEND_INTERNAL_API_KEY
+        description: Shared secret used to forward IVR notification statuses back to the voice backend.
       - key: WHATSAPP_BACKEND_INTERNAL_API_KEY
         description: Shared secret for IVR backend calls to /internal/ivr/notify. Must match the voice backend WHATSAPP_BACKEND_INTERNAL_API_KEY.
     plan: free

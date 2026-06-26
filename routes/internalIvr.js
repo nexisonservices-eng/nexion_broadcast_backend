@@ -3,7 +3,8 @@ const router = express.Router();
 
 const whatsappService = require('../services/whatsappService');
 const {
-  getWhatsAppCredentialsByUserId
+  getWhatsAppCredentialsByUserId,
+  getAdminBackendConfig
 } = require('../services/userWhatsAppCredentialsService');
 
 const trimOrNull = (value) => {
@@ -80,6 +81,14 @@ router.post('/notify', requireInternalApiKey, async (req, res) => {
       });
     }
 
+    const adminBackendConfig = getAdminBackendConfig();
+    if (!adminBackendConfig.configured) {
+      return res.status(503).json({
+        success: false,
+        error: `Admin backend credentials lookup is not configured (${adminBackendConfig.missing.join(', ')})`
+      });
+    }
+
     const credentials = await getWhatsAppCredentialsByUserId(userId);
     if (!credentials) {
       return res.status(404).json({
@@ -89,24 +98,30 @@ router.post('/notify', requireInternalApiKey, async (req, res) => {
     }
 
     const normalizedMessageType = String(messageType || 'text').trim().toLowerCase();
-    let result;
-    if (normalizedMessageType === 'template' || templateName) {
-      result = await whatsappService.sendTemplateMessage(
-        recipient,
-        templateName,
-        language || 'en_US',
-        Array.isArray(variables) ? variables : [],
-        credentials,
-        true,
-        Array.isArray(templateComponents) && templateComponents.length > 0 ? templateComponents : components
-      );
-    } else {
-      result = await whatsappService.sendTextMessage(
-        recipient,
-        text,
-        credentials
-      );
+    if (normalizedMessageType !== 'template') {
+      return res.status(400).json({
+        success: false,
+        error: 'IVR WhatsApp notifications are template-only'
+      });
     }
+
+    const normalizedTemplateName = String(templateName || '').trim();
+    if (!normalizedTemplateName) {
+      return res.status(400).json({
+        success: false,
+        error: 'templateName is required for IVR WhatsApp notifications'
+      });
+    }
+
+    const result = await whatsappService.sendTemplateMessage(
+      recipient,
+      normalizedTemplateName,
+      language || 'en_US',
+      Array.isArray(variables) ? variables : [],
+      credentials,
+      true,
+      Array.isArray(templateComponents) && templateComponents.length > 0 ? templateComponents : components
+    );
 
     if (!result.success) {
       return res.status(400).json({
@@ -117,7 +132,8 @@ router.post('/notify', requireInternalApiKey, async (req, res) => {
 
     return res.json({
       success: true,
-      data: result.data || null
+      data: result.data || null,
+      providerMessageId: result.providerMessageId || result.data?.messages?.[0]?.id || ''
     });
   } catch (error) {
     return res.status(500).json({

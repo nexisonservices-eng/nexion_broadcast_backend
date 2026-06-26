@@ -79,8 +79,6 @@ const ADMIN_USAGE_ENDPOINT =
 const ADMIN_API_BASE_URLS = [
   process.env.ADMIN_API_BASE_URL,
   process.env.ADMIN_BACKEND_URL,
-  "http://localhost:8000",
-  "http://localhost:5000",
 ]
   .map((url) => (url || "").trim())
   .filter(Boolean)

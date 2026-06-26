@@ -6,29 +6,12 @@ const trimOrNull = (value = '') => {
   return normalized || null;
 };
 
-const LOCAL_VOICE_BACKEND_URL = 'http://localhost:5000';
-const HOSTED_VOICE_BACKEND_URL = 'https://technova-hub-voice-backend-node-1.onrender.com';
-
-const isHostedRuntime = () => {
-  const publicBackendUrl = trimOrNull(process.env.PUBLIC_BACKEND_URL) || '';
-  const frontendUrl = trimOrNull(process.env.FRONTEND_URL) || '';
-  return Boolean(
-    process.env.NODE_ENV === 'production' ||
-    process.env.RENDER ||
-    process.env.RENDER_SERVICE_ID ||
-    process.env.RENDER_SERVICE_NAME ||
-    (publicBackendUrl && !publicBackendUrl.includes('localhost') && !publicBackendUrl.includes('127.0.0.1')) ||
-    (frontendUrl && !frontendUrl.includes('localhost') && !frontendUrl.includes('127.0.0.1'))
-  );
-};
-
 const resolveVoiceBackendUrl = () => {
   const configuredUrl = trimOrNull(
     process.env.IVR_BACKEND_INTERNAL_URL ||
     process.env.VOICE_BACKEND_INTERNAL_URL
   );
-  if (configuredUrl) return configuredUrl;
-  return isHostedRuntime() ? HOSTED_VOICE_BACKEND_URL : LOCAL_VOICE_BACKEND_URL;
+  return configuredUrl;
 };
 
 const buildStatusError = (statusData = {}) => {
