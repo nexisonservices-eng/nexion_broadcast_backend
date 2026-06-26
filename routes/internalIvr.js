@@ -12,6 +12,29 @@ const trimOrNull = (value) => {
   return normalized.length > 0 ? normalized : null;
 };
 
+const normalizeErrorMessage = (value, fallback = 'Failed to send WhatsApp message') => {
+  if (!value) return fallback;
+  if (typeof value === 'string') return value;
+  if (value instanceof Error) return value.message || fallback;
+  if (typeof value === 'object') {
+    const nested =
+      value.message ||
+      value.error_user_msg ||
+      value.error_user_title ||
+      value.details ||
+      value.error ||
+      value.title ||
+      value.description;
+    if (nested && nested !== value) return normalizeErrorMessage(nested, fallback);
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return fallback;
+    }
+  }
+  return String(value || fallback);
+};
+
 const requireInternalApiKey = (req, res, next) => {
   const expected = trimOrNull(process.env.WHATSAPP_BACKEND_INTERNAL_API_KEY || process.env.INTERNAL_API_KEY || process.env.ADMIN_INTERNAL_API_KEY);
   const provided = trimOrNull(req.headers['x-internal-api-key']);
@@ -82,7 +105,7 @@ router.post('/notify', requireInternalApiKey, async (req, res) => {
     if (!result.success) {
       return res.status(400).json({
         success: false,
-        error: result.error || 'Failed to send WhatsApp message'
+        error: normalizeErrorMessage(result.error)
       });
     }
 
