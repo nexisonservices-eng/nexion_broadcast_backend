@@ -3,7 +3,6 @@ const axios = require('axios');
 const ADMIN_API_BASE_URLS = [
   process.env.ADMIN_API_BASE_URL,
   process.env.ADMIN_BACKEND_URL,
-  'https://nexion-admin-node-backend-cc5a.onrender.com',
   'http://localhost:8000',
   'http://localhost:5000'
 ]
@@ -19,7 +18,13 @@ const ADMIN_USER_CREDENTIALS_ENDPOINT =
 const ADMIN_USER_CREDENTIALS_BY_ID_ENDPOINT =
   process.env.ADMIN_USER_CREDENTIALS_BY_ID_ENDPOINT || '/internal/user/credentials';
 
-const ADMIN_INTERNAL_API_KEY = process.env.ADMIN_INTERNAL_API_KEY || null;
+const ADMIN_INTERNAL_API_KEY = [
+  process.env.ADMIN_INTERNAL_API_KEY,
+  process.env.INTERNAL_API_KEY,
+  process.env.WHATSAPP_BACKEND_INTERNAL_API_KEY
+]
+  .map((value) => (value || '').trim())
+  .find(Boolean) || null;
 
 const normalizeMetaConfig = (data) => {
   if (!data) return null;

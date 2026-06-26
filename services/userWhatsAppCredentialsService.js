@@ -27,7 +27,13 @@ const ADMIN_USER_CREDENTIALS_BY_ID_ENDPOINT =
 const ADMIN_USER_CREDENTIALS_UPDATE_ENDPOINT =
   process.env.ADMIN_USER_CREDENTIALS_UPDATE_ENDPOINT || '/internal/user/credentials';
 
-const ADMIN_INTERNAL_API_KEY = process.env.ADMIN_INTERNAL_API_KEY || null;
+const ADMIN_INTERNAL_API_KEY = [
+  process.env.ADMIN_INTERNAL_API_KEY,
+  process.env.INTERNAL_API_KEY,
+  process.env.WHATSAPP_BACKEND_INTERNAL_API_KEY
+]
+  .map((value) => (value || '').trim())
+  .find(Boolean) || null;
 
 const userCredentialCache = new Map();
 const phoneNumberToUserIdCache = new Map();
