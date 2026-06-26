@@ -250,6 +250,31 @@ const normalizeWhatsAppPhone = (value = '') => {
   return normalizedPhone;
 };
 
+const normalizeMetaSendError = (error, fallback = 'Failed to send WhatsApp message') => {
+  const metaError = error?.response?.data?.error || {};
+  const metaMessage =
+    metaError?.message ||
+    metaError?.error_user_msg ||
+    error?.response?.data?.message ||
+    '';
+  const metaCode = String(metaError?.code || metaError?.error_subcode || '').trim();
+  const metaDetails = String(
+    metaError?.error_data?.details ||
+      metaError?.error_user_title ||
+      metaError?.fbtrace_id ||
+      ''
+  ).trim();
+  const status = Number(error?.response?.status || 0) || null;
+  const baseMessage = String(metaMessage || error?.message || fallback).trim();
+  const parts = [
+    baseMessage && baseMessage !== 'Error' ? baseMessage : fallback,
+    metaCode ? `code ${metaCode}` : '',
+    metaDetails ? `details ${metaDetails}` : '',
+    status ? `status ${status}` : ''
+  ].filter(Boolean);
+  return parts.join(' | ');
+};
+
 class WhatsAppService {
   constructor() {
     this.apiUrl = 'https://graph.facebook.com/v20.0';
@@ -317,14 +342,9 @@ class WhatsAppService {
       return { success: true, data: response.data };
     } catch (error) {
       console.error('Error sending text message:', error.response?.data || error.message);
-      const normalizedError =
-        error.response?.data?.error?.message ||
-        error.response?.data?.error?.error_user_msg ||
-        error.message ||
-        'Failed to send text message';
       return { 
         success: false, 
-        error: normalizedError
+        error: normalizeMetaSendError(error, 'Failed to send text message')
       };
     }
   }
@@ -556,6 +576,9 @@ class WhatsAppService {
             normalizedError = 'Unknown WhatsApp API error';
           }
         }
+      }
+      if (!normalizedError || normalizedError === 'Error') {
+        normalizedError = normalizeMetaSendError(error, 'Failed to send template message');
       }
 
       return {
