@@ -2,6 +2,13 @@
 const FormData = require('form-data');
 const { isDebugLoggingEnabled } = require('../utils/securityConfig');
 const META_REQUEST_TIMEOUT_MS = Number(process.env.WHATSAPP_META_REQUEST_TIMEOUT_MS || 12000);
+const HOSTED_RUNTIME_FLAG = () =>
+  Boolean(
+    process.env.NODE_ENV === 'production' ||
+    process.env.RENDER ||
+    process.env.RENDER_SERVICE_ID ||
+    process.env.RENDER_SERVICE_NAME
+  );
 
 const debugLog = (...args) => {
   if (isDebugLoggingEnabled()) {
@@ -278,7 +285,13 @@ const normalizeMetaSendError = (error, fallback = 'Failed to send WhatsApp messa
 class WhatsAppService {
   constructor() {
     this.apiUrl = 'https://graph.facebook.com/v20.0';
-    this.mockMode = process.env.WHATSAPP_MOCK_MODE === 'true';
+    const requestedMockMode = process.env.WHATSAPP_MOCK_MODE === 'true';
+    const allowMockInHostedRuntime = process.env.WHATSAPP_ALLOW_MOCK_IN_PROD === 'true';
+    this.mockMode = requestedMockMode && (!HOSTED_RUNTIME_FLAG() || allowMockInHostedRuntime);
+
+    if (requestedMockMode && HOSTED_RUNTIME_FLAG() && !this.mockMode) {
+      console.warn('WHATSAPP_MOCK_MODE was requested but ignored in hosted runtime');
+    }
   }
 
   // Initialize service with user-specific credentials
