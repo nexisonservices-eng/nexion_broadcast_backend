@@ -27,5 +27,7 @@ services:
         description: 32+ character encryption key for stored Meta tokens
       - key: WHATSAPP_OPTIN_PUBLIC_KEY
         description: Shared public key used by website / landing page opt-in forms
+      - key: WHATSAPP_BACKEND_INTERNAL_API_KEY
+        description: Shared secret for IVR backend calls to /internal/ivr/notify. Must match the voice backend WHATSAPP_BACKEND_INTERNAL_API_KEY.
     plan: free
     autoDeploy: true
