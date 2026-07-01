@@ -450,6 +450,7 @@ const syncConversationAndContact = async ({ req, conversation, patch = {} }) => 
         if (patch.assignedTo !== undefined) {
           contact.assignedTo = patch.assignedTo || null;
           contact.assignedAgent = patch.assignedTo || null;
+          contact.ownerId = patch.assignedTo || null;
         }
         if (patch.leadStatus !== undefined) {
           contact.leadStatus = patch.leadStatus || 'new_lead';
