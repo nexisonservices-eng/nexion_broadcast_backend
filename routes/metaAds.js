@@ -53,7 +53,7 @@ const getMetaOAuthRedirectUri = () => {
 const resolveMetaOAuthConfig = (metaConfig = null) => ({
   appId: String(metaConfig?.appId || process.env.META_APP_ID || '').trim(),
   appSecret: String(metaConfig?.appSecret || process.env.META_APP_SECRET || '').trim(),
-  apiVersion: String(metaConfig?.apiVersion || process.env.META_API_VERSION || 'v22.0').trim(),
+  apiVersion: String(metaConfig?.apiVersion || process.env.META_API_VERSION || 'v23.0').trim(),
   credentialOwnerUserId: String(metaConfig?.credentialOwnerUserId || '').trim()
 });
 

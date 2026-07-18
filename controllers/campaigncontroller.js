@@ -1072,6 +1072,12 @@ exports.publishCampaign = async (req, res) => {
         const campaign = await Campaign.findById(req.params.id);
         if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to publish this campaign')) return;
 
+        const requestMetaAccessToken = String(
+            req.body?.metaAccessToken ||
+            req.headers['x-meta-access-token'] ||
+            ''
+        ).trim();
+
         const metaSetup = await metaAdsService.getSetupBundle({ userId: req.user.id });
         if (!metaSetup?.pageId || !metaSetup?.pageAccessReady) {
             campaign.lifecycleStatus = 'draft';
@@ -1107,6 +1113,7 @@ exports.publishCampaign = async (req, res) => {
             try {
                 metaCampaign = await metaAdsService.createMetaAdStackFromCrud({
                     userId: req.user.id,
+                    accessToken: requestMetaAccessToken,
                     campaignName: campaign.name,
                     objective: campaign.objective,
                     dailyBudget: campaign.dailyBudget,
