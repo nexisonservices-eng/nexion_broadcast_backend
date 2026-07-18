@@ -1,5 +1,5 @@
 const axios = require('axios');
-const { getMetaAdsConfig, getCanonicalMetaOAuthRedirectUri } = require('../config/metaAdsConfig');
+const { getMetaAdsConfig, CANONICAL_META_OAUTH_REDIRECT_URI } = require('../config/metaAdsConfig');
 
 const MetaAdsConnection = require('../models/MetaAdsConnection');
 const { decryptMetaToken, encryptMetaToken } = require('../utils/metaTokenCrypto');
@@ -8,7 +8,9 @@ const { getMetaConfigByUserId } = require('./userMetaCredentialsService');
 const GRAPH_BASE_URL = 'https://graph.facebook.com';
 
 const resolveMetaOAuthRedirectUri = (redirectUri) => {
-  const canonicalRedirectUri = getCanonicalMetaOAuthRedirectUri();
+  const canonicalRedirectUri =
+    String(CANONICAL_META_OAUTH_REDIRECT_URI || '').trim() ||
+    String(getMetaAdsConfig().redirectUri || '').trim();
   const configuredRedirectUri = String(redirectUri || '').trim().replace(/\/+$/, '');
 
   if (configuredRedirectUri && configuredRedirectUri !== canonicalRedirectUri) {

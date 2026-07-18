@@ -32,10 +32,7 @@ const {
 const router = express.Router();
 const OAUTH_STATE_CACHE_TTL_MS = 15 * 60 * 1000;
 const oauthStateConfigCache = new Map();
-const {
-  CANONICAL_META_OAUTH_REDIRECT_URI,
-  getCanonicalMetaOAuthRedirectUri
-} = require('../config/metaAdsConfig');
+const { CANONICAL_META_OAUTH_REDIRECT_URI } = require('../config/metaAdsConfig');
 
 const normalizeOrigin = (value) => String(value || '').trim().replace(/\/+$/, '');
 const isSafeFrontendOrigin = (value) => /^https?:\/\/[^/\s]+$/i.test(normalizeOrigin(value));
@@ -49,7 +46,7 @@ const escapeHtml = (value) =>
 const getBackendOrigin = (req) =>
   normalizeOrigin(process.env.PUBLIC_BACKEND_URL) || `${req.protocol}://${req.get('host')}`;
 const getMetaOAuthRedirectUri = () => {
-  return getCanonicalMetaOAuthRedirectUri();
+  return String(CANONICAL_META_OAUTH_REDIRECT_URI || '').trim();
 };
 const resolveMetaOAuthConfig = (metaConfig = null) => ({
   appId: String(metaConfig?.appId || process.env.META_APP_ID || '').trim(),
