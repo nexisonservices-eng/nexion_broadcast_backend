@@ -12,6 +12,10 @@ const { GRAPH_BASE_URL, decryptMetaToken, encryptMetaToken } = metaAuthService;
 
 const normalizeArray = (value) => (Array.isArray(value) ? value.filter(Boolean) : []);
 const normalizeAdAccountId = (value) => String(value || '').replace(/^act_/i, '');
+const summarizePage = (page) => ({
+  id: String(page?.id || '').trim(),
+  name: String(page?.name || '').trim()
+});
 const buildAdAccountPath = (adAccountId, resource = '') => {
   const normalizedId = normalizeAdAccountId(adAccountId);
   const cleanResource = String(resource || '').replace(/^\/+/, '');
@@ -440,7 +444,7 @@ const getSetupBundle = async ({ userId } = {}) => {
   const [pagesResult, businessesResult, adAccountsResult, pageDetailsResult] = await Promise.allSettled([
     graphRequest({
       path: 'me/accounts',
-      params: { fields: 'id,name,instagram_business_account{id,username}' },
+      params: { fields: 'id,name,access_token,instagram_business_account{id,username}' },
       accessToken: accessContext.accessToken
     }),
     graphRequest({
@@ -488,9 +492,11 @@ const getSetupBundle = async ({ userId } = {}) => {
 
   const fallbackAccessiblePageId = String(pages[0]?.id || '').trim();
   const requestedPageId = String(savedSelection.selectedPageId || fallbackAccessiblePageId || '').trim();
-  const accessiblePageIds = new Set(
-    pages.map((page) => String(page?.id || '').trim()).filter(Boolean)
-  );
+  const accessiblePageIds = new Set(pages.map((page) => String(page?.id || '').trim()).filter(Boolean));
+  let selectedPageRecord =
+    (requestedPageId && pages.find((page) => String(page?.id || '').trim() === requestedPageId)) ||
+    pages[0] ||
+    null;
   let selectedPageId =
     (requestedPageId && accessiblePageIds.has(requestedPageId) ? requestedPageId : '') ||
     fallbackAccessiblePageId ||
@@ -508,9 +514,25 @@ const getSetupBundle = async ({ userId } = {}) => {
       pageDetailsResult.value?.whatsapp_business_account?.phone_numbers ||
       [];
     selectedPageId = String(pageDetailsResult.value?.id || selectedPageId || '').trim();
+    selectedPageRecord =
+      pages.find((page) => String(page?.id || '').trim() === selectedPageId) ||
+      selectedPageRecord ||
+      null;
   } else if (pageDetailsResult.status === 'rejected') {
     warnings.push(`Page details: ${extractApiErrorMessage(pageDetailsResult.reason)}`);
   }
+
+  const selectedPageName = String(
+    selectedPageRecord?.name ||
+      savedSelection.selectedPageName ||
+      pageDetailsResult.value?.name ||
+      ''
+  ).trim();
+  const selectedPageAccessToken = String(
+    selectedPageRecord?.access_token ||
+      decryptMetaToken(savedSelection.selectedPageAccessToken || '') ||
+      ''
+  ).trim();
 
   if (selectedPageId && !whatsappNumbers.length && (!pageDetailsResult.value || String(pageDetailsResult.value?.id || '').trim() !== selectedPageId)) {
     try {
@@ -529,12 +551,23 @@ const getSetupBundle = async ({ userId } = {}) => {
     }
   }
 
-  if (userId && selectedPageId && selectedPageId !== String(savedSelection.selectedPageId || '').trim()) {
+  const storedSelectedPageToken = decryptMetaToken(savedSelection.selectedPageAccessToken || '');
+  const shouldPersistPageSelection =
+    Boolean(userId && selectedPageId) &&
+    (
+      selectedPageId !== String(savedSelection.selectedPageId || '').trim() ||
+      selectedPageName !== String(savedSelection.selectedPageName || '').trim() ||
+      (selectedPageAccessToken && selectedPageAccessToken !== storedSelectedPageToken)
+    );
+
+  if (userId && shouldPersistPageSelection) {
     await MetaAdsConnection.updateOne(
       { userId },
       {
         $set: {
           selectedPageId,
+          selectedPageName,
+          selectedPageAccessToken: selectedPageAccessToken ? encryptMetaToken(selectedPageAccessToken) : String(savedSelection.selectedPageAccessToken || ''),
           lastValidatedAt: new Date()
         }
       }
@@ -543,6 +576,17 @@ const getSetupBundle = async ({ userId } = {}) => {
 
   if (!selectedPageId && requestedPageId) {
     warnings.push('Page access: Reconnect Facebook and grant page access so a valid Facebook Page can be used for ad creatives.');
+  }
+
+  if (pages.length) {
+    console.log(
+      '[Meta OAuth] Page assets loaded',
+      JSON.stringify({
+        userId: String(userId || ''),
+        pagesCount: pages.length,
+        pages: pages.map(summarizePage)
+      })
+    );
   }
 
   const hasConnectedAuth = Boolean(accessContext?.accessToken && ['user', 'admin'].includes(accessContext.source));
@@ -555,8 +599,10 @@ const getSetupBundle = async ({ userId } = {}) => {
       connected: true,
       adAccountId: selectedAdAccountId,
       pageId: selectedPageId,
+      selectedPageName,
+      pageAccessReady: Boolean(selectedPageAccessToken),
       selectedWhatsappNumber: savedSelection.selectedWhatsappNumber || whatsappNumbers[0]?.display_phone_number || '',
-      pages,
+      pages: pages.map(summarizePage),
       businesses,
       adAccounts,
       whatsappNumbers,
@@ -576,8 +622,10 @@ const getSetupBundle = async ({ userId } = {}) => {
       connected: true,
       adAccountId: savedSelection.selectedAdAccountId || '',
       pageId: savedSelection.selectedPageId || '',
+      selectedPageName: savedSelection.selectedPageName || '',
+      pageAccessReady: Boolean(decryptMetaToken(savedSelection.selectedPageAccessToken || '')),
       selectedWhatsappNumber: savedSelection.selectedWhatsappNumber || '',
-      pages,
+      pages: pages.map(summarizePage),
       businesses,
       adAccounts,
       whatsappNumbers,
@@ -592,8 +640,10 @@ const getSetupBundle = async ({ userId } = {}) => {
     connected: false,
     adAccountId: savedSelection.selectedAdAccountId || '',
     pageId: savedSelection.selectedPageId || '',
+    selectedPageName: savedSelection.selectedPageName || '',
+    pageAccessReady: Boolean(decryptMetaToken(savedSelection.selectedPageAccessToken || '')),
     selectedWhatsappNumber: savedSelection.selectedWhatsappNumber || '',
-    pages,
+    pages: pages.map(summarizePage),
     businesses,
     adAccounts,
     whatsappNumbers,
@@ -639,6 +689,7 @@ const getConnectionDiagnostics = async ({ userId } = {}) => {
         hasAccessToken: false,
         hasAdAccountId: false,
         hasPageId: false,
+        hasPageAccessToken: false,
         forceMock: env.forceMock,
         authSource: accessContext?.source || 'none',
         connectedProfileName: ''
@@ -706,6 +757,7 @@ const getConnectionDiagnostics = async ({ userId } = {}) => {
       hasAccessToken: Boolean(accessContext.accessToken),
       hasAdAccountId: Boolean(selectedAdAccountId),
       hasPageId: Boolean(selectedPageId),
+      hasPageAccessToken: Boolean(decryptMetaToken(accessContext?.connection?.selectedPageAccessToken || '')),
       forceMock: env.forceMock,
       authSource: accessContext.source,
       connectedProfileName: accessContext.connection?.name || ''
@@ -748,6 +800,7 @@ const getConnectionDiagnostics = async ({ userId } = {}) => {
 
   diagnostics.targets = {
     pageId: selectedPageId,
+    pageAccessReady: Boolean(decryptMetaToken(accessContext?.connection?.selectedPageAccessToken || '')),
     adAccountId: selectedAdAccountId,
     apiVersion: env.apiVersion,
     graphBaseUrl: GRAPH_BASE_URL
@@ -1248,14 +1301,40 @@ const saveUserSelections = async ({ userId, adAccountId, pageId, whatsappNumber 
   }
   if (pageId !== undefined) {
     const normalizedPageId = String(pageId || '').trim();
+    let matchedPage = null;
     if (normalizedPageId) {
-      const accessiblePages = await getAccessiblePages({ accessToken: decryptMetaToken(existingConnection.accessToken) });
-      const matchedPage = accessiblePages.find((page) => String(page?.id || '').trim() === normalizedPageId);
+      const accessiblePages = await getAccessiblePages({
+        accessToken: decryptMetaToken(existingConnection.accessToken)
+      });
+      matchedPage = accessiblePages.find((page) => String(page?.id || '').trim() === normalizedPageId);
       if (!matchedPage) {
         const error = new Error('The selected Facebook Page is not available for this Facebook login. Reconnect Facebook and grant page access, then try again.');
         error.status = 400;
         throw error;
       }
+
+      const selectedPageAccessToken = String(matchedPage?.access_token || '').trim();
+      if (!selectedPageAccessToken) {
+        const error = new Error(
+          'Facebook page access token is missing for this Meta connection. Reconnect Meta, approve page permissions, and select a Page that returns a Page access token.'
+        );
+        error.status = 400;
+        throw error;
+      }
+
+      updates.selectedPageName = String(matchedPage?.name || '').trim();
+      updates.selectedPageAccessToken = encryptMetaToken(selectedPageAccessToken);
+      console.log(
+        '[Meta OAuth] Page selection saved',
+        JSON.stringify({
+          userId: String(userId || ''),
+          pageId: String(matchedPage?.id || ''),
+          pageName: String(matchedPage?.name || '')
+        })
+      );
+    } else {
+      updates.selectedPageName = '';
+      updates.selectedPageAccessToken = '';
     }
 
     updates.selectedPageId = normalizedPageId;
@@ -1443,6 +1522,23 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
     accessToken: resolvedAccessToken
   });
   const configuredPageId = creativePageContext.pageId;
+  const configuredPageAccessToken = String(
+    creativePageContext.pageAccessToken ||
+      accessContext.connection?.selectedPageAccessToken ||
+      ''
+  ).trim();
+  if (!configuredPageAccessToken) {
+    throw buildStageErrorWithDetails(
+      'Creative creation',
+      'Facebook page access is missing for this Meta connection. Click Reconnect Meta, approve page permissions, then select a page and save the setup before publishing campaigns.',
+      {
+        requestedPageId,
+        resolvedPageId: configuredPageId,
+        accessiblePages: creativePageContext.accessiblePages
+      },
+      400
+    );
+  }
   const instagramActorId = campaign.configuredInstagramActorId || undefined;
   const { whatsappNumber: sanitizedWhatsappNumber, destinationUrl } = buildCreativeDestination({
     whatsappNumber: campaign.whatsappNumber,
@@ -1622,6 +1718,7 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
       creative: campaign.creative,
       creativeUpload,
       configuredPageId,
+      pageAccessToken: configuredPageAccessToken,
       instagramActorId,
       destinationUrl: resolvedDestinationUrl,
       sanitizedWhatsappNumber,

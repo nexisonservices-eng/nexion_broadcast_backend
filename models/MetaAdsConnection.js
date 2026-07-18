@@ -33,6 +33,14 @@ const metaAdsConnectionSchema = new mongoose.Schema(
       type: String,
       default: ''
     },
+    selectedPageName: {
+      type: String,
+      default: ''
+    },
+    selectedPageAccessToken: {
+      type: String,
+      default: ''
+    },
     selectedWhatsappNumber: {
       type: String,
       default: ''

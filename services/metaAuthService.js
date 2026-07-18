@@ -1,11 +1,28 @@
 const axios = require('axios');
+const { getMetaAdsConfig, getCanonicalMetaOAuthRedirectUri } = require('../config/metaAdsConfig');
 
 const MetaAdsConnection = require('../models/MetaAdsConnection');
-const { getMetaAdsConfig } = require('../config/metaAdsConfig');
 const { decryptMetaToken, encryptMetaToken } = require('../utils/metaTokenCrypto');
 const { getMetaConfigByUserId } = require('./userMetaCredentialsService');
 
 const GRAPH_BASE_URL = 'https://graph.facebook.com';
+
+const resolveMetaOAuthRedirectUri = (redirectUri) => {
+  const canonicalRedirectUri = getCanonicalMetaOAuthRedirectUri();
+  const configuredRedirectUri = String(redirectUri || '').trim().replace(/\/+$/, '');
+
+  if (configuredRedirectUri && configuredRedirectUri !== canonicalRedirectUri) {
+    console.warn(
+      '[Meta OAuth] Ignoring non-canonical redirect URI passed to auth helper.',
+      JSON.stringify({
+        configuredRedirectUri,
+        canonicalRedirectUri
+      })
+    );
+  }
+
+  return canonicalRedirectUri;
+};
 
 const getAccessContextForUser = async (userId) => {
   const env = getMetaAdsConfig();
@@ -89,12 +106,13 @@ const exchangeCodeForAccessToken = async ({ code, redirectUri, appId, appSecret,
   const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v22.0').trim();
   const resolvedAppId = String(appId || '').trim();
   const resolvedAppSecret = String(appSecret || '').trim();
+  const resolvedRedirectUri = resolveMetaOAuthRedirectUri(redirectUri);
 
   const response = await axios.get(`${GRAPH_BASE_URL}/${resolvedApiVersion}/oauth/access_token`, {
     params: {
       client_id: resolvedAppId,
       client_secret: resolvedAppSecret,
-      redirect_uri: redirectUri,
+      redirect_uri: resolvedRedirectUri,
       code
     }
   });
@@ -111,20 +129,16 @@ const getLoginDialogUrl = ({ redirectUri, state, appId, apiVersion }) => {
     'business_management',
     'ads_management',
     'ads_read',
-    'pages_show_list',
     'pages_read_engagement',
     'pages_manage_metadata'
   ].join(',');
+  const resolvedRedirectUri = resolveMetaOAuthRedirectUri(redirectUri);
 
-  const params = new URLSearchParams({
-    client_id: resolvedAppId,
-    redirect_uri: redirectUri,
-    scope: scopes,
-    response_type: 'code',
-    state
-  });
-
-  return `https://www.facebook.com/${resolvedApiVersion}/dialog/oauth?${params.toString()}`;
+  return `https://www.facebook.com/${resolvedApiVersion}/dialog/oauth?client_id=${encodeURIComponent(
+    resolvedAppId
+  )}&redirect_uri=${encodeURIComponent(resolvedRedirectUri)}&scope=${encodeURIComponent(
+    scopes
+  )}&response_type=code&state=${encodeURIComponent(String(state || ''))}`;
 };
 
 const saveUserConnection = async ({ userId, accessToken, scopes = [], graphRequest }) => {

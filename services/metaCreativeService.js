@@ -27,10 +27,15 @@ const buildCreativeDestination = ({ whatsappNumber, pageId }) => {
   };
 };
 
+const summarizePage = (page) => ({
+  id: String(page?.id || '').trim(),
+  name: String(page?.name || '').trim()
+});
+
 const getAccessiblePages = async ({ accessToken, graphRequest }) => {
   const response = await graphRequest({
     path: 'me/accounts',
-    params: { fields: 'id,name' },
+    params: { fields: 'id,name,access_token' },
     accessToken
   });
 
@@ -46,6 +51,9 @@ const resolveCreativePageContext = async ({
 }) => {
   const normalizedRequestedPageId = String(requestedPageId || '').trim();
   const accessiblePages = await getAccessiblePages({ accessToken, graphRequest });
+  const matchedPage =
+    accessiblePages.find((page) => String(page?.id || '') === normalizedRequestedPageId) ||
+    accessiblePages[0];
 
   if (!accessiblePages.length) {
     throw buildStageErrorWithDetails(
@@ -57,15 +65,11 @@ const resolveCreativePageContext = async ({
         requestedPageId: normalizedRequestedPageId || '',
         accessiblePages: [],
         action:
-          'Reconnect Facebook with a user who has Page access, grant pages_show_list/pages_read_engagement/pages_manage_metadata, and then select the correct Facebook Page before creating ads.'
+          'Reconnect Facebook with a user who has full Page access, then select the correct Facebook Page before creating ads.'
       },
       400
     );
   }
-
-  const matchedPage =
-    accessiblePages.find((page) => String(page?.id || '') === normalizedRequestedPageId) ||
-    accessiblePages[0];
 
   if (!matchedPage?.id) {
     throw buildStageErrorWithDetails(
@@ -73,7 +77,7 @@ const resolveCreativePageContext = async ({
       'The selected Facebook page is not available for this Meta token.',
       {
         requestedPageId: normalizedRequestedPageId,
-        accessiblePages
+        accessiblePages: accessiblePages.map(summarizePage)
       },
       400
     );
@@ -82,8 +86,9 @@ const resolveCreativePageContext = async ({
   return {
     pageId: String(matchedPage.id),
     pageName: String(matchedPage.name || ''),
+    pageAccessToken: String(matchedPage.access_token || '').trim(),
     requestedPageId: normalizedRequestedPageId,
-    accessiblePages
+    accessiblePages: accessiblePages.map(summarizePage)
   };
 };
 
@@ -256,6 +261,7 @@ const createCreative = async ({
   creative,
   creativeUpload,
   configuredPageId,
+  pageAccessToken,
   instagramActorId,
   destinationUrl,
   sanitizedWhatsappNumber,
@@ -345,7 +351,7 @@ const createCreative = async ({
           name: `${campaignName} - Creative`,
           object_story_spec: objectStorySpec
         },
-        accessToken
+        accessToken: String(pageAccessToken || accessToken || '').trim()
       });
     } catch (error) {
       lastError = error;
@@ -364,6 +370,7 @@ const createCreative = async ({
       requestedPageId: creativePageContext.requestedPageId,
       resolvedPageId: creativePageContext.pageId,
       resolvedPageName: creativePageContext.pageName,
+      resolvedPageAccessToken: Boolean(creativePageContext.pageAccessToken),
       accessiblePages: creativePageContext.accessiblePages
     },
     lastError?.response?.status || 400

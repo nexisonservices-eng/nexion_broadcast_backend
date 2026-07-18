@@ -32,6 +32,10 @@ const {
 const router = express.Router();
 const OAUTH_STATE_CACHE_TTL_MS = 15 * 60 * 1000;
 const oauthStateConfigCache = new Map();
+const {
+  CANONICAL_META_OAUTH_REDIRECT_URI,
+  getCanonicalMetaOAuthRedirectUri
+} = require('../config/metaAdsConfig');
 
 const normalizeOrigin = (value) => String(value || '').trim().replace(/\/+$/, '');
 const isSafeFrontendOrigin = (value) => /^https?:\/\/[^/\s]+$/i.test(normalizeOrigin(value));
@@ -44,39 +48,12 @@ const escapeHtml = (value) =>
     .replace(/'/g, '&#39;');
 const getBackendOrigin = (req) =>
   normalizeOrigin(process.env.PUBLIC_BACKEND_URL) || `${req.protocol}://${req.get('host')}`;
-const getCallbackUrl = (req) => `${getBackendOrigin(req)}/api/meta-ads/oauth/callback`;
-const getForcedRedirectUri = () => normalizeOrigin(process.env.META_OAUTH_REDIRECT_URI);
-const getUrlOrigin = (value) => {
-  try {
-    return new URL(normalizeOrigin(value)).origin;
-  } catch {
-    return '';
-  }
-};
-const getResolvedRedirectUri = (req, metaConfig = null) => {
-  const forcedRedirectUri = getForcedRedirectUri();
-  if (forcedRedirectUri) return forcedRedirectUri;
-
-  const callbackUrl = getCallbackUrl(req);
-  const configuredRedirect = normalizeOrigin(metaConfig?.redirectUri);
-  if (!configuredRedirect) return callbackUrl;
-
-  const allowExternalRedirect =
-    String(process.env.META_OAUTH_ALLOW_EXTERNAL_REDIRECT || '').trim().toLowerCase() === 'true';
-  if (allowExternalRedirect) return configuredRedirect;
-
-  const configuredOrigin = getUrlOrigin(configuredRedirect);
-  const backendOrigin = getUrlOrigin(getBackendOrigin(req));
-  if (configuredOrigin && backendOrigin && configuredOrigin === backendOrigin) {
-    return configuredRedirect;
-  }
-
-  return callbackUrl;
+const getMetaOAuthRedirectUri = () => {
+  return getCanonicalMetaOAuthRedirectUri();
 };
 const resolveMetaOAuthConfig = (metaConfig = null) => ({
   appId: String(metaConfig?.appId || process.env.META_APP_ID || '').trim(),
   appSecret: String(metaConfig?.appSecret || process.env.META_APP_SECRET || '').trim(),
-  redirectUri: normalizeOrigin(metaConfig?.redirectUri),
   apiVersion: String(metaConfig?.apiVersion || process.env.META_API_VERSION || 'v22.0').trim(),
   credentialOwnerUserId: String(metaConfig?.credentialOwnerUserId || '').trim()
 });
@@ -199,8 +176,14 @@ const buildFacebookAuthUrl = async (req) => {
 
   setCachedOAuthConfig(state, metaConfig);
 
+  const redirectUri = getMetaOAuthRedirectUri();
+  console.log(
+    '[Meta OAuth] Building Facebook auth URL with redirect URI:',
+    JSON.stringify({ redirectUri, apiVersion: metaConfig.apiVersion, appId: metaConfig.appId })
+  );
+
   return metaAdsService.getLoginDialogUrl({
-    redirectUri: getResolvedRedirectUri(req, metaConfig),
+    redirectUri,
     state,
     appId: metaConfig.appId,
     apiVersion: metaConfig.apiVersion
@@ -345,6 +328,7 @@ router.post('/auth/facebook', auth, async (req, res) => {
 
 router.get('/oauth/callback', async (req, res) => {
   const { code, state, error: authError, error_message: authErrorMessage } = req.query;
+  let decodedUserId = '';
 
   const renderCallbackPage = ({ message, payload, targetOrigin = '' }) => `
       <!doctype html>
@@ -399,6 +383,7 @@ router.get('/oauth/callback', async (req, res) => {
 
   try {
     const { payload, signature, decoded } = parseSignedState(state);
+    decodedUserId = String(decoded?.userId || '');
     const credentialLookupUserId = decoded.credentialOwnerUserId || decoded.userId;
     const metaConfig = resolveMetaOAuthConfig(
       getCachedOAuthConfig(state) || (await getMetaConfigByUserId(credentialLookupUserId))
@@ -417,9 +402,15 @@ router.get('/oauth/callback', async (req, res) => {
       throw new Error('Meta OAuth state expired.');
     }
 
+    const redirectUri = getMetaOAuthRedirectUri();
+    console.log(
+      '[Meta OAuth] Exchanging authorization code with redirect URI:',
+      JSON.stringify({ redirectUri, apiVersion: metaConfig.apiVersion, userId: decoded.userId })
+    );
+
     const tokenData = await metaAdsService.exchangeCodeForAccessToken({
       code,
-      redirectUri: getResolvedRedirectUri(req, metaConfig),
+      redirectUri,
       appId: metaConfig.appId,
       appSecret: metaConfig.appSecret,
       apiVersion: metaConfig.apiVersion
@@ -433,6 +424,21 @@ router.get('/oauth/callback', async (req, res) => {
     deleteCachedOAuthConfig(state);
 
     const setup = await metaAdsService.getSetupBundle({ userId: decoded.userId });
+    console.log(
+      '[Meta OAuth] OAuth success',
+      JSON.stringify({
+        userId: String(decoded.userId || ''),
+        pagesCount: Array.isArray(setup?.pages) ? setup.pages.length : 0,
+        pages: Array.isArray(setup?.pages)
+          ? setup.pages.map((page) => ({
+              id: String(page?.id || ''),
+              name: String(page?.name || '')
+            }))
+          : [],
+        selectedPageId: String(setup?.pageId || ''),
+        selectedPageName: String(setup?.selectedPageName || '')
+      })
+    );
     const targetOrigin = isSafeFrontendOrigin(decoded.origin)
       ? normalizeOrigin(decoded.origin)
       : (isSafeFrontendOrigin(process.env.FRONTEND_URL) ? normalizeOrigin(process.env.FRONTEND_URL) : '');
@@ -447,6 +453,15 @@ router.get('/oauth/callback', async (req, res) => {
         })
       );
   } catch (error) {
+    console.error(
+      '[Meta OAuth] Callback failed:',
+      JSON.stringify({
+        message: error?.message || 'Meta OAuth failed.',
+        userId: decodedUserId,
+        hasCode: Boolean(code),
+        hasState: Boolean(state)
+      })
+    );
     deleteCachedOAuthConfig(state);
     return res
       .status(200)

@@ -47,6 +47,7 @@ const buildMetaCreateErrorMessage = (metaError) => {
     if (
         stage === 'Creative creation' &&
         (
+            /page access is missing/i.test(rawMessage) ||
             /no permission to access this profile/i.test(title) ||
             /required permission to access this profile/i.test(userMessage) ||
             /application does not have permission for this action/i.test(rawMessage) ||
@@ -1072,7 +1073,7 @@ exports.publishCampaign = async (req, res) => {
         if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to publish this campaign')) return;
 
         const metaSetup = await metaAdsService.getSetupBundle({ userId: req.user.id });
-        if (!metaSetup?.pageId) {
+        if (!metaSetup?.pageId || !metaSetup?.pageAccessReady) {
             campaign.lifecycleStatus = 'draft';
             campaign.deliveryStatus = 'not_published';
             await campaign.save();
@@ -1085,9 +1086,11 @@ exports.publishCampaign = async (req, res) => {
                 details: {
                     setup: {
                         pageId: metaSetup?.pageId || '',
+                        pageName: metaSetup?.selectedPageName || '',
                         adAccountId: metaSetup?.adAccountId || '',
                         authSource: metaSetup?.authSource || metaSetup?.mode || '',
                         pagesAvailable: Array.isArray(metaSetup?.pages) ? metaSetup.pages.length : 0,
+                        pageAccessReady: Boolean(metaSetup?.pageAccessReady),
                         setupError: metaSetup?.setupError || ''
                     }
                 },
