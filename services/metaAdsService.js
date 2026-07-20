@@ -371,12 +371,19 @@ const verifyMetaAdsManagementPermission = async ({ accessToken, appId, appSecret
   }
 
   if (!resolvedAppId || !resolvedAppSecret) {
-    throw buildStageErrorWithDetails(
-      'Meta token verification',
-      'Meta app credentials are missing. Set META_APP_ID and META_APP_SECRET so token permissions can be verified.',
-      { missing: ['META_APP_ID', 'META_APP_SECRET'] },
-      400
+    console.warn(
+      '[Meta API] Skipping token permission verification because Meta app credentials are not configured.',
+      JSON.stringify({
+        hasAppId: Boolean(resolvedAppId),
+        hasAppSecret: Boolean(resolvedAppSecret)
+      })
     );
+
+    return {
+      isValid: true,
+      skipped: true,
+      reason: 'Meta app credentials are not configured for debug_token verification.'
+    };
   }
 
   const appAccessToken = `${resolvedAppId}|${resolvedAppSecret}`;
