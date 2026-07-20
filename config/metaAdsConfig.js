@@ -3,16 +3,49 @@ const parseBoolean = (value, defaultValue = false) => {
   return String(value).trim().toLowerCase() === 'true' || String(value).trim() === '1';
 };
 
+const CANONICAL_META_OAUTH_REDIRECT_URI =
+  'https://nexion-broadcast-backend-t4u8.onrender.com/api/meta-ads/oauth/callback';
+
+const normalizeUrl = (value) => String(value || '').trim().replace(/\/+$/, '');
+
 const parseNumber = (value, fallback) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 };
 
 const getMetaAdsConfig = () => {
-  const apiVersion = String(process.env.META_API_VERSION || 'v22.0').trim();
+  const apiVersion = String(process.env.META_API_VERSION || 'v23.0').trim();
   const pixelId = String(process.env.META_PIXEL_ID || '').trim();
   const appId = String(process.env.META_APP_ID || '').trim();
   const appSecret = String(process.env.META_APP_SECRET || '').trim();
+  const accessToken = String(
+    process.env.META_ACCESS_TOKEN ||
+      process.env.FACEBOOK_ACCESS_TOKEN ||
+      ''
+  ).trim();
+  const adAccountId = String(
+    process.env.META_AD_ACCOUNT_ID ||
+      process.env.FACEBOOK_AD_ACCOUNT_ID ||
+      ''
+  ).trim();
+  const configuredRedirectUri = normalizeUrl(
+    process.env.META_REDIRECT_URI ||
+      process.env.FACEBOOK_REDIRECT_URI ||
+      process.env.META_OAUTH_REDIRECT_URI ||
+      ''
+  );
+  const redirectUri = CANONICAL_META_OAUTH_REDIRECT_URI;
+
+  if (configuredRedirectUri && configuredRedirectUri !== redirectUri) {
+    console.warn(
+      '[Meta OAuth] Ignoring non-canonical redirect URI from env.',
+      JSON.stringify({
+        configuredRedirectUri,
+        canonicalRedirectUri: redirectUri
+      })
+    );
+  }
+
   const tokenEncryptionKey = String(
     process.env.META_TOKEN_ENCRYPTION_KEY || process.env.JWT_SECRET || ''
   ).trim();
@@ -28,6 +61,9 @@ const getMetaAdsConfig = () => {
     pixelId,
     appId,
     appSecret,
+    accessToken,
+    adAccountId,
+    redirectUri,
     tokenEncryptionKey,
     forceMock,
     advantageAudience,
@@ -36,6 +72,8 @@ const getMetaAdsConfig = () => {
     hasOAuthConfig: Boolean(appId && appSecret)
   };
 };
+
+const getCanonicalMetaOAuthRedirectUri = () => CANONICAL_META_OAUTH_REDIRECT_URI;
 
 const validateMetaAdsEnv = ({ strict = false } = {}) => {
   const config = getMetaAdsConfig();
@@ -61,5 +99,7 @@ const validateMetaAdsEnv = ({ strict = false } = {}) => {
 
 module.exports = {
   getMetaAdsConfig,
-  validateMetaAdsEnv
+  validateMetaAdsEnv,
+  CANONICAL_META_OAUTH_REDIRECT_URI,
+  getCanonicalMetaOAuthRedirectUri
 };

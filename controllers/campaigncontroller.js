@@ -91,6 +91,39 @@ const sendMetaError = (res, metaError, fallbackMessage) =>
     metaStage: metaError.stage || null
   });
 
+const META_CAMPAIGN_OBJECTIVES = new Set(['awareness', 'traffic', 'engagement', 'leads', 'sales', 'catalog']);
+const META_CAMPAIGN_LOCAL_STATUSES = new Set(['draft', 'active', 'paused', 'ended', 'archived']);
+
+const normalizeCampaignCreatePayload = (payload = {}) => {
+    const normalized = { ...(payload || {}) };
+    normalized.name = String(normalized.name || '').trim();
+    normalized.platform = String(normalized.platform || 'both').trim().toLowerCase();
+    normalized.objective = String(normalized.objective || '').trim().toLowerCase();
+    normalized.status = String(normalized.status || 'paused').trim().toLowerCase();
+    return normalized;
+};
+
+const validateMetaBackedCampaignCreatePayload = (payload = {}) => {
+    const errors = [];
+    if (!payload.name) {
+        errors.push('Campaign name is required');
+    }
+    if (!payload.startDate) {
+        errors.push('Start date is required');
+    }
+    if (!payload.platform) {
+        errors.push('Platform is required');
+    }
+    if (!META_CAMPAIGN_OBJECTIVES.has(payload.objective)) {
+        errors.push('Invalid campaign objective');
+    }
+    if (payload.status && !META_CAMPAIGN_LOCAL_STATUSES.has(payload.status)) {
+        errors.push('Invalid status');
+    }
+
+    return errors;
+};
+
 const normalizeCreativeImageUrl = (value) => {
     const raw = String(value || '').trim();
     if (!raw) return '';
@@ -455,9 +488,20 @@ exports.createCampaign = async (req, res) => {
         // Add user to request body
         req.body.createdBy = req.user.id;
         req.body.companyId = req.companyId;
+        req.body.updatedBy = req.user.id;
+
+        const normalizedPayload = normalizeCampaignCreatePayload(req.body);
+        const validationErrors = validateMetaBackedCampaignCreatePayload(normalizedPayload);
+        if (validationErrors.length > 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Campaign validation failed',
+                errors: validationErrors.map((message) => ({ message }))
+            });
+        }
 
         // Validate budget
-        if (req.body.dailyBudget && req.body.lifetimeBudget) {
+        if (normalizedPayload.dailyBudget && normalizedPayload.lifetimeBudget) {
             return res.status(400).json({
                 success: false,
                 message: 'Cannot set both daily and lifetime budget'
@@ -465,49 +509,93 @@ exports.createCampaign = async (req, res) => {
         }
 
         const { imageFile, videoFile } = getUploadedCreativeFiles(req);
-        const requestedMediaType = String(req.body.mediaType || '').toLowerCase() === 'video' ? 'video' : 'image';
-        req.body.mediaType = requestedMediaType;
+        const requestedMediaType = String(normalizedPayload.mediaType || '').toLowerCase() === 'video' ? 'video' : 'image';
+        normalizedPayload.mediaType = requestedMediaType;
         if (requestedMediaType === 'video') {
-            req.body.imageUrl = '';
+            normalizedPayload.imageUrl = '';
         } else {
-            req.body.videoUrl = '';
+            normalizedPayload.videoUrl = '';
         }
 
         if (requestedMediaType === 'video' && videoFile?.buffer) {
-            req.body.videoUrl = await uploadCampaignCreative(videoFile, {
+            normalizedPayload.videoUrl = await uploadCampaignCreative(videoFile, {
                 companyContext: resolveCompanyStorageContext(req),
                 resourceType: 'video'
             });
         } else if (requestedMediaType === 'image' && imageFile?.buffer) {
-            req.body.imageUrl = await uploadCampaignCreative(imageFile, {
+            normalizedPayload.imageUrl = await uploadCampaignCreative(imageFile, {
                 companyContext: resolveCompanyStorageContext(req),
                 resourceType: 'image'
             });
         } else if (videoFile?.buffer && !imageFile?.buffer) {
-            req.body.mediaType = 'video';
-            req.body.videoUrl = await uploadCampaignCreative(videoFile, {
+            normalizedPayload.mediaType = 'video';
+            normalizedPayload.videoUrl = await uploadCampaignCreative(videoFile, {
                 companyContext: resolveCompanyStorageContext(req),
                 resourceType: 'video'
             });
         } else if (imageFile?.buffer && !videoFile?.buffer) {
-            req.body.mediaType = 'image';
-            req.body.imageUrl = await uploadCampaignCreative(imageFile, {
+            normalizedPayload.mediaType = 'image';
+            normalizedPayload.imageUrl = await uploadCampaignCreative(imageFile, {
                 companyContext: resolveCompanyStorageContext(req),
                 resourceType: 'image'
             });
         }
 
-        const wantsActiveLaunch = String(req.body.status || '').toLowerCase() === 'active';
-        Object.assign(req.body, normalizeLifecycleState({ requestedStatus: req.body.status }));
+        const metaCampaign = await metaAdsService.createMetaCampaignInAdsManager({
+            name: normalizedPayload.name,
+            objective: normalizedPayload.objective,
+            adAccountId: process.env.META_AD_ACCOUNT_ID || process.env.FACEBOOK_AD_ACCOUNT_ID || '',
+            accessToken: process.env.META_ACCESS_TOKEN || process.env.FACEBOOK_ACCESS_TOKEN || '',
+            apiVersion: process.env.META_API_VERSION || 'v23.0'
+        });
+
+        const metaCampaignId = String(metaCampaign?.id || '').trim();
+        const metaStatus = String(metaCampaign?.metaStatus || metaCampaign?.status || 'PAUSED').trim().toUpperCase() || 'PAUSED';
+        const localStatus = 'created';
+
+        if (!metaCampaignId) {
+            return res.status(502).json({
+                success: false,
+                message: 'Meta campaign creation did not return a campaign ID.',
+                details: metaCampaign || null
+            });
+        }
+
+        normalizedPayload.metaCampaignId = metaCampaignId;
+        normalizedPayload.adAccountId =
+            String(metaCampaign?.adAccountId || process.env.META_AD_ACCOUNT_ID || process.env.FACEBOOK_AD_ACCOUNT_ID || '').trim();
+        normalizedPayload.metaStatus = metaStatus;
+        normalizedPayload.localStatus = localStatus;
+        normalizedPayload.status = 'paused';
+        normalizedPayload.lifecycleStatus = 'approved';
+        normalizedPayload.paymentStatus = 'verified';
+        normalizedPayload.reviewStatus = 'approved';
+        normalizedPayload.deliveryStatus = 'paused';
+        normalizedPayload.publishedAt = new Date();
+        normalizedPayload.metaResponse = metaCampaign;
 
         // Create campaign
-        const campaign = await Campaign.create(req.body);
+        let campaign;
+        try {
+            campaign = await Campaign.create(normalizedPayload);
+        } catch (localSaveError) {
+            if (metaCampaignId) {
+                try {
+                    await metaAdsService.deleteMetaCampaignInAdsManager({
+                        campaignId: metaCampaignId,
+                        accessToken: process.env.META_ACCESS_TOKEN || process.env.FACEBOOK_ACCESS_TOKEN || '',
+                        apiVersion: process.env.META_API_VERSION || 'v23.0'
+                    });
+                } catch (rollbackError) {
+                    console.error('Failed to roll back Meta campaign after local save error:', rollbackError);
+                }
+            }
+            throw localSaveError;
+        }
 
         res.status(201).json({
             success: true,
-            message: wantsActiveLaunch
-                ? 'Campaign created and is ready to publish.'
-                : 'Campaign draft created successfully.',
+            message: 'Campaign created successfully in Meta Ads Manager.',
             data: serializeCampaignRecord(campaign)
         });
     } catch (error) {
@@ -535,7 +623,8 @@ exports.createCampaign = async (req, res) => {
         if (Number(error.status) >= 400 && Number(error.status) < 600) {
             return res.status(Number(error.status)).json({
                 success: false,
-                message: error.message || 'Error creating campaign'
+                message: error.message || 'Error creating campaign',
+                details: error.details || null
             });
         }
 
@@ -543,7 +632,34 @@ exports.createCampaign = async (req, res) => {
             success: false,
             message: 'Error creating campaign',
             error: error.message,
+            details: error.details || null,
             stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+        });
+    }
+};
+
+// @desc    Fetch campaigns directly from Meta Ads Manager
+// @route   GET /api/campaigns/meta
+// @access  Private
+exports.getMetaCampaigns = async (req, res) => {
+    try {
+        const campaigns = await metaAdsService.fetchMetaCampaignsFromAdsManager({
+            adAccountId: process.env.META_AD_ACCOUNT_ID || process.env.FACEBOOK_AD_ACCOUNT_ID || '',
+            accessToken: process.env.META_ACCESS_TOKEN || process.env.FACEBOOK_ACCESS_TOKEN || '',
+            apiVersion: process.env.META_API_VERSION || 'v23.0'
+        });
+
+        res.status(200).json({
+            success: true,
+            count: campaigns.length,
+            data: campaigns
+        });
+    } catch (error) {
+        console.error('Error fetching Meta campaigns:', error);
+        res.status(error.status || 500).json({
+            success: false,
+            message: error.message || 'Error fetching Meta campaigns',
+            details: error.details || null
         });
     }
 };

@@ -241,6 +241,16 @@ router.get(
 );
 
 /**
+ * @route   GET /api/campaigns/meta
+ * @desc    Fetch campaigns directly from Meta Ads Manager
+ * @access  Private
+ */
+router.get(
+    '/meta',
+    campaignController.getMetaCampaigns
+);
+
+/**
  * @route   POST /api/campaigns
  * @desc    Create a new campaign
  * @access  Private

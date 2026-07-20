@@ -253,10 +253,25 @@ const campaignSchema = new mongoose.Schema({
         min: 0
     },
     // Meta/Facebook specific fields
+    adAccountId: {
+        type: String,
+        trim: true,
+        default: ''
+    },
     metaCampaignId: {
         type: String,
         sparse: true,
         unique: true
+    },
+    metaStatus: {
+        type: String,
+        trim: true,
+        default: ''
+    },
+    localStatus: {
+        type: String,
+        trim: true,
+        default: 'draft'
     },
     metaAdSetId: {
         type: String,

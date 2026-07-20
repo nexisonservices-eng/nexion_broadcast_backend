@@ -93,6 +93,20 @@ const parseDelimitedTerms = (value) =>
 
 const getEnvConfig = () => getMetaAdsConfig();
 
+const resolveMetaCampaignEnvConfig = () => {
+  const env = getEnvConfig();
+  const adAccountId = String(env.adAccountId || '').trim().replace(/^act_/i, '');
+  const accessToken = String(env.accessToken || '').trim();
+
+  return {
+    apiVersion: String(env.apiVersion || 'v23.0').trim(),
+    appId: String(env.appId || '').trim(),
+    appSecret: String(env.appSecret || '').trim(),
+    adAccountId,
+    accessToken
+  };
+};
+
 const graphRequest = async ({ method = 'GET', path, params, data, headers, accessToken: overrideToken, apiVersion: overrideApiVersion }) => {
   const { apiVersion } = getEnvConfig();
   const resolvedAccessToken = String(overrideToken || '').trim();
@@ -173,6 +187,20 @@ const mapCrudObjectiveToMetaObjective = (objective) => {
   }
 };
 
+const validateCrudObjective = (objective) => {
+  const normalizedObjective = String(objective || '').trim().toLowerCase();
+  if (!['awareness', 'traffic', 'engagement', 'leads', 'sales', 'catalog'].includes(normalizedObjective)) {
+    throw buildStageErrorWithDetails(
+      'Campaign validation',
+      'Invalid campaign objective. Allowed values: awareness, traffic, engagement, leads, sales, catalog.',
+      { objective: String(objective || '') },
+      400
+    );
+  }
+
+  return normalizedObjective;
+};
+
 const getAllowedOptimizationGoalsForCrudObjective = (objective) => {
   const normalizedObjective = String(objective || '').trim().toLowerCase();
 
@@ -217,7 +245,247 @@ const shouldUseMockMode = () => {
   return config.forceMock;
 };
 
+const verifyMetaAdsManagementPermission = async ({ accessToken, appId, appSecret, apiVersion } = {}) => {
+  const resolvedAccessToken = String(accessToken || '').trim();
+  const resolvedAppId = String(appId || '').trim();
+  const resolvedAppSecret = String(appSecret || '').trim();
+
+  if (!resolvedAccessToken) {
+    throw buildStageErrorWithDetails(
+      'Meta token verification',
+      'Meta access token is missing. Set META_ACCESS_TOKEN or FACEBOOK_ACCESS_TOKEN in the environment.',
+      { envVar: 'META_ACCESS_TOKEN' },
+      400
+    );
+  }
+
+  if (!resolvedAppId || !resolvedAppSecret) {
+    throw buildStageErrorWithDetails(
+      'Meta token verification',
+      'Meta app credentials are missing. Set META_APP_ID and META_APP_SECRET so token permissions can be verified.',
+      { missing: ['META_APP_ID', 'META_APP_SECRET'] },
+      400
+    );
+  }
+
+  const appAccessToken = `${resolvedAppId}|${resolvedAppSecret}`;
+  const debugResponse = await graphRequest({
+    path: 'debug_token',
+    params: {
+      input_token: resolvedAccessToken
+    },
+    accessToken: appAccessToken,
+    apiVersion
+  });
+
+  const debugData = debugResponse?.data || {};
+  const scopes = [
+    ...(Array.isArray(debugData.scopes) ? debugData.scopes : []),
+    ...(Array.isArray(debugData.granular_scopes)
+      ? debugData.granular_scopes.flatMap((item) => {
+          if (Array.isArray(item?.scope)) return item.scope;
+          if (item?.scope) return [item.scope];
+          return [];
+        })
+      : [])
+  ]
+    .map((scope) => String(scope || '').trim())
+    .filter(Boolean);
+
+  if (!debugData.is_valid) {
+    throw buildStageErrorWithDetails(
+      'Meta token verification',
+      'Meta access token is invalid or expired.',
+      {
+        debugToken: debugData
+      },
+      401
+    );
+  }
+
+  if (!scopes.includes('ads_management')) {
+    throw buildStageErrorWithDetails(
+      'Meta token verification',
+      'Meta access token is missing the required ads_management permission.',
+      {
+        scopes,
+        debugToken: debugData
+      },
+      403
+    );
+  }
+
+  return {
+    isValid: true,
+    scopes,
+    debugToken: debugData
+  };
+};
+
 const getAccessContextForUser = async (userId) => metaAuthService.getAccessContextForUser(userId);
+
+const createMetaCampaignInAdsManager = async ({ name, objective, adAccountId, accessToken, apiVersion } = {}) => {
+  if (shouldUseMockMode()) {
+    return {
+      apiMode: 'mock',
+      id: `mock-campaign-${Date.now()}`,
+      name: String(name || 'Campaign').trim(),
+      objective: mapCrudObjectiveToMetaObjective(objective),
+      status: 'PAUSED',
+      effective_status: 'PAUSED'
+    };
+  }
+
+  const env = resolveMetaCampaignEnvConfig();
+  const resolvedAdAccountId = String(adAccountId || env.adAccountId || '').trim().replace(/^act_/i, '');
+  const resolvedAccessToken = String(accessToken || env.accessToken || '').trim();
+  const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v23.0').trim();
+
+  if (!resolvedAdAccountId) {
+    throw buildStageErrorWithDetails(
+      'Campaign creation',
+      'Missing Meta ad account ID. Set META_AD_ACCOUNT_ID or FACEBOOK_AD_ACCOUNT_ID in the environment.',
+      { envVar: 'META_AD_ACCOUNT_ID' },
+      400
+    );
+  }
+
+  if (!resolvedAccessToken) {
+    throw buildStageErrorWithDetails(
+      'Campaign creation',
+      'Missing Meta access token. Set META_ACCESS_TOKEN or FACEBOOK_ACCESS_TOKEN in the environment.',
+      { envVar: 'META_ACCESS_TOKEN' },
+      400
+    );
+  }
+
+  validateCrudObjective(objective);
+  await verifyMetaAdsManagementPermission({
+    accessToken: resolvedAccessToken,
+    appId: env.appId,
+    appSecret: env.appSecret,
+    apiVersion: resolvedApiVersion
+  });
+
+  try {
+    const response = await graphRequest({
+      method: 'POST',
+      path: buildAdAccountPath(resolvedAdAccountId, 'campaigns'),
+      data: {
+        name: String(name || 'Campaign').trim(),
+        objective: mapCrudObjectiveToMetaObjective(objective),
+        status: 'PAUSED',
+        special_ad_categories: []
+      },
+      accessToken: resolvedAccessToken,
+      apiVersion: resolvedApiVersion
+    });
+
+    return {
+      apiMode: 'live',
+      adAccountId: toCanonicalAdAccountId(resolvedAdAccountId),
+      metaStatus: String(response?.status || 'PAUSED').trim().toUpperCase() || 'PAUSED',
+      ...response
+    };
+  } catch (error) {
+    throw buildStageError('Campaign creation', error);
+  }
+};
+
+const fetchMetaCampaignsFromAdsManager = async ({ adAccountId, accessToken, apiVersion, limit = 100 } = {}) => {
+  if (shouldUseMockMode()) {
+    return [];
+  }
+
+  const env = resolveMetaCampaignEnvConfig();
+  const resolvedAdAccountId = String(adAccountId || env.adAccountId || '').trim().replace(/^act_/i, '');
+  const resolvedAccessToken = String(accessToken || env.accessToken || '').trim();
+  const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v23.0').trim();
+
+  if (!resolvedAdAccountId) {
+    throw buildStageErrorWithDetails(
+      'Campaign sync',
+      'Missing Meta ad account ID. Set META_AD_ACCOUNT_ID or FACEBOOK_AD_ACCOUNT_ID in the environment.',
+      { envVar: 'META_AD_ACCOUNT_ID' },
+      400
+    );
+  }
+
+  if (!resolvedAccessToken) {
+    throw buildStageErrorWithDetails(
+      'Campaign sync',
+      'Missing Meta access token. Set META_ACCESS_TOKEN or FACEBOOK_ACCESS_TOKEN in the environment.',
+      { envVar: 'META_ACCESS_TOKEN' },
+      400
+    );
+  }
+
+  await verifyMetaAdsManagementPermission({
+    accessToken: resolvedAccessToken,
+    appId: env.appId,
+    appSecret: env.appSecret,
+    apiVersion: resolvedApiVersion
+  });
+
+  const response = await graphRequest({
+    path: buildAdAccountPath(resolvedAdAccountId, 'campaigns'),
+    params: {
+      fields: 'id,name,status,effective_status,objective,created_time,updated_time',
+      limit
+    },
+    accessToken: resolvedAccessToken,
+    apiVersion: resolvedApiVersion
+  });
+
+  return Array.isArray(response?.data) ? response.data : [];
+};
+
+const deleteMetaCampaignInAdsManager = async ({ campaignId, accessToken, apiVersion } = {}) => {
+  if (shouldUseMockMode()) {
+    return {
+      apiMode: 'mock',
+      deleted: Boolean(campaignId)
+    };
+  }
+
+  const env = resolveMetaCampaignEnvConfig();
+  const resolvedCampaignId = String(campaignId || '').trim();
+  const resolvedAccessToken = String(accessToken || env.accessToken || '').trim();
+  const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v23.0').trim();
+
+  if (!resolvedCampaignId) {
+    return {
+      skipped: true,
+      reason: 'No Meta campaign ID was provided.'
+    };
+  }
+
+  if (!resolvedAccessToken) {
+    throw buildStageErrorWithDetails(
+      'Campaign rollback',
+      'Missing Meta access token. Set META_ACCESS_TOKEN or FACEBOOK_ACCESS_TOKEN in the environment.',
+      { envVar: 'META_ACCESS_TOKEN' },
+      400
+    );
+  }
+
+  try {
+    await graphRequest({
+      method: 'DELETE',
+      path: resolvedCampaignId,
+      accessToken: resolvedAccessToken,
+      apiVersion: resolvedApiVersion
+    });
+
+    return {
+      apiMode: 'live',
+      deleted: true,
+      id: resolvedCampaignId
+    };
+  } catch (error) {
+    throw buildStageError('Campaign rollback', error);
+  }
+};
 
 const ensureConnectedMetaUser = async (userId, stage = 'Meta access') => {
   const accessContext = await getAccessContextForUser(userId);
@@ -1106,12 +1374,12 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
         response = await graphRequest({
           path: buildAdAccountPath(adAccountId, 'campaigns'),
           params: {
-            fields:
-              'id,name,status,effective_status,objective,daily_budget,lifetime_budget,start_time,stop_time,created_time,updated_time,insights.limit(1){impressions,clicks,spend,ctr,cpc}',
+            fields: 'id,name,status,effective_status,objective',
             limit: 100
           },
           accessToken
         });
+        console.log('Campaigns from Meta:', response?.data);
         break;
       } catch (error) {
         console.warn(
@@ -1227,10 +1495,13 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
         syncedFromMeta: true,
         metaCampaignId: remoteId,
         metaAdAccountId: adAccountId,
+        adAccountId,
         name: String(campaign?.name || `Meta Campaign ${remoteId}`),
         platform: 'both',
         objective: mapMetaObjectiveToCrudObjective(campaign?.objective),
         status: mapMetaStatusToCrudStatus(campaign?.status, campaign?.effective_status),
+        metaStatus: String(campaign?.effective_status || campaign?.status || '').trim().toUpperCase(),
+        localStatus: 'synced',
         dailyBudget: toMoneyAmount(campaign?.daily_budget),
         lifetimeBudget: toMoneyAmount(campaign?.lifetime_budget),
         startDate: normalizeMetaDateValue(campaign?.start_time || campaign?.created_time || ''),
@@ -1473,10 +1744,10 @@ const resolveAdIdFromCreation = async ({
   return '';
 };
 
-const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
+const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken }) => {
   const env = getEnvConfig();
   const accessContext = await ensureConnectedMetaUser(userId, 'Campaign creation');
-  let resolvedAccessToken = accessContext.accessToken;
+  let resolvedAccessToken = String(accessToken || accessContext.accessToken || '').trim();
   const initialDeliveryStatus =
     String(campaign?.status || '').trim().toUpperCase() === 'ACTIVE' ? 'ACTIVE' : 'PAUSED';
   const effectiveAdAccountId =
@@ -1563,6 +1834,13 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
   const budgetInMinorUnit = Math.max(1, Math.round(resolvedBudgetAmount * 100));
   const startTime = campaign.schedule?.startTime ? new Date(campaign.schedule.startTime).toISOString() : new Date().toISOString();
   const endTime = campaign.schedule?.endTime ? new Date(campaign.schedule.endTime).toISOString() : undefined;
+  const campaignCreateUrl = `${GRAPH_BASE_URL}/${env.apiVersion.replace(/^\/+/, '')}/${buildAdAccountPath(effectiveAdAccountId, 'campaigns')}`;
+
+  console.log('Access token exists:', !!resolvedAccessToken);
+  console.log('Ad Account ID:', effectiveAdAccountId);
+  console.log('Date range:', { startTime, endTime });
+  console.log('Meta API URL:', campaignCreateUrl);
+
   if (useLifetimeBudget && !endTime) {
     throw buildStageErrorWithDetails(
       'Ad set creation',
@@ -1585,6 +1863,7 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId }) => {
       },
       accessToken: resolvedAccessToken
     });
+    console.log('Meta API response:', createdCampaign);
   } catch (error) {
     throw buildStageError('Campaign creation', error);
   }
@@ -2001,7 +2280,7 @@ const syncCampaignAnalyticsRecord = async (campaign) => {
   return campaign;
 };
 
-const createMetaCampaignFromCrud = async ({ userId, name, objective, status }) => {
+const createMetaCampaignFromCrud = async ({ userId, name, objective, status, accessToken }) => {
   const accessContext = await ensureConnectedMetaUser(userId, 'Campaign creation');
   const effectiveAdAccountId = accessContext.connection?.selectedAdAccountId;
 
@@ -2032,7 +2311,7 @@ const createMetaCampaignFromCrud = async ({ userId, name, objective, status }) =
         status: String(status || 'PAUSED').toUpperCase() === 'ACTIVE' ? 'ACTIVE' : 'PAUSED',
         special_ad_categories: []
       },
-      accessToken: accessContext.accessToken
+      accessToken: String(accessToken || accessContext.accessToken || '').trim()
     });
 
     return {
@@ -2061,6 +2340,7 @@ const parseTargetingCountriesFromCrud = (targeting) => {
 
 const createMetaAdStackFromCrud = async ({
   userId,
+  accessToken,
   campaignName,
   objective,
   dailyBudget,
@@ -2092,6 +2372,7 @@ const createMetaAdStackFromCrud = async ({
 }) => {
   const env = getEnvConfig();
   const accessContext = await ensureConnectedMetaUser(userId, 'Campaign creation');
+  const resolvedAccessToken = String(accessToken || accessContext.accessToken || '').trim();
   const normalizedStatus = String(status || '').trim().toUpperCase() === 'ACTIVE' ? 'ACTIVE' : 'PAUSED';
   const allowedOptimizationGoals = getAllowedOptimizationGoalsForCrudObjective(objective);
   const normalizedOptimizationGoal = String(optimizationGoal || '').trim().toUpperCase();
@@ -2140,16 +2421,16 @@ const createMetaAdStackFromCrud = async ({
   const interestTerms = parseDelimitedTerms(interests);
   const behaviorTerms = parseDelimitedTerms(behaviors);
   const [resolvedInterests, resolvedBehaviors] = await Promise.all([
-    interestTerms.length
+        interestTerms.length
       ? resolveMetaTargetingEntries({
-          accessToken: accessContext.accessToken,
+          accessToken: resolvedAccessToken,
           terms: interestTerms,
           type: 'adinterest'
         })
       : Promise.resolve([]),
     behaviorTerms.length
       ? resolveMetaTargetingEntries({
-          accessToken: accessContext.accessToken,
+          accessToken: resolvedAccessToken,
           terms: behaviorTerms,
           type: 'adTargetingCategory',
           extraParams: { class: 'behaviors' }
@@ -2186,6 +2467,7 @@ const createMetaAdStackFromCrud = async ({
 
   const stack = await createFullAdStack({
     userId,
+    accessToken: resolvedAccessToken,
     creativeUpload,
     campaign: {
       campaignName,
@@ -3062,6 +3344,10 @@ module.exports = {
   getSetupBundle,
   getConnectionDiagnostics,
   getAdAccountBillingSummary,
+  verifyMetaAdsManagementPermission,
+  createMetaCampaignInAdsManager,
+  fetchMetaCampaignsFromAdsManager,
+  deleteMetaCampaignInAdsManager,
   exchangeCodeForAccessToken,
   getLoginDialogUrl,
   saveUserConnection,
