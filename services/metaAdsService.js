@@ -492,7 +492,8 @@ const createMetaCampaignInAdsManager = async ({ name, objective, adAccountId, ac
         name: String(name || 'Campaign').trim(),
         objective: mapCrudObjectiveToMetaObjective(objective),
         status: 'PAUSED',
-        special_ad_categories: []
+        special_ad_categories: [],
+        is_adset_budget_sharing_enabled: false
       },
       accessToken: resolvedAccessToken,
       apiVersion: resolvedApiVersion
@@ -2002,7 +2003,8 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken
         name: campaign.campaignName,
         objective: deliveryObjective,
         status: initialDeliveryStatus,
-        special_ad_categories: []
+        special_ad_categories: [],
+        is_adset_budget_sharing_enabled: false
       },
       accessToken: resolvedAccessToken
     });
