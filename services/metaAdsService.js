@@ -17,12 +17,16 @@ const normalizeAdAccountId = (value) => {
   const collapsed = raw.replace(/^(?:act_)+/i, '');
   return collapsed ? `act_${collapsed}` : '';
 };
+const normalizeAdAccountIdForPath = (value) => {
+  const canonical = normalizeAdAccountId(value);
+  return canonical.replace(/^act_/i, '');
+};
 const summarizePage = (page) => ({
   id: String(page?.id || '').trim(),
   name: String(page?.name || '').trim()
 });
 const buildAdAccountPath = (adAccountId, resource = '') => {
-  const normalizedId = normalizeAdAccountId(adAccountId);
+  const normalizedId = normalizeAdAccountIdForPath(adAccountId);
   const cleanResource = String(resource || '').replace(/^\/+/, '');
   return cleanResource ? `act_${normalizedId}/${cleanResource}` : `act_${normalizedId}`;
 };
