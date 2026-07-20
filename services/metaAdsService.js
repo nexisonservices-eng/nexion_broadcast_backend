@@ -11,7 +11,12 @@ const metaCreativeService = require('./metaCreativeService');
 const { GRAPH_BASE_URL, decryptMetaToken, encryptMetaToken } = metaAuthService;
 
 const normalizeArray = (value) => (Array.isArray(value) ? value.filter(Boolean) : []);
-const normalizeAdAccountId = (value) => String(value || '').replace(/^act_/i, '');
+const normalizeAdAccountId = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const collapsed = raw.replace(/^(?:act_)+/i, '');
+  return collapsed ? `act_${collapsed}` : '';
+};
 const summarizePage = (page) => ({
   id: String(page?.id || '').trim(),
   name: String(page?.name || '').trim()
@@ -93,16 +98,39 @@ const parseDelimitedTerms = (value) =>
 
 const getEnvConfig = () => getMetaAdsConfig();
 
+const requireCanonicalMetaAdAccountId = (value, stage = 'Campaign creation') => {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    throw buildStageErrorWithDetails(
+      stage,
+      'Missing Meta ad account ID. Set META_AD_ACCOUNT_ID in the environment as act_XXXXXXXXXXXXXXX.',
+      { envVar: 'META_AD_ACCOUNT_ID' },
+      400
+    );
+  }
+
+  if (!/^act_[A-Za-z0-9]+$/i.test(raw)) {
+    throw buildStageErrorWithDetails(
+      stage,
+      'Invalid Meta ad account ID format. META_AD_ACCOUNT_ID must be in the form act_XXXXXXXXXXXXXXX and must not repeat the act_ prefix.',
+      { envVar: 'META_AD_ACCOUNT_ID', value: raw },
+      400
+    );
+  }
+
+  return raw;
+};
+
 const resolveMetaCampaignEnvConfig = () => {
   const env = getEnvConfig();
-  const adAccountId = String(env.adAccountId || '').trim().replace(/^act_/i, '');
+  const rawAdAccountId = String(env.rawAdAccountId || '').trim();
   const accessToken = String(env.accessToken || '').trim();
 
   return {
     apiVersion: String(env.apiVersion || 'v23.0').trim(),
     appId: String(env.appId || '').trim(),
     appSecret: String(env.appSecret || '').trim(),
-    adAccountId,
+    adAccountId: rawAdAccountId,
     accessToken
   };
 };
@@ -337,18 +365,9 @@ const createMetaCampaignInAdsManager = async ({ name, objective, adAccountId, ac
   }
 
   const env = resolveMetaCampaignEnvConfig();
-  const resolvedAdAccountId = String(adAccountId || env.adAccountId || '').trim().replace(/^act_/i, '');
+  const resolvedAdAccountId = requireCanonicalMetaAdAccountId(adAccountId || env.adAccountId, 'Campaign creation');
   const resolvedAccessToken = String(accessToken || env.accessToken || '').trim();
   const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v23.0').trim();
-
-  if (!resolvedAdAccountId) {
-    throw buildStageErrorWithDetails(
-      'Campaign creation',
-      'Missing Meta ad account ID. Set META_AD_ACCOUNT_ID or FACEBOOK_AD_ACCOUNT_ID in the environment.',
-      { envVar: 'META_AD_ACCOUNT_ID' },
-      400
-    );
-  }
 
   if (!resolvedAccessToken) {
     throw buildStageErrorWithDetails(
@@ -398,18 +417,9 @@ const fetchMetaCampaignsFromAdsManager = async ({ adAccountId, accessToken, apiV
   }
 
   const env = resolveMetaCampaignEnvConfig();
-  const resolvedAdAccountId = String(adAccountId || env.adAccountId || '').trim().replace(/^act_/i, '');
+  const resolvedAdAccountId = requireCanonicalMetaAdAccountId(adAccountId || env.adAccountId, 'Campaign sync');
   const resolvedAccessToken = String(accessToken || env.accessToken || '').trim();
   const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v23.0').trim();
-
-  if (!resolvedAdAccountId) {
-    throw buildStageErrorWithDetails(
-      'Campaign sync',
-      'Missing Meta ad account ID. Set META_AD_ACCOUNT_ID or FACEBOOK_AD_ACCOUNT_ID in the environment.',
-      { envVar: 'META_AD_ACCOUNT_ID' },
-      400
-    );
-  }
 
   if (!resolvedAccessToken) {
     throw buildStageErrorWithDetails(

@@ -7,6 +7,12 @@ const CANONICAL_META_OAUTH_REDIRECT_URI =
   'https://nexion-broadcast-backend-t4u8.onrender.com/api/meta-ads/oauth/callback';
 
 const normalizeUrl = (value) => String(value || '').trim().replace(/\/+$/, '');
+const normalizeMetaAdAccountId = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const collapsed = raw.replace(/^(?:act_)+/i, '');
+  return collapsed ? `act_${collapsed}` : '';
+};
 
 const parseNumber = (value, fallback) => {
   const parsed = Number(value);
@@ -23,11 +29,8 @@ const getMetaAdsConfig = () => {
       process.env.FACEBOOK_ACCESS_TOKEN ||
       ''
   ).trim();
-  const adAccountId = String(
-    process.env.META_AD_ACCOUNT_ID ||
-      process.env.FACEBOOK_AD_ACCOUNT_ID ||
-      ''
-  ).trim();
+  const rawAdAccountId = String(process.env.META_AD_ACCOUNT_ID || '').trim();
+  const adAccountId = normalizeMetaAdAccountId(rawAdAccountId);
   const configuredRedirectUri = normalizeUrl(
     process.env.META_REDIRECT_URI ||
       process.env.FACEBOOK_REDIRECT_URI ||
@@ -63,6 +66,7 @@ const getMetaAdsConfig = () => {
     appSecret,
     accessToken,
     adAccountId,
+    rawAdAccountId,
     redirectUri,
     tokenEncryptionKey,
     forceMock,
@@ -82,6 +86,11 @@ const validateMetaAdsEnv = ({ strict = false } = {}) => {
   if (!config.apiVersion) warnings.push('META_API_VERSION is missing.');
   if (!config.tokenEncryptionKey) warnings.push('META_TOKEN_ENCRYPTION_KEY or JWT_SECRET is missing.');
   if (!config.pixelId) warnings.push('META_PIXEL_ID is missing. Pixel conversion tracking will be disabled.');
+  if (!config.rawAdAccountId) {
+    warnings.push('META_AD_ACCOUNT_ID is missing. Use META_AD_ACCOUNT_ID=act_XXXXXXXXXXXXXXX.');
+  } else if (!/^act_[A-Za-z0-9]+$/i.test(config.rawAdAccountId)) {
+    warnings.push('META_AD_ACCOUNT_ID must be in the form act_XXXXXXXXXXXXXXX and must not repeat the act_ prefix.');
+  }
 
   if (strict && warnings.length) {
     const error = new Error(`Meta Ads configuration invalid: ${warnings.join(' ')}`);

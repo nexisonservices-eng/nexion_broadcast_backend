@@ -543,10 +543,7 @@ exports.createCampaign = async (req, res) => {
 
         const metaCampaign = await metaAdsService.createMetaCampaignInAdsManager({
             name: normalizedPayload.name,
-            objective: normalizedPayload.objective,
-            adAccountId: process.env.META_AD_ACCOUNT_ID || process.env.FACEBOOK_AD_ACCOUNT_ID || '',
-            accessToken: process.env.META_ACCESS_TOKEN || process.env.FACEBOOK_ACCESS_TOKEN || '',
-            apiVersion: process.env.META_API_VERSION || 'v23.0'
+            objective: normalizedPayload.objective
         });
 
         const metaCampaignId = String(metaCampaign?.id || '').trim();
@@ -563,7 +560,7 @@ exports.createCampaign = async (req, res) => {
 
         normalizedPayload.metaCampaignId = metaCampaignId;
         normalizedPayload.adAccountId =
-            String(metaCampaign?.adAccountId || process.env.META_AD_ACCOUNT_ID || process.env.FACEBOOK_AD_ACCOUNT_ID || '').trim();
+            String(metaCampaign?.adAccountId || process.env.META_AD_ACCOUNT_ID || '').trim();
         normalizedPayload.metaStatus = metaStatus;
         normalizedPayload.localStatus = localStatus;
         normalizedPayload.status = 'paused';
@@ -582,9 +579,7 @@ exports.createCampaign = async (req, res) => {
             if (metaCampaignId) {
                 try {
                     await metaAdsService.deleteMetaCampaignInAdsManager({
-                        campaignId: metaCampaignId,
-                        accessToken: process.env.META_ACCESS_TOKEN || process.env.FACEBOOK_ACCESS_TOKEN || '',
-                        apiVersion: process.env.META_API_VERSION || 'v23.0'
+                        campaignId: metaCampaignId
                     });
                 } catch (rollbackError) {
                     console.error('Failed to roll back Meta campaign after local save error:', rollbackError);
@@ -644,9 +639,7 @@ exports.createCampaign = async (req, res) => {
 exports.getMetaCampaigns = async (req, res) => {
     try {
         const campaigns = await metaAdsService.fetchMetaCampaignsFromAdsManager({
-            adAccountId: process.env.META_AD_ACCOUNT_ID || process.env.FACEBOOK_AD_ACCOUNT_ID || '',
-            accessToken: process.env.META_ACCESS_TOKEN || process.env.FACEBOOK_ACCESS_TOKEN || '',
-            apiVersion: process.env.META_API_VERSION || 'v23.0'
+            adAccountId: process.env.META_AD_ACCOUNT_ID || ''
         });
 
         res.status(200).json({
