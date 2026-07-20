@@ -68,7 +68,7 @@ const fetchMetaLead = async ({ userId, leadId }) => {
     throw error;
   }
 
-  const apiVersion = String(accessContext.apiVersion || 'v22.0').trim();
+  const apiVersion = String(accessContext.apiVersion || 'v23.0').trim();
   const response = await axios.get(`${GRAPH_BASE_URL}/${apiVersion}/${encodeURIComponent(leadId)}`, {
     params: {
       access_token: accessContext.accessToken,

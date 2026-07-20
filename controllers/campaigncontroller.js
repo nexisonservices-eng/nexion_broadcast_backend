@@ -541,9 +541,12 @@ exports.createCampaign = async (req, res) => {
             });
         }
 
+        const adAccountId = String(req.body?.adAccountId || normalizedPayload.adAccountId || '').trim();
         const metaCampaign = await metaAdsService.createMetaCampaignInAdsManager({
             name: normalizedPayload.name,
-            objective: normalizedPayload.objective
+            objective: normalizedPayload.objective,
+            adAccountId,
+            userId: req.user.id
         });
 
         const metaCampaignId = String(metaCampaign?.id || '').trim();
@@ -559,8 +562,7 @@ exports.createCampaign = async (req, res) => {
         }
 
         normalizedPayload.metaCampaignId = metaCampaignId;
-        normalizedPayload.adAccountId =
-            String(metaCampaign?.adAccountId || process.env.META_AD_ACCOUNT_ID || '').trim();
+        normalizedPayload.adAccountId = String(metaCampaign?.adAccountId || adAccountId || '').trim();
         normalizedPayload.metaStatus = metaStatus;
         normalizedPayload.localStatus = localStatus;
         normalizedPayload.status = 'paused';
@@ -639,7 +641,8 @@ exports.createCampaign = async (req, res) => {
 exports.getMetaCampaigns = async (req, res) => {
     try {
         const campaigns = await metaAdsService.fetchMetaCampaignsFromAdsManager({
-            adAccountId: process.env.META_AD_ACCOUNT_ID || ''
+            userId: req.user.id,
+            adAccountId: req.query?.adAccountId || req.body?.adAccountId || ''
         });
 
         res.status(200).json({

@@ -496,7 +496,7 @@ router.get('/adaccounts', auth, async (req, res) => {
     res.json({
       success: true,
       adAccounts,
-      selectedAdAccountId: setup.adAccountId || ''
+      selectedAdAccountId: setup.selectedAdAccountId || setup.adAccountId || ''
     });
   } catch (error) {
     res.status(error.status || 500).json({ success: false, error: error.message });

@@ -83,7 +83,7 @@ const getAccessContextForUser = async (userId) => {
   if (adminMetaConfig?.userAccessToken) {
     return {
       accessToken: adminMetaConfig.userAccessToken,
-      apiVersion: String(adminMetaConfig.apiVersion || env.apiVersion || 'v22.0').trim(),
+      apiVersion: String(adminMetaConfig.apiVersion || env.apiVersion || 'v23.0').trim(),
       source: 'admin',
       connection: {
         selectedAdAccountId: adminMetaConfig.adAccountId || '',
@@ -108,7 +108,7 @@ const getAccessContextForUser = async (userId) => {
 
 const exchangeCodeForAccessToken = async ({ code, redirectUri, appId, appSecret, apiVersion }) => {
   const env = getMetaAdsConfig();
-  const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v22.0').trim();
+  const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v23.0').trim();
   const resolvedAppId = String(appId || '').trim();
   const resolvedAppSecret = String(appSecret || '').trim();
   const resolvedRedirectUri = resolveMetaOAuthRedirectUri(redirectUri);
@@ -126,7 +126,7 @@ const exchangeCodeForAccessToken = async ({ code, redirectUri, appId, appSecret,
 
 const getLoginDialogUrl = ({ redirectUri, state, appId, apiVersion }) => {
   const env = getMetaAdsConfig();
-  const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v22.0').trim();
+  const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v23.0').trim();
   const resolvedAppId = String(appId || '').trim();
   const scopes = [
     'public_profile',

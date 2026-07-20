@@ -29,8 +29,6 @@ const getMetaAdsConfig = () => {
       process.env.FACEBOOK_ACCESS_TOKEN ||
       ''
   ).trim();
-  const rawAdAccountId = String(process.env.META_AD_ACCOUNT_ID || '').trim();
-  const adAccountId = normalizeMetaAdAccountId(rawAdAccountId);
   const configuredRedirectUri = normalizeUrl(
     process.env.META_REDIRECT_URI ||
       process.env.FACEBOOK_REDIRECT_URI ||
@@ -65,8 +63,6 @@ const getMetaAdsConfig = () => {
     appId,
     appSecret,
     accessToken,
-    adAccountId,
-    rawAdAccountId,
     redirectUri,
     tokenEncryptionKey,
     forceMock,
@@ -86,11 +82,6 @@ const validateMetaAdsEnv = ({ strict = false } = {}) => {
   if (!config.apiVersion) warnings.push('META_API_VERSION is missing.');
   if (!config.tokenEncryptionKey) warnings.push('META_TOKEN_ENCRYPTION_KEY or JWT_SECRET is missing.');
   if (!config.pixelId) warnings.push('META_PIXEL_ID is missing. Pixel conversion tracking will be disabled.');
-  if (!config.rawAdAccountId) {
-    warnings.push('META_AD_ACCOUNT_ID is missing. Use META_AD_ACCOUNT_ID=act_XXXXXXXXXXXXXXX.');
-  } else if (!/^act_[A-Za-z0-9]+$/i.test(config.rawAdAccountId)) {
-    warnings.push('META_AD_ACCOUNT_ID must be in the form act_XXXXXXXXXXXXXXX and must not repeat the act_ prefix.');
-  }
 
   if (strict && warnings.length) {
     const error = new Error(`Meta Ads configuration invalid: ${warnings.join(' ')}`);

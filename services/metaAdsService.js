@@ -105,37 +105,104 @@ const getEnvConfig = () => getMetaAdsConfig();
 const requireCanonicalMetaAdAccountId = (value, stage = 'Campaign creation') => {
   const raw = String(value || '').trim();
   if (!raw) {
+    const error = new Error('Please select a Meta Ad Account before creating a campaign.');
+    error.stage = stage;
+    error.status = 400;
+    throw error;
+  }
+
+  const collapsed = raw.replace(/^(?:act_)+/i, '');
+  if (!collapsed || !/^[A-Za-z0-9]+$/i.test(collapsed)) {
     throw buildStageErrorWithDetails(
       stage,
-      'Missing Meta ad account ID. Set META_AD_ACCOUNT_ID in the environment as act_XXXXXXXXXXXXXXX.',
-      { envVar: 'META_AD_ACCOUNT_ID' },
+      'Invalid Meta Ad Account ID. Please choose a valid ad account from your connected Meta accounts.',
+      { value: raw },
       400
     );
   }
 
-  if (!/^act_[A-Za-z0-9]+$/i.test(raw)) {
-    throw buildStageErrorWithDetails(
-      stage,
-      'Invalid Meta ad account ID format. META_AD_ACCOUNT_ID must be in the form act_XXXXXXXXXXXXXXX and must not repeat the act_ prefix.',
-      { envVar: 'META_AD_ACCOUNT_ID', value: raw },
-      400
-    );
-  }
-
-  return raw;
+  return `act_${collapsed}`;
 };
 
 const resolveMetaCampaignEnvConfig = () => {
   const env = getEnvConfig();
-  const rawAdAccountId = String(env.rawAdAccountId || '').trim();
   const accessToken = String(env.accessToken || '').trim();
 
   return {
     apiVersion: String(env.apiVersion || 'v23.0').trim(),
     appId: String(env.appId || '').trim(),
     appSecret: String(env.appSecret || '').trim(),
-    adAccountId: rawAdAccountId,
     accessToken
+  };
+};
+
+const normalizeMetaAdAccountRecord = (account = {}) => ({
+  ...account,
+  id: toCanonicalAdAccountId(account?.id),
+  name: String(account?.name || '').trim(),
+  accountStatus: account?.account_status ?? account?.accountStatus ?? null,
+  currency: String(account?.currency || '').trim(),
+  amountSpent: Number(account?.amount_spent || account?.amountSpent || 0) || 0
+});
+
+const resolveMetaAdAccountSelection = async ({
+  userId,
+  adAccountId,
+  accessToken,
+  apiVersion,
+  stage = 'Campaign creation'
+} = {}) => {
+  const userAccessContext = userId ? await getAccessContextForUser(userId) : null;
+  const accessContext = {
+    ...(userAccessContext || {}),
+    accessToken: String(accessToken || userAccessContext?.accessToken || '').trim(),
+    apiVersion: String(apiVersion || userAccessContext?.apiVersion || getEnvConfig().apiVersion || 'v23.0').trim()
+  };
+
+  const resolvedAccessToken = String(accessContext.accessToken || '').trim();
+  const resolvedApiVersion = String(accessContext.apiVersion || apiVersion || getEnvConfig().apiVersion || 'v23.0').trim();
+  const requestedAdAccountId = toCanonicalAdAccountId(adAccountId);
+  const savedAdAccountId = toCanonicalAdAccountId(accessContext?.connection?.selectedAdAccountId || '');
+  const selectedAdAccountId = requestedAdAccountId || savedAdAccountId;
+
+  if (!selectedAdAccountId) {
+    const error = new Error('Please select a Meta Ad Account before creating a campaign.');
+    error.stage = stage;
+    error.details = { userId: String(userId || '') };
+    error.status = 400;
+    throw error;
+  }
+
+  const availableAdAccounts = await getUserAdAccounts({
+    userId,
+    accessToken: resolvedAccessToken,
+    apiVersion: resolvedApiVersion
+  });
+  const matchedAccount = availableAdAccounts.find(
+    (account) => toCanonicalAdAccountId(account?.id || '') === selectedAdAccountId
+  );
+
+  if (!matchedAccount) {
+    throw buildStageErrorWithDetails(
+      stage,
+      'The selected Meta Ad Account is not available for this connected Meta user.',
+      {
+        adAccountId: selectedAdAccountId,
+        availableAdAccounts: availableAdAccounts.map((account) => ({
+          id: account.id,
+          name: account.name
+        }))
+      },
+      400
+    );
+  }
+
+  return {
+    accessToken: resolvedAccessToken,
+    apiVersion: resolvedApiVersion,
+    selectedAdAccountId,
+    availableAdAccounts,
+    accessContext
   };
 };
 
@@ -356,7 +423,7 @@ const verifyMetaAdsManagementPermission = async ({ accessToken, appId, appSecret
 
 const getAccessContextForUser = async (userId) => metaAuthService.getAccessContextForUser(userId);
 
-const createMetaCampaignInAdsManager = async ({ name, objective, adAccountId, accessToken, apiVersion } = {}) => {
+const createMetaCampaignInAdsManager = async ({ name, objective, adAccountId, accessToken, apiVersion, userId } = {}) => {
   if (shouldUseMockMode()) {
     return {
       apiMode: 'mock',
@@ -369,9 +436,16 @@ const createMetaCampaignInAdsManager = async ({ name, objective, adAccountId, ac
   }
 
   const env = resolveMetaCampaignEnvConfig();
-  const resolvedAdAccountId = requireCanonicalMetaAdAccountId(adAccountId || env.adAccountId, 'Campaign creation');
-  const resolvedAccessToken = String(accessToken || env.accessToken || '').trim();
-  const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v23.0').trim();
+  const accountSelection = await resolveMetaAdAccountSelection({
+    userId,
+    adAccountId,
+    accessToken: accessToken || env.accessToken,
+    apiVersion: apiVersion || env.apiVersion,
+    stage: 'Campaign creation'
+  });
+  const resolvedAdAccountId = accountSelection.selectedAdAccountId;
+  const resolvedAccessToken = String(accountSelection.accessToken || env.accessToken || '').trim();
+  const resolvedApiVersion = String(accountSelection.apiVersion || env.apiVersion || 'v23.0').trim();
 
   if (!resolvedAccessToken) {
     throw buildStageErrorWithDetails(
@@ -407,6 +481,7 @@ const createMetaCampaignInAdsManager = async ({ name, objective, adAccountId, ac
     return {
       apiMode: 'live',
       adAccountId: toCanonicalAdAccountId(resolvedAdAccountId),
+      availableAdAccounts: accountSelection.availableAdAccounts,
       metaStatus: String(response?.status || 'PAUSED').trim().toUpperCase() || 'PAUSED',
       ...response
     };
@@ -415,15 +490,22 @@ const createMetaCampaignInAdsManager = async ({ name, objective, adAccountId, ac
   }
 };
 
-const fetchMetaCampaignsFromAdsManager = async ({ adAccountId, accessToken, apiVersion, limit = 100 } = {}) => {
+const fetchMetaCampaignsFromAdsManager = async ({ adAccountId, accessToken, apiVersion, limit = 100, userId } = {}) => {
   if (shouldUseMockMode()) {
     return [];
   }
 
   const env = resolveMetaCampaignEnvConfig();
-  const resolvedAdAccountId = requireCanonicalMetaAdAccountId(adAccountId || env.adAccountId, 'Campaign sync');
-  const resolvedAccessToken = String(accessToken || env.accessToken || '').trim();
-  const resolvedApiVersion = String(apiVersion || env.apiVersion || 'v23.0').trim();
+  const accountSelection = await resolveMetaAdAccountSelection({
+    userId,
+    adAccountId,
+    accessToken: accessToken || env.accessToken,
+    apiVersion: apiVersion || env.apiVersion,
+    stage: 'Campaign sync'
+  });
+  const resolvedAdAccountId = accountSelection.selectedAdAccountId;
+  const resolvedAccessToken = String(accountSelection.accessToken || env.accessToken || '').trim();
+  const resolvedApiVersion = String(accountSelection.apiVersion || env.apiVersion || 'v23.0').trim();
 
   if (!resolvedAccessToken) {
     throw buildStageErrorWithDetails(
@@ -680,9 +762,15 @@ const getSetupBundle = async ({ userId } = {}) => {
       mode: 'mock',
       connected: true,
       adAccountId: connection?.selectedAdAccountId || 'act_mock_account',
+      selectedAdAccountId: toCanonicalAdAccountId(connection?.selectedAdAccountId || 'act_mock_account'),
       pageId: connection?.selectedPageId || 'mock-page',
+      selectedPageId: connection?.selectedPageId || 'mock-page',
       selectedWhatsappNumber: connection?.selectedWhatsappNumber || '',
+      linkedWhatsappNumber: connection?.selectedWhatsappNumber || '',
       pages: [
+        { id: connection?.selectedPageId || '615785750230178', name: 'Technovo Demo Page' }
+      ],
+      availablePages: [
         { id: connection?.selectedPageId || '615785750230178', name: 'Technovo Demo Page' }
       ],
       businesses: [
@@ -691,7 +779,13 @@ const getSetupBundle = async ({ userId } = {}) => {
       adAccounts: [
         { id: connection?.selectedAdAccountId || 'act_mock_account', name: 'Technovo Demo Ad Account' }
       ],
+      availableAdAccounts: [
+        { id: toCanonicalAdAccountId(connection?.selectedAdAccountId || 'act_mock_account'), name: 'Technovo Demo Ad Account' }
+      ],
       whatsappNumbers: [
+        { id: 'mock-waba-1', display_phone_number: connection?.selectedWhatsappNumber || '+91 98765 43210' }
+      ],
+      availableWhatsappNumbers: [
         { id: 'mock-waba-1', display_phone_number: connection?.selectedWhatsappNumber || '+91 98765 43210' }
       ]
     };
@@ -708,12 +802,18 @@ const getSetupBundle = async ({ userId } = {}) => {
       mode: 'disconnected',
       connected: false,
       adAccountId: '',
+      selectedAdAccountId: '',
       pageId: '',
+      selectedPageId: '',
       selectedWhatsappNumber: '',
+      linkedWhatsappNumber: '',
       pages: [],
+      availablePages: [],
       businesses: [],
       adAccounts: [],
+      availableAdAccounts: [],
       whatsappNumbers: [],
+      availableWhatsappNumbers: [],
       setupError,
       authSource: accessContext?.source || 'none',
       profileName: ''
@@ -736,7 +836,7 @@ const getSetupBundle = async ({ userId } = {}) => {
     }),
     graphRequest({
       path: 'me/adaccounts',
-      params: { fields: 'id,name,account_status,currency,timezone_name' },
+      params: { fields: 'id,name,account_status,currency,amount_spent' },
       accessToken: accessContext.accessToken
     }),
     savedSelection.selectedPageId
@@ -766,7 +866,7 @@ const getSetupBundle = async ({ userId } = {}) => {
 
   const adAccounts =
     adAccountsResult.status === 'fulfilled' && Array.isArray(adAccountsResult.value?.data)
-      ? adAccountsResult.value.data
+      ? adAccountsResult.value.data.map(normalizeMetaAdAccountRecord)
       : [];
   if (adAccountsResult.status === 'rejected') {
     warnings.push(`Ad accounts: ${extractApiErrorMessage(adAccountsResult.reason)}`);
@@ -783,11 +883,7 @@ const getSetupBundle = async ({ userId } = {}) => {
     (requestedPageId && accessiblePageIds.has(requestedPageId) ? requestedPageId : '') ||
     fallbackAccessiblePageId ||
     '';
-  const selectedAdAccountId =
-    savedSelection.selectedAdAccountId ||
-    accessContext?.adminMetaConfig?.adAccountId ||
-    adAccounts[0]?.id ||
-    '';
+  const selectedAdAccountId = toCanonicalAdAccountId(savedSelection.selectedAdAccountId || '');
   let whatsappNumbers = [];
 
   if (pageDetailsResult.status === 'fulfilled' && pageDetailsResult.value) {
@@ -880,14 +976,20 @@ const getSetupBundle = async ({ userId } = {}) => {
       mode: warnings.length ? 'live-partial' : 'live',
       connected: true,
       adAccountId: selectedAdAccountId,
+      selectedAdAccountId,
       pageId: selectedPageId,
+      selectedPageId,
       selectedPageName,
       pageAccessReady: Boolean(selectedPageAccessToken),
       selectedWhatsappNumber: savedSelection.selectedWhatsappNumber || whatsappNumbers[0]?.display_phone_number || '',
+      linkedWhatsappNumber: savedSelection.selectedWhatsappNumber || whatsappNumbers[0]?.display_phone_number || '',
       pages: pages.map(summarizePage),
+      availablePages: pages.map(summarizePage),
       businesses,
       adAccounts,
+      availableAdAccounts: adAccounts,
       whatsappNumbers,
+      availableWhatsappNumbers: whatsappNumbers,
       setupError: warnings.join(' | '),
       authSource: accessContext.source,
       profileName: accessContext.connection?.name || ''
@@ -903,14 +1005,20 @@ const getSetupBundle = async ({ userId } = {}) => {
       mode: 'live-partial',
       connected: true,
       adAccountId: savedSelection.selectedAdAccountId || '',
+      selectedAdAccountId: toCanonicalAdAccountId(savedSelection.selectedAdAccountId || ''),
       pageId: savedSelection.selectedPageId || '',
+      selectedPageId: savedSelection.selectedPageId || '',
       selectedPageName: savedSelection.selectedPageName || '',
       pageAccessReady: Boolean(decryptMetaToken(savedSelection.selectedPageAccessToken || '')),
       selectedWhatsappNumber: savedSelection.selectedWhatsappNumber || '',
+      linkedWhatsappNumber: savedSelection.selectedWhatsappNumber || '',
       pages: pages.map(summarizePage),
+      availablePages: pages.map(summarizePage),
       businesses,
       adAccounts,
+      availableAdAccounts: adAccounts,
       whatsappNumbers,
+      availableWhatsappNumbers: whatsappNumbers,
       setupError: setupWarning,
       authSource: accessContext.source,
       profileName: accessContext.connection?.name || ''
@@ -1153,17 +1261,17 @@ const exchangeCodeForAccessToken = async ({ code, redirectUri, appId, appSecret,
 const getUserAdAccounts = async ({ userId } = {}) => {
   if (shouldUseMockMode()) {
     const setup = await getSetupBundle({ userId });
-    return setup.adAccounts || [];
+    return (setup.adAccounts || []).map(normalizeMetaAdAccountRecord);
   }
 
   const accessContext = await ensureConnectedMetaUser(userId, 'Meta account selection');
   const response = await graphRequest({
     path: 'me/adaccounts',
-    params: { fields: 'id,name,account_status,currency,timezone_name' },
+    params: { fields: 'id,name,account_status,currency,amount_spent' },
     accessToken: accessContext.accessToken
   });
 
-  return Array.isArray(response?.data) ? response.data : [];
+  return Array.isArray(response?.data) ? response.data.map(normalizeMetaAdAccountRecord) : [];
 };
 
 const mapMetaObjectiveToCrudObjective = (objective) => {
@@ -1582,7 +1690,7 @@ const saveUserSelections = async ({ userId, adAccountId, pageId, whatsappNumber 
   };
 
   if (adAccountId !== undefined) {
-    updates.selectedAdAccountId = String(adAccountId || '');
+    updates.selectedAdAccountId = toCanonicalAdAccountId(adAccountId);
   }
   if (pageId !== undefined) {
     const normalizedPageId = String(pageId || '').trim();
