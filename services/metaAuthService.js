@@ -130,12 +130,12 @@ const getLoginDialogUrl = ({ redirectUri, state, appId, apiVersion }) => {
   const resolvedAppId = String(appId || '').trim();
   const scopes = [
     'public_profile',
-    'email',
+   
     'business_management',
     'ads_management',
     'ads_read',
     'pages_read_engagement',
-    'pages_manage_metadata'
+    
   ].join(',');
   const resolvedRedirectUri = resolveMetaOAuthRedirectUri(redirectUri);
 
