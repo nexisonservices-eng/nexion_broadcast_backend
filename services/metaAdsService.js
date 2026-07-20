@@ -136,6 +136,16 @@ const resolveMetaCampaignEnvConfig = () => {
   };
 };
 
+const resolveMetaCampaignAuthConfig = (accessContext = {}) => {
+  const env = getEnvConfig();
+  const adminMetaConfig = accessContext?.adminMetaConfig || {};
+
+  return {
+    appId: String(adminMetaConfig.appId || env.appId || '').trim(),
+    appSecret: String(adminMetaConfig.appSecret || env.appSecret || '').trim()
+  };
+};
+
 const normalizeMetaAdAccountRecord = (account = {}) => ({
   ...account,
   id: toCanonicalAdAccountId(account?.id),
@@ -163,7 +173,14 @@ const resolveMetaAdAccountSelection = async ({
   const resolvedApiVersion = String(accessContext.apiVersion || apiVersion || getEnvConfig().apiVersion || 'v23.0').trim();
   const requestedAdAccountId = toCanonicalAdAccountId(adAccountId);
   const savedAdAccountId = toCanonicalAdAccountId(accessContext?.connection?.selectedAdAccountId || '');
-  const selectedAdAccountId = requestedAdAccountId || savedAdAccountId;
+
+  const availableAdAccounts = await getUserAdAccounts({
+    userId,
+    accessToken: resolvedAccessToken,
+    apiVersion: resolvedApiVersion
+  });
+  const firstAvailableAdAccountId = toCanonicalAdAccountId(availableAdAccounts[0]?.id || '');
+  const selectedAdAccountId = requestedAdAccountId || savedAdAccountId || firstAvailableAdAccountId;
 
   if (!selectedAdAccountId) {
     const error = new Error('Please select a Meta Ad Account before creating a campaign.');
@@ -173,11 +190,6 @@ const resolveMetaAdAccountSelection = async ({
     throw error;
   }
 
-  const availableAdAccounts = await getUserAdAccounts({
-    userId,
-    accessToken: resolvedAccessToken,
-    apiVersion: resolvedApiVersion
-  });
   const matchedAccount = availableAdAccounts.find(
     (account) => toCanonicalAdAccountId(account?.id || '') === selectedAdAccountId
   );
@@ -457,10 +469,11 @@ const createMetaCampaignInAdsManager = async ({ name, objective, adAccountId, ac
   }
 
   validateCrudObjective(objective);
+  const authConfig = resolveMetaCampaignAuthConfig(accountSelection.accessContext);
   await verifyMetaAdsManagementPermission({
     accessToken: resolvedAccessToken,
-    appId: env.appId,
-    appSecret: env.appSecret,
+    appId: authConfig.appId,
+    appSecret: authConfig.appSecret,
     apiVersion: resolvedApiVersion
   });
 
@@ -516,10 +529,11 @@ const fetchMetaCampaignsFromAdsManager = async ({ adAccountId, accessToken, apiV
     );
   }
 
+  const authConfig = resolveMetaCampaignAuthConfig(accountSelection.accessContext);
   await verifyMetaAdsManagementPermission({
     accessToken: resolvedAccessToken,
-    appId: env.appId,
-    appSecret: env.appSecret,
+    appId: authConfig.appId,
+    appSecret: authConfig.appSecret,
     apiVersion: resolvedApiVersion
   });
 
