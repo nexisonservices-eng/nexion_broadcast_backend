@@ -12,10 +12,11 @@ const { GRAPH_BASE_URL, decryptMetaToken, encryptMetaToken } = metaAuthService;
 
 const normalizeArray = (value) => (Array.isArray(value) ? value.filter(Boolean) : []);
 const normalizeAdAccountId = (value) => {
-  const raw = String(value || '').trim();
-  if (!raw) return '';
-  const collapsed = raw.replace(/^(?:act_)+/i, '');
-  return collapsed ? `act_${collapsed}` : '';
+  const raw = String(value || '')
+    .trim()
+    .replace(/^(?:act_)+/i, '');
+
+  return raw ? `act_${raw}` : '';
 };
 const normalizeAdAccountIdForPath = (value) => {
   const canonical = normalizeAdAccountId(value);
@@ -30,10 +31,7 @@ const buildAdAccountPath = (adAccountId, resource = '') => {
   const cleanResource = String(resource || '').replace(/^\/+/, '');
   return cleanResource ? `act_${normalizedId}/${cleanResource}` : `act_${normalizedId}`;
 };
-const toCanonicalAdAccountId = (value) => {
-  const normalizedId = normalizeAdAccountId(value);
-  return normalizedId ? `act_${normalizedId}` : '';
-};
+const toCanonicalAdAccountId = (value) => normalizeAdAccountId(value);
 
 const normalizeCountryToken = (value) =>
   String(value || '')
@@ -218,7 +216,16 @@ const resolveMetaAdAccountSelection = async ({
   };
 };
 
-const graphRequest = async ({ method = 'GET', path, params, data, headers, accessToken: overrideToken, apiVersion: overrideApiVersion }) => {
+const graphRequest = async ({
+  method = 'GET',
+  path,
+  params,
+  data,
+  headers,
+  accessToken: overrideToken,
+  apiVersion: overrideApiVersion,
+  returnResponse = false
+}) => {
   const { apiVersion } = getEnvConfig();
   const resolvedAccessToken = String(overrideToken || '').trim();
   if (!resolvedAccessToken) {
@@ -254,7 +261,7 @@ const graphRequest = async ({ method = 'GET', path, params, data, headers, acces
 
   try {
     const response = await axios(requestConfig);
-    return response.data;
+    return returnResponse ? response : response.data;
   } catch (error) {
     console.error(
       '[Meta API Error]',
@@ -276,6 +283,46 @@ const extractApiErrorMessage = (error) => {
     error?.response?.data?.message ||
     error?.message ||
     'Meta API request failed'
+  );
+};
+
+const normalizeMetaApiError = (error) => {
+  const metaError = error?.response?.data?.error || error?.response?.data || {};
+  const code = Number(metaError?.code);
+  const subcode = Number(metaError?.error_subcode);
+
+  return {
+    message: String(metaError?.message || error?.message || 'Meta API request failed'),
+    type: String(metaError?.type || ''),
+    code: Number.isFinite(code) ? code : null,
+    error_subcode: Number.isFinite(subcode) ? subcode : null,
+    fbtrace_id: String(metaError?.fbtrace_id || '')
+  };
+};
+
+const logMetaApiRequest = ({
+  stage,
+  endpoint,
+  adAccountId,
+  payload,
+  response,
+  error
+} = {}) => {
+  const metaError = normalizeMetaApiError(error);
+  console.log(
+    '[Meta API Request]',
+    JSON.stringify({
+      stage: String(stage || '').trim(),
+      endpoint: String(endpoint || '').trim(),
+      normalizedAdAccountId: normalizeAdAccountId(adAccountId),
+      requestPayload: payload || null,
+      httpStatus: response?.status ?? error?.response?.status ?? null,
+      metaResponse: response?.data ?? null,
+      metaErrorCode: metaError.code,
+      metaErrorSubcode: metaError.error_subcode,
+      metaErrorMessage: metaError.message,
+      fbtrace_id: metaError.fbtrace_id
+    })
   );
 };
 
@@ -340,6 +387,7 @@ const buildStageError = (stage, error) => {
   wrappedError.stage = stage;
   wrappedError.details = error?.response?.data || null;
   wrappedError.status = error?.response?.status || 500;
+  wrappedError.metaError = normalizeMetaApiError(error);
   return wrappedError;
 };
 
@@ -348,6 +396,7 @@ const buildStageErrorWithDetails = (stage, message, details, status = 400) => {
   wrappedError.stage = stage;
   wrappedError.details = details || null;
   wrappedError.status = status;
+  wrappedError.metaError = details?.metaError || null;
   return wrappedError;
 };
 
@@ -2488,6 +2537,8 @@ const parseTargetingCountriesFromCrud = (targeting) => {
 const createMetaAdStackFromCrud = async ({
   userId,
   accessToken,
+  adAccountId,
+  configuredPageId,
   campaignName,
   objective,
   dailyBudget,
@@ -2515,11 +2566,14 @@ const createMetaAdStackFromCrud = async ({
   videoUrl,
   videoFileBuffer,
   videoFileName,
-  status
+  status,
+  logMetaRequest
 }) => {
   const env = getEnvConfig();
   const accessContext = await ensureConnectedMetaUser(userId, 'Campaign creation');
   const resolvedAccessToken = String(accessToken || accessContext.accessToken || '').trim();
+  const resolvedAdAccountId = toCanonicalAdAccountId(adAccountId || accessContext.connection?.selectedAdAccountId || '');
+  const resolvedPageId = String(configuredPageId || accessContext.connection?.selectedPageId || '').trim();
   const normalizedStatus = String(status || '').trim().toUpperCase() === 'ACTIVE' ? 'ACTIVE' : 'PAUSED';
   const allowedOptimizationGoals = getAllowedOptimizationGoalsForCrudObjective(objective);
   const normalizedOptimizationGoal = String(optimizationGoal || '').trim().toUpperCase();
@@ -2527,13 +2581,12 @@ const createMetaAdStackFromCrud = async ({
     ? normalizedOptimizationGoal
     : getDefaultOptimizationGoalForCrudObjective(objective);
   const genders = [];
+  const partialData = {};
 
   if (String(gender || '').toLowerCase() === 'male') genders.push(1);
   if (String(gender || '').toLowerCase() === 'female') genders.push(2);
 
-  const configuredPageId = accessContext.connection?.selectedPageId;
-  const selectedAdAccountId = accessContext.connection?.selectedAdAccountId;
-  if (!configuredPageId) {
+  if (!resolvedPageId) {
     throw buildStageErrorWithDetails(
       'Campaign creation',
       'Select a Facebook Page for this user before publishing campaigns.',
@@ -2541,7 +2594,7 @@ const createMetaAdStackFromCrud = async ({
       400
     );
   }
-  if (!selectedAdAccountId) {
+  if (!resolvedAdAccountId) {
     throw buildStageErrorWithDetails(
       'Campaign creation',
       'Select a Meta ad account for this user before publishing campaigns.',
@@ -2549,6 +2602,7 @@ const createMetaAdStackFromCrud = async ({
       400
     );
   }
+
   const normalizedMediaType = String(mediaType || '').trim().toLowerCase() === 'video' ? 'video' : 'image';
   const parsedDailyBudget = Number(dailyBudget || 0);
   const parsedLifetimeBudget = Number(lifetimeBudget || 0);
@@ -2568,7 +2622,7 @@ const createMetaAdStackFromCrud = async ({
   const interestTerms = parseDelimitedTerms(interests);
   const behaviorTerms = parseDelimitedTerms(behaviors);
   const [resolvedInterests, resolvedBehaviors] = await Promise.all([
-        interestTerms.length
+    interestTerms.length
       ? resolveMetaTargetingEntries({
           accessToken: resolvedAccessToken,
           terms: interestTerms,
@@ -2591,7 +2645,7 @@ const createMetaAdStackFromCrud = async ({
     mediaUrl: normalizedMediaType === 'video' ? videoUrl : imageUrl,
     mediaType: normalizedMediaType,
     userId,
-    adAccountId: selectedAdAccountId
+    adAccountId: resolvedAdAccountId
   });
 
   if (normalizedMediaType === 'video' && !creativeUpload?.videoId) {
@@ -2612,67 +2666,272 @@ const createMetaAdStackFromCrud = async ({
     );
   }
 
-  const stack = await createFullAdStack({
-    userId,
-    accessToken: resolvedAccessToken,
-    creativeUpload,
-    campaign: {
-      campaignName,
-      objective: mapCrudObjectiveToMetaObjective(objective),
-      status: normalizedStatus,
-      platform: ['facebook', 'instagram', 'both'].includes(String(platform || '').toLowerCase())
-        ? String(platform || '').toLowerCase()
-        : 'both',
-      configuredPageId,
-      budget: {
-        dailyBudget: Math.max(0, Number(resolvedDailyBudget || 0)),
-        lifetimeBudget: Math.max(0, Number(resolvedLifetimeBudget || 0)),
-        currency: 'INR'
-      },
-      targeting: {
-        countries: parseTargetingCountriesFromCrud(targeting),
-        ageMin: Math.max(13, Number(ageMin || 18)),
-        ageMax: Math.min(65, Number(ageMax || 65)),
-        genders,
-        interests: resolvedInterests,
-        behaviors: resolvedBehaviors
-      },
+  const campaignPayload = {
+    name: String(campaignName || 'Campaign').trim(),
+    objective: mapCrudObjectiveToMetaObjective(objective),
+    status: normalizedStatus,
+    special_ad_categories: [],
+    is_adset_budget_sharing_enabled: false
+  };
+  const campaignPath = buildAdAccountPath(resolvedAdAccountId, 'campaigns');
+
+  let createdCampaignResponse;
+  try {
+    createdCampaignResponse = await graphRequest({
+      method: 'POST',
+      path: campaignPath,
+      data: campaignPayload,
+      accessToken: resolvedAccessToken,
+      returnResponse: true
+    });
+    logMetaRequest?.({
+      stage: 'campaign',
+      endpoint: campaignPath,
+      adAccountId: resolvedAdAccountId,
+      payload: campaignPayload,
+      response: createdCampaignResponse
+    });
+  } catch (error) {
+    logMetaRequest?.({
+      stage: 'campaign',
+      endpoint: campaignPath,
+      adAccountId: resolvedAdAccountId,
+      payload: campaignPayload,
+      error
+    });
+    const wrappedError = buildStageError('Campaign creation', error);
+    wrappedError.partialData = partialData;
+    throw wrappedError;
+  }
+
+  const createdCampaign = createdCampaignResponse?.data || {};
+  partialData.metaCampaignId = String(createdCampaign.id || '').trim();
+  partialData.campaignStatus = String(createdCampaign.status || createdCampaign.effective_status || normalizedStatus || 'PAUSED')
+    .trim()
+    .toUpperCase() || 'PAUSED';
+  if (!partialData.metaCampaignId) {
+    const wrappedError = buildStageErrorWithDetails(
+      'Campaign creation',
+      'Meta campaign creation did not return a campaign ID.',
+      { partialData },
+      502
+    );
+    wrappedError.partialData = partialData;
+    throw wrappedError;
+  }
+
+  const adSetPayload = {
+    name: `${String(campaignName || 'Campaign').trim()} - Ad Set`,
+    campaign_id: partialData.metaCampaignId,
+    ...(resolvedLifetimeBudget > 0 ? { lifetime_budget: Math.max(1, Math.round(resolvedLifetimeBudget * 100)) } : { daily_budget: Math.max(1, Math.round(resolvedDailyBudget * 100)) }),
+    billing_event: 'IMPRESSIONS',
+    optimization_goal: resolvedOptimizationGoal,
+    bid_strategy: String(bidStrategy || env.bidStrategy || 'LOWEST_COST_WITHOUT_CAP').trim().toUpperCase(),
+    ...(env.bidAmount && Number.isFinite(Number(env.bidAmount)) && Number(env.bidAmount) > 0
+      ? { bid_amount: Math.round(Number(env.bidAmount)) }
+      : {}),
+    targeting: buildTargeting({
+      countries: parseTargetingCountriesFromCrud(targeting),
+      ageMin: Math.max(13, Number(ageMin || 18)),
+      ageMax: Math.min(65, Number(ageMax || 65)),
+      genders,
+      interests: resolvedInterests,
+      behaviors: resolvedBehaviors,
+      customAudienceIds: []
+    }),
+    status: normalizedStatus,
+    start_time: startDate ? new Date(startDate).toISOString() : new Date().toISOString(),
+    ...(endDate ? { end_time: new Date(endDate).toISOString() } : {}),
+    promoted_object: /^https?:\/\//i.test(String(destinationUrl || ''))
+      ? { page_id: resolvedPageId }
+      : undefined,
+    is_adset_budget_sharing_enabled: false
+  };
+
+  Object.keys(adSetPayload).forEach((key) => adSetPayload[key] === undefined && delete adSetPayload[key]);
+
+  const adSetPath = buildAdAccountPath(resolvedAdAccountId, 'adsets');
+  let createdAdSetResponse;
+  try {
+    createdAdSetResponse = await graphRequest({
+      method: 'POST',
+      path: adSetPath,
+      data: adSetPayload,
+      accessToken: resolvedAccessToken,
+      returnResponse: true
+    });
+    logMetaRequest?.({
+      stage: 'adset',
+      endpoint: adSetPath,
+      adAccountId: resolvedAdAccountId,
+      payload: adSetPayload,
+      response: createdAdSetResponse
+    });
+  } catch (error) {
+    logMetaRequest?.({
+      stage: 'adset',
+      endpoint: adSetPath,
+      adAccountId: resolvedAdAccountId,
+      payload: adSetPayload,
+      error
+    });
+    const wrappedError = buildStageError('Ad set creation', error);
+    wrappedError.partialData = partialData;
+    throw wrappedError;
+  }
+
+  const createdAdSet = createdAdSetResponse?.data || {};
+  partialData.metaAdSetId = String(createdAdSet.id || '').trim();
+  partialData.adSetStatus = String(createdAdSet.status || createdAdSet.effective_status || normalizedStatus || 'PAUSED')
+    .trim()
+    .toUpperCase() || 'PAUSED';
+  if (!partialData.metaAdSetId) {
+    const wrappedError = buildStageErrorWithDetails(
+      'Ad set creation',
+      'Meta ad set creation did not return an ad set ID.',
+      { partialData },
+      502
+    );
+    wrappedError.partialData = partialData;
+    throw wrappedError;
+  }
+
+  let createdCreative;
+  try {
+    const creativePageContext = await metaCreativeService.resolveCreativePageContext({
+      requestedPageId: resolvedPageId,
+      accessToken: resolvedAccessToken,
+      graphRequest,
+      env,
+      buildStageErrorWithDetails
+    });
+
+    createdCreative = await metaCreativeService.createCreative({
+      campaignName: String(campaignName || 'Campaign').trim(),
       creative: {
-        primaryText: String(primaryText || campaignName).trim(),
-        headline: String(headline || campaignName).trim(),
+        primaryText: String(primaryText || campaignName || '').trim(),
+        headline: String(headline || campaignName || '').trim(),
         description: String(description || '').trim(),
         callToAction: String(callToAction || 'LEARN_MORE').trim().toUpperCase(),
-        mediaType: normalizedMediaType,
-        mediaUrl:
-          creativeUpload.mediaUrl ||
-          (normalizedMediaType === 'video' ? videoUrl : imageUrl) ||
-          '',
-        mediaHash: creativeUpload.mediaHash,
-        videoId: creativeUpload.videoId || ''
+        mediaType: normalizedMediaType
       },
-      schedule: {
-        startTime: startDate || undefined,
-        endTime: endDate || undefined
+      creativeUpload,
+      configuredPageId: creativePageContext.pageId,
+      pageAccessToken: String(creativePageContext.pageAccessToken || '').trim(),
+      instagramActorId: undefined,
+      destinationUrl: String(destinationUrl || '').trim() || `https://www.facebook.com/${creativePageContext.pageId}`,
+      sanitizedWhatsappNumber: '',
+      adAccountId: resolvedAdAccountId,
+      accessToken: resolvedAccessToken,
+      graphRequest,
+      buildAdAccountPath,
+      buildStageErrorWithDetails,
+      extractApiErrorMessage,
+      creativePageContext: {
+        requestedPageId: creativePageContext.requestedPageId,
+        pageId: creativePageContext.pageId,
+        pageName: creativePageContext.pageName,
+        pageAccessToken: creativePageContext.pageAccessToken,
+        accessiblePages: creativePageContext.accessiblePages
       },
-      metaOverrides: {
-        optimizationGoal: resolvedOptimizationGoal,
-        bidStrategy: String(bidStrategy || env.bidStrategy || 'LOWEST_COST_WITHOUT_CAP')
-          .trim()
-          .toUpperCase(),
-        destinationUrl: String(destinationUrl || '').trim()
-      }
-    }
-  });
+      logMetaRequest
+    });
+  } catch (error) {
+    logMetaRequest?.({
+      stage: 'creative',
+      endpoint: buildAdAccountPath(resolvedAdAccountId, 'adcreatives'),
+      adAccountId: resolvedAdAccountId,
+      payload: {
+        name: `${String(campaignName || 'Campaign').trim()} - Creative`
+      },
+      error
+    });
+    const wrappedError = error?.stage ? error : buildStageError('Creative creation', error);
+    wrappedError.partialData = partialData;
+    throw wrappedError;
+  }
+
+  if (!createdCreative?.id) {
+    const wrappedError = buildStageErrorWithDetails(
+      'Creative creation',
+      'Meta creative creation did not return a creative ID.',
+      { partialData },
+      400
+    );
+    wrappedError.partialData = partialData;
+    throw wrappedError;
+  }
+
+  partialData.metaCreativeId = String(createdCreative.id || '').trim();
+
+  const adPayload = {
+    name: `${String(campaignName || 'Campaign').trim()} - Ad`,
+    adset_id: partialData.metaAdSetId,
+    creative: { creative_id: partialData.metaCreativeId },
+    status: normalizedStatus
+  };
+  const adPath = buildAdAccountPath(resolvedAdAccountId, 'ads');
+
+  let createdAdResponse;
+  try {
+    createdAdResponse = await graphRequest({
+      method: 'POST',
+      path: adPath,
+      data: adPayload,
+      accessToken: resolvedAccessToken,
+      returnResponse: true
+    });
+    logMetaRequest?.({
+      stage: 'ad',
+      endpoint: adPath,
+      adAccountId: resolvedAdAccountId,
+      payload: adPayload,
+      response: createdAdResponse
+    });
+  } catch (error) {
+    logMetaRequest?.({
+      stage: 'ad',
+      endpoint: adPath,
+      adAccountId: resolvedAdAccountId,
+      payload: adPayload,
+      error
+    });
+    const wrappedError = buildStageError('Ad creation', error);
+    wrappedError.partialData = partialData;
+    throw wrappedError;
+  }
+
+  const createdAd = createdAdResponse?.data || {};
+  partialData.metaAdId = String(createdAd.id || '').trim();
+  partialData.adStatus = String(createdAd.status || createdAd.effective_status || normalizedStatus || 'PAUSED')
+    .trim()
+    .toUpperCase() || 'PAUSED';
+
+  if (!partialData.metaAdId) {
+    const wrappedError = buildStageErrorWithDetails(
+      'Ad creation',
+      'Meta ad was created but its id could not be resolved from the API response.',
+      { partialData },
+      400
+    );
+    wrappedError.partialData = partialData;
+    throw wrappedError;
+  }
 
   return {
-    ...stack,
-    imageHash: creativeUpload.mediaHash,
-    videoId: creativeUpload.videoId || '',
-    mediaType: normalizedMediaType,
-    status: normalizedStatus,
-    destinationUrl:
-      String(destinationUrl || stack.destinationUrl || `https://www.facebook.com/${configuredPageId || ''}`).trim(),
-    pageId: configuredPageId || ''
+    apiMode: 'live',
+    adAccountId: resolvedAdAccountId,
+    campaignId: partialData.metaCampaignId,
+    adSetId: partialData.metaAdSetId,
+    creativeId: partialData.metaCreativeId,
+    adId: partialData.metaAdId,
+    campaignStatus: partialData.campaignStatus,
+    adSetStatus: partialData.adSetStatus,
+    adStatus: partialData.adStatus,
+    mediaHash: creativeUpload?.mediaHash || '',
+    videoId: creativeUpload?.videoId || '',
+    destinationUrl: String(destinationUrl || '').trim() || `https://www.facebook.com/${resolvedPageId}`,
+    pageId: resolvedPageId
   };
 };
 

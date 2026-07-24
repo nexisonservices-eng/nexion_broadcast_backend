@@ -27,6 +27,20 @@ const buildCreativeDestination = ({ whatsappNumber, pageId }) => {
   };
 };
 
+const normalizeMetaApiError = (error) => {
+  const metaError = error?.response?.data?.error || error?.response?.data || {};
+  const code = Number(metaError?.code);
+  const subcode = Number(metaError?.error_subcode);
+
+  return {
+    message: String(metaError?.message || error?.message || 'Meta API request failed'),
+    type: String(metaError?.type || ''),
+    code: Number.isFinite(code) ? code : null,
+    error_subcode: Number.isFinite(subcode) ? subcode : null,
+    fbtrace_id: String(metaError?.fbtrace_id || '')
+  };
+};
+
 const summarizePage = (page) => ({
   id: String(page?.id || '').trim(),
   name: String(page?.name || '').trim()
@@ -271,7 +285,8 @@ const createCreative = async ({
   buildAdAccountPath,
   buildStageErrorWithDetails,
   extractApiErrorMessage,
-  creativePageContext
+  creativePageContext,
+  logMetaRequest
 }) => {
   const requestedCtaType = String(creative?.callToAction || 'WHATSAPP_MESSAGE').trim();
   const effectiveCtaType =
@@ -343,18 +358,37 @@ const createCreative = async ({
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const endpoint = buildAdAccountPath(adAccountId, 'adcreatives');
+    const requestPayload = {
+      name: `${campaignName} - Creative`,
+      object_story_spec: objectStorySpec
+    };
+
     try {
-      return await graphRequest({
+      const response = await graphRequest({
         method: 'POST',
-        path: buildAdAccountPath(adAccountId, 'adcreatives'),
-        data: {
-          name: `${campaignName} - Creative`,
-          object_story_spec: objectStorySpec
-        },
-        accessToken: String(pageAccessToken || accessToken || '').trim()
+        path: endpoint,
+        data: requestPayload,
+        accessToken: String(pageAccessToken || accessToken || '').trim(),
+        returnResponse: true
       });
+      logMetaRequest?.({
+        stage: 'creative',
+        endpoint,
+        adAccountId,
+        payload: requestPayload,
+        response
+      });
+      return response.data;
     } catch (error) {
       lastError = error;
+      logMetaRequest?.({
+        stage: 'creative',
+        endpoint,
+        adAccountId,
+        payload: requestPayload,
+        error
+      });
       if (attempt >= maxAttempts || !isVideoProcessingError(error)) {
         break;
       }

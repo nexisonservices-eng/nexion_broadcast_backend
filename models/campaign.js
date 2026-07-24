@@ -277,9 +277,19 @@ const campaignSchema = new mongoose.Schema({
         type: String,
         sparse: true
     },
+    metaAdSetStatus: {
+        type: String,
+        trim: true,
+        default: ''
+    },
     metaAdId: {
         type: String,
         sparse: true
+    },
+    metaAdStatus: {
+        type: String,
+        trim: true,
+        default: ''
     },
     metaCreativeId: {
         type: String,

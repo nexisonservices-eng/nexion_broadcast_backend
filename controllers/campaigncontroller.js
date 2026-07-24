@@ -91,6 +91,28 @@ const sendMetaError = (res, metaError, fallbackMessage) =>
     metaStage: metaError.stage || null
   });
 
+const normalizeMetaApiError = (error) => {
+    const metaError = error?.metaError || error?.details?.metaError || error?.response?.data?.error || error?.details?.error || {};
+    const code = Number(metaError?.code);
+    const subcode = Number(metaError?.error_subcode);
+
+    return {
+        message: String(metaError?.message || error?.message || 'Meta API request failed'),
+        type: String(metaError?.type || ''),
+        code: Number.isFinite(code) ? code : null,
+        error_subcode: Number.isFinite(subcode) ? subcode : null,
+        fbtrace_id: String(metaError?.fbtrace_id || '')
+    };
+};
+
+const normalizeMetaStage = (stage) => {
+    const normalized = String(stage || '').trim().toLowerCase();
+    if (normalized.includes('ad set')) return 'adset';
+    if (normalized.includes('creative')) return 'creative';
+    if (normalized.includes('ad')) return 'ad';
+    return 'campaign';
+};
+
 const META_CAMPAIGN_OBJECTIVES = new Set(['awareness', 'traffic', 'engagement', 'leads', 'sales', 'catalog']);
 const META_CAMPAIGN_LOCAL_STATUSES = new Set(['draft', 'active', 'paused', 'ended', 'archived']);
 
@@ -541,47 +563,119 @@ exports.createCampaign = async (req, res) => {
             });
         }
 
-        const adAccountId = String(req.body?.adAccountId || normalizedPayload.adAccountId || '').trim();
-        const metaCampaign = await metaAdsService.createMetaCampaignInAdsManager({
-            name: normalizedPayload.name,
-            objective: normalizedPayload.objective,
-            adAccountId,
-            userId: req.user.id
-        });
+        const setupBundle = await metaAdsService.getSetupBundle({ userId: req.user.id });
+        const adAccountId = String(
+            req.body?.adAccountId ||
+            normalizedPayload.adAccountId ||
+            setupBundle?.adAccountId ||
+            setupBundle?.selectedAdAccountId ||
+            ''
+        ).trim();
+        const configuredPageId = String(
+            req.body?.configuredPageId ||
+            req.body?.pageId ||
+            normalizedPayload.configuredPageId ||
+            setupBundle?.pageId ||
+            setupBundle?.selectedPageId ||
+            ''
+        ).trim();
+        const requestMetaAccessToken = String(
+            req.body?.metaAccessToken ||
+            req.body?.accessToken ||
+            req.headers['x-meta-access-token'] ||
+            ''
+        ).trim();
 
-        const metaCampaignId = String(metaCampaign?.id || '').trim();
-        const metaStatus = String(metaCampaign?.metaStatus || metaCampaign?.status || 'PAUSED').trim().toUpperCase() || 'PAUSED';
-        const localStatus = 'created';
+        const metaValidationErrors = [];
+        if (!adAccountId) metaValidationErrors.push('adAccountId is required');
+        if (!normalizedPayload.name) metaValidationErrors.push('campaign name is required');
+        if (!normalizedPayload.objective) metaValidationErrors.push('objective is required');
+        if (!normalizedPayload.startDate) metaValidationErrors.push('start date is required');
+        if (!normalizedPayload.targeting) metaValidationErrors.push('targeting is required');
+        if (!normalizedPayload.primaryText) metaValidationErrors.push('primary text is required');
+        if (!normalizedPayload.headline) metaValidationErrors.push('headline is required');
+        if (!normalizedPayload.destinationUrl) metaValidationErrors.push('destination URL is required');
+        if (!normalizedPayload.callToAction) metaValidationErrors.push('call-to-action is required');
+        if (!configuredPageId && !setupBundle?.pageAccessReady) metaValidationErrors.push('page ID is required');
+        if (!normalizedPayload.imageUrl && !normalizedPayload.videoUrl) metaValidationErrors.push('image or video is required');
 
-        if (!metaCampaignId) {
-            return res.status(502).json({
+        if (metaValidationErrors.length > 0) {
+            return res.status(400).json({
                 success: false,
-                message: 'Meta campaign creation did not return a campaign ID.',
-                details: metaCampaign || null
+                message: 'Meta campaign validation failed',
+                errors: metaValidationErrors.map((message) => ({ message }))
             });
         }
 
-        normalizedPayload.metaCampaignId = metaCampaignId;
-        normalizedPayload.adAccountId = String(metaCampaign?.adAccountId || adAccountId || '').trim();
-        normalizedPayload.metaStatus = metaStatus;
-        normalizedPayload.localStatus = localStatus;
+        let metaResult;
+        try {
+            metaResult = await metaAdsService.createMetaAdStackFromCrud({
+                userId: req.user.id,
+                accessToken: requestMetaAccessToken,
+                adAccountId,
+                configuredPageId,
+                campaignName: normalizedPayload.name,
+                objective: normalizedPayload.objective,
+                dailyBudget: normalizedPayload.dailyBudget,
+                lifetimeBudget: normalizedPayload.lifetimeBudget,
+                startDate: normalizedPayload.startDate,
+                endDate: normalizedPayload.endDate,
+                platform: normalizedPayload.platform,
+                targeting: normalizedPayload.targeting,
+                ageMin: normalizedPayload.ageMin,
+                ageMax: normalizedPayload.ageMax,
+                gender: normalizedPayload.gender,
+                interests: normalizedPayload.interests,
+                behaviors: normalizedPayload.behaviors,
+                primaryText: normalizedPayload.primaryText,
+                headline: normalizedPayload.headline,
+                description: normalizedPayload.description,
+                destinationUrl: normalizedPayload.destinationUrl,
+                callToAction: normalizedPayload.callToAction,
+                optimizationGoal: normalizedPayload.optimizationGoal,
+                bidStrategy: normalizedPayload.bidStrategy,
+                mediaType: normalizedPayload.mediaType,
+                imageUrl: normalizedPayload.imageUrl,
+                videoUrl: normalizedPayload.videoUrl,
+                status: normalizedPayload.status
+            });
+        } catch (metaError) {
+            return res.status(metaError.status || 400).json({
+                success: false,
+                stage: normalizeMetaStage(metaError.stage),
+                message: 'Meta API request failed',
+                partialData: metaError.partialData || metaError.details?.partialData || {},
+                metaError: normalizeMetaApiError(metaError)
+            });
+        }
+
+        normalizedPayload.metaCampaignId = String(metaResult?.campaignId || '').trim();
+        normalizedPayload.metaAdSetId = String(metaResult?.adSetId || '').trim();
+        normalizedPayload.metaCreativeId = String(metaResult?.creativeId || '').trim();
+        normalizedPayload.metaAdId = String(metaResult?.adId || '').trim();
+        normalizedPayload.metaStatus = String(metaResult?.campaignStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED';
+        normalizedPayload.metaAdSetStatus = String(metaResult?.adSetStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED';
+        normalizedPayload.metaAdStatus = String(metaResult?.adStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED';
+        normalizedPayload.adAccountId = String(metaResult?.adAccountId || adAccountId || '').trim();
+        normalizedPayload.localStatus = 'created';
         normalizedPayload.status = 'paused';
-        normalizedPayload.lifecycleStatus = 'approved';
-        normalizedPayload.paymentStatus = 'verified';
-        normalizedPayload.reviewStatus = 'approved';
+        normalizedPayload.lifecycleStatus = 'pending_review';
+        normalizedPayload.reviewStatus = 'pending_review';
         normalizedPayload.deliveryStatus = 'paused';
-        normalizedPayload.publishedAt = new Date();
-        normalizedPayload.metaResponse = metaCampaign;
+        normalizedPayload.metaResponse = metaResult;
 
         // Create campaign
         let campaign;
         try {
             campaign = await Campaign.create(normalizedPayload);
         } catch (localSaveError) {
-            if (metaCampaignId) {
+            if (metaResult?.campaignId || metaResult?.adSetId || metaResult?.adId) {
                 try {
-                    await metaAdsService.deleteMetaCampaignInAdsManager({
-                        campaignId: metaCampaignId
+                    await metaAdsService.archiveMetaCrudAssets({
+                        userId: req.user.id,
+                        campaignId: metaResult?.campaignId,
+                        adSetId: metaResult?.adSetId,
+                        adId: metaResult?.adId
                     });
                 } catch (rollbackError) {
                     console.error('Failed to roll back Meta campaign after local save error:', rollbackError);
@@ -592,8 +686,16 @@ exports.createCampaign = async (req, res) => {
 
         res.status(201).json({
             success: true,
-            message: 'Campaign created successfully in Meta Ads Manager.',
-            data: serializeCampaignRecord(campaign)
+            message: 'Meta campaign, ad set, creative and ad created successfully.',
+            data: {
+                metaCampaignId: String(campaign.metaCampaignId || '').trim(),
+                metaAdSetId: String(campaign.metaAdSetId || '').trim(),
+                metaCreativeId: String(campaign.metaCreativeId || '').trim(),
+                metaAdId: String(campaign.metaAdId || '').trim(),
+                campaignStatus: String(campaign.metaStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
+                adSetStatus: String(campaign.metaAdSetStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
+                adStatus: String(campaign.metaAdStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED'
+            }
         });
     } catch (error) {
         console.error('Error creating campaign:', error);
