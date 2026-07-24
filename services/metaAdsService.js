@@ -14,6 +14,7 @@ const normalizeArray = (value) => (Array.isArray(value) ? value.filter(Boolean) 
 const normalizeAdAccountId = (value) => {
   const raw = String(value || '')
     .trim()
+    .replace(/\s+/g, '')
     .replace(/^(?:act_)+/i, '');
 
   return raw ? `act_${raw}` : '';

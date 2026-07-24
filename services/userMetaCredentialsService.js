@@ -38,12 +38,20 @@ const normalizeMetaConfig = (data) => {
   if (!data) return null;
 
   const trim = (value) => String(value || '').trim();
+  const normalizeAdAccountId = (value) => {
+    const raw = String(value || '')
+      .trim()
+      .replace(/\s+/g, '')
+      .replace(/^(?:act_)+/i, '');
+
+    return raw ? `act_${raw}` : '';
+  };
 
   const appId = trim(data.metaAppId || data.metaappid);
   const appSecret = trim(data.metaAppSecret || data.metaappsecret);
   const redirectUri = trim(data.metaRedirectUri || data.metaredirecturi);
   const userAccessToken = trim(data.metaUserAccessToken || data.metauseraccesstoken);
-  const adAccountId = trim(data.metaAdAccountId || data.metaadaccountid);
+  const adAccountId = normalizeAdAccountId(data.metaAdAccountId || data.metaadaccountid);
   const apiVersion = trim(data.metaApiVersion || data.metaapiversion || 'v23.0') || 'v23.0';
 
   return {

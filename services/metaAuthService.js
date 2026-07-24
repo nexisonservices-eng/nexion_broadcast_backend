@@ -9,6 +9,15 @@ const GRAPH_BASE_URL = 'https://graph.facebook.com';
 const FALLBACK_META_OAUTH_REDIRECT_URI =
   'https://nexion-broadcast-backend-t4u8.onrender.com/api/meta-ads/oauth/callback';
 
+const normalizeAdAccountId = (value) => {
+  const raw = String(value || '')
+    .trim()
+    .replace(/\s+/g, '')
+    .replace(/^(?:act_)+/i, '');
+
+  return raw ? `act_${raw}` : '';
+};
+
 const resolveMetaOAuthRedirectUri = (redirectUri) => {
   const canonicalRedirectUri =
     String(CANONICAL_META_OAUTH_REDIRECT_URI || '').trim() ||
@@ -86,7 +95,7 @@ const getAccessContextForUser = async (userId) => {
       apiVersion: String(adminMetaConfig.apiVersion || env.apiVersion || 'v23.0').trim(),
       source: 'admin',
       connection: {
-        selectedAdAccountId: adminMetaConfig.adAccountId || '',
+        selectedAdAccountId: normalizeAdAccountId(adminMetaConfig.adAccountId || ''),
         selectedPageId: '',
         selectedWhatsappNumber: ''
       },
