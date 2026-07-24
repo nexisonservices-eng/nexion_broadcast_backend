@@ -1862,6 +1862,21 @@ const buildPromotedObject = ({ objective, destinationUrl, pageId }) => {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const normalizeMetaScheduleTime = (value, boundary = 'start') => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+
+  if (boundary === 'end') {
+    date.setUTCHours(23, 59, 59, 999);
+  } else {
+    date.setUTCHours(0, 0, 0, 0);
+  }
+
+  return date.toISOString();
+};
+
 const resolveAdIdFromCreation = async ({
   createdAd,
   createdAdSetId,
@@ -2025,8 +2040,12 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken
     ? rawLifetimeBudget
     : (hasDailyBudget ? rawDailyBudget : 500);
   const budgetInMinorUnit = Math.max(1, Math.round(resolvedBudgetAmount * 100));
-  const startTime = campaign.schedule?.startTime ? new Date(campaign.schedule.startTime).toISOString() : new Date().toISOString();
-  const endTime = campaign.schedule?.endTime ? new Date(campaign.schedule.endTime).toISOString() : undefined;
+  const startTime = campaign.schedule?.startTime
+    ? normalizeMetaScheduleTime(campaign.schedule.startTime, 'start')
+    : new Date().toISOString();
+  const endTime = campaign.schedule?.endTime
+    ? normalizeMetaScheduleTime(campaign.schedule.endTime, 'end')
+    : undefined;
   const campaignCreateUrl = `${GRAPH_BASE_URL}/${env.apiVersion.replace(/^\/+/, '')}/${buildAdAccountPath(effectiveAdAccountId, 'campaigns')}`;
 
   console.log('Access token exists:', !!resolvedAccessToken);
@@ -2750,8 +2769,8 @@ const createMetaAdStackFromCrud = async ({
     bid_strategy: String(bidStrategy || env.bidStrategy || 'LOWEST_COST_WITHOUT_CAP').trim().toUpperCase(),
     targeting: simpleTargeting,
     status: normalizedStatus,
-    start_time: startDate ? new Date(startDate).toISOString() : new Date().toISOString(),
-    ...(endDate ? { end_time: new Date(endDate).toISOString() } : {})
+    start_time: startDate ? normalizeMetaScheduleTime(startDate, 'start') : new Date().toISOString(),
+    ...(endDate ? { end_time: normalizeMetaScheduleTime(endDate, 'end') } : {})
   };
 
   const normalizedObjective = String(objective || '').trim().toLowerCase();
