@@ -2742,7 +2742,10 @@ const createMetaAdStackFromCrud = async ({
       countries: parseTargetingCountriesFromCrud(targeting)
     },
     age_min: Math.max(13, Number(ageMin || 18)),
-    age_max: Math.min(65, Number(ageMax || 65))
+    age_max: Math.min(65, Number(ageMax || 65)),
+    targeting_automation: {
+      advantage_audience: env.advantageAudience === 1 ? 1 : 0
+    }
   };
 
   if (genders.length) {
