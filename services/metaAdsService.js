@@ -2720,6 +2720,29 @@ const createMetaAdStackFromCrud = async ({
     throw wrappedError;
   }
 
+  const simpleTargeting = {
+    geo_locations: {
+      countries: parseTargetingCountriesFromCrud(targeting)
+    },
+    age_min: Math.max(13, Number(ageMin || 18)),
+    age_max: Math.min(65, Number(ageMax || 65))
+  };
+
+  if (genders.length) {
+    simpleTargeting.genders = genders;
+  }
+
+  if (resolvedInterests.length || resolvedBehaviors.length) {
+    const flexibleSpec = {};
+    if (resolvedInterests.length) {
+      flexibleSpec.interests = resolvedInterests;
+    }
+    if (resolvedBehaviors.length) {
+      flexibleSpec.behaviors = resolvedBehaviors;
+    }
+    simpleTargeting.flexible_spec = [flexibleSpec];
+  }
+
   const adSetPayload = {
     name: `${String(campaignName || 'Campaign').trim()} - Ad Set`,
     campaign_id: partialData.metaCampaignId,
@@ -2727,15 +2750,7 @@ const createMetaAdStackFromCrud = async ({
     billing_event: 'IMPRESSIONS',
     optimization_goal: resolvedOptimizationGoal,
     bid_strategy: String(bidStrategy || env.bidStrategy || 'LOWEST_COST_WITHOUT_CAP').trim().toUpperCase(),
-    targeting: buildTargeting({
-      countries: parseTargetingCountriesFromCrud(targeting),
-      ageMin: Math.max(13, Number(ageMin || 18)),
-      ageMax: Math.min(65, Number(ageMax || 65)),
-      genders,
-      interests: resolvedInterests,
-      behaviors: resolvedBehaviors,
-      customAudienceIds: []
-    }),
+    targeting: simpleTargeting,
     status: normalizedStatus,
     start_time: startDate ? new Date(startDate).toISOString() : new Date().toISOString(),
     ...(endDate ? { end_time: new Date(endDate).toISOString() } : {}),
@@ -2746,8 +2761,6 @@ const createMetaAdStackFromCrud = async ({
   if (normalizedObjective === 'awareness') {
     adSetPayload.optimization_goal = 'REACH';
     adSetPayload.bid_strategy = 'LOWEST_COST_WITHOUT_CAP';
-    delete adSetPayload.promoted_object;
-    delete adSetPayload.bid_amount;
   } else {
     if (!['LOWEST_COST_WITHOUT_CAP', 'LOWEST_COST_WITH_BID_CAP'].includes(adSetPayload.bid_strategy)) {
       adSetPayload.bid_strategy = 'LOWEST_COST_WITHOUT_CAP';
