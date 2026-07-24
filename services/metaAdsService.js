@@ -2066,7 +2066,6 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken
     name: `${campaign.campaignName} - Ad Set`,
     campaign_id: createdCampaign.id,
     ...(useLifetimeBudget ? { lifetime_budget: budgetInMinorUnit } : { daily_budget: budgetInMinorUnit }),
-    is_adset_budget_sharing_enabled: false,
     billing_event: 'IMPRESSIONS',
     optimization_goal:
       campaign?.metaOverrides?.optimizationGoal ||
@@ -2112,7 +2111,6 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken
         name: `${campaign.campaignName} - Ad Set`,
         campaign_id: createdCampaign.id,
         ...(useLifetimeBudget ? { lifetime_budget: budgetInMinorUnit } : { daily_budget: budgetInMinorUnit }),
-        is_adset_budget_sharing_enabled: false,
         billing_event: 'IMPRESSIONS',
         optimization_goal: 'REACH',
         bid_strategy: 'LOWEST_COST_WITH_BID_CAP',
@@ -2753,8 +2751,7 @@ const createMetaAdStackFromCrud = async ({
     targeting: simpleTargeting,
     status: normalizedStatus,
     start_time: startDate ? new Date(startDate).toISOString() : new Date().toISOString(),
-    ...(endDate ? { end_time: new Date(endDate).toISOString() } : {}),
-    is_adset_budget_sharing_enabled: false
+    ...(endDate ? { end_time: new Date(endDate).toISOString() } : {})
   };
 
   const normalizedObjective = String(objective || '').trim().toLowerCase();
