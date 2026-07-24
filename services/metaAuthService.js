@@ -2,6 +2,7 @@ const axios = require('axios');
 const { getMetaAdsConfig, CANONICAL_META_OAUTH_REDIRECT_URI } = require('../config/metaAdsConfig');
 
 const MetaAdsConnection = require('../models/MetaAdsConnection');
+const User = require('../models/User');
 const { decryptMetaToken, encryptMetaToken } = require('../utils/metaTokenCrypto');
 const { getMetaConfigByUserId } = require('./userMetaCredentialsService');
 
@@ -16,6 +17,43 @@ const normalizeAdAccountId = (value) => {
     .replace(/^(?:act_)+/i, '');
 
   return raw ? `act_${raw}` : '';
+};
+
+const hasMetaAppCredentials = (metaConfig = {}) =>
+  Boolean(String(metaConfig?.appId || '').trim() && String(metaConfig?.appSecret || '').trim());
+
+const resolveMetaConfigFromHierarchy = async ({ userId, metaConfig } = {}) => {
+  if (hasMetaAppCredentials(metaConfig)) {
+    return metaConfig;
+  }
+
+  const visited = new Set();
+  let currentUserId = String(userId || '').trim();
+
+  while (currentUserId && !visited.has(currentUserId)) {
+    visited.add(currentUserId);
+
+    const directConfig = await getMetaConfigByUserId(currentUserId);
+    if (hasMetaAppCredentials(directConfig)) {
+      return directConfig;
+    }
+
+    let userDoc = null;
+    try {
+      userDoc = await User.findById(currentUserId).select('parentAdminId').lean();
+    } catch {
+      userDoc = null;
+    }
+
+    const parentAdminId = String(userDoc?.parentAdminId || '').trim();
+    if (!parentAdminId || visited.has(parentAdminId)) {
+      break;
+    }
+
+    currentUserId = parentAdminId;
+  }
+
+  return null;
 };
 
 const resolveMetaOAuthRedirectUri = (redirectUri) => {
@@ -76,7 +114,7 @@ const getAccessContextForUser = async (userId) => {
     }
   }
 
-  const adminMetaConfig = await getMetaConfigByUserId(userId);
+  const adminMetaConfig = await resolveMetaConfigFromHierarchy({ userId });
   const credentialOwnerUserId = String(adminMetaConfig?.credentialOwnerUserId || '').trim();
 
   if (credentialOwnerUserId && credentialOwnerUserId !== String(userId)) {
@@ -222,6 +260,8 @@ module.exports = {
   getLoginDialogUrl,
   saveUserConnection,
   ensureUserConnectionRecord,
+  resolveMetaConfigFromHierarchy,
+  hasMetaAppCredentials,
   encryptMetaToken,
   decryptMetaToken
 };

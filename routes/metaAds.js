@@ -6,10 +6,12 @@ const Campaign = require('../models/campaign');
 const MetaAdsTransaction = require('../models/MetaAdsTransaction');
 const MetaAdsWallet = require('../models/MetaAdsWallet');
 const MetaAdsConnection = require('../models/MetaAdsConnection');
+const User = require('../models/User');
 const Contact = require('../models/Contact');
 const metaAdsService = require('../services/metaAdsService');
 const { getMetaConfigForUser, getMetaConfigByUserId } = require('../services/userMetaCredentialsService');
 const { getWhatsAppCredentialsForUser } = require('../services/userWhatsAppCredentialsService');
+const { resolveMetaConfigFromHierarchy } = require('../services/metaAuthService');
 const whatsappService = require('../services/whatsappService');
 const { buildPhoneCandidates } = require('../services/whatsappOutreach/conversationResolver');
 const {
@@ -50,12 +52,51 @@ const getBackendOrigin = (req) =>
 const getMetaOAuthRedirectUri = () => {
   return String(CANONICAL_META_OAUTH_REDIRECT_URI || FALLBACK_META_OAUTH_REDIRECT_URI || '').trim();
 };
-const resolveMetaOAuthConfig = (metaConfig = null) => ({
-  appId: String(metaConfig?.appId || process.env.META_APP_ID || '').trim(),
-  appSecret: String(metaConfig?.appSecret || process.env.META_APP_SECRET || '').trim(),
+const normalizeMetaConfig = (metaConfig = null) => ({
+  appId: String(metaConfig?.appId || '').trim(),
+  appSecret: String(metaConfig?.appSecret || '').trim(),
   apiVersion: String(metaConfig?.apiVersion || process.env.META_API_VERSION || 'v23.0').trim(),
   credentialOwnerUserId: String(metaConfig?.credentialOwnerUserId || '').trim()
 });
+
+const resolveMetaOAuthConfig = (metaConfig = null) => normalizeMetaConfig(metaConfig);
+
+const resolveMetaConfigFromSuperAdmin = async ({ authHeader, userId }) => {
+  const directConfig = resolveMetaOAuthConfig(await getMetaConfigForUser({ authHeader }));
+  if (directConfig.appId && directConfig.appSecret) {
+    return directConfig;
+  }
+
+  const visited = new Set();
+  let currentUserId = String(userId || '').trim();
+
+  while (currentUserId && !visited.has(currentUserId)) {
+    visited.add(currentUserId);
+
+    const hierarchyConfig = resolveMetaOAuthConfig(
+      await resolveMetaConfigFromHierarchy({ userId: currentUserId })
+    );
+    if (hierarchyConfig.appId && hierarchyConfig.appSecret) {
+      return hierarchyConfig;
+    }
+
+    let userDoc = null;
+    try {
+      userDoc = await User.findById(currentUserId).select('parentAdminId').lean();
+    } catch {
+      userDoc = null;
+    }
+
+    const parentAdminId = String(userDoc?.parentAdminId || '').trim();
+    if (!parentAdminId || visited.has(parentAdminId)) {
+      break;
+    }
+
+    currentUserId = parentAdminId;
+  }
+
+  return directConfig;
+};
 
 const parseCsvEnv = (value, fallback = []) => {
   const parsed = String(value || '')
@@ -158,10 +199,10 @@ const parseSignedState = (state) => {
 
 const buildFacebookAuthUrl = async (req) => {
   const authHeader = req.headers.authorization || '';
-  const metaConfig = resolveMetaOAuthConfig(await getMetaConfigForUser({ authHeader }));
+  const metaConfig = await resolveMetaConfigFromSuperAdmin({ authHeader, userId: req.user.id });
   if (!metaConfig.appId || !metaConfig.appSecret) {
     const error = new Error(
-      'Meta App ID and Meta App Secret are missing. Configure them in admin credentials for this company admin, or set META_APP_ID and META_APP_SECRET in backend environment variables.'
+      'Meta App ID and Meta App Secret are missing for the superadmin credential chain.'
     );
     error.status = 400;
     throw error;
@@ -385,11 +426,11 @@ router.get('/oauth/callback', async (req, res) => {
     decodedUserId = String(decoded?.userId || '');
     const credentialLookupUserId = decoded.credentialOwnerUserId || decoded.userId;
     const metaConfig = resolveMetaOAuthConfig(
-      getCachedOAuthConfig(state) || (await getMetaConfigByUserId(credentialLookupUserId))
+      getCachedOAuthConfig(state) || (await resolveMetaConfigFromSuperAdmin({ userId: credentialLookupUserId }))
     );
     if (!metaConfig.appId || !metaConfig.appSecret) {
       throw new Error(
-        'Meta app credentials are not configured. Save Meta App ID and Meta App Secret for the company admin in the admin backend, or set META_APP_ID and META_APP_SECRET in backend env, then try reconnecting again.'
+        'Meta app credentials are not configured in the superadmin credential chain.'
       );
     }
 

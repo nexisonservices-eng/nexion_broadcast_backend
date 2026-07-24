@@ -136,12 +136,11 @@ const resolveMetaCampaignEnvConfig = () => {
 };
 
 const resolveMetaCampaignAuthConfig = (accessContext = {}) => {
-  const env = getEnvConfig();
   const adminMetaConfig = accessContext?.adminMetaConfig || {};
 
   return {
-    appId: String(adminMetaConfig.appId || env.appId || '').trim(),
-    appSecret: String(adminMetaConfig.appSecret || env.appSecret || '').trim()
+    appId: String(adminMetaConfig.appId || '').trim(),
+    appSecret: String(adminMetaConfig.appSecret || '').trim()
   };
 };
 
