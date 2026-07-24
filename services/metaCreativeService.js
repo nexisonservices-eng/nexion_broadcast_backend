@@ -369,7 +369,7 @@ const createCreative = async ({
         method: 'POST',
         path: endpoint,
         data: requestPayload,
-        accessToken: String(pageAccessToken || accessToken || '').trim(),
+        accessToken: String(accessToken || pageAccessToken || '').trim(),
         returnResponse: true
       });
       logMetaRequest?.({
