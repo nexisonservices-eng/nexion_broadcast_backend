@@ -2727,9 +2727,6 @@ const createMetaAdStackFromCrud = async ({
     billing_event: 'IMPRESSIONS',
     optimization_goal: resolvedOptimizationGoal,
     bid_strategy: String(bidStrategy || env.bidStrategy || 'LOWEST_COST_WITHOUT_CAP').trim().toUpperCase(),
-    ...(env.bidAmount && Number.isFinite(Number(env.bidAmount)) && Number(env.bidAmount) > 0
-      ? { bid_amount: Math.round(Number(env.bidAmount)) }
-      : {}),
     targeting: buildTargeting({
       countries: parseTargetingCountriesFromCrud(targeting),
       ageMin: Math.max(13, Number(ageMin || 18)),
@@ -2742,11 +2739,31 @@ const createMetaAdStackFromCrud = async ({
     status: normalizedStatus,
     start_time: startDate ? new Date(startDate).toISOString() : new Date().toISOString(),
     ...(endDate ? { end_time: new Date(endDate).toISOString() } : {}),
-    promoted_object: /^https?:\/\//i.test(String(destinationUrl || ''))
-      ? { page_id: resolvedPageId }
-      : undefined,
     is_adset_budget_sharing_enabled: false
   };
+
+  const normalizedObjective = String(objective || '').trim().toLowerCase();
+  if (normalizedObjective === 'awareness') {
+    adSetPayload.optimization_goal = 'REACH';
+    adSetPayload.bid_strategy = 'LOWEST_COST_WITHOUT_CAP';
+    delete adSetPayload.promoted_object;
+    delete adSetPayload.bid_amount;
+  } else {
+    if (!['LOWEST_COST_WITHOUT_CAP', 'LOWEST_COST_WITH_BID_CAP'].includes(adSetPayload.bid_strategy)) {
+      adSetPayload.bid_strategy = 'LOWEST_COST_WITHOUT_CAP';
+    }
+
+    if (adSetPayload.bid_strategy === 'LOWEST_COST_WITH_BID_CAP') {
+      const rawBidAmount = Number(env.bidAmount || 0);
+      if (Number.isFinite(rawBidAmount) && rawBidAmount > 0) {
+        adSetPayload.bid_amount = Math.round(rawBidAmount);
+      }
+    }
+
+    if (/^https?:\/\//i.test(String(destinationUrl || ''))) {
+      adSetPayload.promoted_object = { page_id: resolvedPageId };
+    }
+  }
 
   Object.keys(adSetPayload).forEach((key) => adSetPayload[key] === undefined && delete adSetPayload[key]);
 
@@ -2819,7 +2836,10 @@ const createMetaAdStackFromCrud = async ({
       configuredPageId: creativePageContext.pageId,
       pageAccessToken: String(creativePageContext.pageAccessToken || '').trim(),
       instagramActorId: undefined,
-      destinationUrl: String(destinationUrl || '').trim() || `https://www.facebook.com/${creativePageContext.pageId}`,
+      destinationUrl:
+        normalizedObjective === 'awareness'
+          ? `https://www.facebook.com/${creativePageContext.pageId}`
+          : (String(destinationUrl || '').trim() || `https://www.facebook.com/${creativePageContext.pageId}`),
       sanitizedWhatsappNumber: '',
       adAccountId: resolvedAdAccountId,
       accessToken: resolvedAccessToken,
