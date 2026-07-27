@@ -315,6 +315,31 @@ router.get('/overview', auth, async (req, res) => {
   }
 });
 
+router.get('/leads', auth, async (req, res) => {
+  try {
+    const pageId = String(req.query.pageId || req.query.page_id || '').trim();
+    const formId = String(req.query.formId || req.query.form_id || '').trim();
+    const limit = Number(req.query.limit || 25);
+    const leads = await metaAdsService.getPageLeads({
+      userId: req.user.id,
+      pageId,
+      formId,
+      limit
+    });
+
+    res.json({
+      success: true,
+      ...leads
+    });
+  } catch (error) {
+    res.status(error.status || 500).json({
+      success: false,
+      error: error.message,
+      details: error.details || null
+    });
+  }
+});
+
 router.get('/diagnostics', auth, async (req, res) => {
   try {
     const diagnostics = await metaAdsService.getConnectionDiagnostics({ userId: req.user.id });

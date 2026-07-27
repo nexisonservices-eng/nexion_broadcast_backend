@@ -52,6 +52,8 @@ const normalizeMetaConfig = (data) => {
   const redirectUri = trim(data.metaRedirectUri || data.metaredirecturi);
   const userAccessToken = trim(data.metaUserAccessToken || data.metauseraccesstoken);
   const adAccountId = normalizeAdAccountId(data.metaAdAccountId || data.metaadaccountid);
+  const leadFormId = trim(data.metaLeadFormId || data.metaleadformid);
+  const pageAccessToken = trim(data.metaPageAccessToken || data.metapageaccesstoken);
   const apiVersion = trim(data.metaApiVersion || data.metaapiversion || 'v23.0') || 'v23.0';
 
   return {
@@ -60,6 +62,8 @@ const normalizeMetaConfig = (data) => {
     redirectUri,
     userAccessToken,
     adAccountId,
+    leadFormId,
+    pageAccessToken,
     apiVersion,
     jwtSecret: trim(data.metaJwtSecret || data.metajwtsecret),
     credentialOwnerUserId: trim(data.credentialOwnerUserId || data.credentialowneruserid || data.userId || data.userid)
