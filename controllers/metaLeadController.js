@@ -1,8 +1,7 @@
 const axios = require('axios');
 
 const GRAPH_API_HOST = 'graph.facebook.com';
-const User = require('../models/User');
-const { getMetaConfigForUser, getMetaConfigByUserId } = require('../services/userMetaCredentialsService');
+const { getMetaConfigByUserId } = require('../services/userMetaCredentialsService');
 
 const normalizeText = (value) => String(value || '').trim();
 
@@ -34,44 +33,6 @@ const toBoolean = (value) => {
   if (typeof value === 'boolean') return value;
   const normalized = normalizeText(value).toLowerCase();
   return ['true', '1', 'yes', 'y'].includes(normalized);
-};
-
-const hasLeadConfig = (metaConfig = {}) =>
-  Boolean(normalizeText(metaConfig?.leadFormId) && normalizeText(metaConfig?.pageAccessToken));
-
-const resolveMetaLeadConfigFromHierarchy = async ({ authHeader = '', userId = '' } = {}) => {
-  const directConfig = normalizeMetaLeadConfig(await getMetaConfigForUser({ authHeader }));
-  if (hasLeadConfig(directConfig)) {
-    return directConfig;
-  }
-
-  const visited = new Set();
-  let currentUserId = normalizeText(userId);
-
-  while (currentUserId && !visited.has(currentUserId)) {
-    visited.add(currentUserId);
-
-    const hierarchyConfig = normalizeMetaLeadConfig(await getMetaConfigByUserId(currentUserId));
-    if (hasLeadConfig(hierarchyConfig)) {
-      return hierarchyConfig;
-    }
-
-    let userDoc = null;
-    try {
-      userDoc = await User.findById(currentUserId).select('parentAdminId').lean();
-    } catch {
-      userDoc = null;
-    }
-
-    const parentAdminId = normalizeText(userDoc?.parentAdminId);
-    if (!parentAdminId || visited.has(parentAdminId)) {
-      break;
-    }
-
-    currentUserId = parentAdminId;
-  }
-
-  return directConfig;
 };
 
 function normalizeMetaLeadConfig(metaConfig = {}) {
@@ -141,10 +102,7 @@ const fetchAllMetaLeads = async ({ formId, accessToken }) => {
 
 const getMetaLeads = async (req, res) => {
   try {
-    const metaConfig = await resolveMetaLeadConfigFromHierarchy({
-      authHeader: req.headers.authorization || '',
-      userId: req.user?.id || req.user?.userId || ''
-    });
+    const metaConfig = normalizeMetaLeadConfig(await getMetaConfigByUserId('superadmin-id'));
     const formId = normalizeText(metaConfig?.leadFormId);
     const accessToken = normalizeText(metaConfig?.pageAccessToken);
 
