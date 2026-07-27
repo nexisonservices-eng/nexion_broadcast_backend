@@ -102,14 +102,19 @@ const fetchAllMetaLeads = async ({ formId, accessToken }) => {
 
 const getMetaLeads = async (req, res) => {
   try {
-    const metaConfig = normalizeMetaLeadConfig(await getMetaConfigByUserId('superadmin-id'));
+    const adminId = normalizeText(req.query?.adminId);
+    const metaConfig = normalizeMetaLeadConfig(
+      await getMetaConfigByUserId(adminId || 'superadmin-id')
+    );
     const formId = normalizeText(metaConfig?.leadFormId);
     const accessToken = normalizeText(metaConfig?.pageAccessToken);
 
     if (!formId || !accessToken) {
       return res.status(400).json({
         success: false,
-        error: 'Lead form ID and page access token are missing from the superadmin Meta settings.'
+        error: adminId
+          ? 'Lead form ID and page access token are missing for the selected admin in Superadmin settings.'
+          : 'Lead form ID and page access token are missing from the superadmin Meta settings.'
       });
     }
 
