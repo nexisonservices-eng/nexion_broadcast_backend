@@ -102,11 +102,9 @@ const fetchAllMetaLeads = async ({ formId, accessToken }) => {
 
 const getMetaLeads = async (req, res) => {
   try {
-    const queryFormId = normalizeText(req.query?.formId);
-    const queryAccessToken = normalizeText(req.query?.pageAccessToken);
     const metaConfig = normalizeMetaLeadConfig(await getMetaConfigByUserId('superadmin-id'));
-    const formId = queryFormId || normalizeText(metaConfig?.leadFormId);
-    const accessToken = queryAccessToken || normalizeText(metaConfig?.pageAccessToken);
+    const formId = normalizeText(metaConfig?.leadFormId);
+    const accessToken = normalizeText(metaConfig?.pageAccessToken);
 
     if (!formId || !accessToken) {
       return res.status(400).json({
