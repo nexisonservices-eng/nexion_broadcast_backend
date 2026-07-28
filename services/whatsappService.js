@@ -250,19 +250,15 @@ const DEFAULT_COUNTRY_CODE = String(
 const normalizeWhatsAppPhone = (value = '') => {
   const rawValue = String(value || '').trim();
   const digits = rawValue.replace(/\D/g, '');
-  let normalizedPhone = rawValue.replace(/[^\d+]/g, '');
+  let normalizedPhone = digits;
 
   if (!normalizedPhone) return '';
 
-  if (normalizedPhone.startsWith('+')) {
-    return normalizedPhone;
-  }
-
   if (digits.length === 10 && DEFAULT_COUNTRY_CODE) {
-    return `+${DEFAULT_COUNTRY_CODE}${digits}`;
+    return `${DEFAULT_COUNTRY_CODE}${digits}`;
   }
 
-  return `+${digits || normalizedPhone}`;
+  return normalizedPhone;
 };
 
 const normalizeMetaSendError = (error, fallback = 'Failed to send WhatsApp message') => {
