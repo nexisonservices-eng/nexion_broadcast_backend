@@ -368,13 +368,28 @@ const getAllowedOptimizationGoalsForCrudObjective = (objective) => {
     case 'engagement':
       return ['POST_ENGAGEMENT', 'REACH', 'IMPRESSIONS'];
     case 'leads':
-      return ['LEADS', 'QUALITY_LEAD', 'CONVERSATIONS'];
+      return ['LEAD_GENERATION', 'QUALITY_LEAD', 'CONVERSATIONS'];
     case 'sales':
       return ['OFFSITE_CONVERSIONS', 'VALUE', 'LINK_CLICKS'];
     case 'awareness':
     default:
       return ['REACH', 'IMPRESSIONS'];
   }
+};
+
+const normalizeOptimizationGoalForCrudObjective = (objective, optimizationGoal) => {
+  const normalizedGoal = String(optimizationGoal || '').trim().toUpperCase();
+  const aliasMap = {
+    LEADS: 'LEAD_GENERATION'
+  };
+  const resolvedGoal = aliasMap[normalizedGoal] || normalizedGoal;
+  const allowedOptimizationGoals = getAllowedOptimizationGoalsForCrudObjective(objective);
+
+  if (allowedOptimizationGoals.includes(resolvedGoal)) {
+    return resolvedGoal;
+  }
+
+  return getDefaultOptimizationGoalForCrudObjective(objective);
 };
 
 const getDefaultOptimizationGoalForCrudObjective = (objective) => {
@@ -2636,11 +2651,7 @@ const createMetaAdStackFromCrud = async ({
   const resolvedAdAccountId = toCanonicalAdAccountId(adAccountId || accessContext.connection?.selectedAdAccountId || '');
   const resolvedPageId = String(configuredPageId || accessContext.connection?.selectedPageId || '').trim();
   const normalizedStatus = String(status || '').trim().toUpperCase() === 'ACTIVE' ? 'ACTIVE' : 'PAUSED';
-  const allowedOptimizationGoals = getAllowedOptimizationGoalsForCrudObjective(objective);
-  const normalizedOptimizationGoal = String(optimizationGoal || '').trim().toUpperCase();
-  const resolvedOptimizationGoal = allowedOptimizationGoals.includes(normalizedOptimizationGoal)
-    ? normalizedOptimizationGoal
-    : getDefaultOptimizationGoalForCrudObjective(objective);
+  const resolvedOptimizationGoal = normalizeOptimizationGoalForCrudObjective(objective, optimizationGoal);
   const genders = [];
   const partialData = {};
 
