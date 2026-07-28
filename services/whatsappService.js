@@ -241,12 +241,28 @@ const hasMediaHeaderParameter = (components = []) =>
     );
   });
 
+const DEFAULT_COUNTRY_CODE = String(
+  process.env.WHATSAPP_DEFAULT_COUNTRY_CODE || '91'
+)
+  .replace(/\D/g, '')
+  .trim();
+
 const normalizeWhatsAppPhone = (value = '') => {
-  let normalizedPhone = String(value || '').replace(/[^\d+]/g, '');
-  if (!normalizedPhone.startsWith('+')) {
-    normalizedPhone = '+' + normalizedPhone;
+  const rawValue = String(value || '').trim();
+  const digits = rawValue.replace(/\D/g, '');
+  let normalizedPhone = rawValue.replace(/[^\d+]/g, '');
+
+  if (!normalizedPhone) return '';
+
+  if (normalizedPhone.startsWith('+')) {
+    return normalizedPhone;
   }
-  return normalizedPhone;
+
+  if (digits.length === 10 && DEFAULT_COUNTRY_CODE) {
+    return `+${DEFAULT_COUNTRY_CODE}${digits}`;
+  }
+
+  return `+${digits || normalizedPhone}`;
 };
 
 const normalizeMetaSendError = (error, fallback = 'Failed to send WhatsApp message') => {
