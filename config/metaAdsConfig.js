@@ -4,7 +4,7 @@ const parseBoolean = (value, defaultValue = false) => {
 };
 
 const CANONICAL_META_OAUTH_REDIRECT_URI =
-  'https://nexion-broadcast-backend-t4u8.onrender.com/api/meta-ads/oauth/callback';
+  'https://nexion-broadcast-backend-1-hekx.onrender.com/api/meta-ads/oauth/callback';
 
 const normalizeUrl = (value) => String(value || '').trim().replace(/\/+$/, '');
 const normalizeMetaAdAccountId = (value) => {

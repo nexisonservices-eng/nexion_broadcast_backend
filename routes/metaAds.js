@@ -36,7 +36,7 @@ const OAUTH_STATE_CACHE_TTL_MS = 15 * 60 * 1000;
 const oauthStateConfigCache = new Map();
 const { CANONICAL_META_OAUTH_REDIRECT_URI } = require('../config/metaAdsConfig');
 const FALLBACK_META_OAUTH_REDIRECT_URI =
-  'https://nexion-broadcast-backend-t4u8.onrender.com/api/meta-ads/oauth/callback';
+  'https://nexion-broadcast-backend-1-hekx.onrender.com/api/meta-ads/oauth/callback';
 
 const normalizeOrigin = (value) => String(value || '').trim().replace(/\/+$/, '');
 const isSafeFrontendOrigin = (value) => /^https?:\/\/[^/\s]+$/i.test(normalizeOrigin(value));
