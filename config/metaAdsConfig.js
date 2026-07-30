@@ -3,39 +3,10 @@ const parseBoolean = (value, defaultValue = false) => {
   return String(value).trim().toLowerCase() === 'true' || String(value).trim() === '1';
 };
 
+const CANONICAL_META_OAUTH_REDIRECT_URI =
+  'https://nexion-broadcast-backend-1-hekx.onrender.com/api/meta-ads/oauth/callback';
+
 const normalizeUrl = (value) => String(value || '').trim().replace(/\/+$/, '');
-
-const resolvePublicBackendUrl = () =>
-  normalizeUrl(
-    process.env.PUBLIC_BACKEND_URL ||
-      process.env.BACKEND_PUBLIC_URL ||
-      process.env.BACKEND_URL ||
-      process.env.SERVICE_PUBLIC_URL ||
-      ''
-  );
-
-const resolveMetaOAuthRedirectUri = () => {
-  const explicitRedirectUri = normalizeUrl(
-    process.env.META_REDIRECT_URI ||
-      process.env.FACEBOOK_REDIRECT_URI ||
-      process.env.META_OAUTH_REDIRECT_URI ||
-      ''
-  );
-
-  if (explicitRedirectUri) {
-    return explicitRedirectUri;
-  }
-
-  const publicBackendUrl = resolvePublicBackendUrl();
-  if (publicBackendUrl) {
-    return `${publicBackendUrl}/api/meta-ads/oauth/callback`;
-  }
-
-  const port = String(process.env.PORT || 3001).trim();
-  return `http://localhost:${port}/api/meta-ads/oauth/callback`;
-};
-
-const CANONICAL_META_OAUTH_REDIRECT_URI = resolveMetaOAuthRedirectUri();
 const normalizeMetaAdAccountId = (value) => {
   const raw = String(value || '').trim();
   if (!raw) return '';

@@ -7,6 +7,8 @@ const { decryptMetaToken, encryptMetaToken } = require('../utils/metaTokenCrypto
 const { getMetaConfigByUserId } = require('./userMetaCredentialsService');
 
 const GRAPH_BASE_URL = 'https://graph.facebook.com';
+const FALLBACK_META_OAUTH_REDIRECT_URI =
+  'https://nexion-broadcast-backend-1-hekx.onrender.com/api/meta-ads/oauth/callback';
 
 const normalizeAdAccountId = (value) => {
   const raw = String(value || '')
@@ -57,7 +59,8 @@ const resolveMetaConfigFromHierarchy = async ({ userId, metaConfig } = {}) => {
 const resolveMetaOAuthRedirectUri = (redirectUri) => {
   const canonicalRedirectUri =
     String(CANONICAL_META_OAUTH_REDIRECT_URI || '').trim() ||
-    String(getMetaAdsConfig().redirectUri || '').trim();
+    String(getMetaAdsConfig().redirectUri || '').trim() ||
+    FALLBACK_META_OAUTH_REDIRECT_URI;
   const configuredRedirectUri = String(redirectUri || '').trim().replace(/\/+$/, '');
 
   if (configuredRedirectUri && configuredRedirectUri !== canonicalRedirectUri) {
