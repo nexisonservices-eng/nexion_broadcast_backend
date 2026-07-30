@@ -34,9 +34,7 @@ const {
 const router = express.Router();
 const OAUTH_STATE_CACHE_TTL_MS = 15 * 60 * 1000;
 const oauthStateConfigCache = new Map();
-const { CANONICAL_META_OAUTH_REDIRECT_URI } = require('../config/metaAdsConfig');
-const FALLBACK_META_OAUTH_REDIRECT_URI =
-  'https://nexion-broadcast-backend-1-hekx.onrender.com/api/meta-ads/oauth/callback';
+const { getCanonicalMetaOAuthRedirectUri } = require('../config/metaAdsConfig');
 
 const normalizeOrigin = (value) => String(value || '').trim().replace(/\/+$/, '');
 const isSafeFrontendOrigin = (value) => /^https?:\/\/[^/\s]+$/i.test(normalizeOrigin(value));
@@ -49,9 +47,7 @@ const escapeHtml = (value) =>
     .replace(/'/g, '&#39;');
 const getBackendOrigin = (req) =>
   normalizeOrigin(process.env.PUBLIC_BACKEND_URL) || `${req.protocol}://${req.get('host')}`;
-const getMetaOAuthRedirectUri = () => {
-  return String(CANONICAL_META_OAUTH_REDIRECT_URI || FALLBACK_META_OAUTH_REDIRECT_URI || '').trim();
-};
+const getMetaOAuthRedirectUri = () => String(getCanonicalMetaOAuthRedirectUri() || '').trim();
 const normalizeMetaConfig = (metaConfig = null) => ({
   appId: String(metaConfig?.appId || '').trim(),
   appSecret: String(metaConfig?.appSecret || '').trim(),
