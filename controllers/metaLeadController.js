@@ -3,6 +3,7 @@ const axios = require('axios');
 const GRAPH_API_HOST = 'graph.facebook.com';
 const Campaign = require('../models/campaign');
 const MetaAdCampaign = require('../models/MetaAdCampaign');
+const metaAdsService = require('../services/metaAdsService');
 const { getMetaConfigByUserId } = require('../services/userMetaCredentialsService');
 
 const normalizeText = (value) => String(value || '').trim();
@@ -103,7 +104,7 @@ const fetchAllMetaLeads = async ({ formId, accessToken }) => {
   return allLeads.map(formatLead);
 };
 
-const buildCampaignNameLookup = async ({ userId, campaignIds = [] } = {}) => {
+const buildCampaignNameLookup = async ({ userId, campaignIds = [], adAccountId = '', accessToken = '', apiVersion = '' } = {}) => {
   const lookup = new Map();
   const uniqueCampaignIds = Array.from(
     new Set(
@@ -152,6 +153,24 @@ const buildCampaignNameLookup = async ({ userId, campaignIds = [] } = {}) => {
     setLookup(campaign?.meta?.campaignId || campaign?.metaCampaignId, campaign?.campaignName);
   });
 
+  const unresolvedCampaignIds = uniqueCampaignIds.filter((campaignId) => !lookup.has(campaignId));
+  if (unresolvedCampaignIds.length && (adAccountId || accessToken)) {
+    try {
+      const remoteCampaigns = await metaAdsService.fetchMetaCampaignsFromAdsManager({
+        userId,
+        adAccountId,
+        accessToken,
+        apiVersion
+      });
+
+      remoteCampaigns.forEach((campaign) => {
+        setLookup(campaign?.id, campaign?.name);
+      });
+    } catch (error) {
+      console.warn('[Meta Leads] Failed to resolve campaign names from Meta Ads Manager:', error?.message || error);
+    }
+  }
+
   return lookup;
 };
 
@@ -183,7 +202,10 @@ const getMetaLeads = async (req, res) => {
     const leads = await fetchAllMetaLeads({ formId, accessToken });
     const campaignNameLookup = await buildCampaignNameLookup({
       userId,
-      campaignIds: leads.map((lead) => lead?.campaignId).filter(Boolean)
+      campaignIds: leads.map((lead) => lead?.campaignId).filter(Boolean),
+      adAccountId: metaConfig?.adAccountId || '',
+      accessToken: metaConfig?.userAccessToken || metaConfig?.pageAccessToken || accessToken,
+      apiVersion: metaConfig?.apiVersion || ''
     });
     const enrichedLeads = leads.map((lead) => {
       const campaignId = normalizeText(lead?.campaignId);
