@@ -1,6 +1,8 @@
 const axios = require('axios');
 
 const GRAPH_API_HOST = 'graph.facebook.com';
+const Campaign = require('../models/campaign');
+const MetaAdCampaign = require('../models/MetaAdCampaign');
 const { getMetaConfigByUserId } = require('../services/userMetaCredentialsService');
 
 const normalizeText = (value) => String(value || '').trim();
@@ -52,6 +54,7 @@ const formatLead = (lead = {}) => {
   return {
     leadId: normalizeText(lead?.id),
     createdTime: normalizeText(lead?.created_time),
+    campaignId: normalizeText(lead?.campaign_id),
     fullName,
     phoneNumber,
     email,
@@ -100,6 +103,58 @@ const fetchAllMetaLeads = async ({ formId, accessToken }) => {
   return allLeads.map(formatLead);
 };
 
+const buildCampaignNameLookup = async ({ userId, campaignIds = [] } = {}) => {
+  const lookup = new Map();
+  const uniqueCampaignIds = Array.from(
+    new Set(
+      (Array.isArray(campaignIds) ? campaignIds : [])
+        .map((campaignId) => normalizeText(campaignId))
+        .filter(Boolean)
+    )
+  );
+
+  if (!uniqueCampaignIds.length) {
+    return lookup;
+  }
+
+  const [localCampaigns, metaCampaigns] = await Promise.all([
+    Campaign.find({
+      createdBy: normalizeText(userId),
+      metaCampaignId: { $in: uniqueCampaignIds }
+    })
+      .select('name metaCampaignId')
+      .lean(),
+    MetaAdCampaign.find({
+      userId: normalizeText(userId),
+      $or: [
+        { 'meta.campaignId': { $in: uniqueCampaignIds } },
+        { metaCampaignId: { $in: uniqueCampaignIds } }
+      ]
+    })
+      .select('campaignName meta metaCampaignId')
+      .lean()
+  ]);
+
+  const setLookup = (campaignId, campaignName) => {
+    const normalizedCampaignId = normalizeText(campaignId);
+    const normalizedCampaignName = normalizeText(campaignName);
+    if (!normalizedCampaignId || !normalizedCampaignName || lookup.has(normalizedCampaignId)) {
+      return;
+    }
+    lookup.set(normalizedCampaignId, normalizedCampaignName);
+  };
+
+  localCampaigns.forEach((campaign) => {
+    setLookup(campaign?.metaCampaignId, campaign?.name);
+  });
+
+  metaCampaigns.forEach((campaign) => {
+    setLookup(campaign?.meta?.campaignId || campaign?.metaCampaignId, campaign?.campaignName);
+  });
+
+  return lookup;
+};
+
 const getMetaLeads = async (req, res) => {
   try {
     const userId = normalizeText(req.query?.userId || req.query?.adminId);
@@ -126,11 +181,34 @@ const getMetaLeads = async (req, res) => {
     }
 
     const leads = await fetchAllMetaLeads({ formId, accessToken });
+    const campaignNameLookup = await buildCampaignNameLookup({
+      userId,
+      campaignIds: leads.map((lead) => lead?.campaignId).filter(Boolean)
+    });
+    const enrichedLeads = leads.map((lead) => {
+      const campaignId = normalizeText(lead?.campaignId);
+      const campaignName = campaignNameLookup.get(campaignId) || '';
+
+      return {
+        ...lead,
+        campaignId,
+        campaign_id: campaignId,
+        campaign_name: campaignName,
+        campaignName
+      };
+    });
 
     return res.json({
       success: true,
-      count: leads.length,
-      leads
+      count: enrichedLeads.length,
+      leads: enrichedLeads,
+      campaigns: Array.from(
+        new Map(
+          enrichedLeads
+            .filter((lead) => normalizeText(lead?.campaignId) && normalizeText(lead?.campaign_name))
+            .map((lead) => [normalizeText(lead.campaignId), normalizeText(lead.campaign_name)])
+        ).entries()
+      ).map(([campaignId, campaignName]) => ({ campaignId, campaignName }))
     });
   } catch (error) {
     const metaError = error?.response?.data?.error || error?.response?.data || {};
