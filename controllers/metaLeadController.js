@@ -55,6 +55,8 @@ const formatLead = (lead = {}) => {
   return {
     leadId: normalizeText(lead?.id),
     createdTime: normalizeText(lead?.created_time),
+    adId: normalizeText(lead?.ad_id),
+    formId: normalizeText(lead?.form_id),
     campaignId: normalizeText(lead?.campaign_id),
     fullName,
     phoneNumber,
@@ -102,6 +104,38 @@ const fetchAllMetaLeads = async ({ formId, accessToken }) => {
   }
 
   return allLeads.map(formatLead);
+};
+
+const fetchCampaignFromAdId = async ({ adId, accessToken, apiVersion = '' } = {}) => {
+  const normalizedAdId = normalizeText(adId);
+  if (!normalizedAdId || !normalizeText(accessToken)) return null;
+
+  try {
+    const response = await axios.get(`https://${GRAPH_API_HOST}/${encodeURIComponent(normalizedAdId)}`, {
+      timeout: 30000,
+      params: {
+        access_token: accessToken,
+        fields: 'id,name,campaign{id,name},campaign_id'
+      }
+    });
+
+    const campaignId = normalizeText(
+      response?.data?.campaign?.id ||
+      response?.data?.campaign_id ||
+      ''
+    );
+    const campaignName = normalizeText(response?.data?.campaign?.name || response?.data?.name || '');
+
+    if (!campaignId && !campaignName) return null;
+    return {
+      adId: normalizedAdId,
+      campaignId,
+      campaignName
+    };
+  } catch (error) {
+    console.warn('[Meta Leads] Failed to resolve campaign from ad id:', normalizedAdId, error?.message || error);
+    return null;
+  }
 };
 
 const buildCampaignNameLookup = async ({ userId, campaignIds = [], adAccountId = '', accessToken = '', apiVersion = '' } = {}) => {
@@ -200,19 +234,39 @@ const getMetaLeads = async (req, res) => {
     }
 
     const leads = await fetchAllMetaLeads({ formId, accessToken });
+    const adCampaignLookups = await Promise.all(
+      leads
+        .map((lead) => normalizeText(lead?.campaignId) ? null : normalizeText(lead?.adId))
+        .filter(Boolean)
+        .map((adId) => fetchCampaignFromAdId({
+          adId,
+          accessToken: metaConfig?.userAccessToken || metaConfig?.pageAccessToken || accessToken,
+          apiVersion: metaConfig?.apiVersion || ''
+        }))
+    );
+
+    const adToCampaignMap = new Map();
+    adCampaignLookups.filter(Boolean).forEach((item) => {
+      if (!item?.adId) return;
+      adToCampaignMap.set(item.adId, item);
+    });
+
     const campaignNameLookup = await buildCampaignNameLookup({
       userId,
-      campaignIds: leads.map((lead) => lead?.campaignId).filter(Boolean),
+      campaignIds: leads.map((lead) => lead?.campaignId || adToCampaignMap.get(normalizeText(lead?.adId))?.campaignId).filter(Boolean),
       adAccountId: metaConfig?.adAccountId || '',
       accessToken: metaConfig?.userAccessToken || metaConfig?.pageAccessToken || accessToken,
       apiVersion: metaConfig?.apiVersion || ''
     });
     const enrichedLeads = leads.map((lead) => {
-      const campaignId = normalizeText(lead?.campaignId);
-      const campaignName = campaignNameLookup.get(campaignId) || '';
+      const adId = normalizeText(lead?.adId);
+      const adCampaign = adToCampaignMap.get(adId) || null;
+      const campaignId = normalizeText(lead?.campaignId || adCampaign?.campaignId);
+      const campaignName = campaignNameLookup.get(campaignId) || adCampaign?.campaignName || '';
 
       return {
         ...lead,
+        adId,
         campaignId,
         campaign_id: campaignId,
         campaign_name: campaignName,
