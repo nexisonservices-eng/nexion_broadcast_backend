@@ -154,6 +154,38 @@ const resolveBroadcastIdForStatusMessage = async (message = null) => {
   return String(dispatch?.broadcastId || '').trim();
 };
 
+const normalizeStatusTimestamp = (value = null) => {
+  const parsed = Number(value || 0);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return new Date(parsed * 1000);
+  }
+  return new Date();
+};
+
+const chooseMonotonicStatus = (currentStatus = '', nextStatus = '') => {
+  const current = String(currentStatus || '').trim().toLowerCase();
+  const next = String(nextStatus || '').trim().toLowerCase();
+
+  if (!next) return current;
+  if (!current) return next;
+  if (current === next) return current;
+  if (current === 'read' || current === 'failed') return current;
+  if (next === 'read') return 'read';
+  if (next === 'delivered') {
+    if (current === 'sent' || current === 'pending' || current === 'sending') {
+      return 'delivered';
+    }
+    return current;
+  }
+  if (next === 'failed') {
+    return current === 'read' || current === 'delivered' ? current : 'failed';
+  }
+  if (next === 'sent') {
+    return current || 'sent';
+  }
+  return next;
+};
+
 const registerWhatsAppWebhookRoutes = (app, deps) => {
   const {
     whatsappConfig,
@@ -930,7 +962,12 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
   const handleMessageStatus = async (statusData, userId, companyId) => {
     try {
       const messageId = statusData.id;
-      const status = statusData.status;
+      const status = String(
+        statusData.status ||
+          statusData.MessageStatus ||
+          statusData.message_status ||
+          ''
+      ).trim().toLowerCase();
       const recipient = statusData.recipient_id;
       const statusErrorParts = [
         statusData?.errors?.[0]?.message,
@@ -953,6 +990,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         conversationStatus: statusData.conversation?.id,
         error: statusError || undefined
       });
+      console.log('Status webhook payload:', JSON.stringify(statusData, null, 2));
 
       await forwardIvrNotificationStatus(statusData);
 
@@ -996,21 +1034,44 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       }
 
       const oldStatus = message.status;
+      const nextStatus = chooseMonotonicStatus(oldStatus, status);
+      const statusAt = normalizeStatusTimestamp(statusData.timestamp);
+      const updateData = {
+        status: nextStatus,
+        updatedAt: new Date()
+      };
+
+      if (!message.sentAt && ['sent', 'delivered', 'read', 'failed'].includes(nextStatus)) {
+        updateData.sentAt = statusAt;
+      }
+
+      if (nextStatus === 'delivered' || nextStatus === 'read') {
+        if (!message.deliveredAt) {
+          updateData.deliveredAt = statusAt;
+        }
+      }
+
+      if (nextStatus === 'read' && !message.readAt) {
+        updateData.readAt = statusAt;
+      }
+
+      if (nextStatus === 'failed') {
+        if (!message.failedAt) {
+          updateData.failedAt = statusAt;
+        }
+        updateData.errorMessage = statusError;
+        if (statusData?.errors?.[0]?.code || statusData?.errors?.[0]?.error_data?.code) {
+          updateData.errorCode = String(
+            statusData?.errors?.[0]?.code ||
+              statusData?.errors?.[0]?.error_data?.code ||
+              ''
+          ).trim();
+        }
+      }
+
       const updatedMessage = await Message.findOneAndUpdate(
         { _id: message._id },
-        {
-          status,
-          errorMessage: status === 'failed' ? statusError : '',
-          errorCode:
-            status === 'failed'
-              ? String(
-                  statusData?.errors?.[0]?.code ||
-                    statusData?.errors?.[0]?.error_data?.code ||
-                    ''
-                ).trim() || undefined
-              : undefined,
-          updatedAt: new Date()
-        },
+        updateData,
         { new: true }
       );
 
@@ -1062,7 +1123,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       emitRealtimeEvent(effectiveUserId, {
         type: 'message_status',
         messageId,
-        status,
+        status: nextStatus,
         errorMessage: updatedMessage.errorMessage || '',
         errorCode: updatedMessage.errorCode || '',
         errorDetails: statusError || '',
@@ -1072,7 +1133,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         mediaPipelineRequestId: mediaPipelineRequestId || null
       });
 
-      if (status === 'read' && oldStatus !== 'read') {
+      if (nextStatus === 'read' && oldStatus !== 'read') {
         const readScoreResult = await applyReadScoreForMessage({
           messageId: updatedMessage._id,
           userId: effectiveUserId,

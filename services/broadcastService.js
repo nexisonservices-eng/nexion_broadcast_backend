@@ -3446,6 +3446,7 @@ class BroadcastService {
         text: message,
         whatsappMessageId,
         status: "sent",
+        sentAt: new Date(),
         ...(broadcastDispatchKey ? { broadcastDispatchKey } : {}),
         ...(broadcastId ? { broadcastId } : {}),
       });

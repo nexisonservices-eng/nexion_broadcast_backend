@@ -47,6 +47,10 @@ const MessageSchema = new mongoose.Schema({
     default: 'sent',
     index: true
   },
+  sentAt: { type: Date, default: null },
+  deliveredAt: { type: Date, default: null },
+  readAt: { type: Date, default: null },
+  failedAt: { type: Date, default: null },
   deliveredTo: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   whatsappMessageId: { type: String, unique: true, sparse: true },
