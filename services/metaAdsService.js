@@ -1132,9 +1132,9 @@ const getSetupBundle = async ({ userId } = {}) => {
   return fallback;
 };
 
-const getPageLeads = async ({ userId, pageId, formId = '', limit = 25 } = {}) => {
+const getPageLeads = async ({ userId, formId = '', limit = 25 } = {}) => {
   const accessContext = await getAccessContextForUser(userId);
-  const selectedPageId = String(pageId || accessContext?.connection?.selectedPageId || '').trim();
+  const selectedPageId = String(accessContext?.connection?.selectedPageId || '').trim();
   const resolvedFormId = String(formId || accessContext?.adminMetaConfig?.leadFormId || '').trim();
   const pageAccessToken = String(
     accessContext?.adminMetaConfig?.pageAccessToken ||
@@ -1202,33 +1202,44 @@ const getPageLeads = async ({ userId, pageId, formId = '', limit = 25 } = {}) =>
       accessToken: pageAccessToken
     });
 
-  let response;
-  let effectiveFormId = resolvedFormId;
-  try {
-    response = await tryFetchLeadsForForm(resolvedFormId);
-  } catch (error) {
-    if (!isInvalidLeadFormError(error)) {
-      throw error;
+  const leadForms = await fetchLeadForms();
+  const fallbackFormIds = leadForms
+    .map((form) => ({
+      id: String(form?.id || '').trim(),
+      createdTime: String(form?.created_time || '').trim()
+    }))
+    .filter((form) => form.id)
+    .sort((left, right) => new Date(right.createdTime || 0).getTime() - new Date(left.createdTime || 0).getTime())
+    .map((form) => form.id);
+
+  const candidateFormIds = Array.from(new Set([resolvedFormId, ...fallbackFormIds].filter(Boolean)));
+
+  console.log('[Meta Leads] Lead form resolution context:', {
+    selectedPageId,
+    requestedFormId: resolvedFormId,
+    candidateFormIds
+  });
+
+  let response = null;
+  let effectiveFormId = '';
+  let lastError = null;
+
+  for (const candidateFormId of candidateFormIds) {
+    try {
+      response = await tryFetchLeadsForForm(candidateFormId);
+      effectiveFormId = candidateFormId;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (!isInvalidLeadFormError(error)) {
+        throw error;
+      }
+      console.warn('[Meta Leads] Invalid lead form id, trying next candidate:', candidateFormId);
     }
+  }
 
-    const leadForms = await fetchLeadForms();
-    const fallbackFormId = String(
-      leadForms
-        .map((form) => ({
-          id: String(form?.id || '').trim(),
-          createdTime: String(form?.created_time || '').trim()
-        }))
-        .filter((form) => form.id)
-        .sort((left, right) => new Date(right.createdTime || 0).getTime() - new Date(left.createdTime || 0).getTime())[0]?.id || ''
-    ).trim();
-
-    if (!fallbackFormId || fallbackFormId === resolvedFormId) {
-      throw error;
-    }
-
-    console.warn('[Meta Leads] Retrying with fallback lead form id:', fallbackFormId);
-    effectiveFormId = fallbackFormId;
-    response = await tryFetchLeadsForForm(fallbackFormId);
+  if (!response) {
+    throw lastError || new Error('Unable to resolve a valid Meta lead form ID.');
   }
 
   const leads = Array.isArray(response?.data) ? response.data : [];

@@ -313,12 +313,10 @@ router.get('/overview', auth, async (req, res) => {
 
 router.get('/leads', auth, async (req, res) => {
   try {
-    const pageId = String(req.query.pageId || req.query.page_id || '').trim();
     const formId = String(req.query.formId || req.query.form_id || '').trim();
     const limit = Number(req.query.limit || 25);
     const leads = await metaAdsService.getPageLeads({
       userId: req.user.id,
-      pageId,
       formId,
       limit
     });
