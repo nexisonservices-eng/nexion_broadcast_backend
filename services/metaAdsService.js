@@ -1134,7 +1134,6 @@ const getSetupBundle = async ({ userId } = {}) => {
 
 const getPageLeads = async ({ userId, pageId, formId = '', limit = 25 } = {}) => {
   const accessContext = await getAccessContextForUser(userId);
-  const selectedPageId = String(pageId || accessContext?.connection?.selectedPageId || '').trim();
   const resolvedFormId = String(formId || accessContext?.adminMetaConfig?.leadFormId || '').trim();
   const pageAccessToken = String(
     accessContext?.adminMetaConfig?.pageAccessToken ||
@@ -1142,20 +1141,20 @@ const getPageLeads = async ({ userId, pageId, formId = '', limit = 25 } = {}) =>
       ''
   ).trim();
 
-  if (!selectedPageId) {
-    const error = new Error('A Facebook Page ID is required to load leads.');
-    error.status = 400;
-    throw error;
-  }
-
   if (!pageAccessToken) {
     const error = new Error('A Facebook Page access token is required to load leads.');
     error.status = 400;
     throw error;
   }
 
+  if (!resolvedFormId) {
+    const error = new Error('A Meta lead form ID is required to load leads.');
+    error.status = 400;
+    throw error;
+  }
+
   const response = await graphRequest({
-    path: `${selectedPageId}/leads`,
+    path: `${resolvedFormId}/leads`,
     params: {
       fields: 'id,created_time,field_data,ad_id,form_id,campaign_id',
       limit: Math.max(1, Math.min(Number(limit) || 25, 100))
@@ -1164,14 +1163,10 @@ const getPageLeads = async ({ userId, pageId, formId = '', limit = 25 } = {}) =>
   });
 
   const leads = Array.isArray(response?.data) ? response.data : [];
-  const filteredLeads = resolvedFormId
-    ? leads.filter((lead) => String(lead?.form_id || '').trim() === resolvedFormId)
-    : leads;
 
   return {
-    pageId: selectedPageId,
     formId: resolvedFormId,
-    leads: filteredLeads,
+    leads,
     paging: response?.paging || null
   };
 };

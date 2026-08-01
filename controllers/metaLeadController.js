@@ -171,7 +171,6 @@ const getMetaLeads = async (req, res) => {
   try {
     const userId = normalizeText(req.query?.userId || req.query?.adminId);
     const requestedFormId = normalizeText(req.params?.formId || req.query?.formId || req.query?.form_id);
-    const requestedPageId = normalizeText(req.query?.pageId || req.query?.page_id);
 
     if (!userId) {
       return res.status(400).json({
@@ -185,7 +184,6 @@ const getMetaLeads = async (req, res) => {
 
     const leadsResult = await metaAdsService.getPageLeads({
       userId,
-      pageId: requestedPageId,
       formId,
       limit: 100
     });
@@ -233,7 +231,6 @@ const getMetaLeads = async (req, res) => {
     return res.json({
       success: true,
       count: enrichedLeads.length,
-      pageId: normalizeText(leadsResult?.pageId || requestedPageId),
       formId: normalizeText(leadsResult?.formId || formId),
       leads: enrichedLeads,
       campaigns: Array.from(
