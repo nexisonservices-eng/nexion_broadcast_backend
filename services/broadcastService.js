@@ -913,41 +913,6 @@ class BroadcastService {
       .sort({ timestamp: 1 })
       .lean();
 
-    // Legacy fallback: old records may not have broadcastId tagged.
-    // In that case, find agent messages in recipient conversations during campaign window.
-    if (outboundMessages.length === 0 && detailsByPhone.size > 0) {
-      const recipientPhoneVariants = Array.from(detailsByPhone.keys());
-      const recipientPhoneRegex = recipientPhoneVariants.map(
-        (phone) => new RegExp(`${phone}$`),
-      );
-      const legacyConversations = await Conversation.find({
-        userId: broadcast.createdById,
-        companyId: broadcast.companyId,
-        $or: [
-          { contactPhone: { $in: recipientPhoneVariants } },
-          ...recipientPhoneRegex.map((phoneRegex) => ({
-            contactPhone: phoneRegex,
-          })),
-        ],
-      })
-        .select("_id contactPhone contactName")
-        .lean();
-
-      const legacyConversationIds = legacyConversations.map((item) => item._id);
-      if (legacyConversationIds.length > 0) {
-        outboundMessages = await Message.find({
-          userId: broadcast.createdById,
-          companyId: broadcast.companyId,
-          sender: "agent",
-          conversationId: { $in: legacyConversationIds },
-          timestamp: { $gte: startTime, $lte: endTime },
-        })
-          .select("conversationId status timestamp text")
-          .sort({ timestamp: 1 })
-          .lean();
-      }
-    }
-
     const conversationIds = Array.from(
       new Set(
         outboundMessages
@@ -4007,17 +3972,11 @@ class BroadcastService {
           ...broadcast,
           sentCount: Number(broadcast?.stats?.sent || 0),
           completedCount: Number(broadcast?.stats?.sent || 0),
-          successful: Math.max(
-            Number(broadcast?.stats?.delivered || 0),
-            Number(broadcast?.stats?.read || 0),
-          ),
+          successful: Number(broadcast?.stats?.delivered || 0),
           successfulPercentage:
             Number(broadcast?.recipientCount || 0) > 0
               ? Math.round(
-                  (Math.max(
-                    Number(broadcast?.stats?.delivered || 0),
-                    Number(broadcast?.stats?.read || 0),
-                  ) /
+                  (Number(broadcast?.stats?.delivered || 0) /
                     Number(broadcast?.recipientCount || 0)) *
                     100,
                 )
@@ -4025,8 +3984,8 @@ class BroadcastService {
           readPercentage:
             Number(broadcast?.stats?.delivered || 0) > 0
               ? Math.round(
-                  (Number(broadcast?.stats?.read || 0) /
-                    Number(broadcast?.stats?.delivered || 0)) *
+                (Number(broadcast?.stats?.read || 0) /
+                  Number(broadcast?.stats?.delivered || 0)) *
                     100,
                 )
               : 0,
@@ -4131,17 +4090,11 @@ class BroadcastService {
         ...broadcast,
         sentCount: Number(broadcast?.stats?.sent || 0),
         completedCount: Number(broadcast?.stats?.sent || 0),
-        successful: Math.max(
-          Number(broadcast?.stats?.delivered || 0),
-          Number(broadcast?.stats?.read || 0),
-        ),
+        successful: Number(broadcast?.stats?.delivered || 0),
         successfulPercentage:
           Number(broadcast?.recipientCount || 0) > 0
             ? Math.round(
-                (Math.max(
-                  Number(broadcast?.stats?.delivered || 0),
-                  Number(broadcast?.stats?.read || 0),
-                ) /
+                (Number(broadcast?.stats?.delivered || 0) /
                   Number(broadcast?.recipientCount || 0)) *
                   100,
               )
@@ -4954,6 +4907,10 @@ class BroadcastService {
 
       const startTime = new Date(broadcast.startedAt || broadcast.createdAt);
       const endTime = new Date();
+      const normalizeStatNumber = (value = 0) => {
+        const parsed = Number(value || 0);
+        return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+      };
       const normalizeStatus = (value = "") =>
         String(value || "").trim().toLowerCase();
       const choosePreferredStatus = (currentStatus = "", nextStatus = "") => {
@@ -5001,12 +4958,12 @@ class BroadcastService {
         .filter(Boolean);
 
       const messageQuery = {
-        userId: broadcast.createdById,
-        companyId: broadcast.companyId,
+        broadcastId: broadcast._id,
+        ...(broadcast.createdById ? { userId: broadcast.createdById } : {}),
+        ...(broadcast.companyId ? { companyId: broadcast.companyId } : {}),
         sender: "agent",
         timestamp: { $gte: startTime, $lte: endTime },
         $or: [
-          { broadcastId: broadcast._id },
           ...(dispatchKeys.length
             ? [{ broadcastDispatchKey: { $in: dispatchKeys } }]
             : []),
@@ -5180,8 +5137,8 @@ class BroadcastService {
       }
 
       console.log("Broadcast ID:", normalizedBroadcastId);
-      console.log("Saved statistics:", broadcast.stats || {});
-      console.log("Calculated statistics:", stats);
+      console.log("Current saved stats:", broadcast.stats || {});
+      console.log("Calculated stats:", stats);
 
       const currentStatus = String(broadcast?.status || "").toLowerCase();
       const resolvedFinalStatus = stats.failed > 0 ? "completed_with_errors" : "completed";
@@ -5244,17 +5201,17 @@ class BroadcastService {
 
       // Only update broadcast stats if they're different
       const currentStats = broadcast.stats || {};
-      const statsChanged =
-        currentStats.sent !== stats.sent ||
-        currentStats.delivered !== stats.delivered ||
-        currentStats.read !== stats.read ||
-        currentStats.failed !== stats.failed ||
-        currentStats.replied !== stats.replied;
+      const hasChanges =
+        normalizeStatNumber(currentStats.sent) !== normalizeStatNumber(stats.sent) ||
+        normalizeStatNumber(currentStats.delivered) !== normalizeStatNumber(stats.delivered) ||
+        normalizeStatNumber(currentStats.read) !== normalizeStatNumber(stats.read) ||
+        normalizeStatNumber(currentStats.failed) !== normalizeStatNumber(stats.failed) ||
+        normalizeStatNumber(currentStats.replied) !== normalizeStatNumber(stats.replied);
       const statusChanged = currentStatus !== resolvedFinalStatus;
       let updatedBroadcast = null;
 
-      if (statsChanged || statusChanged) {
-        await Broadcast.findByIdAndUpdate(
+      if (hasChanges || statusChanged) {
+        updatedBroadcast = await Broadcast.findByIdAndUpdate(
           normalizedBroadcastId,
           {
             $set: {
@@ -5270,8 +5227,10 @@ class BroadcastService {
           { new: true },
         );
 
-        // Get updated broadcast with virtual fields
-        updatedBroadcast = await Broadcast.findById(normalizedBroadcastId);
+        if (!updatedBroadcast) {
+          updatedBroadcast = await Broadcast.findById(normalizedBroadcastId);
+        }
+        console.log("Updated broadcast stats:", updatedBroadcast?.stats || {});
         const repliedPercentage = updatedBroadcast.repliedPercentage;
         const repliedPercentageOfTotal =
           updatedBroadcast.repliedPercentageOfTotal;

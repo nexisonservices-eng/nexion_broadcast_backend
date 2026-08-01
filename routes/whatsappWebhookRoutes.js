@@ -1011,6 +1011,9 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       if (!message) {
         message = await Message.findOne({ whatsappMessageId: messageId });
       }
+      console.log('Provider message ID:', messageId);
+      console.log('Resolved message record:', message?._id || null);
+      console.log('Resolved broadcast ID:', message?.broadcastId || null);
       if (!message) {
         console.log('No message found for whatsappMessageId:', messageId, 'attempting repair from dispatch');
         const repairResult = await broadcastService.repairBroadcastDispatchInbox({
@@ -1100,6 +1103,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           updatedMessage.broadcastId = resolvedBroadcastId;
         }
       }
+      console.log('Resolved broadcast ID:', resolvedBroadcastId || null);
 
       if (updatedMessage.sender === 'agent') {
         try {
@@ -1129,6 +1133,14 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         companyId: effectiveCompanyId,
         conversationId: updatedMessage.conversationId
       });
+
+      if (resolvedBroadcastId) {
+        try {
+          await broadcastService.syncBroadcastStats(resolvedBroadcastId);
+        } catch (syncError) {
+          console.error('Error syncing broadcast stats from webhook:', syncError);
+        }
+      }
 
       emitRealtimeEvent(effectiveUserId, {
         type: 'message_status',
