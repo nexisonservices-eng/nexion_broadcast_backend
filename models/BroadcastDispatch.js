@@ -14,8 +14,12 @@ const BroadcastDispatchSchema = new mongoose.Schema({
   },
   claimedAt: { type: Date, default: null, index: true },
   sentAt: { type: Date, default: null },
+  deliveredAt: { type: Date, default: null },
+  readAt: { type: Date, default: null },
   failedAt: { type: Date, default: null },
   whatsappMessageId: { type: String, default: '' },
+  recipientPhoneNormalized: { type: String, default: '', index: true },
+  recipientPhoneDigits: { type: String, default: '', index: true },
   messageText: { type: String, default: '' },
   messageKind: { type: String, default: 'text' },
   templateName: { type: String, default: '' },
@@ -23,6 +27,9 @@ const BroadcastDispatchSchema = new mongoose.Schema({
   conversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', default: null },
   messageId: { type: mongoose.Schema.Types.ObjectId, ref: 'Message', default: null },
   errorMessage: { type: String, default: '' },
+  lastStatusAt: { type: Date, default: null },
+  lastFailureCode: { type: String, default: '' },
+  lastFailureReason: { type: String, default: '' },
   retryCount: { type: Number, default: 0 },
   lastAttemptAt: { type: Date, default: null },
   chunkId: { type: String, default: '' },
@@ -40,6 +47,7 @@ BroadcastDispatchSchema.pre('save', function(next) {
 BroadcastDispatchSchema.index({ broadcastId: 1, status: 1, updatedAt: -1 });
 BroadcastDispatchSchema.index({ broadcastId: 1, recipientIndex: 1, _id: 1 });
 BroadcastDispatchSchema.index({ broadcastId: 1, recipientPhone: 1, recipientIndex: 1, _id: 1 });
+BroadcastDispatchSchema.index({ broadcastId: 1, recipientPhoneNormalized: 1, recipientIndex: 1, _id: 1 });
 BroadcastDispatchSchema.index({ userId: 1, companyId: 1, createdAt: -1 });
 BroadcastDispatchSchema.index({ companyId: 1, broadcastId: 1, status: 1, recipientIndex: 1, _id: 1 });
 BroadcastDispatchSchema.index({ companyId: 1, broadcastId: 1, recipientPhone: 1, status: 1 });

@@ -990,17 +990,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         .map((value) => String(value || '').trim())
         .filter(Boolean);
       const statusError =
-        statusErrorParts.length > 0 ? statusErrorParts.join(' â€¢ ') : '';
-
-      console.log('Received status update:', {
-        messageId,
-        status,
-        recipient,
-        timestamp: statusData.timestamp,
-        conversationStatus: statusData.conversation?.id,
-        error: statusError || undefined
-      });
-      console.log('Status webhook payload:', JSON.stringify(statusData, null, 2));
+        statusErrorParts.length > 0 ? statusErrorParts.join(' • ') : '';
 
       await forwardIvrNotificationStatus(statusData);
 
@@ -1008,12 +998,6 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       if (companyId) {
         message = await Message.findOne({ whatsappMessageId: messageId, companyId });
       }
-      if (!message) {
-        message = await Message.findOne({ whatsappMessageId: messageId });
-      }
-      console.log('Provider message ID:', messageId);
-      console.log('Resolved message record:', message?._id || null);
-      console.log('Resolved broadcast ID:', message?.broadcastId || null);
       if (!message) {
         console.log('No message found for whatsappMessageId:', messageId, 'attempting repair from dispatch');
         const repairResult = await broadcastService.repairBroadcastDispatchInbox({
@@ -1030,6 +1014,30 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           return;
         }
       }
+
+      const matchedBroadcastId =
+        String(message?.broadcastId || '').trim() ||
+        (await resolveBroadcastIdForStatusMessage(message));
+      console.log(
+        '[WHATSAPP_STATUS_WEBHOOK]',
+        JSON.stringify(
+          {
+            wamid: messageId || null,
+            status: status || null,
+            recipient_id: recipient || null,
+            errors: statusError || null,
+            matchedBroadcastId: matchedBroadcastId || null,
+            matchedRecipient: {
+              messageId: String(message?._id || '').trim() || null,
+              conversationId: String(message?.conversationId || '').trim() || null,
+              broadcastDispatchKey: String(message?.broadcastDispatchKey || '').trim() || null,
+              whatsappMessageId: String(message?.whatsappMessageId || '').trim() || messageId || null
+            }
+          },
+          null,
+          2
+        )
+      );
 
       const effectiveUserId = message.userId || userId;
       const effectiveCompanyId = message.companyId || companyId;
@@ -1051,7 +1059,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       const statusAt = normalizeStatusTimestamp(statusData.timestamp);
       const updateData = {
         status: nextStatus,
-        updatedAt: new Date()
+        updatedAt: new Date(),
+        lastStatusAt: statusAt
       };
 
       if (!message.sentAt && ['sent', 'delivered', 'read', 'failed'].includes(nextStatus)) {
@@ -1073,12 +1082,14 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           updateData.failedAt = statusAt;
         }
         updateData.errorMessage = statusError;
+        updateData.lastFailureReason = statusError;
         if (statusData?.errors?.[0]?.code || statusData?.errors?.[0]?.error_data?.code) {
           updateData.errorCode = String(
             statusData?.errors?.[0]?.code ||
               statusData?.errors?.[0]?.error_data?.code ||
               ''
           ).trim();
+          updateData.lastFailureCode = updateData.errorCode;
         }
       }
 
@@ -1130,7 +1141,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         if (dispatchRecord) {
           const dispatchUpdate = {
             status: nextStatus,
-            updatedAt: new Date()
+            updatedAt: new Date(),
+            lastStatusAt: statusAt
           };
 
           if (resolvedBroadcastId && !String(dispatchRecord.broadcastId || '').trim()) {
@@ -1156,6 +1168,12 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
               dispatchUpdate.failedAt = statusAt;
             }
             dispatchUpdate.errorMessage = statusError;
+            dispatchUpdate.lastFailureReason = statusError;
+            dispatchUpdate.lastFailureCode = String(
+              statusData?.errors?.[0]?.code ||
+                statusData?.errors?.[0]?.error_data?.code ||
+                ''
+            ).trim();
           }
 
           if (
@@ -1314,22 +1332,28 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
     if (data.object !== 'whatsapp_business_account') return;
     for (const entry of data.entry || []) {
       for (const change of entry.changes || []) {
-        if (change.field === 'messages') {
-          const messageData = change.value.messages?.[0];
-          const statusData = change.value.statuses?.[0];
-          const phoneNumberId = change.value?.metadata?.phone_number_id;
-          const userId = await resolveUserIdByPhoneNumberId(phoneNumberId);
-          const credentials = userId
-            ? await getWhatsAppCredentialsByUserId(userId)
-            : null;
-          const companyId = credentials?.companyId || null;
+        const value = change?.value || {};
+        const messageList = Array.isArray(value.messages) ? value.messages : [];
+        const statusList = Array.isArray(value.statuses) ? value.statuses : [];
+        if (!messageList.length && !statusList.length) {
+          continue;
+        }
 
+        const phoneNumberId = value?.metadata?.phone_number_id;
+        const userId = await resolveUserIdByPhoneNumberId(phoneNumberId);
+        const credentials = userId
+          ? await getWhatsAppCredentialsByUserId(userId)
+          : null;
+        const companyId = credentials?.companyId || null;
+
+        for (const messageData of messageList) {
           if (messageData && userId && companyId) {
-            await handleIncomingMessage(messageData, change.value, userId, companyId);
+            await handleIncomingMessage(messageData, value, userId, companyId);
           }
-          if (statusData) {
-            await handleMessageStatus(statusData, userId || null, companyId || null);
-          }
+        }
+
+        for (const statusData of statusList) {
+          await handleMessageStatus(statusData, userId || null, companyId || null);
         }
       }
     }

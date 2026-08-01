@@ -3630,6 +3630,8 @@ class BroadcastService {
           userId,
           companyId: companyId || null,
           recipientPhone,
+          recipientPhoneNormalized: this.normalizePhoneNumber(recipientPhone),
+          recipientPhoneDigits: this.normalizePhoneNumber(recipientPhone),
           chunkId,
           chunkIndex,
           recipientIndex,
@@ -3697,6 +3699,7 @@ class BroadcastService {
       lastAttemptAt: now,
       updatedAt: now,
       errorMessage: String(errorMessage || "").trim(),
+      lastStatusAt: now,
     };
     if (normalizedStatus === "sent") {
       update.sentAt = now;
@@ -3705,6 +3708,7 @@ class BroadcastService {
       update.messageId = messageId || null;
     } else if (normalizedStatus === "failed") {
       update.failedAt = now;
+      update.lastFailureReason = String(errorMessage || "").trim();
     }
 
     await BroadcastDispatch.updateOne(
@@ -3766,6 +3770,7 @@ class BroadcastService {
               existingMessage.whatsappMessageId || whatsappMessageId || "",
             status: "sent",
             sentAt: existingMessage.timestamp || new Date(),
+            lastStatusAt: existingMessage.timestamp || new Date(),
             updatedAt: new Date(),
           },
         },
@@ -3824,6 +3829,7 @@ class BroadcastService {
               whatsappMessageId || dispatch.whatsappMessageId || "",
             status: "sent",
             sentAt: new Date(),
+            lastStatusAt: new Date(),
             updatedAt: new Date(),
           },
         },
@@ -3839,6 +3845,7 @@ class BroadcastService {
               whatsappMessageId || dispatch.whatsappMessageId || "",
             status: "sent",
             sentAt: new Date(),
+            lastStatusAt: new Date(),
             updatedAt: new Date(),
           },
         },
