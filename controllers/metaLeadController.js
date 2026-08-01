@@ -65,47 +65,6 @@ const formatLead = (lead = {}) => {
   };
 };
 
-const buildMetaLeadsUrl = (formId) =>
-  `https://${GRAPH_API_HOST}/${encodeURIComponent(normalizeText(formId))}/leads`;
-
-const fetchAllMetaLeads = async ({ formId, accessToken }) => {
-  const allLeads = [];
-  const visited = new Set();
-  let nextUrl = buildMetaLeadsUrl(formId);
-
-  while (nextUrl) {
-    if (visited.has(nextUrl)) break;
-    visited.add(nextUrl);
-
-    const response = await axios.get(nextUrl, {
-      timeout: 30000,
-      params: nextUrl === buildMetaLeadsUrl(formId) ? { access_token: accessToken } : undefined
-    });
-
-    const pageLeads = Array.isArray(response?.data?.data) ? response.data.data : [];
-    allLeads.push(...pageLeads);
-
-    const pagingNext = normalizeText(response?.data?.paging?.next);
-    if (!pagingNext) {
-      nextUrl = '';
-      continue;
-    }
-
-    try {
-      const parsedNextUrl = new URL(pagingNext);
-      if (parsedNextUrl.hostname.toLowerCase() !== GRAPH_API_HOST) {
-        nextUrl = '';
-        continue;
-      }
-      nextUrl = parsedNextUrl.toString();
-    } catch {
-      nextUrl = '';
-    }
-  }
-
-  return allLeads.map(formatLead);
-};
-
 const fetchCampaignFromAdId = async ({ adId, accessToken, apiVersion = '' } = {}) => {
   const normalizedAdId = normalizeText(adId);
   if (!normalizedAdId || !normalizeText(accessToken)) return null;
@@ -212,6 +171,7 @@ const getMetaLeads = async (req, res) => {
   try {
     const userId = normalizeText(req.query?.userId || req.query?.adminId);
     const requestedFormId = normalizeText(req.params?.formId || req.query?.formId || req.query?.form_id);
+    const requestedPageId = normalizeText(req.query?.pageId || req.query?.page_id);
 
     if (!userId) {
       return res.status(400).json({
@@ -222,25 +182,21 @@ const getMetaLeads = async (req, res) => {
 
     const metaConfig = normalizeMetaLeadConfig(await getMetaConfigByUserId(userId));
     const formId = requestedFormId || normalizeText(metaConfig?.leadFormId);
-    const accessToken = normalizeText(metaConfig?.pageAccessToken);
 
-    if (!formId || !accessToken) {
-      return res.status(400).json({
-        success: false,
-        error: requestedFormId
-          ? 'Page access token is missing for the selected user in Superadmin settings.'
-          : 'Lead form ID and page access token are missing for the selected user in Superadmin settings.'
-      });
-    }
-
-    const leads = await fetchAllMetaLeads({ formId, accessToken });
+    const leadsResult = await metaAdsService.getPageLeads({
+      userId,
+      pageId: requestedPageId,
+      formId,
+      limit: 100
+    });
+    const leads = Array.isArray(leadsResult?.leads) ? leadsResult.leads : [];
     const adCampaignLookups = await Promise.all(
       leads
         .map((lead) => normalizeText(lead?.campaignId) ? null : normalizeText(lead?.adId))
         .filter(Boolean)
         .map((adId) => fetchCampaignFromAdId({
           adId,
-          accessToken: metaConfig?.userAccessToken || metaConfig?.pageAccessToken || accessToken,
+          accessToken: metaConfig?.userAccessToken || metaConfig?.pageAccessToken || '',
           apiVersion: metaConfig?.apiVersion || ''
         }))
     );
@@ -255,7 +211,7 @@ const getMetaLeads = async (req, res) => {
       userId,
       campaignIds: leads.map((lead) => lead?.campaignId || adToCampaignMap.get(normalizeText(lead?.adId))?.campaignId).filter(Boolean),
       adAccountId: metaConfig?.adAccountId || '',
-      accessToken: metaConfig?.userAccessToken || metaConfig?.pageAccessToken || accessToken,
+      accessToken: metaConfig?.userAccessToken || metaConfig?.pageAccessToken || '',
       apiVersion: metaConfig?.apiVersion || ''
     });
     const enrichedLeads = leads.map((lead) => {
@@ -277,6 +233,8 @@ const getMetaLeads = async (req, res) => {
     return res.json({
       success: true,
       count: enrichedLeads.length,
+      pageId: normalizeText(leadsResult?.pageId || requestedPageId),
+      formId: normalizeText(leadsResult?.formId || formId),
       leads: enrichedLeads,
       campaigns: Array.from(
         new Map(
