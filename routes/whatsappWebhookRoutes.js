@@ -1105,6 +1105,76 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       }
       console.log('Resolved broadcast ID:', resolvedBroadcastId || null);
 
+      const dispatchQuery = [];
+      if (String(updatedMessage.broadcastDispatchKey || '').trim()) {
+        dispatchQuery.push({
+          broadcastDispatchKey: String(updatedMessage.broadcastDispatchKey || '').trim()
+        });
+      }
+      if (String(updatedMessage.whatsappMessageId || '').trim()) {
+        dispatchQuery.push({
+          whatsappMessageId: String(updatedMessage.whatsappMessageId || '').trim()
+        });
+      }
+      if (String(updatedMessage._id || '').trim()) {
+        dispatchQuery.push({
+          messageId: updatedMessage._id
+        });
+      }
+
+      if (dispatchQuery.length > 0) {
+        const dispatchRecord = await BroadcastDispatch.findOne({
+          $or: dispatchQuery
+        }).sort({ updatedAt: -1, _id: -1 });
+
+        if (dispatchRecord) {
+          const dispatchUpdate = {
+            status: nextStatus,
+            updatedAt: new Date()
+          };
+
+          if (resolvedBroadcastId && !String(dispatchRecord.broadcastId || '').trim()) {
+            dispatchUpdate.broadcastId = resolvedBroadcastId;
+          }
+
+          if (!dispatchRecord.sentAt && ['sent', 'delivered', 'read', 'failed'].includes(nextStatus)) {
+            dispatchUpdate.sentAt = statusAt;
+          }
+
+          if (nextStatus === 'delivered' || nextStatus === 'read') {
+            if (!dispatchRecord.deliveredAt) {
+              dispatchUpdate.deliveredAt = statusAt;
+            }
+          }
+
+          if (nextStatus === 'read' && !dispatchRecord.readAt) {
+            dispatchUpdate.readAt = statusAt;
+          }
+
+          if (nextStatus === 'failed') {
+            if (!dispatchRecord.failedAt) {
+              dispatchUpdate.failedAt = statusAt;
+            }
+            dispatchUpdate.errorMessage = statusError;
+          }
+
+          if (
+            dispatchRecord.status !== dispatchUpdate.status ||
+            String(dispatchRecord.broadcastId || '').trim() !== String(dispatchUpdate.broadcastId || dispatchRecord.broadcastId || '').trim() ||
+            dispatchUpdate.sentAt ||
+            dispatchUpdate.deliveredAt ||
+            dispatchUpdate.readAt ||
+            dispatchUpdate.failedAt ||
+            dispatchUpdate.errorMessage
+          ) {
+            await BroadcastDispatch.updateOne(
+              { _id: dispatchRecord._id },
+              { $set: dispatchUpdate }
+            );
+          }
+        }
+      }
+
       if (updatedMessage.sender === 'agent') {
         try {
           await Conversation.updateOne(
