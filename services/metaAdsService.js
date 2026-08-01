@@ -1134,6 +1134,7 @@ const getSetupBundle = async ({ userId } = {}) => {
 
 const getPageLeads = async ({ userId, pageId, formId = '', limit = 25 } = {}) => {
   const accessContext = await getAccessContextForUser(userId);
+  const selectedPageId = String(pageId || accessContext?.connection?.selectedPageId || '').trim();
   const resolvedFormId = String(formId || accessContext?.adminMetaConfig?.leadFormId || '').trim();
   const pageAccessToken = String(
     accessContext?.adminMetaConfig?.pageAccessToken ||
@@ -1153,19 +1154,88 @@ const getPageLeads = async ({ userId, pageId, formId = '', limit = 25 } = {}) =>
     throw error;
   }
 
-  const response = await graphRequest({
-    path: `${resolvedFormId}/leads`,
-    params: {
-      fields: 'id,created_time,field_data,ad_id,form_id,campaign_id',
-      limit: Math.max(1, Math.min(Number(limit) || 25, 100))
-    },
-    accessToken: pageAccessToken
-  });
+  const fetchLeadForms = async () => {
+    if (!selectedPageId) return [];
+    try {
+      const response = await graphRequest({
+        path: `${selectedPageId}/leadgen_forms`,
+        params: {
+          fields: 'id,name,created_time',
+          limit: 100
+        },
+        accessToken: pageAccessToken
+      });
+      return Array.isArray(response?.data) ? response.data : [];
+    } catch (error) {
+      console.warn('[Meta Leads] Failed to load lead forms:', error?.message || error);
+      return [];
+    }
+  };
+
+  const isInvalidLeadFormError = (error = {}) => {
+    const code = Number(error?.response?.data?.error?.code || error?.response?.data?.code || error?.code || 0);
+    const subcode = Number(error?.response?.data?.error?.error_subcode || error?.response?.data?.error_subcode || 0);
+    const message = String(
+      error?.response?.data?.error?.message ||
+        error?.response?.data?.message ||
+        error?.message ||
+        ''
+    ).toLowerCase();
+    return (
+      code === 100 &&
+      (
+        subcode === 33 ||
+        message.includes('nonexisting field (leads)') ||
+        message.includes('unsupported get request') ||
+        message.includes('does not exist')
+      )
+    );
+  };
+
+  const tryFetchLeadsForForm = async (candidateFormId) =>
+    graphRequest({
+      path: `${candidateFormId}/leads`,
+      params: {
+        fields: 'id,created_time,field_data,ad_id,form_id,campaign_id',
+        limit: Math.max(1, Math.min(Number(limit) || 25, 100))
+      },
+      accessToken: pageAccessToken
+    });
+
+  let response;
+  let effectiveFormId = resolvedFormId;
+  try {
+    response = await tryFetchLeadsForForm(resolvedFormId);
+  } catch (error) {
+    if (!isInvalidLeadFormError(error)) {
+      throw error;
+    }
+
+    const leadForms = await fetchLeadForms();
+    const fallbackFormId = String(
+      leadForms
+        .map((form) => ({
+          id: String(form?.id || '').trim(),
+          createdTime: String(form?.created_time || '').trim()
+        }))
+        .filter((form) => form.id)
+        .sort((left, right) => new Date(right.createdTime || 0).getTime() - new Date(left.createdTime || 0).getTime())[0]?.id || ''
+    ).trim();
+
+    if (!fallbackFormId || fallbackFormId === resolvedFormId) {
+      throw error;
+    }
+
+    console.warn('[Meta Leads] Retrying with fallback lead form id:', fallbackFormId);
+    effectiveFormId = fallbackFormId;
+    response = await tryFetchLeadsForForm(fallbackFormId);
+  }
 
   const leads = Array.isArray(response?.data) ? response.data : [];
 
   return {
     formId: resolvedFormId,
+    resolvedFormId: effectiveFormId,
     leads,
     paging: response?.paging || null
   };

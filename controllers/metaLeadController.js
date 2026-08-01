@@ -232,6 +232,7 @@ const getMetaLeads = async (req, res) => {
       success: true,
       count: enrichedLeads.length,
       formId: normalizeText(leadsResult?.formId || formId),
+      resolvedFormId: normalizeText(leadsResult?.resolvedFormId || formId),
       leads: enrichedLeads,
       campaigns: Array.from(
         new Map(
