@@ -253,6 +253,73 @@ class BroadcastService {
     ).sort({ createdAt: 1, updatedAt: 1 });
   }
 
+  normalizeBroadcastRecipient(recipient = {}) {
+    const rawRecipient =
+      typeof recipient === "string" ? { phone: recipient } : recipient || {};
+    const normalizedPhone = this.normalizePhoneNumber(rawRecipient?.phone || "");
+    if (!normalizedPhone) return null;
+
+    return {
+      ...rawRecipient,
+      phone: normalizedPhone,
+      normalizedPhone,
+      name: String(rawRecipient?.name || "").trim(),
+      contactId: String(rawRecipient?.contactId || "").trim(),
+      sourceType:
+        String(rawRecipient?.sourceType || "").trim() ||
+        String(rawRecipient?.type || "").trim() ||
+        "imported",
+      variables: Array.isArray(rawRecipient?.variables)
+        ? this.normalizeTemplateVariables(rawRecipient.variables)
+        : [],
+      attributes:
+        rawRecipient?.attributes && typeof rawRecipient.attributes === "object"
+          ? rawRecipient.attributes
+          : rawRecipient?.attributes || {},
+    };
+  }
+
+  dedupeBroadcastRecipients(recipients = []) {
+    const recipientMap = new Map();
+    for (const recipient of Array.isArray(recipients) ? recipients : []) {
+      const normalizedRecipient = this.normalizeBroadcastRecipient(recipient);
+      if (!normalizedRecipient) continue;
+
+      const key = normalizedRecipient.normalizedPhone;
+      const existing = recipientMap.get(key);
+      if (!existing) {
+        recipientMap.set(key, normalizedRecipient);
+        continue;
+      }
+
+      const mergedAttributes = {
+        ...(existing.attributes && typeof existing.attributes === "object"
+          ? existing.attributes
+          : {}),
+        ...(normalizedRecipient.attributes &&
+        typeof normalizedRecipient.attributes === "object"
+          ? normalizedRecipient.attributes
+          : {}),
+      };
+
+      recipientMap.set(key, {
+        ...existing,
+        ...normalizedRecipient,
+        name: normalizedRecipient.name || existing.name || "",
+        contactId: normalizedRecipient.contactId || existing.contactId || "",
+        sourceType: normalizedRecipient.sourceType || existing.sourceType || "imported",
+        variables:
+          Array.isArray(normalizedRecipient.variables) &&
+          normalizedRecipient.variables.length > 0
+            ? normalizedRecipient.variables
+            : existing.variables || [],
+        attributes: mergedAttributes,
+      });
+    }
+
+    return Array.from(recipientMap.values());
+  }
+
   async resolveBroadcastAudienceRecipients({
     broadcast,
     userId = null,
@@ -327,7 +394,7 @@ class BroadcastService {
         }
         if (!recipientMap.has(phone)) {
           recipientMap.set(phone, {
-            phone: String(dispatch?.recipientPhone || "").trim(),
+            phone,
             name: "",
             contactId: "",
             sourceType: "campaign",
@@ -353,7 +420,7 @@ class BroadcastService {
         }
         if (!recipientMap.has(phone)) {
           recipientMap.set(phone, {
-            phone: String(recipient?.phone || "").trim(),
+            phone,
             name: String(recipient?.name || "").trim(),
             contactId: String(
               recipient?.contactId || recipient?.attributes?._id || "",
@@ -368,20 +435,22 @@ class BroadcastService {
         }
       }
 
-      return Array.from(recipientMap.values()).filter((recipient) =>
-        Boolean(this.normalizePhoneNumber(recipient?.phone || "")),
+      return this.dedupeBroadcastRecipients(
+        Array.from(recipientMap.values()).filter((recipient) =>
+          Boolean(this.normalizePhoneNumber(recipient?.phone || "")),
+        ),
       );
     }
 
     if (Array.isArray(recipientSubset) && recipientSubset.length > 0) {
-      return recipientSubset;
+      return this.dedupeBroadcastRecipients(recipientSubset);
     }
 
     const existingRecipients = Array.isArray(broadcast?.recipients)
       ? broadcast.recipients
       : [];
     if (existingRecipients.length > 0) {
-      return existingRecipients;
+      return this.dedupeBroadcastRecipients(existingRecipients);
     }
 
     const audienceSource =
@@ -432,9 +501,10 @@ class BroadcastService {
       )
       .lean();
 
-    return contacts
+    return this.dedupeBroadcastRecipients(
+      contacts
       .map((contact) => ({
-        phone: String(contact?.phone || "").trim(),
+        phone: this.normalizePhoneNumber(contact?.phone || ""),
         name: String(contact?.name || "").trim(),
         contactId: String(contact?._id || "").trim(),
         sourceType:
@@ -442,7 +512,8 @@ class BroadcastService {
         variables: [],
         attributes: contact,
       }))
-      .filter((recipient) => Boolean(recipient.phone));
+      .filter((recipient) => Boolean(recipient.phone)),
+    );
   }
 
   async resolveTemplateCategoryForBroadcast({ broadcast, credentials }) {
@@ -513,7 +584,15 @@ class BroadcastService {
     }
   }
   normalizePhoneNumber(phone) {
-    return String(phone || "").replace(/\D/g, "");
+    const digits = String(phone || "").replace(/\D/g, "");
+    if (!digits) return "";
+    if (digits.length === 10) {
+      return `91${digits}`;
+    }
+    if (digits.length === 11 && digits.startsWith("0")) {
+      return `91${digits.slice(1)}`;
+    }
+    return digits;
   }
 
   async resolveBroadcastContact({ userId, companyId, phone }) {
@@ -1647,6 +1726,28 @@ class BroadcastService {
         };
       }
 
+      broadcastData.recipients = this.dedupeBroadcastRecipients(
+        Array.isArray(broadcastData.recipients) ? broadcastData.recipients : [],
+      );
+      broadcastData.recipientCount = broadcastData.recipients.length;
+      if (broadcastData.audienceSnapshot) {
+        broadcastData.audienceSnapshot = {
+          ...broadcastData.audienceSnapshot,
+          recipients: broadcastData.recipients,
+          summary: {
+            ...(broadcastData.audienceSnapshot.summary || {}),
+            selectedContactCount: broadcastData.recipients.length,
+            validRecipientCount: broadcastData.recipients.length,
+          },
+        };
+      }
+      if (broadcastData.audienceSource) {
+        broadcastData.audienceSource = {
+          ...broadcastData.audienceSource,
+          recipientCount: broadcastData.recipients.length,
+        };
+      }
+
       const templateVariables = this.normalizeTemplateVariables(
         broadcastData.variables || broadcastData.templateParameters || [],
       );
@@ -2125,8 +2226,30 @@ class BroadcastService {
         };
       }
 
+      nextData.recipients = this.dedupeBroadcastRecipients(
+        Array.isArray(nextData.recipients) ? nextData.recipients : [],
+      );
+      nextData.recipientCount = nextData.recipients.length;
+      if (nextData.audienceSnapshot) {
+        nextData.audienceSnapshot = {
+          ...nextData.audienceSnapshot,
+          recipients: nextData.recipients,
+          summary: {
+            ...(nextData.audienceSnapshot.summary || {}),
+            selectedContactCount: nextData.recipients.length,
+            validRecipientCount: nextData.recipients.length,
+          },
+        };
+      }
+      if (nextData.audienceSource) {
+        nextData.audienceSource = {
+          ...nextData.audienceSource,
+          recipientCount: nextData.recipients.length,
+        };
+      }
+
       nextData.audienceSource = {
-        ...audienceSource,
+        ...(nextData.audienceSource || audienceSource),
         recipientCount: nextData.recipients.length,
         selectedContactCount:
           Number(nextData.audienceSnapshot?.summary?.selectedContactCount || nextData.recipients.length) ||
