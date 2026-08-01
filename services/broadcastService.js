@@ -4087,7 +4087,18 @@ class BroadcastService {
               sent > 0 && delivered === 0 && read === 0 && failed === 0;
             const statsLookIncomplete =
               recipientCount > 0 &&
-              (sent < recipientCount || deliveryStatsMissing);
+              (sent === 0 ||
+                sent > recipientCount ||
+                delivered > recipientCount ||
+                read > recipientCount ||
+                failed > recipientCount ||
+                replied > recipientCount ||
+                sent < delivered ||
+                sent < read ||
+                sent < failed ||
+                delivered < read ||
+                delivered < failed ||
+                deliveryStatsMissing);
             const statusRepairNeeded =
               status === "completed_with_errors" && failed > 0;
             return (
@@ -4116,7 +4127,44 @@ class BroadcastService {
         }
       }
 
-      return { success: true, data: broadcasts };
+      const normalizedBroadcasts = broadcasts.map((broadcast) => ({
+        ...broadcast,
+        sentCount: Number(broadcast?.stats?.sent || 0),
+        completedCount: Number(broadcast?.stats?.sent || 0),
+        successful: Math.max(
+          Number(broadcast?.stats?.delivered || 0),
+          Number(broadcast?.stats?.read || 0),
+        ),
+        successfulPercentage:
+          Number(broadcast?.recipientCount || 0) > 0
+            ? Math.round(
+                (Math.max(
+                  Number(broadcast?.stats?.delivered || 0),
+                  Number(broadcast?.stats?.read || 0),
+                ) /
+                  Number(broadcast?.recipientCount || 0)) *
+                  100,
+              )
+            : 0,
+        readPercentage:
+          Number(broadcast?.stats?.delivered || 0) > 0
+            ? Math.round(
+                (Number(broadcast?.stats?.read || 0) /
+                  Number(broadcast?.stats?.delivered || 0)) *
+                  100,
+              )
+            : 0,
+        repliedPercentage:
+          Number(broadcast?.stats?.delivered || 0) > 0
+            ? Math.round(
+                (Number(broadcast?.stats?.replied || 0) /
+                  Number(broadcast?.stats?.delivered || 0)) *
+                  100,
+              )
+            : 0,
+      }));
+
+      return { success: true, data: normalizedBroadcasts };
     } catch (error) {
       return { success: false, error: error.message };
     }
