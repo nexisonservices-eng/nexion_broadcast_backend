@@ -3960,7 +3960,18 @@ class BroadcastService {
             sent > 0 && delivered === 0 && read === 0 && failed === 0;
           const statsLookIncomplete =
             recipientCount > 0 &&
-            (sent < recipientCount || deliveryStatsMissing);
+            (sent === 0 ||
+              sent > recipientCount ||
+              delivered > recipientCount ||
+              read > recipientCount ||
+              failed > recipientCount ||
+              replied > recipientCount ||
+              sent < delivered ||
+              sent < read ||
+              sent < failed ||
+              delivered < read ||
+              delivered < failed ||
+              deliveryStatsMissing);
           const statusRepairNeeded =
             status === "completed_with_errors" && failed > 0;
 
@@ -3996,6 +4007,37 @@ class BroadcastService {
           ...broadcast,
           sentCount: Number(broadcast?.stats?.sent || 0),
           completedCount: Number(broadcast?.stats?.sent || 0),
+          successful: Math.max(
+            Number(broadcast?.stats?.delivered || 0),
+            Number(broadcast?.stats?.read || 0),
+          ),
+          successfulPercentage:
+            Number(broadcast?.recipientCount || 0) > 0
+              ? Math.round(
+                  (Math.max(
+                    Number(broadcast?.stats?.delivered || 0),
+                    Number(broadcast?.stats?.read || 0),
+                  ) /
+                    Number(broadcast?.recipientCount || 0)) *
+                    100,
+                )
+              : 0,
+          readPercentage:
+            Number(broadcast?.stats?.delivered || 0) > 0
+              ? Math.round(
+                  (Number(broadcast?.stats?.read || 0) /
+                    Number(broadcast?.stats?.delivered || 0)) *
+                    100,
+                )
+              : 0,
+          repliedPercentage:
+            Number(broadcast?.stats?.delivered || 0) > 0
+              ? Math.round(
+                  (Number(broadcast?.stats?.replied || 0) /
+                    Number(broadcast?.stats?.delivered || 0)) *
+                    100,
+                )
+              : 0,
         }));
         const lastItem = items[items.length - 1] || null;
 
@@ -4852,112 +4894,214 @@ class BroadcastService {
   // Sync broadcast stats from actual messages in team inbox
   async syncBroadcastStats(broadcastId, broadcaster = null) {
     try {
-      const broadcast = await Broadcast.findById(broadcastId);
+      const normalizedBroadcastId = String(broadcastId || "").trim();
+      if (!normalizedBroadcastId) {
+        return { success: false, error: "Broadcast id is required" };
+      }
+
+      const broadcast = await Broadcast.findById(normalizedBroadcastId);
       if (!broadcast) {
         return { success: false, error: "Broadcast not found" };
       }
 
-      // Find all messages sent from this broadcast
       const startTime = new Date(broadcast.startedAt || broadcast.createdAt);
-      // Use the current time as the upper bound so late delivery/read webhooks
-      // that arrive after completedAt still get counted during a sync.
       const endTime = new Date();
+      const normalizeStatus = (value = "") =>
+        String(value || "").trim().toLowerCase();
+      const choosePreferredStatus = (currentStatus = "", nextStatus = "") => {
+        const current = normalizeStatus(currentStatus);
+        const next = normalizeStatus(nextStatus);
 
-      const broadcastIdQuery = {
+        if (!next) return current;
+        if (!current) return next;
+        if (current === next) return current;
+        if (current === "read" || current === "failed") return current;
+        if (next === "read") return "read";
+        if (next === "delivered") {
+          return ["pending", "sending", "sent"].includes(current)
+            ? "delivered"
+            : current;
+        }
+        if (next === "failed") {
+          return ["pending", "sending", "sent"].includes(current)
+            ? "failed"
+            : current;
+        }
+        if (next === "sent") {
+          return current || "sent";
+        }
+        return next;
+      };
+
+      const dispatches = await BroadcastDispatch.find({
+        broadcastId: broadcast._id,
+      })
+        .select(
+          "broadcastDispatchKey messageId whatsappMessageId recipientPhone recipientIndex status sentAt deliveredAt readAt failedAt errorMessage errorCode conversationId",
+        )
+        .sort({ recipientIndex: 1, _id: 1 })
+        .lean();
+
+      const dispatchKeys = dispatches
+        .map((dispatch) => String(dispatch?.broadcastDispatchKey || "").trim())
+        .filter(Boolean);
+      const whatsappMessageIds = dispatches
+        .map((dispatch) => String(dispatch?.whatsappMessageId || "").trim())
+        .filter(Boolean);
+      const messageIds = dispatches
+        .map((dispatch) => String(dispatch?.messageId || "").trim())
+        .filter(Boolean);
+
+      const messageQuery = {
         userId: broadcast.createdById,
         companyId: broadcast.companyId,
         sender: "agent",
-        broadcastId: broadcast._id,
         timestamp: { $gte: startTime, $lte: endTime },
+        $or: [
+          { broadcastId: broadcast._id },
+          ...(dispatchKeys.length
+            ? [{ broadcastDispatchKey: { $in: dispatchKeys } }]
+            : []),
+          ...(whatsappMessageIds.length
+            ? [{ whatsappMessageId: { $in: whatsappMessageIds } }]
+            : []),
+          ...(messageIds.length ? [{ _id: { $in: messageIds } }] : []),
+        ],
       };
 
-      let messages = await Message.find(broadcastIdQuery);
-      const messageIds = new Set(
-        messages.map((message) => String(message?._id || "")).filter(Boolean),
-      );
+      let messages = await Message.find(messageQuery)
+        .select(
+          "_id conversationId status timestamp broadcastId broadcastDispatchKey whatsappMessageId sentAt deliveredAt readAt failedAt errorMessage errorCode",
+        )
+        .lean();
 
-      // Supplement with legacy conversation-based lookup so partially linked
-      // broadcasts do not undercount sent/delivered/read/failed stats.
-      const recipientPhones = (broadcast.recipients || [])
-        .map((r) => r.phone || r)
-        .map((phone) => String(phone || "").trim())
-        .filter(Boolean);
-      const recipientCount = Number(broadcast?.recipientCount || 0);
-      const hasDeliveryStats = messages.some((msg) => {
-        const status = String(msg?.status || "").toLowerCase();
-        return ["sent", "delivered", "read", "failed"].includes(status);
-      });
-      const shouldSupplementLegacyRows =
-        recipientPhones.length > 0 &&
-        (messages.length === 0 ||
-          (recipientCount > 0 && messages.length < recipientCount) ||
-          !hasDeliveryStats);
+      const messageLookup = new Map();
+      const registerMessage = (message = {}) => {
+        const normalizedMessage = message || {};
+        const status = normalizeStatus(normalizedMessage.status);
+        const keys = [
+          String(normalizedMessage.broadcastDispatchKey || "").trim(),
+          String(normalizedMessage.whatsappMessageId || "").trim(),
+          String(normalizedMessage._id || "").trim(),
+        ].filter(Boolean);
 
-      if (shouldSupplementLegacyRows) {
-        const conversations = await Conversation.find({
-          userId: broadcast.createdById,
-          contactPhone: { $in: recipientPhones },
-        });
-
-        const conversationIds = conversations.map((c) => c._id);
-
-        if (conversationIds.length > 0) {
-          const convoMessages = await Message.find({
-            userId: broadcast.createdById,
-            sender: "agent",
-            conversationId: { $in: conversationIds },
-            timestamp: { $gte: startTime, $lte: endTime },
-          });
-
-          for (const message of convoMessages) {
-            const messageKey = String(message?._id || "");
-            if (!messageKey || messageIds.has(messageKey)) continue;
-            messageIds.add(messageKey);
-            messages.push(message);
+        for (const key of keys) {
+          const current = messageLookup.get(key);
+          if (!current) {
+            messageLookup.set(key, normalizedMessage);
+            continue;
+          }
+          const preferredStatus = choosePreferredStatus(
+            current.status,
+            status,
+          );
+          if (preferredStatus !== normalizeStatus(current.status)) {
+            messageLookup.set(key, {
+              ...current,
+              ...normalizedMessage,
+              status: preferredStatus || normalizedMessage.status,
+            });
           }
         }
+      };
 
-        if (messages.length > 0) {
+      messages.forEach((message) => registerMessage(message));
+
+      if (messages.length > 0) {
+        const backfillMessageIds = messages
+          .filter(
+            (message) =>
+              !String(message?.broadcastId || "").trim() &&
+              String(message?.broadcastDispatchKey || "").trim() &&
+              message.broadcastDispatchKey &&
+              dispatchKeys.includes(String(message.broadcastDispatchKey).trim()),
+          )
+          .map((message) => message._id);
+
+        if (backfillMessageIds.length > 0) {
           await Message.updateMany(
+            { _id: { $in: backfillMessageIds } },
             {
-              _id: { $in: messages.map((m) => m._id) },
-              broadcastId: { $exists: false },
-              conversationId: {
-                $in: recipientPhones.length > 0 ? conversationIds : [],
+              $set: {
+                broadcastId: broadcast._id,
               },
             },
-            { $set: { broadcastId: broadcast._id } },
           );
         }
-
-        // Avoid broad text-based legacy fallback queries:
-        // they can cross-match unrelated broadcasts and cause stat drops/fluctuations.
       }
 
-      console.log(
-        `?? Found ${messages.length} messages for broadcast "${broadcast.name}"`,
-      );
+      const eligibleDispatches = dispatches.filter((dispatch) => {
+        const status = normalizeStatus(dispatch?.status);
+        return !["suppressed", "skipped"].includes(status);
+      });
 
-      // Count statuses with proper validation
       const stats = {
-        sent: messages.length,
-        // In WhatsApp, "read" implies message was delivered.
-        delivered: messages.filter(
-          (msg) => msg.status === "delivered" || msg.status === "read",
-        ).length,
-        read: messages.filter((msg) => msg.status === "read").length,
-        failed: messages.filter((msg) => msg.status === "failed").length,
-        replied: 0, // Will be calculated below
+        sent: 0,
+        delivered: 0,
+        read: 0,
+        failed: 0,
+        replied: 0,
       };
+
+      for (const dispatch of eligibleDispatches) {
+        const dispatchStatus = normalizeStatus(dispatch?.status);
+        const linkedMessage =
+          messageLookup.get(String(dispatch?.broadcastDispatchKey || "").trim()) ||
+          messageLookup.get(String(dispatch?.whatsappMessageId || "").trim()) ||
+          messageLookup.get(String(dispatch?.messageId || "").trim()) ||
+          null;
+        const messageStatus = normalizeStatus(linkedMessage?.status);
+        const effectiveStatus = choosePreferredStatus(dispatchStatus, messageStatus);
+
+        stats.sent += 1;
+        if (
+          effectiveStatus === "delivered" ||
+          effectiveStatus === "read" ||
+          dispatch?.deliveredAt ||
+          dispatch?.readAt ||
+          linkedMessage?.deliveredAt ||
+          linkedMessage?.readAt
+        ) {
+          stats.delivered += 1;
+        }
+        if (
+          effectiveStatus === "read" ||
+          dispatch?.readAt ||
+          linkedMessage?.readAt
+        ) {
+          stats.read += 1;
+        }
+        if (
+          effectiveStatus === "failed" ||
+          dispatch?.failedAt ||
+          linkedMessage?.failedAt
+        ) {
+          stats.failed += 1;
+        }
+      }
+
+      const outboundMessages = messages.slice().sort((left, right) => {
+        const leftTime = new Date(left?.timestamp || 0).getTime();
+        const rightTime = new Date(right?.timestamp || 0).getTime();
+        return leftTime - rightTime;
+      });
+
       const recipientDetails = await this.buildRecipientStatusDetails(broadcast);
       if (Array.isArray(recipientDetails) && recipientDetails.length > 0) {
         const resolvedStats = recipientDetails.reduce(
           (accumulator, detail) => {
             const status = String(detail?.status || "").toLowerCase();
-            if (detail?.sent || ["sent", "delivered", "read", "failed"].includes(status)) {
+            if (
+              detail?.sent ||
+              ["sent", "delivered", "read", "failed"].includes(status)
+            ) {
               accumulator.sent += 1;
             }
-            if (detail?.delivered || status === "delivered" || status === "read") {
+            if (
+              detail?.delivered ||
+              status === "delivered" ||
+              status === "read"
+            ) {
               accumulator.delivered += 1;
             }
             if (detail?.read || status === "read") {
@@ -4987,25 +5131,29 @@ class BroadcastService {
         stats.replied = Math.max(stats.replied, resolvedStats.replied);
       }
 
+      console.log("Broadcast ID:", normalizedBroadcastId);
+      console.log("Saved statistics:", broadcast.stats || {});
+      console.log("Calculated statistics:", stats);
+
       const currentStatus = String(broadcast?.status || "").toLowerCase();
       const resolvedFinalStatus = stats.failed > 0 ? "completed_with_errors" : "completed";
 
       // Debug: Log message statuses to identify issues
       console.log("🔍 DEBUG: Message statuses found:", {
-        totalMessages: messages.length,
+        totalMessages: outboundMessages.length,
         statusBreakdown: {
-          sent: messages.filter((msg) => msg.status === "sent").length,
-          delivered: messages.filter(
+          sent: outboundMessages.filter((msg) => msg.status === "sent").length,
+          delivered: outboundMessages.filter(
             (msg) => msg.status === "delivered" || msg.status === "read",
           ).length,
-          read: messages.filter((msg) => msg.status === "read").length,
-          failed: messages.filter((msg) => msg.status === "failed").length,
-          other: messages.filter(
+          read: outboundMessages.filter((msg) => msg.status === "read").length,
+          failed: outboundMessages.filter((msg) => msg.status === "failed").length,
+          other: outboundMessages.filter(
             (msg) =>
               !["sent", "delivered", "read", "failed"].includes(msg.status),
           ).length,
         },
-        messageDetails: messages.map((m) => ({
+        messageDetails: outboundMessages.map((m) => ({
           id: m._id,
           whatsappId: m.whatsappMessageId,
           status: m.status,
@@ -5015,34 +5163,36 @@ class BroadcastService {
 
       // Count unique contacts who replied to this broadcast
       const conversationIds = Array.from(
-        new Set(messages.map((m) => String(m.conversationId))),
+        new Set(
+          outboundMessages.map((m) => String(m.conversationId)).filter(Boolean),
+        ),
       );
       const replyStartTime =
-        messages.length > 0
+        outboundMessages.length > 0
           ? new Date(
-              Math.min(...messages.map((m) => new Date(m.timestamp).getTime())),
+              Math.min(
+                ...outboundMessages.map((m) =>
+                  new Date(m.timestamp || startTime).getTime(),
+                ),
+              ),
             )
           : startTime;
 
-      const replyMessages = await Message.find({
-        userId: broadcast.createdById,
-        companyId: broadcast.companyId,
-        conversationId: { $in: conversationIds },
-        sender: "contact",
-        timestamp: { $gte: replyStartTime },
-      });
+      const replyMessages = conversationIds.length
+        ? await Message.find({
+            userId: broadcast.createdById,
+            companyId: broadcast.companyId,
+            conversationId: { $in: conversationIds },
+            sender: "contact",
+            timestamp: { $gte: replyStartTime, $lte: endTime },
+          })
+        : [];
 
       // Count unique conversations that have at least one reply
       const uniqueRepliedConversations = new Set(
         replyMessages.map((msg) => msg.conversationId.toString()),
       );
       stats.replied = uniqueRepliedConversations.size;
-
-      console.log("📊 Message status breakdown:", {
-        total: messages.length,
-        statuses: messages.map((m) => ({ id: m._id, status: m.status })),
-        calculatedStats: stats,
-      });
 
       // Only update broadcast stats if they're different
       const currentStats = broadcast.stats || {};
@@ -5056,20 +5206,24 @@ class BroadcastService {
       let updatedBroadcast = null;
 
       if (statsChanged || statusChanged) {
-        // Update only the stats field without touching other fields
-        await Broadcast.updateOne(
-          { _id: broadcastId },
+        await Broadcast.findByIdAndUpdate(
+          normalizedBroadcastId,
           {
             $set: {
-              stats: stats,
+              "stats.sent": stats.sent,
+              "stats.delivered": stats.delivered,
+              "stats.read": stats.read,
+              "stats.failed": stats.failed,
+              "stats.replied": stats.replied,
               status: resolvedFinalStatus,
               updatedAt: new Date(),
             },
           },
+          { new: true },
         );
 
         // Get updated broadcast with virtual fields
-        updatedBroadcast = await Broadcast.findById(broadcastId);
+        updatedBroadcast = await Broadcast.findById(normalizedBroadcastId);
         const repliedPercentage = updatedBroadcast.repliedPercentage;
         const repliedPercentageOfTotal =
           updatedBroadcast.repliedPercentageOfTotal;
@@ -5090,7 +5244,7 @@ class BroadcastService {
 
       this.emitBroadcastRealtimeEvent(broadcaster, {
         type: "broadcast_stats_updated",
-        broadcastId: String(broadcastId),
+        broadcastId: String(normalizedBroadcastId),
         stats,
         broadcast: updatedBroadcast
           ? updatedBroadcast.toObject
@@ -5101,7 +5255,17 @@ class BroadcastService {
 
       return {
         success: true,
-        data: { broadcast, stats, messagesFound: messages.length },
+        data: {
+          broadcast: updatedBroadcast
+            ? updatedBroadcast.toObject
+              ? updatedBroadcast.toObject()
+              : updatedBroadcast
+            : broadcast.toObject
+              ? broadcast.toObject()
+              : broadcast,
+          stats,
+          messagesFound: outboundMessages.length,
+        },
       };
     } catch (error) {
       console.error("Error syncing broadcast stats:", error);

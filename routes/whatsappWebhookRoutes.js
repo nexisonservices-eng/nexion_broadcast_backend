@@ -961,14 +961,24 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
 
   const handleMessageStatus = async (statusData, userId, companyId) => {
     try {
-      const messageId = statusData.id;
+      const messageId = firstNonEmpty(
+        statusData.id,
+        statusData.messageSid,
+        statusData.MessageSid,
+        statusData.message_id,
+        statusData.providerMessageId,
+      );
       const status = String(
         statusData.status ||
           statusData.MessageStatus ||
           statusData.message_status ||
           ''
       ).trim().toLowerCase();
-      const recipient = statusData.recipient_id;
+      const recipient = firstNonEmpty(
+        statusData.recipient_id,
+        statusData.To,
+        statusData.to,
+      );
       const statusErrorParts = [
         statusData?.errors?.[0]?.message,
         statusData?.errors?.[0]?.error_data?.message,
