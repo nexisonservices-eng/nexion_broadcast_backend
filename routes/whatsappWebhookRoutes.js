@@ -41,6 +41,7 @@ const {
 const {
   forwardIvrNotificationStatus
 } = require('../services/ivrNotificationStatusBridge');
+const BroadcastDispatch = require('../models/BroadcastDispatch');
 
 const truncateMediaDebugValue = (value, max = 120) => {
   const raw = String(value || '').trim();
@@ -118,6 +119,39 @@ const emitMediaDebugLog = ({
   }
   console.info(`[MEDIA_PIPELINE] ${serialized}`);
   return payload;
+};
+
+const resolveBroadcastIdForStatusMessage = async (message = null) => {
+  const directBroadcastId = String(message?.broadcastId || '').trim();
+  if (directBroadcastId) {
+    return directBroadcastId;
+  }
+
+  const broadcastDispatchKey = String(message?.broadcastDispatchKey || '').trim();
+  const whatsappMessageId = String(message?.whatsappMessageId || '').trim();
+
+  if (!broadcastDispatchKey && !whatsappMessageId) {
+    return '';
+  }
+
+  const dispatchQuery = [];
+  if (broadcastDispatchKey) {
+    dispatchQuery.push({ broadcastDispatchKey });
+  }
+  if (whatsappMessageId) {
+    dispatchQuery.push({ whatsappMessageId });
+  }
+  if (String(message?._id || '').trim()) {
+    dispatchQuery.push({ messageId: message._id });
+  }
+
+  const dispatch = await BroadcastDispatch.findOne({
+    $or: dispatchQuery,
+  })
+    .select('broadcastId')
+    .lean();
+
+  return String(dispatch?.broadcastId || '').trim();
 };
 
 const registerWhatsAppWebhookRoutes = (app, deps) => {
@@ -984,6 +1018,18 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         return;
       }
 
+      let resolvedBroadcastId = String(updatedMessage.broadcastId || '').trim();
+      if (!resolvedBroadcastId) {
+        resolvedBroadcastId = await resolveBroadcastIdForStatusMessage(updatedMessage);
+        if (resolvedBroadcastId) {
+          await Message.updateOne(
+            { _id: updatedMessage._id },
+            { $set: { broadcastId: resolvedBroadcastId, updatedAt: new Date() } }
+          );
+          updatedMessage.broadcastId = resolvedBroadcastId;
+        }
+      }
+
       if (updatedMessage.sender === 'agent') {
         try {
           await Conversation.updateOne(
@@ -1021,7 +1067,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         errorCode: updatedMessage.errorCode || '',
         errorDetails: statusError || '',
         conversationId: message.conversationId,
-        broadcastId: updatedMessage.broadcastId ? String(updatedMessage.broadcastId) : null,
+        broadcastId: resolvedBroadcastId || null,
         previousStatus: oldStatus,
         mediaPipelineRequestId: mediaPipelineRequestId || null
       });
@@ -1048,10 +1094,10 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         }
       }
 
-      if (updatedMessage.broadcastId && oldStatus !== updatedMessage.status) {
+      if (resolvedBroadcastId && oldStatus !== updatedMessage.status) {
         try {
           const broadcast = await Broadcast.findOne({
-            _id: updatedMessage.broadcastId,
+            _id: resolvedBroadcastId,
             createdById: effectiveUserId,
             companyId: effectiveCompanyId,
             status: { $in: ['sending', 'completed', 'completed_with_errors', 'failed'] }
