@@ -277,6 +277,78 @@ const graphRequest = async ({
   }
 };
 
+const normalizePreviewPlacements = (placements = []) => {
+  const requested = Array.isArray(placements)
+    ? placements
+    : String(placements || '')
+        .split(',')
+        .map((item) => String(item || '').trim())
+        .filter(Boolean);
+
+  const placementMap = new Map([
+    ['facebook_feed', { key: 'facebook_feed', label: 'Facebook Feed', adFormat: 'MOBILE_FEED_STANDARD' }],
+    ['facebook', { key: 'facebook_feed', label: 'Facebook Feed', adFormat: 'MOBILE_FEED_STANDARD' }],
+    ['feed', { key: 'facebook_feed', label: 'Facebook Feed', adFormat: 'MOBILE_FEED_STANDARD' }],
+    ['instagram_feed', { key: 'instagram_feed', label: 'Instagram Feed', adFormat: 'INSTAGRAM_STANDARD' }],
+    ['instagram', { key: 'instagram_feed', label: 'Instagram Feed', adFormat: 'INSTAGRAM_STANDARD' }],
+    ['story', { key: 'story', label: 'Story', adFormat: 'INSTAGRAM_STORY' }],
+    ['instagram_story', { key: 'story', label: 'Story', adFormat: 'INSTAGRAM_STORY' }]
+  ]);
+
+  const resolved = requested
+    .map((placement) => placementMap.get(String(placement).trim().toLowerCase()))
+    .filter(Boolean);
+
+  const uniqueResolved = resolved.filter(
+    (placement, index, list) =>
+      index === list.findIndex((item) => item.key === placement.key)
+  );
+
+  return uniqueResolved.length
+    ? uniqueResolved
+    : [
+        placementMap.get('facebook_feed'),
+        placementMap.get('instagram_feed'),
+        placementMap.get('story')
+      ];
+};
+
+const extractPreviewHtml = (responseData) => {
+  const candidates = [];
+
+  const pushCandidate = (value) => {
+    if (typeof value === 'string' && value.trim()) {
+      candidates.push(value.trim());
+    }
+  };
+
+  pushCandidate(responseData?.body);
+  pushCandidate(responseData?.html);
+  pushCandidate(responseData?.iframe);
+  pushCandidate(responseData?.preview);
+
+  if (Array.isArray(responseData?.data)) {
+    responseData.data.forEach((item) => {
+      pushCandidate(item?.body);
+      pushCandidate(item?.html);
+      pushCandidate(item?.iframe);
+      pushCandidate(item?.preview);
+    });
+  }
+
+  if (typeof responseData === 'string') {
+    pushCandidate(responseData);
+  }
+
+  for (const candidate of candidates) {
+    if (/<iframe[\s>]/i.test(candidate) || /<body[\s>]/i.test(candidate) || /<html[\s>]/i.test(candidate)) {
+      return candidate;
+    }
+  }
+
+  return candidates[0] || '';
+};
+
 const extractApiErrorMessage = (error) => {
   return (
     error?.response?.data?.error?.message ||
@@ -1403,6 +1475,97 @@ const getConnectionDiagnostics = async ({ userId } = {}) => {
   };
 
   return diagnostics;
+};
+
+const getAdPreviews = async ({ userId, adId, placements = [] } = {}) => {
+  if (shouldUseMockMode()) {
+    return {
+      adId: String(adId || '').trim(),
+      previews: normalizePreviewPlacements(placements).map((placement) => ({
+        key: placement.key,
+        label: placement.label,
+        adFormat: placement.adFormat,
+        html:
+          `<div style="font-family:Arial,sans-serif;padding:24px;border:1px solid #dbe4f0;border-radius:16px;">` +
+          `<strong>${placement.label}</strong><p>Mock preview is enabled. Connect live Meta credentials to render the real iframe.</p></div>`,
+        source: 'mock'
+      })),
+      meta: { source: 'mock' }
+    };
+  }
+
+  const accessContext = await ensureConnectedMetaUser(userId, 'Ad preview');
+  const resolvedAdId = String(adId || '').trim();
+  if (!/^\d+$/.test(resolvedAdId)) {
+    throw buildStageErrorWithDetails(
+      'Ad preview',
+      'A valid Meta Ad ID is required. Use the numeric ad.id returned by Meta, not a campaign ID.',
+      { adId: resolvedAdId },
+      400
+    );
+  }
+
+  const authConfig = resolveMetaCampaignAuthConfig(accessContext);
+  await verifyMetaAdsManagementPermission({
+    accessToken: accessContext.accessToken,
+    appId: authConfig.appId,
+    appSecret: authConfig.appSecret,
+    apiVersion: accessContext.apiVersion
+  });
+
+  const previewPlacements = normalizePreviewPlacements(placements);
+  const previews = [];
+
+  for (const placement of previewPlacements) {
+    try {
+      const response = await graphRequest({
+        path: `${resolvedAdId}/previews`,
+        params: {
+          ad_format: placement.adFormat
+        },
+        accessToken: accessContext.accessToken,
+        apiVersion: accessContext.apiVersion
+      });
+
+      const html = extractPreviewHtml(response) || '';
+      previews.push({
+        key: placement.key,
+        label: placement.label,
+        adFormat: placement.adFormat,
+        html,
+        source: 'meta-graph'
+      });
+    } catch (error) {
+      console.warn(
+        '[Meta Ad Preview] Failed to load preview:',
+        JSON.stringify({
+          adId: resolvedAdId,
+          placement: placement.key,
+          message: extractApiErrorMessage(error),
+          code: error?.response?.data?.error?.code || error?.response?.data?.code || null
+        })
+      );
+      throw buildStageErrorWithDetails(
+        'Ad preview',
+        `Unable to load the ${placement.label} preview from Meta.`,
+        {
+          adId: resolvedAdId,
+          placement: placement.key,
+          metaError: normalizeMetaApiError(error)
+        },
+        error?.response?.status || 502
+      );
+    }
+  }
+
+  return {
+    adId: resolvedAdId,
+    previews,
+    meta: {
+      source: 'meta-graph',
+      requestedPlacements: previewPlacements.map((placement) => placement.key)
+    }
+  };
 };
 
 const getAdAccountBillingSummary = async ({ userId } = {}) => {
@@ -3932,6 +4095,7 @@ module.exports = {
   getUserAdAccounts,
   getSetupBundle,
   getConnectionDiagnostics,
+  getAdPreviews,
   getPageLeads,
   getAdAccountBillingSummary,
   verifyMetaAdsManagementPermission,

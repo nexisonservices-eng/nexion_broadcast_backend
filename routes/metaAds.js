@@ -639,6 +639,40 @@ router.post('/save-adaccount', auth, async (req, res) => {
   }
 });
 
+router.get('/ads/:adId/previews', auth, async (req, res) => {
+  try {
+    const adId = String(req.params.adId || '').trim();
+    if (!/^\d+$/.test(adId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'A valid Meta Ad ID is required. Use the numeric ad.id returned by Meta.'
+      });
+    }
+
+    const placements = String(req.query.placements || req.query.placement || '')
+      .split(',')
+      .map((item) => String(item || '').trim())
+      .filter(Boolean);
+
+    const previewBundle = await metaAdsService.getAdPreviews({
+      userId: req.user.id,
+      adId,
+      placements
+    });
+
+    res.json({
+      success: true,
+      ...previewBundle
+    });
+  } catch (error) {
+    res.status(error.status || 500).json({
+      success: false,
+      error: error.message,
+      details: error.details || null
+    });
+  }
+});
+
 // Meta Lead Ads webhook verification
 router.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
