@@ -84,11 +84,57 @@ const normalizeCampaignContractPayload = (payload = {}) => {
 
 const shapeCampaignContract = (campaign = {}) => {
   const source = campaign && typeof campaign === 'object' ? campaign : {};
-  const fallbackBudgetType = source.dailyBudget ? 'daily' : 'lifetime';
-  const derivedBudgetType = toCleanString(source?.deliveryPolicy?.budgetType || source?.budgetType).toLowerCase();
+  const sourceDeliveryPolicy = source?.deliveryPolicy && typeof source.deliveryPolicy === 'object' ? source.deliveryPolicy : {};
+  const sourceAnalytics = source?.analytics && typeof source.analytics === 'object' ? source.analytics : {};
+  const fallbackBudgetType =
+    sourceDeliveryPolicy.dailyBudget || source.dailyBudget
+      ? 'daily'
+      : 'lifetime';
+  const derivedBudgetType = toCleanString(sourceDeliveryPolicy.budgetType || source?.budgetType).toLowerCase();
   const budgetType = derivedBudgetType === 'daily' || derivedBudgetType === 'lifetime'
     ? derivedBudgetType
     : fallbackBudgetType;
+
+  const dailyBudgetValue =
+    sourceDeliveryPolicy.dailyBudget !== undefined && sourceDeliveryPolicy.dailyBudget !== null
+      ? sourceDeliveryPolicy.dailyBudget
+      : source.dailyBudget;
+  const lifetimeBudgetValue =
+    sourceDeliveryPolicy.lifetimeBudget !== undefined && sourceDeliveryPolicy.lifetimeBudget !== null
+      ? sourceDeliveryPolicy.lifetimeBudget
+      : source.lifetimeBudget;
+  const spentValue =
+    sourceAnalytics.spent !== undefined && sourceAnalytics.spent !== null
+      ? sourceAnalytics.spent
+      : source.spent;
+  const impressionsValue =
+    sourceAnalytics.impressions !== undefined && sourceAnalytics.impressions !== null
+      ? sourceAnalytics.impressions
+      : source.impressions;
+  const clicksValue =
+    sourceAnalytics.clicks !== undefined && sourceAnalytics.clicks !== null
+      ? sourceAnalytics.clicks
+      : source.clicks;
+  const ctrValue =
+    sourceAnalytics.ctr !== undefined && sourceAnalytics.ctr !== null
+      ? sourceAnalytics.ctr
+      : source.ctr;
+  const cpcValue =
+    sourceAnalytics.cpc !== undefined && sourceAnalytics.cpc !== null
+      ? sourceAnalytics.cpc
+      : source.cpc;
+  const revenueValue =
+    sourceAnalytics.revenue !== undefined && sourceAnalytics.revenue !== null
+      ? sourceAnalytics.revenue
+      : source.revenue;
+  const roasValue =
+    sourceAnalytics.roas !== undefined && sourceAnalytics.roas !== null
+      ? sourceAnalytics.roas
+      : source.roas;
+  const roiValue =
+    sourceAnalytics.roi !== undefined && sourceAnalytics.roi !== null
+      ? sourceAnalytics.roi
+      : source.roi;
 
   return {
     audience: {
@@ -107,14 +153,12 @@ const shapeCampaignContract = (campaign = {}) => {
       lifecycleStatus: toCleanString(source.lifecycleStatus || 'draft') || 'draft',
       deliveryStatus: toCleanString(source.deliveryStatus || 'not_published') || 'not_published',
       budgetType,
-      dailyBudget: toSafeNumber(source.dailyBudget, null),
-      lifetimeBudget: toSafeNumber(source.lifetimeBudget, null),
+      dailyBudget: toSafeNumber(dailyBudgetValue, null),
+      lifetimeBudget: toSafeNumber(lifetimeBudgetValue, null),
       startDate: toSafeDate(source.startDate, null),
       endDate: toSafeDate(source.endDate, null),
       quietHours:
-        source.deliveryPolicy && typeof source.deliveryPolicy === 'object'
-          ? source.deliveryPolicy.quietHours || null
-          : null
+        sourceDeliveryPolicy.quietHours || null
     },
     retryPolicy: {
       enabled: Boolean(source?.retryPolicy?.enabled),
@@ -133,14 +177,14 @@ const shapeCampaignContract = (campaign = {}) => {
       retentionDays: toSafeNumber(source?.compliancePolicy?.retentionDays, null)
     },
     analytics: {
-      spent: toSafeNumber(source.spent, 0),
-      impressions: toSafeNumber(source.impressions, 0),
-      clicks: toSafeNumber(source.clicks, 0),
-      ctr: toSafeNumber(source.ctr, 0),
-      cpc: toSafeNumber(source.cpc, 0),
-      revenue: toSafeNumber(source.revenue, 0),
-      roas: toSafeNumber(source.roas, 0),
-      roi: toSafeNumber(source.roi, 0)
+      spent: toSafeNumber(spentValue, 0),
+      impressions: toSafeNumber(impressionsValue, 0),
+      clicks: toSafeNumber(clicksValue, 0),
+      ctr: toSafeNumber(ctrValue, 0),
+      cpc: toSafeNumber(cpcValue, 0),
+      revenue: toSafeNumber(revenueValue, 0),
+      roas: toSafeNumber(roasValue, 0),
+      roi: toSafeNumber(roiValue, 0)
     }
   };
 };
