@@ -1833,6 +1833,36 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
   const remoteCampaignImageMap = new Map();
   const creativeCampaignMap = new Map();
   const accountIds = [...adAccountCandidates.keys()];
+  const remoteInsightDatePreset = mapCrudDateRangeToMetaPreset(filters.dateRange || 'last30days');
+
+  const fetchRemoteCampaignInsights = async (remoteId) => {
+    for (const accessToken of tokenCandidates) {
+      try {
+        const response = await graphRequest({
+          path: `${remoteId}/insights`,
+          params: {
+            fields: 'impressions,reach,clicks,spend,ctr,cpc,actions',
+            date_preset: remoteInsightDatePreset,
+            limit: 1
+          },
+          accessToken
+        });
+
+        return Array.isArray(response?.data) ? response.data[0] || {} : {};
+      } catch (error) {
+        console.warn(
+          '[Meta Ads] Unable to load campaign insights for remote campaign',
+          JSON.stringify({
+            remoteId,
+            source: accessContext.source,
+            message: extractApiErrorMessage(error)
+          })
+        );
+      }
+    }
+
+    return {};
+  };
 
   for (const adAccountId of accountIds) {
     let adsResponse = null;
@@ -1865,7 +1895,7 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
         response = await graphRequest({
           path: buildAdAccountPath(adAccountId, 'campaigns'),
           params: {
-            fields: 'id,name,status,effective_status,objective',
+            fields: 'id,name,status,effective_status,objective,daily_budget,lifetime_budget,created_time,updated_time',
             limit: 100
           },
           accessToken
@@ -1977,7 +2007,7 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
       const remoteId = String(campaign?.id || '').trim();
       if (!remoteId || remoteCampaignMap.has(remoteId)) continue;
 
-      const insight = Array.isArray(campaign?.insights?.data) ? campaign.insights.data[0] || {} : {};
+      const insight = await fetchRemoteCampaignInsights(remoteId);
       remoteCampaignMap.set(remoteId, {
         _id: `meta_${remoteId}`,
         id: `meta_${remoteId}`,
