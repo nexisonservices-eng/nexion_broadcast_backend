@@ -990,7 +990,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         .map((value) => String(value || '').trim())
         .filter(Boolean);
       const statusError =
-        statusErrorParts.length > 0 ? statusErrorParts.join(' • ') : '';
+        statusErrorParts.length > 0 ? statusErrorParts.join(' â€¢ ') : '';
 
       await forwardIvrNotificationStatus(statusData);
 
