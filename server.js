@@ -211,6 +211,13 @@ app.use(
     }
   })
 );
+
+app.get("/", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "Server is running"
+  });
+});
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 app.get('/healthz', (req, res) => {
