@@ -84,6 +84,7 @@ const { createWebSocketHub } = require('./realtime/websocketHub');
 const { startAppScheduler } = require('./jobs/appScheduler');
 
 const app = express();
+app.set("trust proxy", 1);
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 const HEARTBEAT_INTERVAL_MS = Number(process.env.WS_HEARTBEAT_INTERVAL_MS || 30000);
@@ -102,6 +103,13 @@ if (securityEnvValidation.errors.length) {
   console.error('Security configuration errors:', securityEnvValidation.errors.join(' '));
   process.exit(1);
 }
+
+const sendHealthResponse = (req, res) => {
+  res.status(200).json({ status: 'ok' });
+};
+
+app.get('/', sendHealthResponse);
+app.get('/health', sendHealthResponse);
 
 // Middleware
 const toTrimmed = (value) => String(value || '').trim();
@@ -212,12 +220,6 @@ app.use(
   })
 );
 
-app.get("/", (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: "Server is running"
-  });
-});
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 app.get('/healthz', (req, res) => {
