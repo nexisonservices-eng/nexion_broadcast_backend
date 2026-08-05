@@ -42,6 +42,8 @@ const {
   forwardIvrNotificationStatus
 } = require('../services/ivrNotificationStatusBridge');
 const BroadcastDispatch = require('../models/BroadcastDispatch');
+const isWhatsAppStatusDebugEnabled = () =>
+  String(process.env.WHATSAPP_STATUS_DEBUG || '').trim().toLowerCase() === 'true';
 
 const truncateMediaDebugValue = (value, max = 120) => {
   const raw = String(value || '').trim();
@@ -979,6 +981,17 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         statusData.To,
         statusData.to,
       );
+      const debugEnabled = isWhatsAppStatusDebugEnabled();
+      if (debugEnabled) {
+        console.log('[WhatsApp Status Debug] Incoming status payload', {
+          messageId: messageId || null,
+          status: status || null,
+          recipient: recipient || null,
+          userId: userId || null,
+          companyId: companyId || null,
+          rawKeys: Object.keys(statusData || {})
+        });
+      }
       const statusErrorParts = [
         statusData?.errors?.[0]?.message,
         statusData?.errors?.[0]?.error_data?.message,
@@ -1018,6 +1031,17 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       const matchedBroadcastId =
         String(message?.broadcastId || '').trim() ||
         (await resolveBroadcastIdForStatusMessage(message));
+      if (debugEnabled) {
+        console.log('[WhatsApp Status Debug] Message resolved', {
+          messageId,
+          resolvedMessageId: String(message?._id || ''),
+          resolvedBroadcastId: matchedBroadcastId || null,
+          currentStatus: String(message?.status || '').trim() || null,
+          nextStatus,
+          broadcastDispatchKey: String(message?.broadcastDispatchKey || '').trim() || null,
+          whatsappMessageId: String(message?.whatsappMessageId || '').trim() || null
+        });
+      }
       console.log(
         '[WHATSAPP_STATUS_WEBHOOK]',
         JSON.stringify(
@@ -1275,6 +1299,14 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           });
 
           if (!broadcast) {
+            if (debugEnabled) {
+              console.log('[WhatsApp Status Debug] Broadcast not eligible for increment', {
+                resolvedBroadcastId,
+                effectiveUserId: effectiveUserId || null,
+                effectiveCompanyId: effectiveCompanyId || null,
+                currentMessageStatus: String(updatedMessage.status || '').trim() || null
+              });
+            }
             return;
           }
 
@@ -1296,6 +1328,14 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           }
 
           if (Object.keys(update).length > 0) {
+            if (debugEnabled) {
+              console.log('[WhatsApp Status Debug] Applying broadcast stat increment', {
+                broadcastId: String(broadcast._id || ''),
+                oldStatus,
+                newStatus,
+                update
+              });
+            }
             await Broadcast.updateOne({ _id: broadcast._id }, { $inc: update });
             const updatedBroadcast = await Broadcast.findById(broadcast._id);
 
@@ -1317,7 +1357,20 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
                 stats: updatedBroadcast.stats,
                 statusChange: `${oldStatus} -> ${newStatus}`
               });
+              if (debugEnabled) {
+                console.log('[WhatsApp Status Debug] Broadcast stats updated', {
+                  broadcastId: String(updatedBroadcast._id || ''),
+                  stats: updatedBroadcast.stats,
+                  statusChange: `${oldStatus} -> ${newStatus}`
+                });
+              }
             }
+          } else if (debugEnabled) {
+            console.log('[WhatsApp Status Debug] No stat increment required', {
+              broadcastId: String(broadcast._id || ''),
+              oldStatus,
+              newStatus
+            });
           }
         } catch (broadcastError) {
           console.error('Error updating broadcast stats:', broadcastError);
