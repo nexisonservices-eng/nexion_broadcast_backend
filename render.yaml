@@ -17,6 +17,9 @@ services:
         description: Public HTTPS URL for this backend (for OAuth callbacks and public consent links)
       - key: FRONTEND_URL
         description: Frontend app URL
+      - key: GOOGLE_OAUTH_REDIRECT_URI
+        value: https://whatsapp-business-backend.onrender.com/api/google-calendar/oauth/callback
+        description: Exact Google OAuth callback URL for Google Calendar connect.
       - key: META_APP_ID
         description: Meta app ID used for Meta Ads / lead sync
       - key: META_APP_SECRET
