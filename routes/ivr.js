@@ -30,10 +30,18 @@ const toClientMenu = (doc) => ({
   updatedAt: doc.updatedAt
 });
 
-const buildScopedQuery = (req) => ({
-  userId: String(req.user?.id || ''),
-  companyId: String(req.companyId || '')
-});
+const buildScopedQuery = (req) => {
+  const query = {
+    userId: String(req.user?.id || '')
+  };
+
+  const companyId = String(req.companyId || '').trim();
+  if (companyId) {
+    query.companyId = companyId;
+  }
+
+  return query;
+};
 
 router.get('/menus', async (req, res) => {
   try {
