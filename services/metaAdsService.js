@@ -216,6 +216,234 @@ const resolveMetaAdAccountSelection = async ({
   };
 };
 
+const META_GRAPH_CACHE_TTL_MS = 10 * 60 * 1000;
+const META_AUTO_SYNC_COOLDOWN_MS = 10 * 60 * 1000;
+const META_MANUAL_SYNC_DEBOUNCE_MS = 60 * 1000;
+const META_GRAPH_MAX_CONCURRENCY = 2;
+const META_GRAPH_BASE_BACKOFF_MS = 60 * 1000;
+const metaGraphRequestCache = new Map();
+const metaGraphRequestInflight = new Map();
+const metaGraphRequestQueue = [];
+const metaGraphRateLimits = new Map();
+let metaGraphRequestActiveCount = 0;
+let metaGraphRequestSequence = 0;
+const metaGraphRequestStats = {
+  requestCount: 0,
+  cacheHits: 0,
+  duplicateSkips: 0,
+  cooldownSkips: 0,
+  rateLimitEvents: 0
+};
+
+const cloneMetaValue = (value) => {
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  try {
+    if (typeof structuredClone === 'function') {
+      return structuredClone(value);
+    }
+  } catch {
+    // Fall through to JSON cloning.
+  }
+
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return value;
+  }
+};
+
+const stableSerialize = (value) => {
+  if (value === null || value === undefined) return value;
+  if (Array.isArray(value)) return value.map((item) => stableSerialize(item));
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value !== 'object') return value;
+
+  return Object.keys(value)
+    .sort()
+    .reduce((acc, key) => {
+      const item = value[key];
+      if (item === undefined) return acc;
+      acc[key] = stableSerialize(item);
+      return acc;
+    }, {});
+};
+
+const buildMetaGraphRequestKey = ({ method, path, params, data, accessToken, apiVersion }) =>
+  JSON.stringify({
+    method: String(method || 'GET').trim().toUpperCase(),
+    path: String(path || '').trim().replace(/^\/+/, ''),
+    params: stableSerialize(params || {}),
+    data: stableSerialize(data || {}),
+    accessToken: String(accessToken || '').trim(),
+    apiVersion: String(apiVersion || '').trim()
+  });
+
+const getMetaTokenKey = ({ accessToken, apiVersion }) =>
+  `${String(apiVersion || '').trim()}::${String(accessToken || '').trim()}`;
+
+const cloneMetaResponse = (response) => {
+  if (!response) return null;
+
+  return {
+    data: cloneMetaValue(response.data),
+    status: response.status,
+    statusText: response.statusText,
+    headers: cloneMetaValue(response.headers || {}),
+    config: cloneMetaValue(response.config || {})
+  };
+};
+
+const getCachedMetaGraphResponse = (key) => {
+  const entry = metaGraphRequestCache.get(key);
+  if (!entry) return null;
+
+  if (entry.expiresAt <= Date.now()) {
+    metaGraphRequestCache.delete(key);
+    return null;
+  }
+
+  return cloneMetaValue(entry.response);
+};
+
+const setCachedMetaGraphResponse = (key, response, ttlMs = META_GRAPH_CACHE_TTL_MS) => {
+  metaGraphRequestCache.set(key, {
+    expiresAt: Date.now() + ttlMs,
+    response: cloneMetaResponse(response)
+  });
+};
+
+const parseRetryAfterMs = (error) => {
+  const rawHeader =
+    error?.response?.headers?.['retry-after'] ||
+    error?.response?.headers?.['Retry-After'] ||
+    error?.response?.headers?.RetryAfter ||
+    error?.response?.headers?.retryAfter;
+  if (rawHeader === undefined || rawHeader === null || rawHeader === '') {
+    return null;
+  }
+
+  const numeric = Number(rawHeader);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric * 1000;
+  }
+
+  const parsedDate = Date.parse(String(rawHeader));
+  if (Number.isFinite(parsedDate)) {
+    return Math.max(0, parsedDate - Date.now());
+  }
+
+  return null;
+};
+
+const normalizeMetaRateLimitError = (error) => {
+  const metaError = error?.response?.data?.error || error?.response?.data || {};
+  const code = Number(metaError?.code);
+  const errorSubcode = Number(metaError?.error_subcode);
+
+  return {
+    code: Number.isFinite(code) ? code : null,
+    errorSubcode: Number.isFinite(errorSubcode) ? errorSubcode : null,
+    message: String(metaError?.message || error?.message || '').trim(),
+    retryAfterMs: parseRetryAfterMs(error),
+    fbtrace_id: String(metaError?.fbtrace_id || '').trim()
+  };
+};
+
+const isMetaRateLimitError = (error) => {
+  const metaError = normalizeMetaRateLimitError(error);
+  return metaError.code === 17 || metaError.errorSubcode === 2446079 || /too many api calls/i.test(metaError.message);
+};
+
+const getMetaRateLimitState = (tokenKey) => metaGraphRateLimits.get(tokenKey) || null;
+
+const setMetaRateLimitState = ({ tokenKey, error, requestKey }) => {
+  const current = getMetaRateLimitState(tokenKey) || {};
+  const rateLimitError = normalizeMetaRateLimitError(error);
+  const retryAfterMs = rateLimitError.retryAfterMs;
+  const retryCount = Number(current.retryCount || 0) + 1;
+  const backoffMs = Math.min(
+    10 * 60 * 1000,
+    META_GRAPH_BASE_BACKOFF_MS * Math.pow(2, Math.max(0, retryCount - 1))
+  );
+  const blockedForMs = retryAfterMs || backoffMs;
+  const blockedUntil = new Date(Date.now() + blockedForMs);
+
+  metaGraphRateLimits.set(tokenKey, {
+    retryCount,
+    blockedUntil,
+    lastErrorAt: new Date(),
+    lastRequestKey: requestKey || current.lastRequestKey || '',
+    lastError: rateLimitError.message,
+    code: rateLimitError.code,
+    errorSubcode: rateLimitError.errorSubcode
+  });
+
+  metaGraphRequestStats.rateLimitEvents += 1;
+  console.warn(
+    '[Meta API Rate Limit]',
+    JSON.stringify({
+      tokenKey: tokenKey ? `${tokenKey.slice(0, 12)}...` : '',
+      blockedUntil: blockedUntil.toISOString(),
+      retryAfterMs: retryAfterMs || null,
+      backoffMs,
+      retryCount,
+      code: rateLimitError.code,
+      errorSubcode: rateLimitError.errorSubcode,
+      requestKey: requestKey ? requestKey.slice(0, 120) : ''
+    })
+  );
+
+  return metaGraphRateLimits.get(tokenKey);
+};
+
+const clearMetaRateLimitState = (tokenKey) => {
+  if (metaGraphRateLimits.has(tokenKey)) {
+    metaGraphRateLimits.delete(tokenKey);
+  }
+};
+
+const getMetaQueueStatus = () => ({
+  active: metaGraphRequestActiveCount,
+  queued: metaGraphRequestQueue.length,
+  inFlight: metaGraphRequestInflight.size
+});
+
+const logMetaGraphEvent = (event, payload = {}) => {
+  console.log(
+    '[Meta Graph]',
+    JSON.stringify({
+      event,
+      ...payload,
+      stats: { ...metaGraphRequestStats },
+      queue: getMetaQueueStatus()
+    })
+  );
+};
+
+const drainMetaGraphRequestQueue = () => {
+  while (metaGraphRequestActiveCount < META_GRAPH_MAX_CONCURRENCY && metaGraphRequestQueue.length) {
+    const nextRequest = metaGraphRequestQueue.shift();
+    metaGraphRequestActiveCount += 1;
+
+    Promise.resolve()
+      .then(nextRequest.run)
+      .then(nextRequest.resolve, nextRequest.reject)
+      .finally(() => {
+        metaGraphRequestActiveCount = Math.max(0, metaGraphRequestActiveCount - 1);
+        drainMetaGraphRequestQueue();
+      });
+  }
+};
+
+const enqueueMetaGraphRequest = (run) =>
+  new Promise((resolve, reject) => {
+    metaGraphRequestQueue.push({ run, resolve, reject });
+    drainMetaGraphRequestQueue();
+  });
+
 const graphRequest = async ({
   method = 'GET',
   path,
@@ -237,10 +465,81 @@ const graphRequest = async ({
     );
   }
 
-  const url = `${GRAPH_BASE_URL}/${(overrideApiVersion || apiVersion).replace(/^\/+/, '')}/${path.replace(/^\/+/, '')}`;
+  const resolvedApiVersion = String(overrideApiVersion || apiVersion || 'v23.0').trim();
+  const normalizedPath = String(path || '').replace(/^\/+/, '');
+  const requestMethod = String(method || 'GET').trim().toUpperCase();
+  const requestKey = buildMetaGraphRequestKey({
+    method: requestMethod,
+    path: normalizedPath,
+    params,
+    data,
+    accessToken: resolvedAccessToken,
+    apiVersion: resolvedApiVersion
+  });
+  const tokenKey = getMetaTokenKey({ accessToken: resolvedAccessToken, apiVersion: resolvedApiVersion });
+  const cacheable = requestMethod === 'GET';
+  const cachedResponse = cacheable ? getCachedMetaGraphResponse(requestKey) : null;
+  const blockedState = getMetaRateLimitState(tokenKey);
+  const blockedUntil = blockedState?.blockedUntil ? new Date(blockedState.blockedUntil) : null;
+  const isBlocked = Boolean(blockedUntil && blockedUntil.getTime() > Date.now());
+
+  if (cacheable && cachedResponse) {
+    metaGraphRequestStats.cacheHits += 1;
+    logMetaGraphEvent('cache-hit', {
+      method: requestMethod,
+      path: normalizedPath,
+      tokenKey: tokenKey ? `${tokenKey.slice(0, 12)}...` : ''
+    });
+    return returnResponse ? cachedResponse : cachedResponse.data;
+  }
+
+  if (isBlocked) {
+    metaGraphRequestStats.cooldownSkips += 1;
+    logMetaGraphEvent('cooldown-skip', {
+      method: requestMethod,
+      path: normalizedPath,
+      tokenKey: tokenKey ? `${tokenKey.slice(0, 12)}...` : '',
+      blockedUntil: blockedUntil?.toISOString() || null
+    });
+
+    if (cacheable && cachedResponse) {
+      return returnResponse ? cachedResponse : cachedResponse.data;
+    }
+
+    const blockedError = buildStageErrorWithDetails(
+      'Meta rate limit',
+      'Meta API requests are temporarily rate-limited. Please retry after the cooldown expires.',
+      {
+        code: blockedState?.code || 17,
+        errorSubcode: blockedState?.errorSubcode || 2446079,
+        blockedUntil: blockedUntil?.toISOString() || null,
+        requestKey: requestKey.slice(0, 120)
+      },
+      429
+    );
+    blockedError.metaRateLimited = true;
+    blockedError.metaRateLimit = {
+      blockedUntil: blockedUntil?.toISOString() || null,
+      code: blockedState?.code || 17,
+      errorSubcode: blockedState?.errorSubcode || 2446079
+    };
+    throw blockedError;
+  }
+
+  if (metaGraphRequestInflight.has(requestKey)) {
+    metaGraphRequestStats.duplicateSkips += 1;
+    logMetaGraphEvent('duplicate-skip', {
+      method: requestMethod,
+      path: normalizedPath,
+      tokenKey: tokenKey ? `${tokenKey.slice(0, 12)}...` : ''
+    });
+    return metaGraphRequestInflight.get(requestKey);
+  }
+
+  const url = `${GRAPH_BASE_URL}/${resolvedApiVersion}/${normalizedPath}`;
   const requestConfig = {
     url,
-    method,
+    method: requestMethod,
     params: {
       access_token: resolvedAccessToken,
       ...(params || {})
@@ -249,32 +548,136 @@ const graphRequest = async ({
     headers
   };
 
-  console.log(
-    '[Meta API]',
-    JSON.stringify({
-      method: requestConfig.method,
-      path,
+  const requestPromise = enqueueMetaGraphRequest(async () => {
+    const currentBlockedState = getMetaRateLimitState(tokenKey);
+    const currentBlockedUntil = currentBlockedState?.blockedUntil ? new Date(currentBlockedState.blockedUntil) : null;
+    const stillBlocked = Boolean(currentBlockedUntil && currentBlockedUntil.getTime() > Date.now());
+
+    if (stillBlocked) {
+      if (cacheable) {
+        const staleCachedResponse = getCachedMetaGraphResponse(requestKey);
+        if (staleCachedResponse) {
+          metaGraphRequestStats.cacheHits += 1;
+          logMetaGraphEvent('cache-hit-stale', {
+            method: requestMethod,
+            path: normalizedPath,
+            tokenKey: tokenKey ? `${tokenKey.slice(0, 12)}...` : '',
+            blockedUntil: currentBlockedUntil.toISOString()
+          });
+          return returnResponse ? staleCachedResponse : staleCachedResponse.data;
+        }
+      }
+
+      const blockedError = buildStageErrorWithDetails(
+        'Meta rate limit',
+        'Meta API requests are temporarily rate-limited. Please retry after the cooldown expires.',
+        {
+          code: currentBlockedState?.code || 17,
+          errorSubcode: currentBlockedState?.errorSubcode || 2446079,
+          blockedUntil: currentBlockedUntil?.toISOString() || null,
+          requestKey: requestKey.slice(0, 120)
+        },
+        429
+      );
+      blockedError.metaRateLimited = true;
+      blockedError.metaRateLimit = {
+        blockedUntil: currentBlockedUntil?.toISOString() || null,
+        code: currentBlockedState?.code || 17,
+        errorSubcode: currentBlockedState?.errorSubcode || 2446079
+      };
+      throw blockedError;
+    }
+
+    metaGraphRequestStats.requestCount += 1;
+    const requestId = ++metaGraphRequestSequence;
+    logMetaGraphEvent('request-start', {
+      requestId,
+      method: requestMethod,
+      path: normalizedPath,
       hasToken: Boolean(requestConfig.params.access_token),
       params: Object.keys(params || {})
-    })
-  );
+    });
 
-  try {
-    const response = await axios(requestConfig);
-    return returnResponse ? response : response.data;
-  } catch (error) {
-    console.error(
-      '[Meta API Error]',
-      JSON.stringify({
-        method: requestConfig.method,
-        path,
-        message: error?.response?.data?.error?.message || error.message,
-        status: error?.response?.status || null,
-        details: error?.response?.data || null
-      })
-    );
-    throw error;
-  }
+    try {
+      const response = await axios(requestConfig);
+      clearMetaRateLimitState(tokenKey);
+
+      if (cacheable) {
+        setCachedMetaGraphResponse(requestKey, response);
+      }
+
+      logMetaGraphEvent('request-success', {
+        requestId,
+        method: requestMethod,
+        path: normalizedPath,
+        status: response?.status || null
+      });
+
+      return returnResponse ? cloneMetaResponse(response) : cloneMetaValue(response.data);
+    } catch (error) {
+      const metaRateLimited = isMetaRateLimitError(error);
+      const errorInfo = normalizeMetaRateLimitError(error);
+      console.error(
+        '[Meta API Error]',
+        JSON.stringify({
+          method: requestMethod,
+          path: normalizedPath,
+          message: errorInfo.message || error?.message || 'Meta API request failed',
+          status: error?.response?.status || null,
+          details: error?.response?.data || null
+        })
+      );
+
+      if (metaRateLimited) {
+        const rateLimitState = setMetaRateLimitState({
+          tokenKey,
+          error,
+          requestKey
+        });
+
+        if (cacheable) {
+          const staleCachedResponse = getCachedMetaGraphResponse(requestKey);
+          if (staleCachedResponse) {
+            logMetaGraphEvent('rate-limit-cache-hit', {
+              requestId,
+              method: requestMethod,
+              path: normalizedPath,
+              blockedUntil: rateLimitState?.blockedUntil?.toISOString() || null
+            });
+            return returnResponse ? staleCachedResponse : staleCachedResponse.data;
+          }
+        }
+
+        const rateLimitError = buildStageErrorWithDetails(
+          'Meta rate limit',
+          'Meta API requests are temporarily rate-limited. Please retry after the cooldown expires.',
+          {
+            code: errorInfo.code || 17,
+            errorSubcode: errorInfo.errorSubcode || 2446079,
+            retryAfterMs: errorInfo.retryAfterMs,
+            blockedUntil: rateLimitState?.blockedUntil?.toISOString() || null,
+            requestKey: requestKey.slice(0, 120)
+          },
+          429
+        );
+        rateLimitError.metaRateLimited = true;
+        rateLimitError.metaRateLimit = {
+          blockedUntil: rateLimitState?.blockedUntil?.toISOString() || null,
+          code: errorInfo.code || 17,
+          errorSubcode: errorInfo.errorSubcode || 2446079,
+          retryAfterMs: errorInfo.retryAfterMs || null
+        };
+        throw rateLimitError;
+      }
+
+      throw error;
+    } finally {
+      metaGraphRequestInflight.delete(requestKey);
+    }
+  });
+
+  metaGraphRequestInflight.set(requestKey, requestPromise);
+  return requestPromise;
 };
 
 const normalizePreviewPlacements = (placements = []) => {
@@ -1634,13 +2037,32 @@ const getUserAdAccounts = async ({ userId } = {}) => {
   }
 
   const accessContext = await ensureConnectedMetaUser(userId, 'Meta account selection');
-  const response = await graphRequest({
-    path: 'me/adaccounts',
-    params: { fields: 'id,name,account_status,currency,amount_spent' },
-    accessToken: accessContext.accessToken
-  });
+  try {
+    const response = await graphRequest({
+      path: 'me/adaccounts',
+      params: { fields: 'id,name,account_status,currency,amount_spent' },
+      accessToken: accessContext.accessToken
+    });
 
-  return Array.isArray(response?.data) ? response.data.map(normalizeMetaAdAccountRecord) : [];
+    return Array.isArray(response?.data) ? response.data.map(normalizeMetaAdAccountRecord) : [];
+  } catch (error) {
+    if (error?.metaRateLimited || error?.status === 429) {
+      const fallbackAccountId = toCanonicalAdAccountId(accessContext.connection?.selectedAdAccountId || '');
+      logMetaGraphEvent('fallback-adaccounts', {
+        userId: String(userId || ''),
+        fallbackAccountId
+      });
+
+      return fallbackAccountId
+        ? [normalizeMetaAdAccountRecord({
+            id: fallbackAccountId,
+            name: accessContext.connection?.name || 'Selected Meta Ad Account'
+          })]
+        : [];
+    }
+
+    throw error;
+  }
 };
 
 const mapMetaObjectiveToCrudObjective = (objective) => {
@@ -1786,6 +2208,156 @@ const lookupMetaImageUrlByHash = async ({ adAccountId, accessToken, imageHash })
   }
 };
 
+const getCampaignInsightsFromRow = (row = {}) => {
+  const actions = Array.isArray(row?.actions) ? row.actions : [];
+  const leadAction = actions.find((item) => String(item?.action_type || '').toLowerCase().includes('lead'));
+  const leads = Number(leadAction?.value || 0);
+  const spend = Number(row?.spend || 0);
+
+  return {
+    impressions: Number(row?.impressions || 0),
+    reach: Number(row?.reach || 0),
+    clicks: Number(row?.clicks || 0),
+    spend,
+    ctr: Number(row?.ctr || 0),
+    cpc: Number(row?.cpc || 0),
+    leads,
+    cpl: leads ? Number((spend / leads).toFixed(2)) : 0
+  };
+};
+
+const fetchAccountCampaignInsightsMap = async ({
+  accountId,
+  campaignIds = [],
+  range = 'last30days',
+  tokenCandidates = []
+} = {}) => {
+  const uniqueCampaignIds = [...new Set(
+    normalizeArray(campaignIds)
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+  )];
+
+  if (!uniqueCampaignIds.length) {
+    return new Map();
+  }
+
+  const datePreset = mapCrudDateRangeToMetaPreset(range);
+  const response = await requestMetaAcrossTokens({
+    path: buildAdAccountPath(accountId, 'insights'),
+    params: {
+      fields: 'campaign_id,impressions,reach,clicks,spend,ctr,cpc,actions',
+      date_preset: datePreset,
+      level: 'campaign',
+      filtering: JSON.stringify([
+        { field: 'campaign.id', operator: 'IN', value: uniqueCampaignIds }
+      ]),
+      limit: uniqueCampaignIds.length
+    },
+    tokenCandidates
+  });
+
+  const rows = Array.isArray(response?.data) ? response.data : [];
+  const insightMap = new Map();
+
+  for (const row of rows) {
+    const campaignId = String(row?.campaign_id || row?.campaign?.id || row?.campaign || '').trim();
+    if (!campaignId) continue;
+
+    const current = insightMap.get(campaignId) || {
+      impressions: 0,
+      reach: 0,
+      clicks: 0,
+      spend: 0,
+      ctr: 0,
+      cpc: 0,
+      leads: 0,
+      cpl: 0
+    };
+    const metrics = getCampaignInsightsFromRow(row);
+    const merged = {
+      impressions: current.impressions + metrics.impressions,
+      reach: current.reach + metrics.reach,
+      clicks: current.clicks + metrics.clicks,
+      spend: Number((current.spend + metrics.spend).toFixed(2)),
+      ctr: 0,
+      cpc: 0,
+      leads: current.leads + metrics.leads,
+      cpl: 0
+    };
+    merged.ctr = merged.impressions > 0 ? Number(((merged.clicks / merged.impressions) * 100).toFixed(2)) : 0;
+    merged.cpc = merged.clicks > 0 ? Number((merged.spend / merged.clicks).toFixed(2)) : 0;
+    merged.cpl = merged.leads > 0 ? Number((merged.spend / merged.leads).toFixed(2)) : 0;
+    insightMap.set(campaignId, merged);
+  }
+
+  return insightMap;
+};
+
+const getMetaConnectionSyncState = (connection = {}) => ({
+  lastSuccessfulAt: connection?.metaSyncLastSuccessfulAt || null,
+  lastAutoAt: connection?.metaSyncLastAutoAt || null,
+  lastManualAt: connection?.metaSyncLastManualAt || null,
+  cooldownUntil: connection?.metaSyncCooldownUntil || null,
+  rateLimitedUntil: connection?.metaSyncRateLimitedUntil || null,
+  lastErrorCode: connection?.metaSyncLastErrorCode ?? null,
+  lastErrorSubcode: connection?.metaSyncLastErrorSubcode ?? null
+});
+
+const persistMetaConnectionSyncState = async ({ userId, updates = {} } = {}) => {
+  if (!userId) return null;
+
+  return MetaAdsConnection.findOneAndUpdate(
+    { userId },
+    { $set: updates },
+    { new: true }
+  );
+};
+
+const getMetaSyncStatus = (connection = {}) => {
+  const state = getMetaConnectionSyncState(connection);
+  const cooldownUntil = state.cooldownUntil ? new Date(state.cooldownUntil) : null;
+  const rateLimitedUntil = state.rateLimitedUntil ? new Date(state.rateLimitedUntil) : null;
+  const now = Date.now();
+
+  return {
+    ...state,
+    cooldownActive: Boolean(cooldownUntil && cooldownUntil.getTime() > now),
+    rateLimitedActive: Boolean(rateLimitedUntil && rateLimitedUntil.getTime() > now)
+  };
+};
+
+const resolveSyncMode = (mode) => {
+  const normalized = String(mode || '').trim().toLowerCase();
+  if (normalized === 'auto' || normalized === 'scheduled') return 'auto';
+  return 'manual';
+};
+
+const isMetaAutoSyncAllowed = (connection = {}) => {
+  const status = getMetaSyncStatus(connection);
+  const lastSuccessfulAt = status.lastSuccessfulAt ? new Date(status.lastSuccessfulAt) : null;
+  const cooldownUntil = status.cooldownUntil ? new Date(status.cooldownUntil) : null;
+  const now = Date.now();
+
+  if (cooldownUntil && cooldownUntil.getTime() > now) {
+    return {
+      allowed: false,
+      reason: 'cooldown',
+      cooldownUntil
+    };
+  }
+
+  if (lastSuccessfulAt && now - lastSuccessfulAt.getTime() < META_AUTO_SYNC_COOLDOWN_MS) {
+    return {
+      allowed: false,
+      reason: 'recent-success',
+      cooldownUntil: new Date(lastSuccessfulAt.getTime() + META_AUTO_SYNC_COOLDOWN_MS)
+    };
+  }
+
+  return { allowed: true };
+};
+
 const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
   if (shouldUseMockMode()) {
     return [];
@@ -1834,35 +2406,6 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
   const creativeCampaignMap = new Map();
   const accountIds = [...adAccountCandidates.keys()];
   const remoteInsightDatePreset = mapCrudDateRangeToMetaPreset(filters.dateRange || 'last30days');
-
-  const fetchRemoteCampaignInsights = async (remoteId) => {
-    for (const accessToken of tokenCandidates) {
-      try {
-        const response = await graphRequest({
-          path: `${remoteId}/insights`,
-          params: {
-            fields: 'impressions,reach,clicks,spend,ctr,cpc,actions',
-            date_preset: remoteInsightDatePreset,
-            limit: 1
-          },
-          accessToken
-        });
-
-        return Array.isArray(response?.data) ? response.data[0] || {} : {};
-      } catch (error) {
-        console.warn(
-          '[Meta Ads] Unable to load campaign insights for remote campaign',
-          JSON.stringify({
-            remoteId,
-            source: accessContext.source,
-            message: extractApiErrorMessage(error)
-          })
-        );
-      }
-    }
-
-    return {};
-  };
 
   for (const adAccountId of accountIds) {
     let adsResponse = null;
@@ -2003,11 +2546,30 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
     }
 
     const campaigns = Array.isArray(response?.data) ? response.data : [];
+    let campaignInsights = new Map();
+    try {
+      campaignInsights = await fetchAccountCampaignInsightsMap({
+        accountId: adAccountId,
+        campaignIds: campaigns.map((campaign) => campaign?.id),
+        range: filters.dateRange || 'last30days',
+        tokenCandidates
+      });
+    } catch (error) {
+      console.warn(
+        '[Meta Ads] Unable to load batched campaign insights for remote campaigns',
+        JSON.stringify({
+          adAccountId,
+          source: accessContext.source,
+          message: extractApiErrorMessage(error)
+        })
+      );
+    }
+
     for (const campaign of campaigns) {
       const remoteId = String(campaign?.id || '').trim();
       if (!remoteId || remoteCampaignMap.has(remoteId)) continue;
 
-      const insight = await fetchRemoteCampaignInsights(remoteId);
+      const insight = campaignInsights.get(remoteId) || {};
       remoteCampaignMap.set(remoteId, {
         _id: `meta_${remoteId}`,
         id: `meta_${remoteId}`,
