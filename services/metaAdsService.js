@@ -3215,37 +3215,42 @@ const fetchCampaignInsights = async (campaign) => {
     );
   }
   try {
-    response = await graphRequest({
-      path: buildAdAccountPath(effectiveAdAccountId, 'insights'),
-      params: {
-        fields: 'impressions,reach,clicks,spend,ctr,cpc,actions',
-        filtering: JSON.stringify([
-          { field: 'campaign.id', operator: 'EQUAL', value: campaign.meta.campaignId }
-        ]),
-        limit: 1
-      },
-      accessToken: accessContext.accessToken
+    const insightMap = await fetchAccountCampaignInsightsMap({
+      accountId: effectiveAdAccountId,
+      campaignIds: [campaign.meta.campaignId],
+      range: 'last30days',
+      tokenCandidates: [accessContext.accessToken]
     });
+    const insight = insightMap.get(String(campaign.meta.campaignId)) || {};
+
+    return {
+      impressions: Number(insight.impressions || 0),
+      reach: Number(insight.reach || 0),
+      clicks: Number(insight.clicks || 0),
+      leads: Number(insight.leads || 0),
+      spend: Number(insight.spend || 0),
+      ctr: Number(insight.ctr || 0),
+      cpc: Number(insight.cpc || 0),
+      cpl: Number(insight.cpl || 0),
+      lastSyncedAt: new Date()
+    };
   } catch (error) {
+    if (error?.metaRateLimited || error?.status === 429) {
+      const existingAnalytics = campaign?.analytics || {};
+      return {
+        impressions: Number(existingAnalytics.impressions || 0),
+        reach: Number(existingAnalytics.reach || 0),
+        clicks: Number(existingAnalytics.clicks || 0),
+        leads: Number(existingAnalytics.leads || 0),
+        spend: Number(existingAnalytics.spend || 0),
+        ctr: Number(existingAnalytics.ctr || 0),
+        cpc: Number(existingAnalytics.cpc || 0),
+        cpl: Number(existingAnalytics.cpl || 0),
+        lastSyncedAt: existingAnalytics.lastSyncedAt || campaign?.updatedAt || new Date()
+      };
+    }
     throw buildStageError('Insights sync', error);
   }
-
-  const row = Array.isArray(response?.data) ? response.data[0] : null;
-  const actions = Array.isArray(row?.actions) ? row.actions : [];
-  const leadAction = actions.find((item) => String(item.action_type || '').includes('lead'));
-  const leads = Number(leadAction?.value || 0);
-
-  return {
-    impressions: Number(row?.impressions || 0),
-    reach: Number(row?.reach || 0),
-    clicks: Number(row?.clicks || 0),
-    leads,
-    spend: Number(row?.spend || 0),
-    ctr: Number(row?.ctr || 0),
-    cpc: Number(row?.cpc || 0),
-    cpl: leads ? Number((Number(row?.spend || 0) / leads).toFixed(2)) : 0,
-    lastSyncedAt: new Date()
-  };
 };
 
 const getOrCreateWalletRecord = async (userId) => {
@@ -4117,38 +4122,42 @@ const fetchCrudCampaignInsights = async ({ campaign, userId, range = 'last30days
 
   let response;
   try {
-    response = await graphRequest({
-      path: buildAdAccountPath(effectiveAdAccountId, 'insights'),
-      params: {
-        fields: 'impressions,reach,clicks,spend,ctr,cpc,actions',
-        date_preset: mapCrudDateRangeToMetaPreset(range),
-        filtering: JSON.stringify([
-          { field: 'campaign.id', operator: 'EQUAL', value: String(campaign.metaCampaignId) }
-        ]),
-        limit: 1
-      },
-      accessToken: accessContext.accessToken
+    const insightMap = await fetchAccountCampaignInsightsMap({
+      accountId: effectiveAdAccountId,
+      campaignIds: [campaign.metaCampaignId],
+      range,
+      tokenCandidates: [accessContext.accessToken]
     });
+    const insight = insightMap.get(String(campaign.metaCampaignId)) || {};
+
+    return {
+      impressions: Number(insight.impressions || 0),
+      reach: Number(insight.reach || 0),
+      clicks: Number(insight.clicks || 0),
+      spend: Number(insight.spend || 0),
+      ctr: Number(insight.ctr || 0),
+      cpc: Number(insight.cpc || 0),
+      leads: Number(insight.leads || 0),
+      cpl: Number(insight.cpl || 0),
+      lastSyncedAt: new Date()
+    };
   } catch (error) {
+    if (error?.metaRateLimited || error?.status === 429) {
+      const existingAnalytics = campaign?.analytics || {};
+      return {
+        impressions: Number(existingAnalytics.impressions || 0),
+        reach: Number(existingAnalytics.reach || 0),
+        clicks: Number(existingAnalytics.clicks || 0),
+        spend: Number(existingAnalytics.spend || 0),
+        ctr: Number(existingAnalytics.ctr || 0),
+        cpc: Number(existingAnalytics.cpc || 0),
+        leads: Number(existingAnalytics.leads || 0),
+        cpl: Number(existingAnalytics.cpl || 0),
+        lastSyncedAt: existingAnalytics.lastSyncedAt || campaign?.updatedAt || new Date()
+      };
+    }
     throw buildStageError('Insights sync', error);
   }
-
-  const row = Array.isArray(response?.data) ? response.data[0] : null;
-  const actions = Array.isArray(row?.actions) ? row.actions : [];
-  const leadAction = actions.find((item) => String(item.action_type || '').includes('lead'));
-  const leads = Number(leadAction?.value || 0);
-
-  return {
-    impressions: Number(row?.impressions || 0),
-    reach: Number(row?.reach || 0),
-    clicks: Number(row?.clicks || 0),
-    spend: Number(row?.spend || 0),
-    ctr: Number(row?.ctr || 0),
-    cpc: Number(row?.cpc || 0),
-    leads,
-    cpl: leads ? Number((Number(row?.spend || 0) / leads).toFixed(2)) : 0,
-    lastSyncedAt: new Date()
-  };
 };
 
 const syncCrudCampaignAnalyticsRecord = async ({ campaign, userId, range = 'last30days' }) => {
