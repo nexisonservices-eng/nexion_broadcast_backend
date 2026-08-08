@@ -373,16 +373,6 @@ exports.getCampaigns = async (req, res) => {
         const normalizedRole = getNormalizedRequestRole(req);
         const isSuperAdmin = normalizedRole === 'superadmin';
 
-        if (String(req.query.includeLiveMetrics || '').toLowerCase() === 'true') {
-            try {
-                await metaAdsService.syncAllCrudCampaignAnalytics({
-                    userId: isSuperAdmin ? undefined : req.user.id
-                });
-            } catch (syncError) {
-                console.warn('Live metric sync warning before campaign list:', syncError.message || syncError);
-            }
-        }
-
         // Build query
         const scopedBaseFilter = buildCampaignScopedFilter(req);
         const query = Campaign.find(scopedBaseFilter);
@@ -1844,7 +1834,8 @@ exports.syncAllWithMeta = async (req, res) => {
         const normalizedRole = getNormalizedRequestRole(req);
         const isSuperAdmin = normalizedRole === 'superadmin';
         const syncResult = await metaAdsService.syncAllCrudCampaignAnalytics({
-            userId: isSuperAdmin ? undefined : req.user.id
+            userId: isSuperAdmin ? undefined : req.user.id,
+            mode: 'manual'
         });
 
         return res.status(200).json({

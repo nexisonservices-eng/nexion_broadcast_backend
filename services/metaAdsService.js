@@ -4160,7 +4160,7 @@ const fetchCrudCampaignInsights = async ({ campaign, userId, range = 'last30days
   }
 };
 
-const syncCrudCampaignAnalyticsRecord = async ({ campaign, userId, range = 'last30days' }) => {
+const syncCrudCampaignAnalyticsRecord = async ({ campaign, userId, range = 'last30days', syncMode = 'manual' }) => {
   const latestInsights = await fetchCrudCampaignInsights({ campaign, userId, range });
   if (!latestInsights) return null;
 
@@ -4183,13 +4183,34 @@ const syncCrudCampaignAnalyticsRecord = async ({ campaign, userId, range = 'last
   persistedCampaign.markModified('metaResponse');
   await persistedCampaign.save();
 
+  const normalizedUserId = String(userId || campaign?.createdBy || '').trim();
+  if (normalizedUserId) {
+    const now = new Date();
+    const updates = {
+      metaSyncLastSuccessfulAt: now,
+      metaSyncLastErrorCode: null,
+      metaSyncLastErrorSubcode: null,
+      metaSyncRateLimitedUntil: null
+    };
+
+    if (resolveSyncMode(syncMode) === 'auto') {
+      updates.metaSyncLastAutoAt = now;
+      updates.metaSyncCooldownUntil = new Date(now.getTime() + META_AUTO_SYNC_COOLDOWN_MS);
+    } else {
+      updates.metaSyncLastManualAt = now;
+    }
+
+    await persistMetaConnectionSyncState({ userId: normalizedUserId, updates });
+  }
+
   return {
     campaign: persistedCampaign,
     insights: latestInsights
   };
 };
 
-const syncAllCrudCampaignAnalytics = async ({ userId } = {}) => {
+const syncAllCrudCampaignAnalytics = async ({ userId, mode = 'manual', range = 'last30days' } = {}) => {
+  const syncMode = resolveSyncMode(mode);
   const query = {
     metaCampaignId: { $exists: true, $ne: '' },
     status: { $in: ['active', 'paused'] }
@@ -4201,20 +4222,153 @@ const syncAllCrudCampaignAnalytics = async ({ userId } = {}) => {
   const campaigns = await Campaign.find(query);
   const results = {
     synced: 0,
+    skipped: 0,
+    rateLimited: false,
     warnings: []
   };
 
+  const groupedCampaigns = new Map();
   for (const campaign of campaigns) {
-    try {
-      await syncCrudCampaignAnalyticsRecord({
-        campaign,
-        userId: String(campaign.createdBy || userId || '')
+    const ownerUserId = String(campaign.createdBy || userId || '').trim();
+    const adAccountId = toCanonicalAdAccountId(
+      campaign?.metaAdAccountId ||
+      campaign?.metaResponse?.adAccountId ||
+      campaign?.setupSnapshot?.selectedAdAccountId ||
+      ''
+    );
+
+    if (!ownerUserId || !adAccountId) {
+      results.skipped += 1;
+      continue;
+    }
+
+    const groupKey = `${ownerUserId}::${adAccountId}`;
+    if (!groupedCampaigns.has(groupKey)) {
+      groupedCampaigns.set(groupKey, {
+        userId: ownerUserId,
+        adAccountId,
+        campaigns: []
       });
-      results.synced += 1;
+    }
+
+    groupedCampaigns.get(groupKey).campaigns.push(campaign);
+  }
+
+  for (const [groupKey, group] of groupedCampaigns.entries()) {
+    let accessContext;
+    try {
+      accessContext = await ensureConnectedMetaUser(group.userId, 'Insights sync');
     } catch (error) {
       results.warnings.push({
-        campaignId: String(campaign._id || ''),
-        campaignName: String(campaign.name || ''),
+        group: groupKey,
+        error: error.message || 'Unable to load Meta access context'
+      });
+      continue;
+    }
+
+    const syncStatus = getMetaSyncStatus(accessContext.connection || {});
+    if (syncMode === 'auto') {
+      const autoAllowed = isMetaAutoSyncAllowed(accessContext.connection || {});
+      if (!autoAllowed.allowed) {
+        results.skipped += group.campaigns.length;
+        logMetaGraphEvent('sync-cooldown-skip', {
+          groupKey,
+          userId: group.userId,
+          adAccountId: group.adAccountId,
+          reason: autoAllowed.reason,
+          cooldownUntil: autoAllowed.cooldownUntil ? autoAllowed.cooldownUntil.toISOString() : null
+        });
+        continue;
+      }
+    } else {
+      const lastManualAt = syncStatus.lastManualAt ? new Date(syncStatus.lastManualAt) : null;
+      if (lastManualAt && Date.now() - lastManualAt.getTime() < META_MANUAL_SYNC_DEBOUNCE_MS) {
+        results.skipped += group.campaigns.length;
+        logMetaGraphEvent('sync-manual-debounce', {
+          groupKey,
+          userId: group.userId,
+          adAccountId: group.adAccountId,
+          lastManualAt: lastManualAt.toISOString()
+        });
+        continue;
+      }
+    }
+
+    try {
+      const campaignIds = group.campaigns.map((campaign) => campaign.metaCampaignId);
+      const insightMap = await fetchAccountCampaignInsightsMap({
+        accountId: group.adAccountId,
+        campaignIds,
+        range,
+        tokenCandidates: [accessContext.accessToken]
+      });
+
+      for (const campaign of group.campaigns) {
+        const insight = insightMap.get(String(campaign.metaCampaignId || '').trim()) || getCampaignInsightsFromRow({});
+        const persistedCampaign = campaign;
+        persistedCampaign.spent = Number(insight.spend || 0);
+        persistedCampaign.impressions = Number(insight.impressions || 0);
+        persistedCampaign.clicks = Number(insight.clicks || 0);
+        persistedCampaign.ctr = Number(insight.ctr || 0);
+        persistedCampaign.cpc = Number(insight.cpc || 0);
+
+        const existingMetaResponse =
+          persistedCampaign.metaResponse && typeof persistedCampaign.metaResponse === 'object'
+            ? persistedCampaign.metaResponse
+            : {};
+        persistedCampaign.metaResponse = {
+          ...existingMetaResponse,
+          latestInsights: {
+            ...insight,
+            lastSyncedAt: new Date()
+          },
+          analyticsLastSyncedAt: new Date().toISOString()
+        };
+        persistedCampaign.markModified('metaResponse');
+        await persistedCampaign.save();
+        results.synced += 1;
+      }
+
+      const now = new Date();
+      await persistMetaConnectionSyncState({
+        userId: group.userId,
+        updates: {
+          metaSyncLastSuccessfulAt: now,
+          metaSyncLastAutoAt: syncMode === 'auto' ? now : undefined,
+          metaSyncLastManualAt: syncMode === 'manual' ? now : undefined,
+          metaSyncCooldownUntil: syncMode === 'auto' ? new Date(now.getTime() + META_AUTO_SYNC_COOLDOWN_MS) : null,
+          metaSyncRateLimitedUntil: null,
+          metaSyncLastErrorCode: null,
+          metaSyncLastErrorSubcode: null
+        }
+      });
+    } catch (error) {
+      if (error?.metaRateLimited || error?.status === 429) {
+        const blockedUntil = error?.metaRateLimit?.blockedUntil ? new Date(error.metaRateLimit.blockedUntil) : null;
+        await persistMetaConnectionSyncState({
+          userId: group.userId,
+          updates: {
+            metaSyncRateLimitedUntil: blockedUntil || new Date(Date.now() + META_AUTO_SYNC_COOLDOWN_MS),
+            metaSyncLastErrorCode: error?.metaRateLimit?.code || 17,
+            metaSyncLastErrorSubcode: error?.metaRateLimit?.errorSubcode || 2446079
+          }
+        });
+        results.rateLimited = true;
+        results.warnings.push({
+          group: groupKey,
+          error: error.message || 'Meta API rate limit reached'
+        });
+        logMetaGraphEvent('sync-rate-limited', {
+          groupKey,
+          userId: group.userId,
+          adAccountId: group.adAccountId,
+          blockedUntil: blockedUntil ? blockedUntil.toISOString() : null
+        });
+        break;
+      }
+
+      results.warnings.push({
+        group: groupKey,
         error: error.message || 'Campaign analytics sync failed'
       });
     }
@@ -4240,7 +4394,8 @@ const refreshCrudCampaignAnalytics = async ({ campaignId, userId, range = 'last3
   return syncCrudCampaignAnalyticsRecord({
     campaign,
     userId: String(campaign.createdBy || ''),
-    range
+    range,
+    syncMode: 'manual'
   });
 };
 

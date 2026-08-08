@@ -101,7 +101,9 @@ const startAppScheduler = ({
         return;
       }
 
-      const result = await metaAdsService.syncAllCrudCampaignAnalytics();
+      const result = await metaAdsService.syncAllCrudCampaignAnalytics({
+        mode: 'auto'
+      });
       if (result.synced || result.warnings.length) {
         console.log(`Meta Ads sync completed. Synced: ${result.synced}, warnings: ${result.warnings.length}`);
       }
