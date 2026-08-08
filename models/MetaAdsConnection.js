@@ -52,6 +52,34 @@ const metaAdsConnectionSchema = new mongoose.Schema(
     lastValidatedAt: {
       type: Date,
       default: Date.now
+    },
+    metaSyncLastSuccessfulAt: {
+      type: Date,
+      default: null
+    },
+    metaSyncLastAutoAt: {
+      type: Date,
+      default: null
+    },
+    metaSyncLastManualAt: {
+      type: Date,
+      default: null
+    },
+    metaSyncCooldownUntil: {
+      type: Date,
+      default: null
+    },
+    metaSyncRateLimitedUntil: {
+      type: Date,
+      default: null
+    },
+    metaSyncLastErrorCode: {
+      type: Number,
+      default: null
+    },
+    metaSyncLastErrorSubcode: {
+      type: Number,
+      default: null
     }
   },
   {
