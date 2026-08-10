@@ -95,9 +95,28 @@ router.post('/menus', async (req, res) => {
       req.body?.workflowId || req.body?.menuId || req.body?.promptKey,
       `ivr_${Date.now().toString(36)}`
     );
-    const nodes = Array.isArray(req.body?.nodes) ? req.body.nodes : Array.isArray(req.body?.workflowConfig?.nodes) ? req.body.workflowConfig.nodes : [];
-    const edges = Array.isArray(req.body?.edges) ? req.body.edges : Array.isArray(req.body?.workflowConfig?.edges) ? req.body.workflowConfig.edges : [];
-    const metadata = req.body?.metadata && typeof req.body.metadata === 'object' ? req.body.metadata : {};
+    const payloadConfig = req.body?.config && typeof req.body.config === 'object' ? req.body.config : {};
+    const nodes = Array.isArray(req.body?.nodes)
+      ? req.body.nodes
+      : Array.isArray(req.body?.workflowConfig?.nodes)
+        ? req.body.workflowConfig.nodes
+        : Array.isArray(payloadConfig?.nodes)
+          ? payloadConfig.nodes
+          : [];
+    const edges = Array.isArray(req.body?.edges)
+      ? req.body.edges
+      : Array.isArray(req.body?.workflowConfig?.edges)
+        ? req.body.workflowConfig.edges
+        : Array.isArray(payloadConfig?.edges)
+          ? payloadConfig.edges
+          : [];
+    const metadata = req.body?.metadata && typeof req.body.metadata === 'object'
+      ? req.body.metadata
+      : payloadConfig?.config && typeof payloadConfig.config === 'object'
+        ? payloadConfig.config
+        : payloadConfig?.settings && typeof payloadConfig.settings === 'object'
+          ? payloadConfig.settings
+          : {};
 
     const created = await WhatsAppWorkflow.create({
       workflowId,
@@ -155,18 +174,27 @@ router.put('/menus/:id', async (req, res) => {
     if (req.body?.status !== undefined) {
       row.status = toSafeString(req.body.status, row.status || 'draft');
     }
+    const payloadConfig = req.body?.config && typeof req.body.config === 'object' ? req.body.config : {};
     if (Array.isArray(req.body?.nodes)) {
       row.nodes = req.body.nodes;
     } else if (Array.isArray(req.body?.workflowConfig?.nodes)) {
       row.nodes = req.body.workflowConfig.nodes;
+    } else if (Array.isArray(payloadConfig?.nodes)) {
+      row.nodes = payloadConfig.nodes;
     }
     if (Array.isArray(req.body?.edges)) {
       row.edges = req.body.edges;
     } else if (Array.isArray(req.body?.workflowConfig?.edges)) {
       row.edges = req.body.workflowConfig.edges;
+    } else if (Array.isArray(payloadConfig?.edges)) {
+      row.edges = payloadConfig.edges;
     }
     if (req.body?.metadata && typeof req.body.metadata === 'object') {
       row.metadata = req.body.metadata;
+    } else if (payloadConfig?.config && typeof payloadConfig.config === 'object') {
+      row.metadata = payloadConfig.config;
+    } else if (payloadConfig?.settings && typeof payloadConfig.settings === 'object') {
+      row.metadata = payloadConfig.settings;
     }
     row.version = Number(row.version || 1) + 1;
     await row.save();
