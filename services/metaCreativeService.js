@@ -113,6 +113,7 @@ const uploadCreativeAsset = async ({
   mediaType,
   userId,
   adAccountId,
+  accessContext,
   shouldUseMockMode,
   getAccessContextForUser,
   getEnvConfig,
@@ -137,12 +138,12 @@ const uploadCreativeAsset = async ({
     };
   }
 
-  const accessContext = await getAccessContextForUser(userId);
+  const resolvedAccessContext = accessContext || await getAccessContextForUser(userId);
   const adAccountCandidates = [
     adAccountId,
-    accessContext.connection?.selectedAdAccountId
+    resolvedAccessContext.connection?.selectedAdAccountId
   ].filter(Boolean);
-  const tokenCandidates = [...new Set([accessContext.accessToken].filter(Boolean))];
+  const tokenCandidates = [...new Set([resolvedAccessContext.accessToken].filter(Boolean))];
 
   const tryUpload = async ({ effectiveAdAccountId, accessToken }) => {
     if (normalizedMediaType === 'video') {

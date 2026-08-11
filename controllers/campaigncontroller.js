@@ -683,22 +683,6 @@ exports.createCampaign = async (req, res) => {
             });
         }
 
-        const setupBundle = await metaAdsService.getSetupBundle({ userId: req.user.id });
-        const adAccountId = String(
-            req.body?.adAccountId ||
-            normalizedPayload.adAccountId ||
-            setupBundle?.adAccountId ||
-            setupBundle?.selectedAdAccountId ||
-            ''
-        ).trim();
-        const configuredPageId = String(
-            req.body?.configuredPageId ||
-            req.body?.pageId ||
-            normalizedPayload.configuredPageId ||
-            setupBundle?.pageId ||
-            setupBundle?.selectedPageId ||
-            ''
-        ).trim();
         const requestMetaAccessToken = String(
             req.body?.metaAccessToken ||
             req.body?.accessToken ||
@@ -707,7 +691,6 @@ exports.createCampaign = async (req, res) => {
         ).trim();
 
         const metaValidationErrors = [];
-        if (!adAccountId) metaValidationErrors.push('adAccountId is required');
         if (!normalizedPayload.name) metaValidationErrors.push('campaign name is required');
         if (!normalizedPayload.objective) metaValidationErrors.push('objective is required');
         if (!normalizedPayload.startDate) metaValidationErrors.push('start date is required');
@@ -716,7 +699,6 @@ exports.createCampaign = async (req, res) => {
         if (!normalizedPayload.headline) metaValidationErrors.push('headline is required');
         if (!normalizedPayload.destinationUrl) metaValidationErrors.push('destination URL is required');
         if (!normalizedPayload.callToAction) metaValidationErrors.push('call-to-action is required');
-        if (!configuredPageId && !setupBundle?.pageAccessReady) metaValidationErrors.push('page ID is required');
         if (!normalizedPayload.imageUrl && !normalizedPayload.videoUrl) metaValidationErrors.push('image or video is required');
 
         if (metaValidationErrors.length > 0) {
@@ -744,8 +726,8 @@ exports.createCampaign = async (req, res) => {
             campaignId: campaign._id,
             userId: req.user.id,
             accessToken: requestMetaAccessToken,
-            adAccountId,
-            configuredPageId,
+            adAccountId: String(req.body?.adAccountId || normalizedPayload.adAccountId || '').trim(),
+            configuredPageId: String(req.body?.configuredPageId || req.body?.pageId || normalizedPayload.configuredPageId || '').trim(),
             normalizedPayload,
             imageFile,
             videoFile

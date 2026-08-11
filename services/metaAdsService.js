@@ -3486,6 +3486,9 @@ const createMetaAdStackFromCrud = async ({
   const resolvedAccessToken = String(accessToken || accessContext.accessToken || '').trim();
   const resolvedAdAccountId = toCanonicalAdAccountId(adAccountId || accessContext.connection?.selectedAdAccountId || '');
   const resolvedPageId = String(configuredPageId || accessContext.connection?.selectedPageId || '').trim();
+  const resolvedPageAccessToken = String(
+    decryptMetaToken(accessContext.connection?.selectedPageAccessToken || '') || ''
+  ).trim();
   const normalizedStatus = String(status || '').trim().toUpperCase() === 'ACTIVE' ? 'ACTIVE' : 'PAUSED';
   const resolvedOptimizationGoal = normalizeOptimizationGoalForCrudObjective(objective, optimizationGoal);
   const genders = [];
@@ -3553,7 +3556,8 @@ const createMetaAdStackFromCrud = async ({
     mediaUrl: normalizedMediaType === 'video' ? videoUrl : imageUrl,
     mediaType: normalizedMediaType,
     userId,
-    adAccountId: resolvedAdAccountId
+    adAccountId: resolvedAdAccountId,
+    accessContext
   });
 
   if (normalizedMediaType === 'video' && !creativeUpload?.videoId) {
@@ -3738,14 +3742,6 @@ const createMetaAdStackFromCrud = async ({
 
   let createdCreative;
   try {
-    const creativePageContext = await metaCreativeService.resolveCreativePageContext({
-      requestedPageId: resolvedPageId,
-      accessToken: resolvedAccessToken,
-      graphRequest,
-      env,
-      buildStageErrorWithDetails
-    });
-
     createdCreative = await metaCreativeService.createCreative({
       campaignName: String(campaignName || 'Campaign').trim(),
       creative: {
@@ -3756,13 +3752,13 @@ const createMetaAdStackFromCrud = async ({
         mediaType: normalizedMediaType
       },
       creativeUpload,
-      configuredPageId: creativePageContext.pageId,
-      pageAccessToken: String(creativePageContext.pageAccessToken || '').trim(),
+      configuredPageId: resolvedPageId,
+      pageAccessToken: resolvedPageAccessToken || resolvedAccessToken,
       instagramActorId: undefined,
       destinationUrl:
         normalizedObjective === 'awareness'
-          ? `https://www.facebook.com/${creativePageContext.pageId}`
-          : (String(destinationUrl || '').trim() || `https://www.facebook.com/${creativePageContext.pageId}`),
+          ? `https://www.facebook.com/${resolvedPageId}`
+          : (String(destinationUrl || '').trim() || `https://www.facebook.com/${resolvedPageId}`),
       sanitizedWhatsappNumber: '',
       adAccountId: resolvedAdAccountId,
       accessToken: resolvedAccessToken,
@@ -3770,13 +3766,6 @@ const createMetaAdStackFromCrud = async ({
       buildAdAccountPath,
       buildStageErrorWithDetails,
       extractApiErrorMessage,
-      creativePageContext: {
-        requestedPageId: creativePageContext.requestedPageId,
-        pageId: creativePageContext.pageId,
-        pageName: creativePageContext.pageName,
-        pageAccessToken: creativePageContext.pageAccessToken,
-        accessiblePages: creativePageContext.accessiblePages
-      },
       logMetaRequest
     });
   } catch (error) {
