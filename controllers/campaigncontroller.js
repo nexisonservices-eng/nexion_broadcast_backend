@@ -1890,7 +1890,8 @@ exports.syncWithMeta = async (req, res) => {
             message: 'Campaign synced with Meta successfully.',
             data: {
                 campaignId: String(syncResult?.campaign?._id || campaign._id),
-                insights: syncResult?.insights || null
+                insights: syncResult?.insights || null,
+                campaign: serializeCampaignRecord(syncResult?.campaign || campaign)
             }
         });
     } catch (error) {
@@ -1913,10 +1914,22 @@ exports.syncAllWithMeta = async (req, res) => {
             mode: 'manual'
         });
 
+        const query = {
+            metaCampaignId: { $exists: true, $ne: '' },
+            status: { $in: ['active', 'paused'] }
+        };
+        if (!isSuperAdmin) {
+            query.createdBy = req.user.id;
+        }
+        const campaigns = await Campaign.find(query).sort({ createdAt: -1 }).lean();
+
         return res.status(200).json({
             success: true,
             message: 'Meta sync completed.',
-            data: syncResult
+            data: {
+                ...syncResult,
+                campaigns: campaigns.map((campaign) => serializeCampaignRecord(campaign))
+            }
         });
     } catch (error) {
         console.error('Error syncing campaigns with Meta:', error);
