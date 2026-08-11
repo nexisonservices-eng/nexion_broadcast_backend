@@ -449,6 +449,24 @@ const continueCampaignMetaCreation = async ({
     }
 };
 
+const continueCampaignMetaArchive = async ({ userId, campaignId, adSetId, adId }) => {
+    try {
+        await metaAdsService.archiveMetaCrudAssets({
+            userId,
+            campaignId,
+            adSetId,
+            adId
+        });
+    } catch (metaError) {
+        console.error('Background Meta campaign archive failed:', {
+            campaignId,
+            adSetId,
+            adId,
+            message: metaError?.message || metaError
+        });
+    }
+};
+
 const getUploadedCreativeFiles = (req = {}) => {
     const imageFromFields = Array.isArray(req.files?.creativeImage) ? req.files.creativeImage[0] : null;
     const videoFromFields = Array.isArray(req.files?.creativeVideo) ? req.files.creativeVideo[0] : null;
@@ -986,32 +1004,23 @@ exports.deleteCampaign = async (req, res) => {
 
         if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to delete this campaign')) return;
 
-        let metaDeletion = null;
-        if (campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId) {
-            try {
-                metaDeletion = await metaAdsService.archiveMetaCrudAssets({
-                    userId: req.user.id,
-                    campaignId: campaign.metaCampaignId,
-                    adSetId: campaign.metaAdSetId,
-                    adId: campaign.metaAdId
-                });
-            } catch (metaError) {
-                return sendMetaError(
-                    res,
-                    metaError,
-                    'Meta campaign deletion failed. The local campaign was not removed.'
-                );
-            }
-        }
-
         await campaign.deleteOne();
+
+        if (campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId) {
+            void continueCampaignMetaArchive({
+                userId: req.user.id,
+                campaignId: campaign.metaCampaignId,
+                adSetId: campaign.metaAdSetId,
+                adId: campaign.metaAdId
+            });
+        }
 
         res.status(200).json({
             success: true,
-            message: metaDeletion?.archived?.length
-                ? 'Campaign deleted locally and archived in Meta successfully'
+            message: (campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId)
+                ? 'Campaign deleted successfully. Meta cleanup continues in the background.'
                 : 'Campaign deleted successfully',
-            meta: metaDeletion || null
+            meta: null
         });
     } catch (error) {
         console.error('Error deleting campaign:', error);
