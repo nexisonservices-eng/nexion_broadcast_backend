@@ -976,12 +976,22 @@ exports.deleteCampaign = async (req, res) => {
 
         mark('start');
         const requestedId = String(req.params.id || '').trim();
+        const requestedMetaCampaignId = String(
+            req.body?.metaCampaignId ||
+            (requestedId.startsWith('meta_') ? requestedId.replace(/^meta_/, '') : '')
+        ).trim();
         let campaign = null;
 
         if (!requestedId.startsWith('meta_')) {
             mark('lookup_start');
             campaign = await Campaign.findById(req.params.id);
             mark('lookup_done', { found: Boolean(campaign) });
+        }
+
+        if (!campaign && requestedMetaCampaignId) {
+            mark('lookup_meta_start', { metaCampaignId: requestedMetaCampaignId });
+            campaign = await Campaign.findOne({ metaCampaignId: requestedMetaCampaignId });
+            mark('lookup_meta_done', { found: Boolean(campaign) });
         }
 
         if (!campaign && req.body?.metaCampaignId) {
@@ -1001,7 +1011,21 @@ exports.deleteCampaign = async (req, res) => {
                 return res.status(200).json({
                     success: true,
                     message: 'Meta campaign archived successfully',
-                    meta: metaDeletion || null
+                    meta: metaDeletion || null,
+                    data: {
+                        _id: requestedId,
+                        id: requestedId,
+                        metaCampaignId: String(req.body.metaCampaignId || requestedMetaCampaignId || '').trim(),
+                        metaAdSetId: String(req.body.metaAdSetId || '').trim(),
+                        metaAdId: String(req.body.metaAdId || '').trim(),
+                        campaignName: String(req.body.campaignName || req.body.name || '').trim(),
+                        name: String(req.body.campaignName || req.body.name || '').trim(),
+                        status: 'archived',
+                        lifecycleStatus: 'archived',
+                        deliveryStatus: 'completed',
+                        localStatus: 'archived',
+                        meta: metaDeletion || null
+                    }
                 });
             } catch (metaError) {
                 return sendMetaError(
