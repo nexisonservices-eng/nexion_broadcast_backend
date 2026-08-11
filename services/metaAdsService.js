@@ -324,7 +324,8 @@ const setCachedMetaGraphResponse = (key, response, ttlMs = META_GRAPH_CACHE_TTL_
 const invalidateMetaGraphCacheEntries = ({
   accessToken,
   apiVersion,
-  paths = []
+  paths = [],
+  invalidateCampaignCollections = false
 } = {}) => {
   const resolvedApiVersion = String(apiVersion || getEnvConfig().apiVersion || 'v23.0').trim();
   const tokenKey = String(accessToken || '').trim()
@@ -357,6 +358,10 @@ const invalidateMetaGraphCacheEntries = ({
     }
 
     const requestPath = normalizeMetaGraphCachePath(parsed?.path);
+    if (invalidateCampaignCollections && requestPath.endsWith('/campaigns')) {
+      return true;
+    }
+
     return normalizedPaths.some((path) => {
       if (!path) return false;
       return (
@@ -447,7 +452,8 @@ const invalidateMetaCampaignCache = async ({
   return invalidateMetaGraphCacheEntries({
     accessToken,
     apiVersion: String(apiVersion || getEnvConfig().apiVersion || 'v23.0').trim(),
-    paths
+    paths,
+    invalidateCampaignCollections: true
   });
 };
 
