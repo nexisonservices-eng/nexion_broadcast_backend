@@ -980,22 +980,42 @@ exports.updateCampaign = async (req, res) => {
 // @access  Private
 exports.deleteCampaign = async (req, res) => {
     try {
+        const requestStartedAt = Date.now();
+        const requestId = `${requestStartedAt}-${Math.random().toString(36).slice(2, 8)}`;
+        const mark = (phase, extra = {}) => {
+            console.info('[campaign-delete]', {
+                requestId,
+                phase,
+                elapsedMs: Date.now() - requestStartedAt,
+                campaignId: String(req.params.id || ''),
+                ...extra
+            });
+        };
+
+        mark('start');
         const requestedId = String(req.params.id || '').trim();
         let campaign = null;
 
         if (!requestedId.startsWith('meta_')) {
+            mark('lookup_start');
             campaign = await Campaign.findById(req.params.id);
+            mark('lookup_done', { found: Boolean(campaign) });
         }
 
         if (!campaign && req.body?.metaCampaignId) {
             try {
+                mark('meta_archive_start', { directMetaArchive: true });
                 const metaDeletion = await metaAdsService.archiveMetaCrudAssets({
                     userId: req.user.id,
                     campaignId: req.body.metaCampaignId,
                     adSetId: req.body.metaAdSetId,
                     adId: req.body.metaAdId
                 });
+                mark('meta_archive_done', { directMetaArchive: true });
 
+                res.setHeader('X-Campaign-Delete-Request-Id', requestId);
+                res.setHeader('X-Campaign-Delete-Duration-Ms', String(Date.now() - requestStartedAt));
+                res.setHeader('X-Campaign-Delete-Phase', 'meta-archived');
                 return res.status(200).json({
                     success: true,
                     message: 'Meta campaign archived successfully',
@@ -1019,14 +1039,17 @@ exports.deleteCampaign = async (req, res) => {
 
         if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to delete this campaign')) return;
 
+        mark('local_archive_start');
         campaign.status = 'archived';
         campaign.lifecycleStatus = 'archived';
         campaign.deliveryStatus = 'completed';
         campaign.localStatus = 'archived';
         campaign.reviewNotes = campaign.reviewNotes || 'Archived from campaign manager';
         await campaign.save();
+        mark('local_archive_done');
 
         if (campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId) {
+            mark('meta_archive_queued');
             void continueCampaignMetaArchive({
                 userId: req.user.id,
                 campaignId: campaign.metaCampaignId,
@@ -1035,6 +1058,9 @@ exports.deleteCampaign = async (req, res) => {
             });
         }
 
+        res.setHeader('X-Campaign-Delete-Request-Id', requestId);
+        res.setHeader('X-Campaign-Delete-Duration-Ms', String(Date.now() - requestStartedAt));
+        res.setHeader('X-Campaign-Delete-Phase', campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId ? 'archived-plus-meta-background' : 'archived');
         res.status(200).json({
             success: true,
             message: (campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId)
@@ -1043,6 +1069,7 @@ exports.deleteCampaign = async (req, res) => {
             meta: null,
             data: serializeCampaignRecord(campaign)
         });
+        mark('response_sent');
     } catch (error) {
         console.error('Error deleting campaign:', error);
         
