@@ -490,7 +490,11 @@ exports.getCampaigns = async (req, res) => {
 
         // Build query
         const scopedBaseFilter = buildCampaignScopedFilter(req);
-        const query = Campaign.find(scopedBaseFilter);
+        const visibleBaseFilter = {
+            ...scopedBaseFilter,
+            status: { $ne: 'archived' }
+        };
+        const query = Campaign.find(visibleBaseFilter);
         
         // Apply filters, sorting, pagination
         const features = new APIFeatures(query, req.query)
@@ -504,10 +508,16 @@ exports.getCampaigns = async (req, res) => {
         const campaigns = await features.query;
 
         const localCampaigns = campaigns.map((campaign) => serializeCampaignRecord(campaign));
+        const archivedCampaigns = await Campaign.find({
+            ...scopedBaseFilter,
+            status: 'archived'
+        })
+            .select('metaCampaignId')
+            .lean();
 
         // Get total count for pagination
         const combinedFilter = {
-            ...scopedBaseFilter,
+            ...visibleBaseFilter,
             ...(features.filterConditions || {})
         };
         const totalCount = await Campaign.countDocuments(combinedFilter);
@@ -522,7 +532,12 @@ exports.getCampaigns = async (req, res) => {
         }
 
         const existingMetaCampaignIds = new Set(
-            localCampaigns.map((campaign) => String(campaign.metaCampaignId || '').trim()).filter(Boolean)
+            [
+                ...localCampaigns,
+                ...archivedCampaigns
+            ]
+                .map((campaign) => String(campaign.metaCampaignId || '').trim())
+                .filter(Boolean)
         );
         const remoteOnlyCampaigns = remoteCampaigns.filter(
             (campaign) => !existingMetaCampaignIds.has(String(campaign.metaCampaignId || '').trim())
@@ -1004,7 +1019,12 @@ exports.deleteCampaign = async (req, res) => {
 
         if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to delete this campaign')) return;
 
-        await campaign.deleteOne();
+        campaign.status = 'archived';
+        campaign.lifecycleStatus = 'archived';
+        campaign.deliveryStatus = 'completed';
+        campaign.localStatus = 'archived';
+        campaign.reviewNotes = campaign.reviewNotes || 'Archived from campaign manager';
+        await campaign.save();
 
         if (campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId) {
             void continueCampaignMetaArchive({
@@ -1018,9 +1038,10 @@ exports.deleteCampaign = async (req, res) => {
         res.status(200).json({
             success: true,
             message: (campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId)
-                ? 'Campaign deleted successfully. Meta cleanup continues in the background.'
-                : 'Campaign deleted successfully',
-            meta: null
+                ? 'Campaign archived successfully. Meta cleanup continues in the background.'
+                : 'Campaign archived successfully',
+            meta: null,
+            data: serializeCampaignRecord(campaign)
         });
     } catch (error) {
         console.error('Error deleting campaign:', error);
