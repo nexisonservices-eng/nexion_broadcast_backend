@@ -326,8 +326,9 @@ const invalidateMetaGraphCacheEntries = ({
   apiVersion,
   paths = []
 } = {}) => {
+  const resolvedApiVersion = String(apiVersion || getEnvConfig().apiVersion || 'v23.0').trim();
   const tokenKey = String(accessToken || '').trim()
-    ? getMetaTokenKey({ accessToken, apiVersion })
+    ? getMetaTokenKey({ accessToken, apiVersion: resolvedApiVersion })
     : '';
   const normalizedPaths = [...new Set(
     (Array.isArray(paths) ? paths : [])
@@ -445,7 +446,7 @@ const invalidateMetaCampaignCache = async ({
 
   return invalidateMetaGraphCacheEntries({
     accessToken,
-    apiVersion,
+    apiVersion: String(apiVersion || getEnvConfig().apiVersion || 'v23.0').trim(),
     paths
   });
 };
