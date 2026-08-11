@@ -352,6 +352,103 @@ const normalizeLifecycleState = ({ requestedStatus, existingCampaign } = {}) => 
     };
 };
 
+const continueCampaignMetaCreation = async ({
+    campaignId,
+    userId,
+    accessToken,
+    adAccountId,
+    configuredPageId,
+    normalizedPayload,
+    imageFile,
+    videoFile
+}) => {
+    try {
+        const metaResult = await metaAdsService.createMetaAdStackFromCrud({
+            userId,
+            accessToken,
+            adAccountId,
+            configuredPageId,
+            campaignName: normalizedPayload.name,
+            objective: normalizedPayload.objective,
+            dailyBudget: normalizedPayload.dailyBudget,
+            lifetimeBudget: normalizedPayload.lifetimeBudget,
+            startDate: normalizedPayload.startDate,
+            endDate: normalizedPayload.endDate,
+            platform: normalizedPayload.platform,
+            targeting: normalizedPayload.targeting,
+            ageMin: normalizedPayload.ageMin,
+            ageMax: normalizedPayload.ageMax,
+            gender: normalizedPayload.gender,
+            interests: normalizedPayload.interests,
+            behaviors: normalizedPayload.behaviors,
+            primaryText: normalizedPayload.primaryText,
+            headline: normalizedPayload.headline,
+            description: normalizedPayload.description,
+            destinationUrl: normalizedPayload.destinationUrl,
+            callToAction: normalizedPayload.callToAction,
+            optimizationGoal: normalizedPayload.optimizationGoal,
+            bidStrategy: normalizedPayload.bidStrategy,
+            mediaType: normalizedPayload.mediaType,
+            imageUrl: normalizedPayload.imageUrl,
+            imageFileBuffer: imageFile?.buffer,
+            imageFileName: imageFile?.originalname,
+            videoUrl: normalizedPayload.videoUrl,
+            videoFileBuffer: videoFile?.buffer,
+            videoFileName: videoFile?.originalname,
+            status: normalizedPayload.status
+        });
+
+        await Campaign.findByIdAndUpdate(
+            campaignId,
+            {
+                $set: {
+                    metaCampaignId: String(metaResult?.campaignId || '').trim(),
+                    metaAdSetId: String(metaResult?.adSetId || '').trim(),
+                    metaCreativeId: String(metaResult?.creativeId || '').trim(),
+                    metaAdId: String(metaResult?.adId || '').trim(),
+                    metaStatus: String(metaResult?.campaignStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
+                    metaAdSetStatus: String(metaResult?.adSetStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
+                    metaAdStatus: String(metaResult?.adStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
+                    adAccountId: String(metaResult?.adAccountId || adAccountId || '').trim(),
+                    status: 'paused',
+                    lifecycleStatus: 'pending_review',
+                    reviewStatus: 'pending_review',
+                    deliveryStatus: 'paused',
+                    metaResponse: metaResult,
+                    updatedBy: userId
+                }
+            },
+            { new: true }
+        );
+    } catch (metaError) {
+        const reviewNotes = buildMetaCreateErrorMessage(metaError);
+        console.error('Background Meta campaign creation failed:', {
+            campaignId,
+            message: reviewNotes,
+            error: metaError?.message || metaError
+        });
+
+        await Campaign.findByIdAndUpdate(
+            campaignId,
+            {
+                $set: {
+                    lifecycleStatus: 'rejected',
+                    reviewStatus: 'rejected',
+                    deliveryStatus: 'rejected',
+                    reviewNotes,
+                    metaResponse: {
+                        stage: normalizeMetaStage(metaError.stage),
+                        message: metaError?.message || 'Meta campaign creation failed',
+                        details: metaError?.details || null,
+                        metaError: normalizeMetaApiError(metaError)
+                    }
+                }
+            },
+            { new: true }
+        );
+    }
+};
+
 const getUploadedCreativeFiles = (req = {}) => {
     const imageFromFields = Array.isArray(req.files?.creativeImage) ? req.files.creativeImage[0] : null;
     const videoFromFields = Array.isArray(req.files?.creativeVideo) ? req.files.creativeVideo[0] : null;
@@ -597,95 +694,34 @@ exports.createCampaign = async (req, res) => {
             });
         }
 
-        let metaResult;
-        try {
-            metaResult = await metaAdsService.createMetaAdStackFromCrud({
-                userId: req.user.id,
-                accessToken: requestMetaAccessToken,
-                adAccountId,
-                configuredPageId,
-                campaignName: normalizedPayload.name,
-                objective: normalizedPayload.objective,
-                dailyBudget: normalizedPayload.dailyBudget,
-                lifetimeBudget: normalizedPayload.lifetimeBudget,
-                startDate: normalizedPayload.startDate,
-                endDate: normalizedPayload.endDate,
-                platform: normalizedPayload.platform,
-                targeting: normalizedPayload.targeting,
-                ageMin: normalizedPayload.ageMin,
-                ageMax: normalizedPayload.ageMax,
-                gender: normalizedPayload.gender,
-                interests: normalizedPayload.interests,
-                behaviors: normalizedPayload.behaviors,
-                primaryText: normalizedPayload.primaryText,
-                headline: normalizedPayload.headline,
-                description: normalizedPayload.description,
-                destinationUrl: normalizedPayload.destinationUrl,
-                callToAction: normalizedPayload.callToAction,
-                optimizationGoal: normalizedPayload.optimizationGoal,
-                bidStrategy: normalizedPayload.bidStrategy,
-                mediaType: normalizedPayload.mediaType,
-                imageUrl: normalizedPayload.imageUrl,
-                videoUrl: normalizedPayload.videoUrl,
-                status: normalizedPayload.status
-            });
-        } catch (metaError) {
-            return res.status(metaError.status || 400).json({
-                success: false,
-                stage: normalizeMetaStage(metaError.stage),
-                message: 'Meta API request failed',
-                partialData: metaError.partialData || metaError.details?.partialData || {},
-                metaError: normalizeMetaApiError(metaError)
-            });
-        }
-
-        normalizedPayload.metaCampaignId = String(metaResult?.campaignId || '').trim();
-        normalizedPayload.metaAdSetId = String(metaResult?.adSetId || '').trim();
-        normalizedPayload.metaCreativeId = String(metaResult?.creativeId || '').trim();
-        normalizedPayload.metaAdId = String(metaResult?.adId || '').trim();
-        normalizedPayload.metaStatus = String(metaResult?.campaignStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED';
-        normalizedPayload.metaAdSetStatus = String(metaResult?.adSetStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED';
-        normalizedPayload.metaAdStatus = String(metaResult?.adStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED';
-        normalizedPayload.adAccountId = String(metaResult?.adAccountId || adAccountId || '').trim();
-        normalizedPayload.localStatus = 'created';
-        normalizedPayload.status = 'paused';
-        normalizedPayload.lifecycleStatus = 'pending_review';
+        normalizedPayload.status = 'draft';
+        normalizedPayload.lifecycleStatus = 'publishing';
         normalizedPayload.reviewStatus = 'pending_review';
-        normalizedPayload.deliveryStatus = 'paused';
-        normalizedPayload.metaResponse = metaResult;
+        normalizedPayload.deliveryStatus = 'publishing';
 
-        // Create campaign
+        // Persist the local record first so the UI can show the new campaign immediately.
         let campaign;
         try {
             campaign = await Campaign.create(normalizedPayload);
         } catch (localSaveError) {
-            if (metaResult?.campaignId || metaResult?.adSetId || metaResult?.adId) {
-                try {
-                    await metaAdsService.archiveMetaCrudAssets({
-                        userId: req.user.id,
-                        campaignId: metaResult?.campaignId,
-                        adSetId: metaResult?.adSetId,
-                        adId: metaResult?.adId
-                    });
-                } catch (rollbackError) {
-                    console.error('Failed to roll back Meta campaign after local save error:', rollbackError);
-                }
-            }
             throw localSaveError;
         }
 
+        void continueCampaignMetaCreation({
+            campaignId: campaign._id,
+            userId: req.user.id,
+            accessToken: requestMetaAccessToken,
+            adAccountId,
+            configuredPageId,
+            normalizedPayload,
+            imageFile,
+            videoFile
+        });
+
         res.status(201).json({
             success: true,
-            message: 'Meta campaign, ad set, creative and ad created successfully.',
-            data: {
-                metaCampaignId: String(campaign.metaCampaignId || '').trim(),
-                metaAdSetId: String(campaign.metaAdSetId || '').trim(),
-                metaCreativeId: String(campaign.metaCreativeId || '').trim(),
-                metaAdId: String(campaign.metaAdId || '').trim(),
-                campaignStatus: String(campaign.metaStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
-                adSetStatus: String(campaign.metaAdSetStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
-                adStatus: String(campaign.metaAdStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED'
-            }
+            message: 'Campaign created. Meta publishing continues in the background.',
+            data: serializeCampaignRecord(campaign)
         });
     } catch (error) {
         console.error('Error creating campaign:', error);
