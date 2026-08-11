@@ -296,6 +296,12 @@ const cloneMetaResponse = (response) => {
   };
 };
 
+const normalizeMetaGraphCachePath = (path) =>
+  String(path || '')
+    .trim()
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+
 const getCachedMetaGraphResponse = (key) => {
   const entry = metaGraphRequestCache.get(key);
   if (!entry) return null;
@@ -312,6 +318,135 @@ const setCachedMetaGraphResponse = (key, response, ttlMs = META_GRAPH_CACHE_TTL_
   metaGraphRequestCache.set(key, {
     expiresAt: Date.now() + ttlMs,
     response: cloneMetaResponse(response)
+  });
+};
+
+const invalidateMetaGraphCacheEntries = ({
+  accessToken,
+  apiVersion,
+  paths = []
+} = {}) => {
+  const tokenKey = String(accessToken || '').trim()
+    ? getMetaTokenKey({ accessToken, apiVersion })
+    : '';
+  const normalizedPaths = [...new Set(
+    (Array.isArray(paths) ? paths : [])
+      .map((path) => normalizeMetaGraphCachePath(path))
+      .filter(Boolean)
+  )];
+
+  if (!normalizedPaths.length) {
+    return 0;
+  }
+
+  const shouldInvalidate = (requestKey) => {
+    let parsed;
+    try {
+      parsed = JSON.parse(requestKey);
+    } catch {
+      return false;
+    }
+
+    if (String(parsed?.method || '').trim().toUpperCase() !== 'GET') {
+      return false;
+    }
+
+    if (tokenKey && getMetaTokenKey(parsed) !== tokenKey) {
+      return false;
+    }
+
+    const requestPath = normalizeMetaGraphCachePath(parsed?.path);
+    return normalizedPaths.some((path) => {
+      if (!path) return false;
+      return (
+        requestPath === path ||
+        requestPath.startsWith(`${path}/`) ||
+        path.startsWith(`${requestPath}/`)
+      );
+    });
+  };
+
+  let removed = 0;
+  for (const key of [...metaGraphRequestCache.keys()]) {
+    if (shouldInvalidate(key)) {
+      metaGraphRequestCache.delete(key);
+      removed += 1;
+    }
+  }
+
+  for (const key of [...metaGraphRequestInflight.keys()]) {
+    if (shouldInvalidate(key)) {
+      metaGraphRequestInflight.delete(key);
+    }
+  }
+
+  return removed;
+};
+
+const resolveMetaCampaignCacheContext = async ({ campaignId, adSetId, adId, adAccountId } = {}) => {
+  const resolvedCampaignId = String(campaignId || '').trim();
+  const resolvedAdSetId = String(adSetId || '').trim();
+  const resolvedAdId = String(adId || '').trim();
+  const resolvedAdAccountId = toCanonicalAdAccountId(adAccountId || '');
+
+  if (resolvedAdAccountId) {
+    return {
+      campaignId: resolvedCampaignId,
+      adSetId: resolvedAdSetId,
+      adId: resolvedAdId,
+      adAccountId: resolvedAdAccountId
+    };
+  }
+
+  const campaign = await Campaign.findOne({
+    $or: [
+      resolvedCampaignId ? { metaCampaignId: resolvedCampaignId } : null,
+      resolvedAdSetId ? { metaAdSetId: resolvedAdSetId } : null,
+      resolvedAdId ? { metaAdId: resolvedAdId } : null
+    ].filter(Boolean)
+  })
+    .select('metaCampaignId metaAdSetId metaAdId adAccountId metaAdAccountId')
+    .lean();
+
+  return {
+    campaignId: String(campaign?.metaCampaignId || resolvedCampaignId || '').trim(),
+    adSetId: String(campaign?.metaAdSetId || resolvedAdSetId || '').trim(),
+    adId: String(campaign?.metaAdId || resolvedAdId || '').trim(),
+    adAccountId: toCanonicalAdAccountId(campaign?.adAccountId || campaign?.metaAdAccountId || '')
+  };
+};
+
+const invalidateMetaCampaignCache = async ({
+  accessToken,
+  apiVersion,
+  campaignId,
+  adSetId,
+  adId,
+  adAccountId
+} = {}) => {
+  const cacheContext = await resolveMetaCampaignCacheContext({
+    campaignId,
+    adSetId,
+    adId,
+    adAccountId
+  });
+
+  const paths = [
+    cacheContext.campaignId,
+    cacheContext.adSetId,
+    cacheContext.adId
+  ];
+
+  if (cacheContext.adAccountId) {
+    paths.push(
+      buildAdAccountPath(cacheContext.adAccountId, 'campaigns')
+    );
+  }
+
+  return invalidateMetaGraphCacheEntries({
+    accessToken,
+    apiVersion,
+    paths
   });
 };
 
@@ -1038,6 +1173,13 @@ const createMetaCampaignInAdsManager = async ({ name, objective, adAccountId, ac
       apiVersion: resolvedApiVersion
     });
 
+    await invalidateMetaCampaignCache({
+      accessToken: resolvedAccessToken,
+      apiVersion: resolvedApiVersion,
+      campaignId: response?.id,
+      adAccountId: resolvedAdAccountId
+    });
+
     return {
       apiMode: 'live',
       adAccountId: toCanonicalAdAccountId(resolvedAdAccountId),
@@ -1132,6 +1274,12 @@ const deleteMetaCampaignInAdsManager = async ({ campaignId, accessToken, apiVers
       path: resolvedCampaignId,
       accessToken: resolvedAccessToken,
       apiVersion: resolvedApiVersion
+    });
+
+    await invalidateMetaCampaignCache({
+      accessToken: resolvedAccessToken,
+      apiVersion: resolvedApiVersion,
+      campaignId: resolvedCampaignId
     });
 
     return {
@@ -3422,6 +3570,13 @@ const createMetaCampaignFromCrud = async ({ userId, name, objective, status, acc
       accessToken: String(accessToken || accessContext.accessToken || '').trim()
     });
 
+    await invalidateMetaCampaignCache({
+      accessToken: String(accessToken || accessContext.accessToken || '').trim(),
+      apiVersion: getEnvConfig().apiVersion,
+      campaignId: response?.id,
+      adAccountId: effectiveAdAccountId
+    });
+
     return {
       apiMode: 'live',
       ...response
@@ -3850,6 +4005,15 @@ const createMetaAdStackFromCrud = async ({
     throw wrappedError;
   }
 
+  await invalidateMetaCampaignCache({
+    accessToken: resolvedAccessToken,
+    apiVersion: getEnvConfig().apiVersion,
+    campaignId: partialData.metaCampaignId,
+    adSetId: partialData.metaAdSetId,
+    adId: partialData.metaAdId,
+    adAccountId: resolvedAdAccountId
+  });
+
   return {
     apiMode: 'live',
     adAccountId: resolvedAdAccountId,
@@ -3890,6 +4054,13 @@ const updateMetaCrudDeliveryStatus = async ({ userId, campaignId, adSetId, adId,
 
   try {
     await Promise.all(updates);
+    await invalidateMetaCampaignCache({
+      accessToken: accessContext.accessToken,
+      apiVersion: getEnvConfig().apiVersion,
+      campaignId,
+      adSetId,
+      adId
+    });
     return {
       apiMode: 'live',
       status: normalizedStatus
@@ -3956,6 +4127,14 @@ const archiveMetaCrudAssets = async ({ userId, campaignId, adSetId, adId }) => {
     }
   }
 
+  await invalidateMetaCampaignCache({
+    accessToken: accessContext.accessToken,
+    apiVersion: getEnvConfig().apiVersion,
+    campaignId,
+    adSetId,
+    adId
+  });
+
   return {
     apiMode: 'live',
     archived
@@ -4002,6 +4181,12 @@ const updateMetaCampaignFromCrud = async ({ userId, campaignId, name, status }) 
       path: campaignId,
       data: payload,
       accessToken: accessContext.accessToken
+    });
+
+    await invalidateMetaCampaignCache({
+      accessToken: accessContext.accessToken,
+      apiVersion: getEnvConfig().apiVersion,
+      campaignId
     });
 
     return {
