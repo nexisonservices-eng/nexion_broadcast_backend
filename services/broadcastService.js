@@ -1140,6 +1140,11 @@ class BroadcastService {
       detail.replyCount += 1;
       detail.lastReplyAt = replyTime || detail.lastReplyAt;
       detail.lastReplyText = String(message.text || "").trim();
+      detail.read = true;
+      detail.delivered = true;
+      if (this.getStatusScore(detail.status) < this.getStatusScore("read")) {
+        detail.status = "read";
+      }
     });
 
     const deliveryResults = Array.isArray(broadcast?.deliveryResults)
@@ -5234,12 +5239,13 @@ class BroadcastService {
             }
             if (
               detail?.delivered ||
+              detail?.replied ||
               status === "delivered" ||
               status === "read"
             ) {
               accumulator.delivered += 1;
             }
-            if (detail?.read || status === "read") {
+            if (detail?.read || detail?.replied || status === "read") {
               accumulator.read += 1;
             }
             if (status === "failed") {
