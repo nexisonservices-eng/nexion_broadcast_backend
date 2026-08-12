@@ -118,10 +118,11 @@ BroadcastSchema.virtual('repliedPercentageOfTotal').get(function() {
   return ((this.stats.replied / this.recipientCount) * 100).toFixed(1);
 });
 
-// Virtual field for read percentage based on sent count
+// Virtual field for read percentage based on the recipient base
 BroadcastSchema.virtual('readPercentage').get(function() {
-  if (!this.stats || this.stats.sent === 0) return 0;
-  return ((this.stats.read / this.stats.sent) * 100).toFixed(1);
+  const recipientBase = this.recipientCount || this.stats?.sent || 0;
+  if (!this.stats || recipientBase === 0) return 0;
+  return ((this.stats.read / recipientBase) * 100).toFixed(1);
 });
 
 // Virtual field for read percentage based on total recipients

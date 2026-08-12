@@ -4040,6 +4040,8 @@ class BroadcastService {
           .sort({ createdAt: -1, _id: -1 })
           .limit(limit + 1)
           .lean();
+        const getAudienceBase = (broadcast = {}) =>
+          Number(broadcast?.recipientCount || broadcast?.stats?.sent || 0);
 
         const needsStatsRepair = (broadcast = {}) => {
           const status = String(broadcast?.status || "").toLowerCase();
@@ -4109,26 +4111,26 @@ class BroadcastService {
           completedCount: Number(broadcast?.stats?.sent || 0),
           successful: Number(broadcast?.stats?.delivered || 0),
           successfulPercentage:
-            Number(broadcast?.recipientCount || 0) > 0
+            getAudienceBase(broadcast) > 0
               ? Math.round(
                   (Number(broadcast?.stats?.delivered || 0) /
-                    Number(broadcast?.recipientCount || 0)) *
+                    getAudienceBase(broadcast)) *
                     100,
                 )
               : 0,
           readPercentage:
-            Number(broadcast?.stats?.delivered || 0) > 0
+            getAudienceBase(broadcast) > 0
               ? Math.round(
                 (Number(broadcast?.stats?.read || 0) /
-                  Number(broadcast?.stats?.delivered || 0)) *
+                  getAudienceBase(broadcast)) *
                     100,
                 )
               : 0,
           repliedPercentage:
-            Number(broadcast?.stats?.delivered || 0) > 0
+            getAudienceBase(broadcast) > 0
               ? Math.round(
                   (Number(broadcast?.stats?.replied || 0) /
-                    Number(broadcast?.stats?.delivered || 0)) *
+                    getAudienceBase(broadcast)) *
                     100,
                 )
               : 0,
@@ -4227,28 +4229,28 @@ class BroadcastService {
         completedCount: Number(broadcast?.stats?.sent || 0),
         successful: Number(broadcast?.stats?.delivered || 0),
         successfulPercentage:
-          Number(broadcast?.recipientCount || 0) > 0
+          Number(broadcast?.recipientCount || broadcast?.stats?.sent || 0) > 0
             ? Math.round(
                 (Number(broadcast?.stats?.delivered || 0) /
-                  Number(broadcast?.recipientCount || 0)) *
+                  Number(broadcast?.recipientCount || broadcast?.stats?.sent || 0)) *
                   100,
               )
             : 0,
         readPercentage:
-          Number(broadcast?.stats?.delivered || 0) > 0
+          Number(broadcast?.recipientCount || broadcast?.stats?.sent || 0) > 0
             ? Math.round(
                 (Number(broadcast?.stats?.read || 0) /
-                  Number(broadcast?.stats?.delivered || 0)) *
+                  Number(broadcast?.recipientCount || broadcast?.stats?.sent || 0)) *
                   100,
               )
             : 0,
         repliedPercentage:
-          Number(broadcast?.stats?.delivered || 0) > 0
+          Number(broadcast?.recipientCount || broadcast?.stats?.sent || 0) > 0
             ? Math.round(
-                (Number(broadcast?.stats?.replied || 0) /
-                  Number(broadcast?.stats?.delivered || 0)) *
+                  (Number(broadcast?.stats?.replied || 0) /
+                    Number(broadcast?.recipientCount || broadcast?.stats?.sent || 0)) *
                   100,
-              )
+                )
             : 0,
       }));
 
