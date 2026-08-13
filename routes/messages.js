@@ -841,6 +841,264 @@ const buildScopedMessageFilters = (req, extra = {}, options = {}) => {
 };
 
 router.post(
+  '/send',
+  sendMessageRateLimit,
+  requirePlanFeature('teamInbox'),
+  requireWhatsAppCredentials,
+  async (req, res) => {
+    try {
+      const mediaPipelineRequestId =
+        String(req.headers?.['x-request-id'] || '').trim() ||
+        `message-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+      const {
+        to,
+        text = '',
+        mediaType = '',
+        mediaUrl = '',
+        conversationId,
+        replyToMessageId = '',
+        whatsappContextMessageId = ''
+      } = req.body || {};
+
+      const normalizedTo = String(to || '').trim();
+      const normalizedConversationId = String(conversationId || '').trim();
+      const normalizedText = String(text || '').trim();
+      const normalizedMediaType = String(mediaType || '').trim().toLowerCase();
+      const normalizedMediaUrl = String(mediaUrl || '').trim();
+      const hasMediaPayload = Boolean(normalizedMediaType || normalizedMediaUrl);
+
+      if (!normalizedTo || !normalizedConversationId) {
+        return res.status(400).json({
+          success: false,
+          error: 'to and conversationId are required',
+          mediaPipelineRequestId
+        });
+      }
+
+      if (!hasMediaPayload && !normalizedText) {
+        return res.status(400).json({
+          success: false,
+          error: 'text is required for text messages',
+          mediaPipelineRequestId
+        });
+      }
+
+      if (hasMediaPayload && !normalizedMediaType) {
+        return res.status(400).json({
+          success: false,
+          error: 'mediaType is required when mediaUrl is provided',
+          mediaPipelineRequestId
+        });
+      }
+
+      const conversation = await resolveConversationForOutboundSend({
+        userId: req.user.id,
+        companyId: req.companyId || null,
+        conversationId: normalizedConversationId,
+        to: normalizedTo,
+        isTenantWide: isTenantWideRole(
+          normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+        )
+      });
+
+      if (!conversation) {
+        return res.status(400).json({
+          success: false,
+          error: 'Conversation not found for provided conversationId',
+          mediaPipelineRequestId
+        });
+      }
+
+      const messageCompanyId = conversation.companyId || req.companyId || null;
+      const outboundContact = await resolveContactForConversation({
+        userId: req.user.id,
+        companyId: messageCompanyId,
+        conversation,
+        isTenantWide: isTenantWideRole(
+          normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+        )
+      });
+
+      let freeformValidation = outboundContact
+        ? validateFreeformOutboundSend(outboundContact)
+        : { ok: true, policy: null };
+
+      if (!freeformValidation.ok && outboundContact) {
+        const latestInboundActivity = await resolveLatestInboundConversationActivity({
+          req,
+          conversationId: conversation._id,
+          conversation
+        });
+
+        if (latestInboundActivity) {
+          const fallbackPolicy = getWhatsAppMessagingPolicy(outboundContact, {
+            conversationLastInboundMessageAt:
+              latestInboundActivity.timestamp ||
+              latestInboundActivity.whatsappTimestamp ||
+              latestInboundActivity.createdAt ||
+              null
+          });
+
+          if (fallbackPolicy.freeformAllowed) {
+            freeformValidation = { ok: true, policy: fallbackPolicy };
+          }
+        }
+      }
+
+      if (!freeformValidation.ok) {
+        return res.status(freeformValidation.statusCode || 403).json({
+          success: false,
+          error: freeformValidation.error,
+          policy: freeformValidation.policy,
+          mediaPipelineRequestId
+        });
+      }
+
+      const replyReference = await resolveReplyReferenceForOutboundSend({
+        userId: req.user.id,
+        companyId: messageCompanyId,
+        conversationId: conversation._id,
+        replyToMessageId,
+        whatsappContextMessageId,
+        isTenantWide: isTenantWideRole(
+          normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+        )
+      });
+
+      const resolvedReplyContextMessageId =
+        String(whatsappContextMessageId || replyReference?.whatsappMessageId || '').trim();
+      const messageTimestamp = new Date();
+      const normalizedMessageType = hasMediaPayload ? normalizedMediaType : 'text';
+      const messageText = hasMediaPayload
+        ? normalizedText || buildAttachmentLabel(normalizedMediaType)
+        : normalizedText;
+
+      const sendResult = hasMediaPayload
+        ? await whatsappService.sendMediaMessage(
+            normalizedTo,
+            normalizedMediaType,
+            normalizedMediaUrl,
+            normalizedText,
+            req.whatsappCredentials,
+            {
+              whatsappContextMessageId: resolvedReplyContextMessageId,
+              allowLinkFallback: true
+            }
+          )
+        : await whatsappService.sendTextMessage(
+            normalizedTo,
+            normalizedText,
+            req.whatsappCredentials,
+            { whatsappContextMessageId: resolvedReplyContextMessageId }
+          );
+
+      if (!sendResult.success) {
+        return res.status(400).json({
+          success: false,
+          error: sendResult.error || (hasMediaPayload ? 'Failed to send media message' : 'Failed to send text message'),
+          errorCode: sendResult.errorCode || null,
+          errorDetails: sendResult.errorDetails || null,
+          mediaPipelineRequestId
+        });
+      }
+
+      const whatsappMessageId =
+        sendResult?.data?.messages?.[0]?.id || sendResult?.data?.messageId || null;
+      const message = await Message.create({
+        userId: req.user.id,
+        companyId: messageCompanyId,
+        conversationId: conversation._id,
+        sender: 'agent',
+        ...resolveOutboundSenderMeta(req.user),
+        text: messageText,
+        ...(hasMediaPayload ? { mediaUrl: normalizedMediaUrl, mediaType: normalizedMessageType, mediaCaption: normalizedText || undefined } : {}),
+        whatsappMessageId,
+        whatsappContextMessageId: resolvedReplyContextMessageId || undefined,
+        replyTo: replyReference?._id || undefined,
+        status: 'sent',
+        timestamp: messageTimestamp
+      });
+      await message.populate(
+        'replyTo',
+        '_id text sender senderRole senderName senderId whatsappMessageId mediaType mediaCaption timestamp'
+      );
+
+      const relatedConversationIds = await resolveRelatedConversationIds({
+        Conversation,
+        ConversationSummary,
+        req,
+        conversation,
+        includeAllIdentityMatches: true
+      });
+
+      await writeConversationThreadState({
+        conversation,
+        companyId: messageCompanyId || '',
+        userId: req.user.id || '',
+        relatedConversationIds,
+        conversationUpdate: {
+          lastMessageTime: messageTimestamp,
+          lastMessage: messageText,
+          lastMessageMediaType: hasMediaPayload ? normalizedMessageType : '',
+          lastMessageAttachmentName: '',
+          lastMessageAttachmentPages: null,
+          lastMessageFrom: 'agent',
+          lastMessageWhatsappMessageId: whatsappMessageId || '',
+          lastMessageStatus: 'sent'
+        },
+        summaryUpdate: {
+          lastMessageTime: messageTimestamp,
+          lastMessage: messageText,
+          lastMessageMediaType: hasMediaPayload ? normalizedMessageType : '',
+          lastMessageAttachmentName: '',
+          lastMessageAttachmentPages: null,
+          lastMessageFrom: 'agent',
+          lastMessageWhatsappMessageId: whatsappMessageId || '',
+          lastMessageStatus: 'sent'
+        }
+      });
+
+      const queuedRealtimeEvent = await enqueueMessageSentEvent({
+        userId: req.user.id,
+        companyId: messageCompanyId,
+        conversationId: conversation._id,
+        message,
+        conversation: conversation?.toObject ? conversation.toObject() : conversation,
+        relatedConversationIds
+      });
+      const realtimeSent = await fanoutMessageSentRealtime({
+        req,
+        companyId: messageCompanyId,
+        conversationId: conversation._id,
+        message,
+        conversation: conversation?.toObject ? conversation.toObject() : conversation,
+        relatedConversationIds
+      });
+      if (!realtimeSent && !queuedRealtimeEvent) {
+        console.warn('message_sent realtime event was not queued and no websocket sender is available.');
+      } else if (!queuedRealtimeEvent) {
+        console.warn('message_sent realtime event was not queued; direct websocket fanout was used.');
+      }
+
+      return res.json({
+        success: true,
+        message,
+        conversationId: conversation._id,
+        contactId: outboundContact?._id || conversation.contactId || null
+      });
+    } catch (error) {
+      console.error('Send message error:', error);
+      return res.status(Number(error?.status || 500)).json({
+        success: false,
+        error: error?.message || 'Failed to send message',
+        mediaPipelineRequestId:
+          String(req.headers?.['x-request-id'] || '').trim() || null
+      });
+    }
+  }
+);
+
+router.post(
   '/template-header-media',
   attachmentRateLimit,
   requirePlanFeature('broadcastMessaging'),
