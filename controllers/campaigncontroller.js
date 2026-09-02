@@ -326,8 +326,28 @@ const ensureCampaignOwnership = (campaign, req, res, actionMessage) => {
 };
 
 const normalizeLifecycleState = ({ requestedStatus, existingCampaign } = {}) => {
-    const wantsActiveLaunch = String(requestedStatus || '').toLowerCase() === 'active';
-    if (!wantsActiveLaunch) {
+    const nextStatus = String(requestedStatus || '').toLowerCase();
+    if (nextStatus === 'active') {
+        return {
+            status: 'active',
+            lifecycleStatus: 'running',
+            paymentStatus: existingCampaign?.paymentStatus || 'verified',
+            reviewStatus: 'approved',
+            deliveryStatus: 'active'
+        };
+    }
+
+    if (nextStatus === 'paused') {
+        return {
+            status: 'paused',
+            lifecycleStatus: 'paused',
+            paymentStatus: existingCampaign?.paymentStatus || 'verified',
+            reviewStatus: existingCampaign?.reviewStatus || 'approved',
+            deliveryStatus: 'paused'
+        };
+    }
+
+    if (!nextStatus || nextStatus === 'draft') {
         return {
             status: 'draft',
             lifecycleStatus:
@@ -335,7 +355,7 @@ const normalizeLifecycleState = ({ requestedStatus, existingCampaign } = {}) => 
                 existingCampaign?.lifecycleStatus === 'payment_verified' ||
                 existingCampaign?.lifecycleStatus === 'pending_review' ||
                 existingCampaign?.lifecycleStatus === 'approved'
-                    ? 'draft'
+                ? 'draft'
                     : (existingCampaign?.lifecycleStatus || 'draft'),
             paymentStatus: existingCampaign?.paymentStatus || 'verified',
             reviewStatus: existingCampaign?.reviewStatus || 'approved',
@@ -344,7 +364,7 @@ const normalizeLifecycleState = ({ requestedStatus, existingCampaign } = {}) => 
     }
 
     return {
-        status: 'draft',
+        status: nextStatus,
         lifecycleStatus: 'approved',
         paymentStatus: 'verified',
         reviewStatus: 'approved',
@@ -398,6 +418,18 @@ const continueCampaignMetaCreation = async ({
             status: normalizedPayload.status
         });
 
+        const requestedStatus = String(normalizedPayload?.status || '').trim().toLowerCase();
+        const nextLocalStatus =
+            requestedStatus === 'active' || requestedStatus === 'paused'
+                ? requestedStatus
+                : String(metaResult?.campaignStatus || 'paused').trim().toLowerCase();
+        const nextLifecycleStatus =
+            nextLocalStatus === 'active'
+                ? 'running'
+                : nextLocalStatus === 'paused'
+                    ? 'paused'
+                    : 'pending_review';
+
         await Campaign.findByIdAndUpdate(
             campaignId,
             {
@@ -410,10 +442,10 @@ const continueCampaignMetaCreation = async ({
                     metaAdSetStatus: String(metaResult?.adSetStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
                     metaAdStatus: String(metaResult?.adStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
                     adAccountId: String(metaResult?.adAccountId || adAccountId || '').trim(),
-                    status: 'paused',
-                    lifecycleStatus: 'pending_review',
+                    status: nextLocalStatus,
+                    lifecycleStatus: nextLifecycleStatus,
                     reviewStatus: 'pending_review',
-                    deliveryStatus: 'paused',
+                    deliveryStatus: nextLocalStatus === 'active' ? 'active' : 'paused',
                     metaResponse: metaResult,
                     updatedBy: userId
                 }
@@ -709,7 +741,8 @@ exports.createCampaign = async (req, res) => {
             });
         }
 
-        normalizedPayload.status = 'draft';
+        const requestedStatus = String(normalizedPayload.status || 'draft').trim().toLowerCase();
+        normalizedPayload.status = ['active', 'paused'].includes(requestedStatus) ? requestedStatus : 'draft';
         normalizedPayload.lifecycleStatus = 'publishing';
         normalizedPayload.reviewStatus = 'pending_review';
         normalizedPayload.deliveryStatus = 'publishing';
