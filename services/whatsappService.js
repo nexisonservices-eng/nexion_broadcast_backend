@@ -976,7 +976,8 @@ class WhatsAppService {
         `${this.apiUrl}/${this.wabaId}/message_templates`,
         {
           headers: this.getHeaders(),
-          params: { name: normalizedName }
+          params: { name: normalizedName },
+          timeout: META_REQUEST_TIMEOUT_MS
         }
       );
 
@@ -984,7 +985,15 @@ class WhatsAppService {
     } catch (error) {
       return {
         success: false,
-        error: error.response?.data?.error?.message || error.message
+        error: [...new Set([
+          error.response?.data?.error?.error_user_msg,
+          error.response?.data?.error?.error_data?.details,
+          error.response?.data?.error?.message || error.message,
+          error.response?.data?.error?.code != null
+            ? `Meta code: ${error.response.data.error.code}` : '',
+          error.response?.data?.error?.error_subcode != null
+            ? `subcode: ${error.response.data.error.error_subcode}` : ''
+        ].filter(Boolean))].join(' | ')
       };
     }
   }

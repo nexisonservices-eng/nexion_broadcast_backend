@@ -443,7 +443,8 @@ class TemplateController {
 
   async deleteMetaTemplate(req, res) {
     try {
-      const templateName = decodeURIComponent(String(req.params.name || '')).trim();
+      // Express has already decoded the route parameter.
+      const templateName = String(req.params.name || '').trim();
       if (!templateName) {
         return res.status(400).json({ success: false, error: 'Template name is required' });
       }
