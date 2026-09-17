@@ -70,7 +70,7 @@ const TemplateSchema = new mongoose.Schema({
 
     type: String, 
 
-    enum: ['draft', 'pending', 'approved', 'rejected'], 
+    enum: ['draft', 'pending', 'approved', 'rejected', 'failed'], 
 
     default: 'draft' 
 

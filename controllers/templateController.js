@@ -1,5 +1,6 @@
 const Template = require('../models/Template');
 const whatsappService = require('../services/whatsappService');
+const { getWhatsAppCredentialsForUser } = require('../services/userWhatsAppCredentialsService');
 
 const normalizeTemplateLookupValue = (value = '') => String(value || '').trim().toLowerCase();
 
@@ -148,6 +149,7 @@ class TemplateController {
   }
 
   async createTemplate(req, res) {
+    let localTemplate = null;
     try {
       const { name, category, language, content, type = 'custom', components } = req.body;
       const normalizedName = String(name || '')
@@ -320,6 +322,7 @@ class TemplateController {
           whatsappTemplateId: null
         });
       }
+      localTemplate = template;
 
       const metaResult = await whatsappService.createTemplate({
         name: templateData.name,
@@ -354,17 +357,28 @@ class TemplateController {
         templateData.variables = this.extractVariables(templateData.content?.body || '');
       }
 
-      // Save locally even when Meta rejects the payload so the draft is not lost.
+      const metaSubmissionFailed = !metaResult.success && !existingMetaTemplate;
+      if (metaSubmissionFailed) {
+        // A missing Meta ID means this record must not look like a template that
+        // is still awaiting Meta review. It is a failed submission that can be
+        // retried or safely removed locally.
+        templateData.status = 'failed';
+        templateData.isActive = false;
+      }
+
+      // Preserve failed submissions locally, but mark them explicitly so they do
+      // not remain indefinitely as pending records without a Meta template ID.
       const savedTemplate = await Template.findOneAndUpdate(
         { userId: req.user.id, companyId: req.companyId, name: normalizedName },
         {
           ...templateData,
-          ...(metaTemplateId ? { whatsappTemplateId: metaTemplateId } : {})
+          whatsappTemplateId: metaTemplateId || null
         },
         { new: true, upsert: true, runValidators: true, setDefaultsOnInsert: true }
       );
+      localTemplate = savedTemplate;
 
-      if (!metaResult.success && !existingMetaTemplate) {
+      if (metaSubmissionFailed) {
         return res.status(201).json({
           success: true,
           data: savedTemplate,
@@ -390,6 +404,18 @@ class TemplateController {
         }
       });
     } catch (error) {
+      // The record is created before contacting Meta so a network or unexpected
+      // Meta error must also transition it out of pending when no Meta ID exists.
+      if (localTemplate?._id && !String(localTemplate.whatsappTemplateId || '').trim()) {
+        try {
+          await Template.findByIdAndUpdate(localTemplate._id, {
+            status: 'failed',
+            isActive: false
+          });
+        } catch (statusUpdateError) {
+          console.error('Failed to mark local template submission as failed:', statusUpdateError.message);
+        }
+      }
       if (error?.name === 'StrictModeError' && /companyId/.test(String(error?.message || ''))) {
         return res.status(500).json({
           success: false,
@@ -431,12 +457,73 @@ class TemplateController {
 
   async deleteTemplate(req, res) {
     try {
-      const template = await Template.findOneAndDelete({ _id: req.params.id, userId: req.user.id, companyId: req.companyId });
+      const template = await Template.findOne({
+        _id: req.params.id,
+        userId: req.user.id,
+        companyId: req.companyId
+      });
+
       if (!template) {
         return res.status(404).json({ success: false, error: 'Template not found' });
       }
-      res.json({ success: true, message: 'Template deleted successfully' });
+
+      const metaTemplateId = String(template.whatsappTemplateId || '').trim();
+      if (!metaTemplateId) {
+        await Template.deleteOne({ _id: template._id });
+        console.info('[TEMPLATE_DELETE] local-only', {
+          templateId: String(template._id),
+          name: template.name,
+          status: template.status
+        });
+        return res.json({ success: true, message: 'Local template deleted successfully' });
+      }
+
+      let credentials;
+      try {
+        credentials = await getWhatsAppCredentialsForUser({
+          authHeader: req.headers.authorization || '',
+          userId: req.user?.id || null
+        });
+      } catch (credentialsError) {
+        return res.status(Number(credentialsError.statusCode) || 502).json({
+          success: false,
+          error: 'Failed to fetch WhatsApp credentials before deleting the Meta template'
+        });
+      }
+
+      if (!credentials) {
+        return res.status(400).json({
+          success: false,
+          error: 'WhatsApp credentials are required to delete this Meta template'
+        });
+      }
+
+      console.info('[TEMPLATE_DELETE] Meta + local', {
+        templateId: String(template._id),
+        metaTemplateId,
+        name: template.name,
+        status: template.status
+      });
+      const metaDeleteResult = await whatsappService.deleteTemplateByName(template.name, credentials);
+      if (!metaDeleteResult.success) {
+        console.error('[TEMPLATE_DELETE] Meta deletion failed', {
+          templateId: String(template._id),
+          metaTemplateId,
+          error: metaDeleteResult.error || 'Unknown Meta deletion error'
+        });
+        return res.status(502).json({
+          success: false,
+          error: metaDeleteResult.error || 'Failed to delete template from Meta'
+        });
+      }
+
+      await Template.deleteOne({ _id: template._id });
+      return res.json({ success: true, message: 'Template deleted from Meta and local database' });
     } catch (error) {
+      console.error('[TEMPLATE_DELETE] Unexpected deletion error:', error);
+      if (error?.name === 'CastError') {
+        return res.status(404).json({ success: false, error: 'Template not found' });
+      }
       res.status(500).json({ success: false, error: error.message });
     }
   }
