@@ -291,7 +291,26 @@ class BroadcastController {
       }
 
       const result = await broadcastService.getBroadcasts(filters);
-      res.json(resolveBroadcastCreators(result, req.user));
+      const resolved = resolveBroadcastCreators(result, req.user);
+      const rows = Array.isArray(result.data) ? result.data : result.data?.items || [];
+      const resolvedRows = Array.isArray(resolved.data) ? resolved.data : resolved.data?.items || [];
+      console.info('[BroadcastCreator] admin-list', JSON.stringify({
+        viewerId: String(req.user.id || ''),
+        viewerRole: normalizedRole,
+        directoryCount: req.user.workspaceCreators?.length || 0,
+        rowCount: rows.length,
+        // Bound the diagnostic output; never log the full request or broadcast.
+        creators: rows.slice(0, 30).map((row, index) => ({
+          broadcastId: String(row._id || ''),
+          creatorId: String(row.createdById?._id || row.createdById || ''),
+          savedName: row.createdByName || row.createdBy || '',
+          savedRole: row.createdByWorkspaceRole || '',
+          resolvedName: resolvedRows[index]?.createdByName || resolvedRows[index]?.createdBy || '',
+          directoryMatch: (req.user.workspaceCreators || []).some((creator) =>
+            String(creator.id) === String(row.createdById?._id || row.createdById || '')),
+        })),
+      }));
+      res.json(resolved);
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }

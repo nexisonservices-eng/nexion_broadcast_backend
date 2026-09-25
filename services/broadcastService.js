@@ -1800,6 +1800,12 @@ class BroadcastService {
       // createdBy is assigned by the authenticated route, never the WhatsApp owner.
       broadcastData.createdByName = broadcastData.createdBy;
       const broadcast = await Broadcast.create(broadcastData);
+      console.info('[BroadcastCreator] saved', JSON.stringify({
+        broadcastId: String(broadcast._id),
+        creatorId: String(broadcast.createdById || ''),
+        creatorName: broadcast.createdByName || broadcast.createdBy || '',
+        creatorRole: broadcast.createdByWorkspaceRole || '',
+      }));
       console.log(
         "✅ Created broadcast with scheduledAt:",
         broadcast.scheduledAt,
