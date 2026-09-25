@@ -591,6 +591,7 @@ router.post(
         createdBy: req.user.username || req.user.email || req.user.id,
         createdByEmail: req.user.email,
         createdById: req.user.id,
+        createdByWorkspaceRole: req.user.normalizedRole || req.user.companyRole || req.user.role || '',
         deliveryPolicy,
         retryPolicy,
         compliancePolicy,

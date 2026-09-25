@@ -1,5 +1,6 @@
 ﻿const Broadcast = require("../models/Broadcast");
 const Message = require("../models/Message");
+const { preserveBroadcastCreator } = require('../utils/broadcastCreator');
 const Conversation = require("../models/Conversation");
 const Contact = require("../models/Contact");
 const BroadcastDispatch = require("../models/BroadcastDispatch");
@@ -1796,6 +1797,8 @@ class BroadcastService {
         broadcastData.scheduledAt = scheduledDate;
       }
 
+      // createdBy is assigned by the authenticated route, never the WhatsApp owner.
+      broadcastData.createdByName = broadcastData.createdBy;
       const broadcast = await Broadcast.create(broadcastData);
       console.log(
         "✅ Created broadcast with scheduledAt:",
@@ -2123,7 +2126,7 @@ class BroadcastService {
 
       const nextData = {
         ...existing.toObject ? existing.toObject() : existing,
-        ...(updateData && typeof updateData === "object" ? updateData : {}),
+        ...preserveBroadcastCreator(existing, updateData && typeof updateData === "object" ? updateData : {}),
       };
 
       delete nextData._id;
@@ -4034,7 +4037,7 @@ class BroadcastService {
       }
 
       const projection =
-        "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource createdBy createdById createdByEmail createdByWorkspaceRole retryPolicy deliveryPolicy compliancePolicy analytics";
+        "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource createdBy createdByName createdById createdByEmail createdByWorkspaceRole retryPolicy deliveryPolicy compliancePolicy analytics";
 
       if (hasPagination) {
         const rows = await Broadcast.find(query)
@@ -4940,6 +4943,8 @@ class BroadcastService {
           failureCodeBreakdown: {},
         },
         createdBy: sourceBroadcast.createdBy,
+        createdByName: sourceBroadcast.createdByName || sourceBroadcast.createdBy,
+        createdByWorkspaceRole: sourceBroadcast.createdByWorkspaceRole,
         createdById: sourceBroadcast.createdById,
         createdByEmail: sourceBroadcast.createdByEmail,
         authHeaderSnapshot: sourceBroadcast.authHeaderSnapshot,

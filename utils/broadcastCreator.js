@@ -1,3 +1,11 @@
+const preserveBroadcastCreator = (existing, updates = {}) => {
+  const next = { ...updates };
+  for (const field of ['createdById', 'createdBy', 'createdByName', 'createdByEmail', 'createdByWorkspaceRole']) {
+    next[field] = existing[field];
+  }
+  return next;
+};
+
 const resolveBroadcastCreator = (broadcast, user = {}) => {
   if (!broadcast) return broadcast;
   const row = typeof broadcast.toObject === 'function' ? broadcast.toObject() : broadcast;
@@ -18,4 +26,4 @@ const resolveBroadcastCreators = (result, user) => {
     : Array.isArray(data?.items) ? { ...data, items: data.items.map((row) => resolveBroadcastCreator(row, user)) }
     : resolveBroadcastCreator(data, user) };
 };
-module.exports = { resolveBroadcastCreator, resolveBroadcastCreators };
+module.exports = { preserveBroadcastCreator, resolveBroadcastCreator, resolveBroadcastCreators };
