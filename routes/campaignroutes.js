@@ -8,11 +8,50 @@ const { requireTenantPolicy } = require('../middleware/tenantPolicy');
 const Campaign = require('../models/campaign');
 const campaignController = require('../controllers/campaigncontroller');
 const { normalizeCampaignContractPayload } = require('../utils/campaignContract');
-const upload = multer({ storage: multer.memoryStorage() });
+const VIDEO_MIME_TYPES = new Set([
+    'video/mp4',
+    'video/quicktime',
+    'video/webm',
+    'video/mpeg',
+    'video/3gpp',
+    'video/x-msvideo',
+    'video/x-matroska'
+]);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.webm', '.mpeg', '.mpg', '.3gp', '.avi', '.mkv']);
+const VIDEO_MAX_SIZE_BYTES = 100 * 1024 * 1024;
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: VIDEO_MAX_SIZE_BYTES },
+    fileFilter: (req, file, callback) => {
+        if (file.fieldname !== 'creativeVideo') return callback(null, true);
+
+        const mimeType = String(file.mimetype || '').toLowerCase();
+        const extension = require('path').extname(String(file.originalname || '')).toLowerCase();
+        if (VIDEO_MIME_TYPES.has(mimeType) || VIDEO_EXTENSIONS.has(extension)) {
+            return callback(null, true);
+        }
+
+        const error = new Error('Unsupported video format. Upload an MP4, MOV, WEBM, MPEG, 3GP, AVI, or MKV video.');
+        error.status = 400;
+        return callback(error);
+    }
+});
 const creativeUpload = upload.fields([
     { name: 'creativeImage', maxCount: 1 },
     { name: 'creativeVideo', maxCount: 1 }
 ]);
+
+const handleCreativeUploadError = (error, req, res, next) => {
+    if (!error) return next();
+    if (error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') {
+        const fileType = error.field === 'creativeVideo' ? 'Video' : 'Creative file';
+        return res.status(413).json({ success: false, message: `${fileType} is too large. Maximum upload size is 100 MB.` });
+    }
+    if (error.status === 400) {
+        return res.status(400).json({ success: false, message: error.message });
+    }
+    return next(error);
+};
 
 // Validation middleware
 const validate = (req, res, next) => {
@@ -258,6 +297,7 @@ router.get(
 router.post(
     '/',
     creativeUpload,
+    handleCreativeUploadError,
     normalizeCampaignContractRequest,
     campaignValidation,
     validate,
@@ -288,6 +328,7 @@ router.get(
 router.put(
     '/:id',
     creativeUpload,
+    handleCreativeUploadError,
     normalizeCampaignContractRequest,
     [
         param('id').isMongoId().withMessage('Invalid campaign ID'),
