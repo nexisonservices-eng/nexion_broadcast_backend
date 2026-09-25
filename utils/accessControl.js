@@ -59,6 +59,8 @@ const buildTenantResourceFilter = ({
 
   if (!isTenantWideRole(role)) {
     filter[ownerField] = req?.user?.id;
+  } else if (!req?.companyId) {
+    filter[ownerField] = { $in: [req?.user?.id, ...(req?.user?.workspaceReadUserIds || [])].filter(Boolean) };
   }
 
   return filter;

@@ -57,6 +57,7 @@ const broadcastRateLimiterRedis = createRedisConnection({
 });
 
 const toQueryObjectId = (value) => {
+  if (Array.isArray(value?.$in)) return { $in: value.$in.map(toQueryObjectId) };
   const normalized = String(value || "").trim();
   if (!normalized) return null;
   if (mongoose.Types.ObjectId.isValid(normalized)) {
@@ -4507,7 +4508,7 @@ class BroadcastService {
       };
       const cacheScope = [
         `company:${normalizedFilters.companyId || "all"}`,
-        `user:${normalizedFilters.createdById || "all"}`,
+        `user:${JSON.stringify(normalizedFilters.createdById || "all")}`,
         `status:${normalizedFilters.status || "all"}`,
         `from:${normalizedFilters.createdFrom || "all"}`,
         `to:${normalizedFilters.createdTo || "all"}`,
@@ -4682,7 +4683,7 @@ class BroadcastService {
       };
       const cacheScope = [
         `company:${normalizedFilters.companyId || "all"}`,
-        `user:${normalizedFilters.createdById || "all"}`,
+        `user:${JSON.stringify(normalizedFilters.createdById || "all")}`,
         `status:${normalizedFilters.status || "all"}`,
         `from:${normalizedFilters.createdFrom || "all"}`,
         `to:${normalizedFilters.createdTo || "all"}`,

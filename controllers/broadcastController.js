@@ -279,6 +279,9 @@ class BroadcastController {
       if (req.query.limit) filters.limit = req.query.limit;
       if (!tenantWideAccess) {
         filters.createdById = req.user.id;
+      } else if (!req.companyId) {
+        const ids = [req.user.id, ...(req.user.workspaceReadUserIds || [])].map(String);
+        filters.createdById = { $in: req.query.createdById ? ids.filter((id) => id === String(req.query.createdById)) : ids };
       }
       if (req.companyId) {
         filters.companyId = req.companyId;
@@ -305,6 +308,9 @@ class BroadcastController {
       };
       if (!tenantWideAccess) {
         filters.createdById = req.user.id;
+      } else if (!req.companyId) {
+        const ids = [req.user.id, ...(req.user.workspaceReadUserIds || [])].map(String);
+        filters.createdById = { $in: req.query.createdById ? ids.filter((id) => id === String(req.query.createdById)) : ids };
       }
       if (req.companyId) {
         filters.companyId = req.companyId;
@@ -330,6 +336,9 @@ class BroadcastController {
       };
       if (!tenantWideAccess) {
         filters.createdById = req.user.id;
+      } else if (!req.companyId) {
+        const ids = [req.user.id, ...(req.user.workspaceReadUserIds || [])].map(String);
+        filters.createdById = { $in: req.query.createdById ? ids.filter((id) => id === String(req.query.createdById)) : ids };
       }
       if (req.companyId) {
         filters.companyId = req.companyId;
@@ -721,6 +730,9 @@ class BroadcastController {
 
       if (!tenantWideAccess) {
         filters.createdById = req.user.id;
+      } else if (!req.companyId) {
+        const ids = [req.user.id, ...(req.user.workspaceReadUserIds || [])].map(String);
+        filters.createdById = { $in: req.query.createdById ? ids.filter((id) => id === String(req.query.createdById)) : ids };
       }
       if (req.companyId) {
         filters.companyId = req.companyId;
@@ -755,6 +767,9 @@ class BroadcastController {
 
       if (!tenantWideAccess) {
         filters.createdById = req.user.id;
+      } else if (!req.companyId) {
+        const ids = [req.user.id, ...(req.user.workspaceReadUserIds || [])].map(String);
+        filters.createdById = { $in: req.query.createdById ? ids.filter((id) => id === String(req.query.createdById)) : ids };
       }
       if (req.companyId) {
         filters.companyId = req.companyId;
