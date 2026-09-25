@@ -3979,6 +3979,7 @@ class BroadcastService {
 
       const query = {};
       const queryClauses = [];
+      if (filters.creatorScope) queryClauses.push(filters.creatorScope);
       if (companyId) query.companyId = companyId;
       if (createdById) {
         query.createdById = createdById;
@@ -4033,7 +4034,7 @@ class BroadcastService {
       }
 
       const projection =
-        "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource createdBy createdById createdByEmail retryPolicy deliveryPolicy compliancePolicy analytics";
+        "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource createdBy createdById createdByEmail createdByWorkspaceRole retryPolicy deliveryPolicy compliancePolicy analytics";
 
       if (hasPagination) {
         const rows = await Broadcast.find(query)

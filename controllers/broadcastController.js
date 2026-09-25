@@ -1,5 +1,6 @@
 const broadcastService = require("../services/broadcastService");
 const { resolveBroadcastCreators } = require('../utils/broadcastCreator');
+const { buildAgentCreatorFilter } = require('../utils/broadcastCreatorFilter');
 const {
   enqueueBroadcastSend,
   getBroadcastQueueCounts,
@@ -275,6 +276,7 @@ class BroadcastController {
       if (req.query.status) filters.status = req.query.status;
       if (req.query.createdBy) filters.createdBy = req.query.createdBy;
       if (req.query.createdById) filters.createdById = req.query.createdById;
+      if (req.query.creatorRole === 'agent') filters.creatorScope = buildAgentCreatorFilter(req.user);
       if (req.query.search) filters.search = req.query.search;
       if (req.query.cursor) filters.cursor = req.query.cursor;
       if (req.query.limit) filters.limit = req.query.limit;
