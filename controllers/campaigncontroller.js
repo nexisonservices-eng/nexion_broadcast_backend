@@ -380,9 +380,35 @@ const continueCampaignMetaCreation = async ({
     configuredPageId,
     normalizedPayload,
     imageFile,
-    videoFile
+    videoFile,
+    companyContext
 }) => {
     try {
+        // Store uploaded media after the local campaign record has been returned to the UI.
+        if (videoFile?.buffer) {
+            normalizedPayload.videoUrl = await uploadCampaignCreative(videoFile, {
+                companyContext,
+                resourceType: 'video'
+            });
+            normalizedPayload.imageUrl = '';
+        } else if (imageFile?.buffer) {
+            normalizedPayload.imageUrl = await uploadCampaignCreative(imageFile, {
+                companyContext,
+                resourceType: 'image'
+            });
+            normalizedPayload.videoUrl = '';
+        }
+
+        if (imageFile?.buffer || videoFile?.buffer) {
+            await Campaign.findByIdAndUpdate(campaignId, {
+                $set: {
+                    imageUrl: normalizedPayload.imageUrl,
+                    videoUrl: normalizedPayload.videoUrl,
+                    updatedBy: userId
+                }
+            });
+        }
+
         const metaResult = await metaAdsService.createMetaAdStackFromCrud({
             userId,
             accessToken,
@@ -691,28 +717,10 @@ exports.createCampaign = async (req, res) => {
             normalizedPayload.videoUrl = '';
         }
 
-        if (requestedMediaType === 'video' && videoFile?.buffer) {
-            normalizedPayload.videoUrl = await uploadCampaignCreative(videoFile, {
-                companyContext: resolveCompanyStorageContext(req),
-                resourceType: 'video'
-            });
-        } else if (requestedMediaType === 'image' && imageFile?.buffer) {
-            normalizedPayload.imageUrl = await uploadCampaignCreative(imageFile, {
-                companyContext: resolveCompanyStorageContext(req),
-                resourceType: 'image'
-            });
-        } else if (videoFile?.buffer && !imageFile?.buffer) {
+        if (videoFile?.buffer && requestedMediaType !== 'video' && !imageFile?.buffer) {
             normalizedPayload.mediaType = 'video';
-            normalizedPayload.videoUrl = await uploadCampaignCreative(videoFile, {
-                companyContext: resolveCompanyStorageContext(req),
-                resourceType: 'video'
-            });
-        } else if (imageFile?.buffer && !videoFile?.buffer) {
+        } else if (imageFile?.buffer && requestedMediaType === 'video' && !videoFile?.buffer) {
             normalizedPayload.mediaType = 'image';
-            normalizedPayload.imageUrl = await uploadCampaignCreative(imageFile, {
-                companyContext: resolveCompanyStorageContext(req),
-                resourceType: 'image'
-            });
         }
 
         const requestMetaAccessToken = String(
@@ -731,7 +739,9 @@ exports.createCampaign = async (req, res) => {
         if (!normalizedPayload.headline) metaValidationErrors.push('headline is required');
         if (!normalizedPayload.destinationUrl) metaValidationErrors.push('destination URL is required');
         if (!normalizedPayload.callToAction) metaValidationErrors.push('call-to-action is required');
-        if (!normalizedPayload.imageUrl && !normalizedPayload.videoUrl) metaValidationErrors.push('image or video is required');
+        if (!normalizedPayload.imageUrl && !normalizedPayload.videoUrl && !imageFile?.buffer && !videoFile?.buffer) {
+            metaValidationErrors.push('image or video is required');
+        }
 
         if (metaValidationErrors.length > 0) {
             return res.status(400).json({
@@ -763,7 +773,8 @@ exports.createCampaign = async (req, res) => {
             configuredPageId: String(req.body?.configuredPageId || req.body?.pageId || normalizedPayload.configuredPageId || '').trim(),
             normalizedPayload,
             imageFile,
-            videoFile
+            videoFile,
+            companyContext: resolveCompanyStorageContext(req)
         });
 
         res.status(201).json({
