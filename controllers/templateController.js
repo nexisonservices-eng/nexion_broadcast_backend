@@ -1,4 +1,5 @@
 const Template = require('../models/Template');
+const { buildTenantResourceFilter } = require('../utils/accessControl');
 const whatsappService = require('../services/whatsappService');
 const { getWhatsAppCredentialsForUser } = require('../services/userWhatsAppCredentialsService');
 
@@ -123,7 +124,7 @@ class TemplateController {
   async getAllTemplates(req, res) {
     try {
       const { status, isActive, category } = req.query;
-      const filters = { userId: req.user.id, companyId: req.companyId };
+      const filters = buildTenantResourceFilter({ req, ownerField: 'userId' });
       
       if (status) filters.status = status;
       if (isActive !== undefined) filters.isActive = isActive === 'true';
@@ -138,7 +139,7 @@ class TemplateController {
 
   async getTemplateById(req, res) {
     try {
-      const template = await Template.findOne({ _id: req.params.id, userId: req.user.id, companyId: req.companyId });
+      const template = await Template.findOne(buildTenantResourceFilter({ req, ownerField: 'userId', base: { _id: req.params.id } }));
       if (!template) {
         return res.status(404).json({ success: false, error: 'Template not found' });
       }
