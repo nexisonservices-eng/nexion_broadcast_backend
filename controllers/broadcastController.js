@@ -1,4 +1,5 @@
 const broadcastService = require("../services/broadcastService");
+const { resolveBroadcastCreators } = require('../utils/broadcastCreator');
 const {
   enqueueBroadcastSend,
   getBroadcastQueueCounts,
@@ -288,7 +289,7 @@ class BroadcastController {
       }
 
       const result = await broadcastService.getBroadcasts(filters);
-      res.json(result);
+      res.json(resolveBroadcastCreators(result, req.user));
     } catch (error) {
       res.status(500).json({ success: false, error: error.message });
     }
@@ -541,7 +542,7 @@ class BroadcastController {
           .json({ success: false, error: "Broadcast not found" });
       }
       if (result.success) {
-        res.json(result);
+        res.json(resolveBroadcastCreators(result, req.user));
       } else {
         emitAuthAuditLog({
           event: "broadcast_ownership",

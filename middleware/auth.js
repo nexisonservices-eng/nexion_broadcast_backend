@@ -44,6 +44,7 @@ module.exports = (req, res, next) => {
             companyId: contextCompanyId || fallbackCompanyId || null,
             companyRole: context.companyRole || fallback.companyRole,
             workspaceReadUserIds: context.workspaceReadUserIds || [],
+            workspaceCreators: context.workspaceCreators || [],
             planCode: context.planCode || fallback.planCode,
             featureFlags: context.featureFlags || fallback.featureFlags,
             subscriptionStatus: context.subscriptionStatus || fallback.subscriptionStatus,
