@@ -257,6 +257,7 @@ if (metaEnvValidation.warnings.length) {
 app.use('/api/bulk', bulkRoutes);
 app.use('/api/templates', templateRoutes);
 app.use('/api/broadcasts', broadcastRoutes);
+app.use('/api/agent-activity', require('./routes/agentActivity'));
 app.use('/api/conversations', conversationRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/contacts', contactRoutes);
