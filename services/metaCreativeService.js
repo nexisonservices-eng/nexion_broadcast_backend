@@ -1,5 +1,20 @@
 const FormData = require('form-data');
 
+// Uploaded campaign videos have a public, versioned Cloudinary URL. A JPG
+// delivery URL extracts a frame without waiting for Meta's thumbnail endpoint.
+const getCloudinaryVideoThumbnail = (mediaUrl) => {
+  try {
+    const url = new URL(mediaUrl);
+    if (url.protocol !== 'https:' || url.hostname !== 'res.cloudinary.com' || url.search ||
+        !/^\/[^/]+\/video\/upload\/v\d+\/.+\.[a-z0-9]+$/i.test(url.pathname)) return '';
+    url.pathname = url.pathname.replace('/video/upload/', '/video/upload/so_0/').replace(/\.[a-z0-9]+$/i, '.jpg');
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return '';
+  }
+};
+
 const sanitizeWhatsappNumber = (value) =>
   String(value || '')
     .replace(/[^\d]/g, '')
@@ -318,8 +333,10 @@ const createCreative = async ({
       : 'image';
 
   if (normalizedMediaType === 'video') {
+    const thumbnailUrl = getCloudinaryVideoThumbnail(creativeUpload?.mediaUrl);
     objectStorySpec.video_data = {
       video_id: creativeUpload?.videoId,
+      ...(thumbnailUrl ? { image_url: thumbnailUrl } : {}),
       message: creative?.primaryText || campaignName || 'Learn more',
       title: creative?.headline || campaignName,
       call_to_action: {

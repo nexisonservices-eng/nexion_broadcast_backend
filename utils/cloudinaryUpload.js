@@ -54,6 +54,7 @@ const uploadCampaignCreative = async (file, options = {}) => {
   const result = await cloudinary.uploader.upload(dataUri, {
     folder,
     resource_type: resourceType,
+    ...(resourceType === 'video' ? { eager: [{ format: 'jpg', start_offset: '0' }], eager_async: false } : {}),
     use_filename: true,
     unique_filename: true,
     overwrite: false

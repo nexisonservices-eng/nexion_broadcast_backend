@@ -49,6 +49,67 @@ test('image creatives retain their link description', async () => {
     });
 });
 
+test('Cloudinary videos supply a frame image without polling Meta thumbnails', async () => {
+    let posts = 0;
+    await createCreative({
+        ...dependencies, creative: { mediaType: 'video' },
+        creativeUpload: { videoId: 'video', mediaUrl: 'https://res.cloudinary.com/demo/video/upload/v123/company/ad.mp4' },
+        graphRequest: async ({ method, data }) => {
+            assert.equal(method, 'POST');
+            assert.equal(data.object_story_spec.video_data.image_url,
+                'https://res.cloudinary.com/demo/video/upload/so_0/v123/company/ad.jpg');
+            posts += 1;
+            return { data: { id: 'creative' } };
+        }
+    });
+    assert.equal(posts, 1);
+});
+
+test('video upload result carries its source URL into the creative thumbnail request', async () => {
+    const mediaUrl = 'https://res.cloudinary.com/demo/video/upload/v123/company/ad.mp4';
+    const requests = [];
+    const graphRequest = async (request) => {
+        requests.push(request);
+        if (request.path === 'account/advideos') {
+            assert.equal(request.data.file_url, mediaUrl);
+            return { id: 'uploaded-video' };
+        }
+        assert.equal(request.path, 'account/adcreatives');
+        assert.equal(request.data.object_story_spec.video_data.video_id, 'uploaded-video');
+        assert.equal(request.data.object_story_spec.video_data.image_url,
+            'https://res.cloudinary.com/demo/video/upload/so_0/v123/company/ad.jpg');
+        return { data: { id: 'creative' } };
+    };
+    const creativeUpload = await uploadCreativeAsset({
+        ...dependencies, graphRequest, mediaUrl, mediaType: 'video', adAccountId: 'account',
+        shouldUseMockMode: () => false,
+        getAccessContextForUser: async () => ({ accessToken: 'test-token', connection: { selectedAdAccountId: 'account' } })
+    });
+    const result = await createCreative({
+        ...dependencies, graphRequest, creativeUpload, creative: { mediaType: 'video' },
+        adAccountId: 'account', configuredPageId: 'page', accessToken: 'test-token'
+    });
+    assert.equal(result.id, 'creative');
+    assert.equal(requests.length, 2);
+});
+
+test('external video URLs use Meta thumbnails without rewriting the video URL', async () => {
+    let reads = 0;
+    await createCreative({
+        ...dependencies, creative: { mediaType: 'video' },
+        creativeUpload: { videoId: 'video', mediaUrl: 'https://example.com/ad.mp4' },
+        graphRequest: async ({ path, data }) => {
+            if (path === 'video/thumbnails') {
+                reads += 1;
+                return { data: [{ uri: 'https://example.com/poster.jpg' }] };
+            }
+            assert.equal(data.object_story_spec.video_data.image_url, 'https://example.com/poster.jpg');
+            return { data: { id: 'creative' } };
+        }
+    });
+    assert.equal(reads, 1);
+});
+
 test('creative failure preserves Meta error when page context is absent', async () => {
     await assert.rejects(createCreative({
         ...dependencies, campaignName: 'Test', creative: { mediaType: 'video' },
