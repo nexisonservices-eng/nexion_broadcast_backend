@@ -9,7 +9,8 @@ class APIFeatures {
     // Filtering
     filter() {
         const queryObj = { ...this.queryString };
-        const excludedFields = ['page', 'sort', 'limit', 'fields', 'search'];
+        // dateRange selects the reporting window, not a stored campaign field.
+        const excludedFields = ['page', 'sort', 'limit', 'fields', 'search', 'dateRange'];
         excludedFields.forEach(el => delete queryObj[el]);
 
         // Advanced filtering
