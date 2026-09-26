@@ -242,7 +242,7 @@ const uploadCreativeAsset = async ({
         lastError = {
           error,
           effectiveAdAccountId,
-          source: accessContext.source
+          source: resolvedAccessContext.source
         };
       }
     }
@@ -402,11 +402,12 @@ const createCreative = async ({
     extractApiErrorMessage(lastError),
     {
       metaError: lastError?.response?.data || null,
-      requestedPageId: creativePageContext.requestedPageId,
-      resolvedPageId: creativePageContext.pageId,
-      resolvedPageName: creativePageContext.pageName,
-      resolvedPageAccessToken: Boolean(creativePageContext.pageAccessToken),
-      accessiblePages: creativePageContext.accessiblePages
+      error: lastError?.response?.data?.error || null,
+      requestedPageId: creativePageContext?.requestedPageId || configuredPageId || '',
+      resolvedPageId: creativePageContext?.pageId || configuredPageId || '',
+      resolvedPageName: creativePageContext?.pageName || '',
+      resolvedPageAccessToken: Boolean(creativePageContext?.pageAccessToken || pageAccessToken),
+      accessiblePages: creativePageContext?.accessiblePages || []
     },
     lastError?.response?.status || 400
   );
