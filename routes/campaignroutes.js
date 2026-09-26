@@ -331,7 +331,7 @@ router.put(
     handleCreativeUploadError,
     normalizeCampaignContractRequest,
     [
-        param('id').isMongoId().withMessage('Invalid campaign ID'),
+        param('id').custom(isLocalOrMetaCampaignId).withMessage('Invalid campaign ID'),
         ...campaignValidation
     ],
     validate,

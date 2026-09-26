@@ -861,7 +861,48 @@ exports.updateCampaign = async (req, res) => {
             });
         }
 
-        let campaign = await Campaign.findById(req.params.id);
+        const requestedId = String(req.params.id || '').trim();
+        const metaId = requestedId.startsWith('meta_') ? requestedId.slice(5) : '';
+        let campaign = metaId
+            ? await Campaign.findOne({ ...buildCampaignScopedFilter(req), metaCampaignId: metaId })
+            : await Campaign.findById(requestedId);
+
+        if (metaId && !campaign) {
+            // Only edit campaigns visible through this user's connected Meta account.
+            const remoteCampaigns = await metaAdsService.fetchRemoteCampaigns({ userId: req.user.id });
+            const remote = remoteCampaigns.find((item) => String(item.metaCampaignId) === metaId);
+            if (!remote) {
+                return res.status(404).json({ success: false, message: 'Campaign not found for this Meta connection.' });
+            }
+            const contractKeys = new Set(['audience', 'deliveryPolicy', 'retryPolicy', 'compliancePolicy', 'analytics']);
+            const unsupported = Object.keys(req.body || {}).some((key) => {
+                if (['name', 'status'].includes(key)) return false;
+                return !contractKeys.has(key) || Object.keys(req.body[key] || {}).length > 0;
+            });
+            const { imageFile, videoFile } = getUploadedCreativeFiles(req);
+            if (unsupported || imageFile || videoFile) {
+                return res.status(400).json({ success: false, message: 'Published campaigns only support name/status updates in this screen.' });
+            }
+            const status = String(req.body.status || remote.status).toLowerCase();
+            if (req.body.status && !['active', 'paused'].includes(status) && status !== remote.status) {
+                return res.status(400).json({ success: false, message: 'Choose Active or Paused for a published campaign.' });
+            }
+            try {
+                await metaAdsService.updateCampaign({
+                    userId: req.user.id,
+                    campaignId: metaId,
+                    name: req.body.name || remote.name,
+                    status: ['active', 'paused'].includes(status) ? status.toUpperCase() : undefined
+                });
+            } catch (metaError) {
+                return sendMetaError(res, metaError, 'Meta campaign update failed');
+            }
+            return res.status(200).json({
+                success: true,
+                message: 'Campaign updated successfully',
+                data: { ...remote, name: req.body.name || remote.name, status, updatedAt: new Date().toISOString() }
+            });
+        }
 
         if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to update this campaign')) return;
 
@@ -969,7 +1010,7 @@ exports.updateCampaign = async (req, res) => {
 
         // Update campaign
         campaign = await Campaign.findByIdAndUpdate(
-            req.params.id,
+            campaign._id,
             req.body,
             {
                 new: true,
