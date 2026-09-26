@@ -287,7 +287,8 @@ const createCreative = async ({
   buildStageErrorWithDetails,
   extractApiErrorMessage,
   creativePageContext,
-  logMetaRequest
+  logMetaRequest,
+  waitForRetry = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 }) => {
   const requestedCtaType = String(creative?.callToAction || 'WHATSAPP_MESSAGE').trim();
   const effectiveCtaType =
@@ -351,8 +352,7 @@ const createCreative = async ({
   const isVideoProcessingError = (error) =>
     /video/i.test(extractApiErrorMessage(error)) &&
     /(processing|not ready|transcod)/i.test(extractApiErrorMessage(error));
-  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const maxAttempts = normalizedMediaType === 'video' && creativeUpload?.videoId ? 4 : 1;
+  const maxAttempts = normalizedMediaType === 'video' && creativeUpload?.videoId ? 20 : 1;
   let lastError = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -363,6 +363,20 @@ const createCreative = async ({
     };
 
     try {
+      if (objectStorySpec.video_data && !objectStorySpec.video_data.image_url) {
+        const thumbnails = await graphRequest({
+          path: `${creativeUpload.videoId}/thumbnails`,
+          params: { fields: 'uri,is_preferred' },
+          accessToken: String(accessToken || pageAccessToken || '').trim()
+        });
+        const candidates = (Array.isArray(thumbnails?.data) ? thumbnails.data : [])
+          .filter((thumbnail) => /^https?:\/\//i.test(String(thumbnail?.uri || '')));
+        const thumbnail = candidates.find((item) => item.is_preferred) || candidates[0];
+        if (!thumbnail) {
+          throw new Error('Video thumbnail is still processing. Please wait for Meta to finish processing the video.');
+        }
+        objectStorySpec.video_data.image_url = thumbnail.uri;
+      }
       const response = await graphRequest({
         method: 'POST',
         path: endpoint,
@@ -390,7 +404,7 @@ const createCreative = async ({
       if (attempt >= maxAttempts || !isVideoProcessingError(error)) {
         break;
       }
-      await wait(3000);
+      await waitForRetry(3000);
     }
   }
 
