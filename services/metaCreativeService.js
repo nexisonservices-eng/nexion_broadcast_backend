@@ -326,9 +326,6 @@ const createCreative = async ({
         value: callToActionValue
       }
     };
-    if (creative?.description) {
-      objectStorySpec.video_data.description = creative.description;
-    }
   } else {
     objectStorySpec.link_data = {
       link: destinationUrl,

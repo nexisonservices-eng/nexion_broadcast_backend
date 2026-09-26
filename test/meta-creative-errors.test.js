@@ -12,6 +12,38 @@ const dependencies = {
     buildStageErrorWithDetails: (stage, message, details, status) => Object.assign(new Error(message), { stage, details, status })
 };
 
+test('video creative with a description publishes without the unsupported video_data field', async () => {
+    const result = await createCreative({
+        ...dependencies,
+        campaignName: 'Video campaign',
+        configuredPageId: 'page',
+        destinationUrl: 'https://example.com',
+        creative: { mediaType: 'video', primaryText: 'Watch this', headline: 'Headline', description: 'Saved description' },
+        creativeUpload: { videoId: 'video' },
+        graphRequest: async ({ data }) => {
+            const video = data.object_story_spec.video_data;
+            assert.equal(Object.hasOwn(video, 'description'), false);
+            assert.equal(video.video_id, 'video');
+            assert.equal(video.message, 'Watch this');
+            assert.equal(video.title, 'Headline');
+            return { data: { id: 'creative' } };
+        }
+    });
+    assert.equal(result.id, 'creative');
+});
+
+test('image creatives retain their link description', async () => {
+    await createCreative({
+        ...dependencies, campaignName: 'Image campaign',
+        creative: { mediaType: 'image', description: 'Image description' },
+        creativeUpload: { mediaHash: 'image' },
+        graphRequest: async ({ data }) => {
+            assert.equal(data.object_story_spec.link_data.description, 'Image description');
+            return { data: { id: 'creative' } };
+        }
+    });
+});
+
 test('creative failure preserves Meta error when page context is absent', async () => {
     await assert.rejects(createCreative({
         ...dependencies, campaignName: 'Test', creative: { mediaType: 'video' },
