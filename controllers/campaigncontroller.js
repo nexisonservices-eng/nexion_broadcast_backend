@@ -441,7 +441,10 @@ const continueCampaignMetaCreation = async ({
             videoUrl: normalizedPayload.videoUrl,
             videoFileBuffer: videoFile?.buffer,
             videoFileName: videoFile?.originalname,
-            status: normalizedPayload.status
+            status: normalizedPayload.status,
+            onCampaignCreated: async (metaCampaignId) => {
+                await Campaign.findByIdAndUpdate(campaignId, { $set: { metaCampaignId } });
+            }
         });
 
         const requestedStatus = String(normalizedPayload?.status || '').trim().toLowerCase();
@@ -566,12 +569,6 @@ exports.getCampaigns = async (req, res) => {
         const campaigns = await features.query;
 
         const localCampaigns = campaigns.map((campaign) => serializeCampaignRecord(campaign));
-        const archivedCampaigns = await Campaign.find({
-            ...scopedBaseFilter,
-            status: 'archived'
-        })
-            .select('metaCampaignId')
-            .lean();
 
         // Get total count for pagination
         const combinedFilter = {
@@ -589,10 +586,13 @@ exports.getCampaigns = async (req, res) => {
             console.warn('Unable to fetch remote Meta campaigns:', remoteError.message || remoteError);
         }
 
+        // Include every local link, not just this page. Read after the Meta request
+        // so campaigns linked while publishing are also excluded from remote rows.
+        const linkedCampaigns = await Campaign.find(scopedBaseFilter).select('metaCampaignId').lean();
         const existingMetaCampaignIds = new Set(
             [
                 ...localCampaigns,
-                ...archivedCampaigns
+                ...linkedCampaigns
             ]
                 .map((campaign) => String(campaign.metaCampaignId || '').trim())
                 .filter(Boolean)

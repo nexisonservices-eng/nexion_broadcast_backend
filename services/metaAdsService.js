@@ -3641,6 +3641,7 @@ const createMetaAdStackFromCrud = async ({
   videoFileBuffer,
   videoFileName,
   status,
+  onCampaignCreated,
   logMetaRequest
 }) => {
   const env = getEnvConfig();
@@ -3793,6 +3794,9 @@ const createMetaAdStackFromCrud = async ({
     wrappedError.partialData = partialData;
     throw wrappedError;
   }
+
+  // Link the local record before creating the remaining ad assets.
+  await onCampaignCreated?.(partialData.metaCampaignId);
 
   const simpleTargeting = {
     geo_locations: {

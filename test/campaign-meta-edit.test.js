@@ -55,3 +55,38 @@ test('imported campaign creative changes are rejected explicitly', async () => {
     assert.equal(response.code, 400);
     assert.equal(calls.length, 0);
 });
+
+test('campaign list excludes Meta copies linked to local records on other pages', async () => {
+    class Features {
+        constructor() { this.query = []; this.filterConditions = {}; }
+        filter() { return this; }
+        sort() { return this; }
+        limitFields() { return this; }
+        paginate() { return this; }
+        search() { return this; }
+    }
+    const dependencies = {
+        '../models/campaign': {
+            find: () => ({ select() { return this; }, lean: async () => [{ metaCampaignId: '123' }] }),
+            countDocuments: async () => 1
+        },
+        '../utils/apifeature': Features,
+        '../utils/accessControl': {
+            normalizeRole: (role) => role,
+            buildTenantResourceFilter: () => ({ companyId: 'tenant' })
+        },
+        '../services/metaAdsService': {
+            fetchRemoteCampaigns: async () => [
+                { metaCampaignId: '123', name: 'Same name' },
+                { metaCampaignId: '456', name: 'Same name' }
+            ]
+        }
+    };
+    const context = { exports: {}, console, require: (name) => dependencies[name] || {} };
+    vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../controllers/campaigncontroller.js'), 'utf8'), context);
+    const response = { status(code) { this.code = code; return this; }, json(data) { this.data = data; return this; } };
+    await context.exports.getCampaigns({ user: { id: 'user', role: 'admin' }, query: {}, companyId: 'tenant' }, response);
+    assert.equal(response.code, 200);
+    assert.equal(response.data.data.length, 1);
+    assert.equal(response.data.data[0].metaCampaignId, '456');
+});
