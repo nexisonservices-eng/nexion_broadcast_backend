@@ -3426,6 +3426,17 @@ class BroadcastService {
   ) {
     try {
       const whatsappMessageId = whatsappResponse?.messages?.[0]?.id;
+      const resolvedSenderMeta =
+        senderMeta && typeof senderMeta === "object"
+          ? senderMeta
+          : await this.resolveBroadcastSenderMeta({ userId });
+      const normalizedSenderRole =
+        String(resolvedSenderMeta?.senderRole || "").trim().toLowerCase() === "admin"
+          ? "admin"
+          : "agent";
+      const normalizedSenderId =
+        toQueryObjectId(resolvedSenderMeta?.senderId || userId) || null;
+      const broadcastOwnerId = normalizedSenderRole === "agent" ? normalizedSenderId : null;
       const exactPhone = String(phone || "").trim();
       const exactPhoneDigits = this.normalizePhoneNumber(exactPhone);
       let contact = await this.resolveBroadcastContact({
@@ -3465,6 +3476,7 @@ class BroadcastService {
         conversation = await Conversation.create({
           userId,
           createdBy: userId || null,
+          broadcastOwnerId,
           companyId,
           contactId: contact._id,
           contactPhone: phone,
@@ -3501,6 +3513,7 @@ class BroadcastService {
         if (broadcastId) {
           conversation.broadcastId = broadcastId;
           if (userId) conversation.createdBy = userId;
+          conversation.broadcastOwnerId = broadcastOwnerId;
         }
         if (contact?._id) {
           conversation.contactId = contact._id;
@@ -3525,20 +3538,9 @@ class BroadcastService {
       }
       await syncConversationSummaryFromConversation(conversation);
 
-      const resolvedSenderMeta =
-        senderMeta && typeof senderMeta === "object"
-          ? senderMeta
-          : await this.resolveBroadcastSenderMeta({ userId });
-      const normalizedSenderRole =
-        String(resolvedSenderMeta?.senderRole || "").trim().toLowerCase() ===
-        "admin"
-          ? "admin"
-          : "agent";
       const normalizedSenderName =
         String(resolvedSenderMeta?.senderName || "").trim() ||
         (normalizedSenderRole === "admin" ? "Admin" : "Agent");
-      const normalizedSenderId =
-        toQueryObjectId(resolvedSenderMeta?.senderId || userId) || undefined;
 
       const savedMessage = await Message.create({
         userId,

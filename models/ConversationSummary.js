@@ -10,6 +10,7 @@ const ConversationSummarySchema = new mongoose.Schema({
   },
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, default: null },
+  broadcastOwnerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, default: null },
   companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'company', index: true },
   contactId: { type: mongoose.Schema.Types.ObjectId, ref: 'Contact', index: true, default: null },
   contactPhone: { type: String, index: true, default: '' },
@@ -76,6 +77,7 @@ ConversationSummarySchema.index({ companyId: 1, contactPhoneDigits: 1, lastMessa
 ConversationSummarySchema.index({ companyId: 1, contactNameLower: 1, lastMessageTime: -1, _id: -1 });
 ConversationSummarySchema.index({ companyId: 1, userId: 1, channel: 1, lastMessageTime: -1, _id: -1 });
 ConversationSummarySchema.index({ companyId: 1, createdBy: 1, lastMessageTime: -1, _id: -1 });
+ConversationSummarySchema.index({ companyId: 1, broadcastOwnerId: 1, lastMessageTime: -1, _id: -1 });
 ConversationSummarySchema.index({ companyId: 1, userId: 1, status: 1, lastMessageTime: -1, _id: -1 });
 ConversationSummarySchema.index({ companyId: 1, userId: 1, assignedTo: 1, lastMessageTime: -1, _id: -1 });
 ConversationSummarySchema.index({ companyId: 1, userId: 1, assignedTo: 1, status: 1, lastMessageTime: -1, _id: -1 });

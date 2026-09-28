@@ -205,13 +205,22 @@ const isAgentWorkspaceUser = (req) => !isTenantWideRole(getInboxRole(req));
 const buildConversationOwnershipFilter = (req) => {
   const userId = toCleanString(req?.user?.id);
   if (!userId) return {};
-  return {
-    $or: [
+  const ownershipClauses = [
       { userId },
       { createdBy: userId },
       { assignedTo: userId },
       { assignedToId: userId },
       { assignedAgent: userId }
+  ];
+  return {
+    $or: [
+      { broadcastOwnerId: userId },
+      {
+        $and: [
+          { $or: [{ broadcastOwnerId: null }, { broadcastOwnerId: { $exists: false } }] },
+          { $or: ownershipClauses }
+        ]
+      }
     ]
   };
 };

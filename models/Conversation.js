@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const ConversationSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, default: null },
+  broadcastOwnerId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true, default: null },
   companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'company', index: true },
   contactId: { type: mongoose.Schema.Types.ObjectId, ref: 'Contact', required: true },
   contactPhone: { type: String, required: true, index: true },
@@ -98,6 +99,7 @@ ConversationSchema.pre(['findOneAndUpdate', 'updateOne', 'updateMany', 'replaceO
 
 ConversationSchema.index({ companyId: 1, userId: 1, contactPhone: 1, status: 1 });
 ConversationSchema.index({ companyId: 1, createdBy: 1, lastMessageTime: -1, _id: -1 });
+ConversationSchema.index({ companyId: 1, broadcastOwnerId: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, userId: 1, contactPhoneDigits: 1, status: 1 });
 ConversationSchema.index({ companyId: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, status: 1, lastMessageTime: -1, _id: -1 });

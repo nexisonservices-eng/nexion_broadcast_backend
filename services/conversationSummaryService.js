@@ -46,6 +46,7 @@ const normalizeSummaryPayload = (payload = {}) => {
     conversationId: toObjectIdValue(payload?.conversationId),
     userId: payload?.userId === undefined ? undefined : toObjectIdValue(payload?.userId),
     createdBy: payload?.createdBy === undefined ? undefined : toObjectIdValue(payload?.createdBy),
+    broadcastOwnerId: payload?.broadcastOwnerId === undefined ? undefined : toObjectIdValue(payload?.broadcastOwnerId),
     companyId: payload?.companyId === undefined ? undefined : toObjectIdValue(payload?.companyId),
     contactId: payload?.contactId === undefined ? undefined : toObjectIdValue(payload?.contactId),
     contactPhone:
@@ -142,6 +143,7 @@ const buildSummaryUpdate = (payload = {}) => {
   const optionalKeys = [
     'contactId',
     'createdBy',
+    'broadcastOwnerId',
     'contactPhone',
     'contactName',
     'contactPhoneDigits',

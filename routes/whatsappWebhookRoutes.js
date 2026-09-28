@@ -903,6 +903,10 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
 
       if (broadcast) {
         const broadcastCreatorId = String(broadcast.createdById || '').trim();
+        const creatorRole = String(broadcast.createdByWorkspaceRole || '').trim().toLowerCase();
+        const broadcastOwnerId = ['agent', 'user'].includes(creatorRole)
+          ? broadcast.createdById
+          : null;
         const previousReplies = await Message.countDocuments({
           conversationId: conversation._id,
           sender: 'contact',
@@ -946,6 +950,10 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         }
         if (broadcastCreatorId && String(conversation.createdBy || '') !== broadcastCreatorId) {
           conversation.createdBy = broadcast.createdById;
+          conversationChanged = true;
+        }
+        if (String(conversation.broadcastOwnerId || '') !== String(broadcastOwnerId || '')) {
+          conversation.broadcastOwnerId = broadcastOwnerId;
           conversationChanged = true;
         }
         if (conversationChanged) {

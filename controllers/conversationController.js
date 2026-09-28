@@ -537,6 +537,7 @@ const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
                 $or: [
                   { userId: userIdentifier },
                   { createdBy: userIdentifier },
+                  { broadcastOwnerId: userIdentifier },
                   { assignedTo: normalizedUserId },
                   { assignedToId: userIdentifier },
                   { assignedAgent: normalizedUserId }
@@ -612,11 +613,21 @@ const buildConversationViewFilters = (req, extra = {}) => {
     const ownershipFilter = userIdentifier
       ? {
           $or: [
-            { userId: userIdentifier },
-            { createdBy: userIdentifier },
-            { assignedTo: normalizedUserId },
-            { assignedToId: userIdentifier },
-            { assignedAgent: normalizedUserId }
+            { broadcastOwnerId: userIdentifier },
+            {
+              $and: [
+                { $or: [{ broadcastOwnerId: null }, { broadcastOwnerId: { $exists: false } }] },
+                {
+                  $or: [
+                    { userId: userIdentifier },
+                    { createdBy: userIdentifier },
+                    { assignedTo: normalizedUserId },
+                    { assignedToId: userIdentifier },
+                    { assignedAgent: normalizedUserId }
+                  ]
+                }
+              ]
+            }
           ]
         }
       : {};
