@@ -1014,6 +1014,16 @@ const loadInboxOverviewSnapshot = async (req, { isAgent = false, filters = {}, s
 
 class ConversationController {
   async getConversations(req, res) {
+    const requestStartedAt = Date.now();
+    const requestLogContext = {
+      userId: String(req?.user?.id || ''),
+      role: String(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role || ''),
+      companyId: String(req?.companyId || req?.user?.companyId || ''),
+      view: String(req?.query?.view || req?.query?.inboxView || 'all'),
+      assignedTo: String(req?.query?.assignedTo || ''),
+      limit: String(req?.query?.limit || '')
+    };
+    console.info('[TeamInboxConversations] request', requestLogContext);
     try {
       const { status, assignedTo, search } = req.query;
       const conversationFilter = normalizeConversationFilter(
@@ -1173,9 +1183,20 @@ class ConversationController {
           }
         });
 
-        return res.json(hydratedResponse || cachedResponse);
+        const responsePayload = hydratedResponse || cachedResponse;
+        console.info('[TeamInboxConversations] response', {
+          ...requestLogContext,
+          count: Array.isArray(responsePayload?.data) ? responsePayload.data.length : 0,
+          durationMs: Date.now() - requestStartedAt
+        });
+        return res.json(responsePayload);
       }
 
+      console.info('[TeamInboxConversations] response', {
+        ...requestLogContext,
+        count: 0,
+        durationMs: Date.now() - requestStartedAt
+      });
       return res.json({
         success: true,
         data: [],
@@ -1187,6 +1208,11 @@ class ConversationController {
         }
       });
     } catch (error) {
+      console.error('[TeamInboxConversations] failed', {
+        ...requestLogContext,
+        durationMs: Date.now() - requestStartedAt,
+        error: error?.message || String(error)
+      });
       res.status(500).json({ success: false, error: error.message });
     }
   }
