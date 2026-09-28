@@ -1026,7 +1026,12 @@ class ConversationController {
       const companyId = toObjectIdIfValid(req?.companyId || req?.user?.companyId);
       let broadcastConversationIds = [];
       if (isAgent && userId) {
-        const broadcastFilter = { createdById: userId };
+        const broadcastFilter = {
+          $or: [
+            { createdById: userId },
+            { createdBy: String(req?.user?.id || '').trim() }
+          ]
+        };
         if (companyId) broadcastFilter.companyId = companyId;
         const ownedBroadcastIds = await Broadcast.distinct('_id', broadcastFilter);
         if (ownedBroadcastIds.length) {
