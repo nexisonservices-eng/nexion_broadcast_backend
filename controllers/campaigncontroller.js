@@ -605,6 +605,31 @@ exports.getCampaigns = async (req, res) => {
         const avgCtrSource = mergedStats.avgCtrSource.filter((value) => Number.isFinite(value));
         const avgCpcSource = mergedStats.avgCpcSource.filter((value) => Number.isFinite(value));
 
+        console.info('[AdsManagerAnalytics]', JSON.stringify({
+            userId: String(req.user?.id || req.user?._id || ''),
+            requestedAt: new Date().toISOString(),
+            filters: {
+                platform: req.query.platform || 'all',
+                status: req.query.status || 'all',
+                dateRange: req.query.dateRange || 'all'
+            },
+            count: mergedCampaigns.length,
+            totals: {
+                spend: mergedStats.totalSpent,
+                impressions: mergedStats.totalImpressions,
+                revenue: mergedStats.totalRevenue
+            },
+            campaigns: mergedCampaigns.slice(0, 100).map((campaign) => ({
+                id: String(campaign?._id || campaign?.id || ''),
+                name: String(campaign?.name || ''),
+                status: String(campaign?.lifecycleStatus || campaign?.status || ''),
+                metaCampaignId: String(campaign?.metaCampaignId || ''),
+                spend: Number(campaign?.spent || campaign?.analytics?.spent || 0),
+                impressions: Number(campaign?.impressions || campaign?.analytics?.impressions || 0),
+                revenue: Number(campaign?.revenue || campaign?.analytics?.revenue || 0)
+            }))
+        }));
+
         res.status(200).json({
             success: true,
             count: mergedCampaigns.length,
