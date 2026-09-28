@@ -2369,14 +2369,33 @@ const lookupMetaImageUrlByHash = async ({ adAccountId, accessToken, imageHash })
 const getCampaignInsightsFromRow = (row = {}) => {
   const actions = Array.isArray(row?.actions) ? row.actions : [];
   const leadAction = actions.find((item) => String(item?.action_type || '').toLowerCase().includes('lead'));
+  const actionValues = Array.isArray(row?.action_values) ? row.action_values : [];
+  const purchaseTypes = [
+    'omni_purchase',
+    'offsite_conversion.fb_pixel_purchase',
+    'onsite_conversion.purchase',
+    'purchase',
+    'mobile_app_purchase'
+  ];
+  const purchaseValue = purchaseTypes
+    .map((type) => actionValues.find((item) => String(item?.action_type || '').toLowerCase() === type))
+    .find(Boolean);
+  const purchaseRoas = (Array.isArray(row?.purchase_roas) ? row.purchase_roas : [])
+    .find((item) => purchaseTypes.includes(String(item?.action_type || '').toLowerCase()));
   const leads = Number(leadAction?.value || 0);
   const spend = Number(row?.spend || 0);
+  const revenue = purchaseValue
+    ? Number(purchaseValue.value || 0)
+    : purchaseRoas
+      ? Number((spend * Number(purchaseRoas.value || 0)).toFixed(2))
+      : 0;
 
   return {
     impressions: Number(row?.impressions || 0),
     reach: Number(row?.reach || 0),
     clicks: Number(row?.clicks || 0),
     spend,
+    revenue,
     ctr: Number(row?.ctr || 0),
     cpc: Number(row?.cpc || 0),
     leads,
@@ -2404,7 +2423,7 @@ const fetchAccountCampaignInsightsMap = async ({
   const response = await requestMetaAcrossTokens({
     path: buildAdAccountPath(accountId, 'insights'),
     params: {
-      fields: 'campaign_id,impressions,reach,clicks,spend,ctr,cpc,actions',
+      fields: 'campaign_id,impressions,reach,clicks,spend,ctr,cpc,actions,action_values,purchase_roas',
       date_preset: datePreset,
       level: 'campaign',
       filtering: JSON.stringify([
@@ -2427,6 +2446,7 @@ const fetchAccountCampaignInsightsMap = async ({
       reach: 0,
       clicks: 0,
       spend: 0,
+      revenue: 0,
       ctr: 0,
       cpc: 0,
       leads: 0,
@@ -2438,6 +2458,7 @@ const fetchAccountCampaignInsightsMap = async ({
       reach: current.reach + metrics.reach,
       clicks: current.clicks + metrics.clicks,
       spend: Number((current.spend + metrics.spend).toFixed(2)),
+      revenue: Number((current.revenue + metrics.revenue).toFixed(2)),
       ctr: 0,
       cpc: 0,
       leads: current.leads + metrics.leads,
@@ -2448,6 +2469,20 @@ const fetchAccountCampaignInsightsMap = async ({
     merged.cpl = merged.leads > 0 ? Number((merged.spend / merged.leads).toFixed(2)) : 0;
     insightMap.set(campaignId, merged);
   }
+
+  console.info('[MetaCampaignInsights]', JSON.stringify({
+    adAccountId: String(accountId || ''),
+    range,
+    datePreset,
+    requestedCampaignCount: uniqueCampaignIds.length,
+    returnedRows: rows.length,
+    matchedCampaignCount: insightMap.size,
+    totals: [...insightMap.values()].reduce((totals, insight) => ({
+      spend: totals.spend + Number(insight.spend || 0),
+      impressions: totals.impressions + Number(insight.impressions || 0),
+      revenue: totals.revenue + Number(insight.revenue || 0)
+    }), { spend: 0, impressions: 0, revenue: 0 })
+  }));
 
   return insightMap;
 };
@@ -2705,6 +2740,7 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
 
     const campaigns = Array.isArray(response?.data) ? response.data : [];
     let campaignInsights = new Map();
+    let campaignInsightsLoaded = false;
     try {
       campaignInsights = await fetchAccountCampaignInsightsMap({
         accountId: adAccountId,
@@ -2712,6 +2748,7 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
         range: filters.dateRange || 'last30days',
         tokenCandidates
       });
+      campaignInsightsLoaded = true;
     } catch (error) {
       console.warn(
         '[Meta Ads] Unable to load batched campaign insights for remote campaigns',
@@ -2753,7 +2790,8 @@ const fetchRemoteCampaigns = async ({ userId, filters = {} } = {}) => {
         clicks: Number(insight?.clicks || 0),
         ctr: Number(insight?.ctr || 0),
         cpc: Number(insight?.cpc || 0),
-        revenue: 0,
+        revenue: Number(insight?.revenue || 0),
+        insightsLoaded: campaignInsightsLoaded,
         createdAt: campaign?.created_time || null,
         updatedAt: campaign?.updated_time || null,
         imageUrl: remoteCampaignImageMap.get(remoteId) || '',

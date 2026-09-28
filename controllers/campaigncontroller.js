@@ -589,9 +589,29 @@ exports.getCampaigns = async (req, res) => {
         // Include every local link, not just this page. Read after the Meta request
         // so campaigns linked while publishing are also excluded from remote rows.
         const linkedCampaigns = await Campaign.find(scopedBaseFilter).select('metaCampaignId').lean();
+        const remoteByMetaCampaignId = new Map(
+            remoteCampaigns
+                .map((campaign) => [String(campaign.metaCampaignId || '').trim(), campaign])
+                .filter(([metaCampaignId]) => Boolean(metaCampaignId))
+        );
+        const enrichedLocalCampaigns = localCampaigns.map((campaign) => {
+            const remote = remoteByMetaCampaignId.get(String(campaign.metaCampaignId || '').trim());
+            if (!remote || remote.insightsLoaded !== true) return campaign;
+
+            const analytics = {
+                ...(campaign.analytics || {}),
+                spent: Number(remote.spent || 0),
+                impressions: Number(remote.impressions || 0),
+                clicks: Number(remote.clicks || 0),
+                ctr: Number(remote.ctr || 0),
+                cpc: Number(remote.cpc || 0),
+                revenue: Number(remote.revenue || 0)
+            };
+            return { ...campaign, ...analytics, analytics };
+        });
         const existingMetaCampaignIds = new Set(
             [
-                ...localCampaigns,
+                ...enrichedLocalCampaigns,
                 ...linkedCampaigns
             ]
                 .map((campaign) => String(campaign.metaCampaignId || '').trim())
@@ -600,7 +620,7 @@ exports.getCampaigns = async (req, res) => {
         const remoteOnlyCampaigns = remoteCampaigns.filter(
             (campaign) => !existingMetaCampaignIds.has(String(campaign.metaCampaignId || '').trim())
         );
-        const mergedCampaigns = [...localCampaigns, ...remoteOnlyCampaigns];
+        const mergedCampaigns = [...enrichedLocalCampaigns, ...remoteOnlyCampaigns];
         const mergedStats = buildCampaignStats(mergedCampaigns);
         const avgCtrSource = mergedStats.avgCtrSource.filter((value) => Number.isFinite(value));
         const avgCpcSource = mergedStats.avgCpcSource.filter((value) => Number.isFinite(value));
