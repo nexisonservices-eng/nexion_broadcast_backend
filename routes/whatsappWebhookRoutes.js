@@ -1413,7 +1413,15 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
   };
 
   const processWebhookPayload = async (data) => {
-    if (data.object !== 'whatsapp_business_account') return;
+    if (data.object !== 'whatsapp_business_account') {
+      console.warn('[WhatsAppWebhook] Ignored unexpected webhook object', {
+        object: String(data?.object || '')
+      });
+      return;
+    }
+    console.info('[WhatsAppWebhook] Payload received', {
+      entries: Array.isArray(data.entry) ? data.entry.length : 0
+    });
     for (const entry of data.entry || []) {
       for (const change of entry.changes || []) {
         const value = change?.value || {};
@@ -1429,10 +1437,30 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           ? await getWhatsAppCredentialsByUserId(userId)
           : null;
         const companyId = credentials?.companyId || null;
+        console.info('[WhatsAppWebhook] Change mapped', {
+          phoneNumberId: String(phoneNumberId || ''),
+          messages: messageList.length,
+          statuses: statusList.length,
+          userResolved: Boolean(userId),
+          companyResolved: Boolean(companyId)
+        });
+
+        if ((messageList.length || statusList.length) && (!userId || !companyId)) {
+          console.error('[WhatsAppWebhook] Cannot process change: phone number is not mapped to a workspace', {
+            phoneNumberId: String(phoneNumberId || ''),
+            userResolved: Boolean(userId),
+            companyResolved: Boolean(companyId)
+          });
+        }
 
         for (const messageData of messageList) {
           if (messageData && userId && companyId) {
             await handleIncomingMessage(messageData, value, userId, companyId);
+            console.info('[WhatsAppWebhook] Inbound message processed', {
+              messageId: String(messageData.id || ''),
+              userId: String(userId),
+              companyId: String(companyId)
+            });
           }
         }
 
