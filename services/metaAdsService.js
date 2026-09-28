@@ -1778,12 +1778,6 @@ const getPageLeads = async ({ userId, formId = '', limit = 25 } = {}) => {
     throw error;
   }
 
-  if (!resolvedFormId) {
-    const error = new Error('A Meta lead form ID is required to load leads.');
-    error.status = 400;
-    throw error;
-  }
-
   const fetchLeadForms = async () => {
     if (!selectedPageId) return [];
     try {
@@ -1869,6 +1863,15 @@ const getPageLeads = async ({ userId, formId = '', limit = 25 } = {}) => {
   }
 
   if (!response) {
+    if (!candidateFormIds.length) {
+      const error = new Error(
+        selectedPageId
+          ? 'No lead forms were found for the connected Facebook Page.'
+          : 'Connect a Facebook Page with lead forms to load Meta leads.'
+      );
+      error.status = 404;
+      throw error;
+    }
     throw lastError || new Error('Unable to resolve a valid Meta lead form ID.');
   }
 
