@@ -1054,7 +1054,10 @@ class ConversationController {
         : scopeVariants[scopeVariants.length - 1];
 
       if (status) filters.status = String(status).trim().toLowerCase();
-      if (assignedTo) filters.assignedTo = assignedTo;
+      const normalizedAssignedTo = String(assignedTo || '').trim();
+      const currentAgentId = String(req?.user?.id || '').trim();
+      const isAgentSelfScope = isAgent && normalizedAssignedTo && normalizedAssignedTo === currentAgentId;
+      if (normalizedAssignedTo && !isAgentSelfScope) filters.assignedTo = normalizedAssignedTo;
 
       const parsedLimit = Number(req.query?.limit);
       const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 200)) : 0;
@@ -1080,7 +1083,7 @@ class ConversationController {
       const summaryFilters = buildConversationViewFilters(req, {}, { broadcastConversationIds, summaryMode: true });
       const fallbackFilters = { ...filters };
       if (status) summaryFilters.status = String(status).trim().toLowerCase();
-      if (assignedTo) summaryFilters.assignedTo = assignedTo;
+      if (normalizedAssignedTo && !isAgentSelfScope) summaryFilters.assignedTo = normalizedAssignedTo;
       const summaryFilterClauses = [];
       const fallbackFilterClauses = [];
       const queryHint = searchPlan.hint;
