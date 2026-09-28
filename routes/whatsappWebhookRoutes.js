@@ -895,14 +895,14 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       }
 
       const broadcast = await Broadcast.findOne({
-        companyId,
-        createdById: userId,
+        ...(companyId ? { companyId } : { createdById: userId }),
         'recipients.phone': { $in: phoneCandidates },
         status: { $in: ['sending', 'completed'] },
-        startedAt: { $exists: true }
+        startedAt: { $exists: true, $lte: inboundActivityAt }
       }).sort({ startedAt: -1 });
 
       if (broadcast) {
+        const broadcastCreatorId = String(broadcast.createdById || '').trim();
         const previousReplies = await Message.countDocuments({
           conversationId: conversation._id,
           sender: 'contact',
@@ -920,7 +920,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
 
           const updatedBroadcast = await Broadcast.findById(broadcast._id);
 
-          emitRealtimeEvent(userId, {
+          const statsUpdate = {
             type: 'broadcast_stats_updated',
             broadcastId: broadcast._id.toString(),
             stats: {
@@ -928,21 +928,44 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
               repliedPercentage: updatedBroadcast.repliedPercentage,
               repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal
             }
-          });
+          };
+          emitRealtimeEvent(userId, statsUpdate);
+          if (broadcastCreatorId && broadcastCreatorId !== String(userId)) {
+            emitRealtimeEvent(broadcastCreatorId, statsUpdate);
+          }
 
           console.log(
             `Updated replied count for broadcast "${broadcast.name}": ${updatedBroadcast.stats.replied} (${updatedBroadcast.repliedPercentage}% of sent)`
           );
         }
 
+        let conversationChanged = false;
         if (String(conversation.channel || '').trim() !== 'broadcast_reply') {
           conversation.channel = resolveConversationChannel({ broadcast });
+          conversationChanged = true;
+        }
+        if (broadcastCreatorId && String(conversation.createdBy || '') !== broadcastCreatorId) {
+          conversation.createdBy = broadcast.createdById;
+          conversationChanged = true;
+        }
+        if (conversationChanged) {
           await conversation.save();
           await syncConversationSummaryFromConversation(conversation);
-          await invalidateInboxConversation({
-            userId,
-            companyId,
-            conversationId: conversation._id
+          await Promise.all([...new Set([String(userId), broadcastCreatorId].filter(Boolean))].map((participantUserId) =>
+            invalidateInboxConversation({
+              userId: participantUserId,
+              companyId,
+              conversationId: conversation._id
+            })
+          ));
+        }
+
+        if (broadcastCreatorId && broadcastCreatorId !== String(userId)) {
+          emitRealtimeEvent(broadcastCreatorId, {
+            type: 'new_message',
+            conversation: conversation.toObject(),
+            relatedConversationIds,
+            message: message.toObject()
           });
         }
       }

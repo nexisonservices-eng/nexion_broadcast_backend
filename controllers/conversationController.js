@@ -536,6 +536,7 @@ const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
               {
                 $or: [
                   { userId: userIdentifier },
+                  { createdBy: userIdentifier },
                   { assignedTo: normalizedUserId },
                   { assignedToId: userIdentifier },
                   { assignedAgent: normalizedUserId }
@@ -612,6 +613,7 @@ const buildConversationViewFilters = (req, extra = {}) => {
       ? {
           $or: [
             { userId: userIdentifier },
+            { createdBy: userIdentifier },
             { assignedTo: normalizedUserId },
             { assignedToId: userIdentifier },
             { assignedAgent: normalizedUserId }

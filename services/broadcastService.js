@@ -3464,6 +3464,7 @@ class BroadcastService {
         });
         conversation = await Conversation.create({
           userId,
+          createdBy: userId || null,
           companyId,
           contactId: contact._id,
           contactPhone: phone,
@@ -3499,6 +3500,7 @@ class BroadcastService {
         conversation.lastMessageWhatsappMessageId = whatsappMessageId || "";
         if (broadcastId) {
           conversation.broadcastId = broadcastId;
+          if (userId) conversation.createdBy = userId;
         }
         if (contact?._id) {
           conversation.contactId = contact._id;

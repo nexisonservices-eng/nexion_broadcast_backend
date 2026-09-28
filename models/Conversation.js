@@ -97,6 +97,7 @@ ConversationSchema.pre(['findOneAndUpdate', 'updateOne', 'updateMany', 'replaceO
 });
 
 ConversationSchema.index({ companyId: 1, userId: 1, contactPhone: 1, status: 1 });
+ConversationSchema.index({ companyId: 1, createdBy: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, userId: 1, contactPhoneDigits: 1, status: 1 });
 ConversationSchema.index({ companyId: 1, lastMessageTime: -1, _id: -1 });
 ConversationSchema.index({ companyId: 1, status: 1, lastMessageTime: -1, _id: -1 });

@@ -208,6 +208,7 @@ const buildConversationOwnershipFilter = (req) => {
   return {
     $or: [
       { userId },
+      { createdBy: userId },
       { assignedTo: userId },
       { assignedToId: userId },
       { assignedAgent: userId }
