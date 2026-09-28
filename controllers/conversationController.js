@@ -3,6 +3,7 @@ const Conversation = require('../models/Conversation');
 const ConversationSummary = require('../models/ConversationSummary');
 const Contact = require('../models/Contact');
 const Message = require('../models/Message');
+const Broadcast = require('../models/Broadcast');
 const {
   normalizeRole,
   isTenantWideRole
@@ -498,7 +499,7 @@ const normalizeInboxView = (value = '') => {
   return allowedViews.has(normalized) ? normalized : 'all';
 };
 
-const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
+const buildConversationStatusFilter = (view = 'all', { userId = '', broadcastConversationIds = [], summaryMode = false } = {}) => {
   const normalizedView = normalizeInboxView(view);
   const normalizedUserId = String(userId || '').trim();
   const normalizedUserObjectId = toObjectIdIfValid(normalizedUserId);
@@ -538,6 +539,9 @@ const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
                   { userId: userIdentifier },
                   { createdBy: userIdentifier },
                   { broadcastOwnerId: userIdentifier },
+                  ...(broadcastConversationIds.length
+                    ? [{ [summaryMode ? 'conversationId' : '_id']: { $in: broadcastConversationIds } }]
+                    : []),
                   { assignedTo: normalizedUserId },
                   { assignedToId: userIdentifier },
                   { assignedAgent: normalizedUserId }
@@ -589,7 +593,7 @@ const buildConversationStatusFilter = (view = 'all', { userId = '' } = {}) => {
   }
 };
 
-const buildConversationViewFilters = (req, extra = {}) => {
+const buildConversationViewFilters = (req, extra = {}, { broadcastConversationIds = [], summaryMode = false } = {}) => {
   const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
   const isAgent = !isTenantWideRole(normalizedRole);
   const normalizedView = normalizeInboxView(extra?.view || req?.query?.view || req?.query?.inboxView);
@@ -606,7 +610,7 @@ const buildConversationViewFilters = (req, extra = {}) => {
 
   const viewFilter = buildConversationStatusFilter(
     isAgent ? (normalizedView === 'all' ? 'my' : normalizedView) : normalizedView,
-    { userId: userIdentifier }
+    { userId: userIdentifier, broadcastConversationIds, summaryMode }
   );
 
   if (isAgent) {
@@ -619,6 +623,9 @@ const buildConversationViewFilters = (req, extra = {}) => {
                 { $or: [{ broadcastOwnerId: null }, { broadcastOwnerId: { $exists: false } }] },
                 {
                   $or: [
+                    ...(broadcastConversationIds.length
+                      ? [{ [summaryMode ? 'conversationId' : '_id']: { $in: broadcastConversationIds } }]
+                      : []),
                     { userId: userIdentifier },
                     { createdBy: userIdentifier },
                     { assignedTo: normalizedUserId },
@@ -1013,7 +1020,24 @@ class ConversationController {
         req.query?.filter || req.query?.conversationFilter || ''
       );
       const leadScoreBand = normalizeLeadScoreBand(req.query?.leadScoreBand || req.query?.scoreBand || 'all');
-      const filters = buildConversationViewFilters(req, {});
+      const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
+      const isAgent = !isTenantWideRole(normalizedRole);
+      const userId = toObjectIdIfValid(req?.user?.id);
+      const companyId = toObjectIdIfValid(req?.companyId || req?.user?.companyId);
+      let broadcastConversationIds = [];
+      if (isAgent && userId) {
+        const broadcastFilter = { createdById: userId };
+        if (companyId) broadcastFilter.companyId = companyId;
+        const ownedBroadcastIds = await Broadcast.distinct('_id', broadcastFilter);
+        if (ownedBroadcastIds.length) {
+          broadcastConversationIds = await Message.distinct('conversationId', {
+            broadcastId: { $in: ownedBroadcastIds },
+            conversationId: { $exists: true, $ne: null },
+            ...(companyId ? { companyId } : {})
+          });
+        }
+      }
+      const filters = buildConversationViewFilters(req, {}, { broadcastConversationIds });
       const scopeVariants = getInboxScopeVariants({
         companyId: filters.companyId,
         userId: req.user?.id || ''
@@ -1048,7 +1072,7 @@ class ConversationController {
         String(limit || 0),
         encodeConversationCursorCacheKey(cursor, cursorDirection)
       ];
-      const summaryFilters = { ...filters };
+      const summaryFilters = buildConversationViewFilters(req, {}, { broadcastConversationIds, summaryMode: true });
       const fallbackFilters = { ...filters };
       const summaryFilterClauses = [];
       const fallbackFilterClauses = [];
