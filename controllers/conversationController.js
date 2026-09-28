@@ -1074,6 +1074,8 @@ class ConversationController {
       ];
       const summaryFilters = buildConversationViewFilters(req, {}, { broadcastConversationIds, summaryMode: true });
       const fallbackFilters = { ...filters };
+      if (status) summaryFilters.status = String(status).trim().toLowerCase();
+      if (assignedTo) summaryFilters.assignedTo = assignedTo;
       const summaryFilterClauses = [];
       const fallbackFilterClauses = [];
       const queryHint = searchPlan.hint;
