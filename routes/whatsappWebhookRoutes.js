@@ -691,6 +691,21 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         ...(conversationLookupFilter || { contactPhone: from })
       }).sort({ createdAt: 1, updatedAt: 1, lastMessageTime: 1, _id: 1 });
       if (!conversation) {
+        // A customer reply should return to the agent-owned broadcast thread,
+        // even when that thread was resolved or archived before the reply.
+        conversation = await Conversation.findOne({
+          companyId,
+          broadcastOwnerId: { $exists: true, $ne: null },
+          ...(conversationLookupFilter || { contactPhone: from })
+        }).sort({ lastMessageTime: -1, updatedAt: -1, _id: -1 });
+      }
+      if (!conversation) {
+        conversation = await Conversation.findOne({
+          companyId,
+          ...(conversationLookupFilter || { contactPhone: from })
+        }).sort({ lastMessageTime: -1, updatedAt: -1, _id: -1 });
+      }
+      if (!conversation) {
         const assignmentPatch = buildConversationAssignmentPatch({
           contact,
           actorUserId: userId,
@@ -733,6 +748,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         if (contact?.name && !String(conversation.contactName || '').trim()) {
           conversation.contactName = contact.name;
         }
+        conversation.status = 'active';
+        conversation.resolvedAt = null;
         Object.assign(conversation, assignmentPatch);
         if (!isReactionMessage) {
           conversation.lastMessageTime = inboundActivityAt;
@@ -779,6 +796,14 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         whatsappTimestamp: new Date(messageData.timestamp * 1000),
         timestamp: new Date()
       });
+      console.info('[WhatsAppInbound] message_saved', JSON.stringify({
+        messageId: String(message?._id || ''),
+        conversationId: String(conversation?._id || ''),
+        userId: String(userId || ''),
+        companyId: String(companyId || ''),
+        broadcastOwnerId: String(conversation?.broadcastOwnerId || ''),
+        status: String(conversation?.status || '')
+      }));
       await message.populate('replyTo', '_id text sender senderRole senderName senderId whatsappMessageId mediaType mediaCaption timestamp');
 
       let relatedConversationIds = [String(conversation._id)];
