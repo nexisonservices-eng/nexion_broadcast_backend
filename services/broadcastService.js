@@ -3571,9 +3571,23 @@ class BroadcastService {
         )
       );
 
+      console.info("[BroadcastInboxWrite] message_persisted", JSON.stringify({
+        broadcastId: String(broadcastId || ""),
+        userId: String(userId || ""),
+        companyId: String(companyId || ""),
+        conversationId,
+        messageId: String(savedMessage?._id || ""),
+        status: String(conversation?.status || ""),
+      }));
+
       return { conversation, message: savedMessage };
     } catch (error) {
-      console.error("Error updating conversation:", error);
+      console.error("[BroadcastInboxWrite] message_persist_failed", JSON.stringify({
+        broadcastId: String(broadcastId || ""),
+        userId: String(userId || ""),
+        companyId: String(companyId || ""),
+        error: error?.message || String(error),
+      }));
       return { conversation: null, message: null };
     }
   }
@@ -3590,7 +3604,7 @@ class BroadcastService {
     contactId = "",
     skipActivityLog = false,
   }) {
-    return enqueueBroadcastInboxWrite({
+    const result = await enqueueBroadcastInboxWrite({
       broadcastId,
       userId,
       companyId,
@@ -3602,6 +3616,20 @@ class BroadcastService {
       contactId,
       skipActivityLog,
     });
+    const logPayload = {
+      broadcastId: String(broadcastId || ""),
+      userId: String(userId || ""),
+      companyId: String(companyId || ""),
+      queued: Boolean(result?.success),
+      jobId: String(result?.data?.jobId || ""),
+      localFallback: Boolean(result?.data?.localFallback),
+      error: result?.error || "",
+    };
+    (result?.success ? console.info : console.error)(
+      `[BroadcastInboxWrite] ${result?.success ? "queued" : "queue_failed"}`,
+      JSON.stringify(logPayload)
+    );
+    return result;
   }
 
   async claimBroadcastDispatch({

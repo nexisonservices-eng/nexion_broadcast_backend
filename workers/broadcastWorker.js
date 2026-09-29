@@ -548,6 +548,13 @@ if (enableBroadcastInboxWorker && canStartBullWorkers) {
       contactId = ''
     } = job.data || {};
 
+    console.info('[BroadcastInboxWorker] processing', JSON.stringify({
+      jobId: String(job.id || ''),
+      broadcastId: String(broadcastId || ''),
+      userId: String(userId || ''),
+      companyId: String(companyId || '')
+    }));
+
     const resolvedContact =
       contactId
         ? await broadcastService.resolveContactForRecipient({
@@ -566,6 +573,14 @@ if (enableBroadcastInboxWorker && canStartBullWorkers) {
       companyId,
       broadcastDispatchKey
     );
+
+    if (!conversation || !savedMessage) {
+      console.error('[BroadcastInboxWorker] persistence_missing', JSON.stringify({
+        jobId: String(job.id || ''),
+        broadcastId: String(broadcastId || ''),
+        userId: String(userId || '')
+      }));
+    }
 
     let contact = resolvedContact;
     if (!contact && conversation?.contactId) {
@@ -647,11 +662,20 @@ if (broadcastWorker) {
 
 if (broadcastInboxWorker) {
   broadcastInboxWorker.on('completed', (job) => {
-    console.log(`Broadcast inbox job completed: ${job.id}`);
+    console.info('[BroadcastInboxWorker] completed', JSON.stringify({
+      jobId: String(job?.id || ''),
+      broadcastId: String(job?.data?.broadcastId || ''),
+      userId: String(job?.data?.userId || '')
+    }));
   });
 
   broadcastInboxWorker.on('failed', async (job, error) => {
-    console.error(`Broadcast inbox job failed: ${job?.id || 'unknown'}`, error?.message || error);
+    console.error('[BroadcastInboxWorker] failed', JSON.stringify({
+      jobId: String(job?.id || ''),
+      broadcastId: String(job?.data?.broadcastId || ''),
+      userId: String(job?.data?.userId || ''),
+      error: error?.message || String(error)
+    }));
   });
 }
 
