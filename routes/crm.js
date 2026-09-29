@@ -42,11 +42,64 @@ const {
 } = require('../services/crmReportsService');
 const { getLeadScoringSettings } = require('../services/leadScoringService');
 const { encryptGoogleToken, decryptGoogleToken } = require('../utils/googleTokenCrypto');
-const { normalizeRole } = require('../utils/accessControl');
+const { normalizeRole, isTenantWideRole } = require('../utils/accessControl');
 
 const router = express.Router();
 router.use(auth);
 router.use(requireCrmPolicy());
+
+router.get('/whatsapp/inbound-status', async (req, res) => {
+  try {
+    const companyId = toObjectIdIfValid(req.companyId || req.user?.companyId);
+    if (!companyId) {
+      return res.status(400).json({ success: false, error: 'Company scope is required' });
+    }
+
+    const messageFilter = { companyId, sender: 'contact' };
+    const role = normalizeRole(req.user?.normalizedRole || req.user?.companyRole || req.user?.role);
+    if (!isTenantWideRole(role)) {
+      const userId = toObjectIdIfValid(req.user?.id);
+      const userIdString = String(req.user?.id || '').trim();
+      const ownership = [
+        ...(userId ? [{ broadcastOwnerId: userId }, { createdBy: userId }] : []),
+        ...(userIdString ? [{ assignedTo: userIdString }, { assignedAgent: userIdString }] : []),
+        ...(userId ? [{ assignedToId: userId }] : [])
+      ];
+      const conversationIds = ownership.length
+        ? await Conversation.distinct('_id', { companyId, $or: ownership })
+        : [];
+      if (!conversationIds.length) {
+        return res.json({ success: true, data: { hasReply: false, lastReplyAt: null } });
+      }
+      messageFilter.conversationId = { $in: conversationIds };
+    }
+
+    const latestMessage = await Message.findOne(messageFilter)
+      .sort({ timestamp: -1, _id: -1 })
+      .select('conversationId timestamp')
+      .lean();
+    if (!latestMessage) {
+      return res.json({ success: true, data: { hasReply: false, lastReplyAt: null } });
+    }
+
+    const conversation = await Conversation.findOne({ _id: latestMessage.conversationId, companyId })
+      .select('contactPhone contactName')
+      .lean();
+    return res.json({
+      success: true,
+      data: {
+        hasReply: true,
+        lastReplyAt: latestMessage.timestamp || null,
+        conversationId: String(latestMessage.conversationId || ''),
+        phone: String(conversation?.contactPhone || ''),
+        contactName: String(conversation?.contactName || '')
+      }
+    });
+  } catch (error) {
+    console.error('[CRM WhatsApp inbound status] failed:', error?.message || error);
+    return res.status(500).json({ success: false, error: 'Failed to load WhatsApp reply status' });
+  }
+});
 
 const LEAD_STAGES = ['new', 'contacted', 'nurturing', 'qualified', 'proposal', 'won', 'lost'];
 const LEAD_STATUSES = ['new', 'contacted', 'nurturing', 'qualified', 'proposal', 'unqualified', 'won', 'lost'];
