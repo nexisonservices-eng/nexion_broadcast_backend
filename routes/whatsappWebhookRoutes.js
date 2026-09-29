@@ -993,22 +993,22 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           ));
         }
 
-        if (broadcastCreatorId && broadcastCreatorId !== String(userId)) {
-          emitRealtimeEvent(broadcastCreatorId, {
-            type: 'new_message',
-            conversation: conversation.toObject(),
-            relatedConversationIds,
-            message: message.toObject()
-          });
-        }
       }
 
-      emitRealtimeEvent(userId, {
+      const inboundMessageEvent = {
         type: 'new_message',
         conversation: conversation.toObject(),
         relatedConversationIds,
         message: message.toObject()
-      });
+      };
+      const eventRecipients = new Set([
+        String(userId || '').trim(),
+        String(conversation?.broadcastOwnerId || '').trim(),
+        String(conversation?.createdBy || '').trim()
+      ].filter(Boolean));
+      for (const recipientUserId of eventRecipients) {
+        emitRealtimeEvent(recipientUserId, inboundMessageEvent);
+      }
 
       console.log('Message processing complete');
     } catch (error) {
