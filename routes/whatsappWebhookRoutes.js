@@ -1498,9 +1498,16 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
 
   app.post('/webhooks/whatsapp', (req, res) => {
     if (!verifyMetaSignature(req)) {
+      console.warn('[WhatsAppWebhook] POST rejected: invalid Meta signature', {
+        signaturePresent: Boolean(req.headers['x-hub-signature-256']),
+        appSecretConfigured: Boolean(process.env.WHATSAPP_APP_SECRET || process.env.META_APP_SECRET),
+        rawBodyAvailable: Boolean(req.rawBody),
+        contentType: String(req.headers['content-type'] || '')
+      });
       return res.sendStatus(401);
     }
 
+    console.info('[WhatsAppWebhook] Signed POST accepted');
     // Acknowledge immediately so Meta retries are avoided on slow downstream processing.
     res.sendStatus(200);
 
