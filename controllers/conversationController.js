@@ -618,6 +618,9 @@ const buildConversationViewFilters = (req, extra = {}, { broadcastConversationId
       ? {
           $or: [
             { broadcastOwnerId: userIdentifier },
+            ...(broadcastConversationIds.length
+              ? [{ [summaryMode ? 'conversationId' : '_id']: { $in: broadcastConversationIds } }]
+              : []),
             {
               $and: [
                 { $or: [{ broadcastOwnerId: null }, { broadcastOwnerId: { $exists: false } }] },
@@ -1036,10 +1039,12 @@ class ConversationController {
       const companyId = toObjectIdIfValid(req?.companyId || req?.user?.companyId);
       let broadcastConversationIds = [];
       if (isAgent && userId) {
+        const userEmail = String(req?.user?.email || '').trim();
         const broadcastFilter = {
           $or: [
             { createdById: userId },
-            { createdBy: String(req?.user?.id || '').trim() }
+            { createdBy: String(req?.user?.id || '').trim() },
+            ...(userEmail ? [{ createdByEmail: new RegExp(`^${userEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }] : [])
           ]
         };
         if (companyId) broadcastFilter.companyId = companyId;
