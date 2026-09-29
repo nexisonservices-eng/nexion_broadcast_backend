@@ -230,7 +230,10 @@ app.get('/healthz', (req, res) => {
     service: 'whatsapp-backend',
     uptimeSeconds: Math.round(process.uptime()),
     dbReady,
-    websocketReady: wss.readyState === WebSocket.OPEN || wss.readyState === WebSocket.CONNECTING
+    // WebSocketServer does not expose a client-style `readyState`; the HTTP
+    // server being bound and the ws client registry being initialized show
+    // that the upgrade endpoint is available.
+    websocketReady: Boolean(server.listening && wss?.clients instanceof Set)
   });
 });
 
