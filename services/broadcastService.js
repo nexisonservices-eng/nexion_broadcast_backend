@@ -1098,8 +1098,6 @@ class BroadcastService {
 
     const incomingMessages = conversationIds.length
       ? await Message.find({
-          userId: broadcast.createdById,
-          companyId: broadcast.companyId,
           sender: "contact",
           conversationId: { $in: conversationIds },
           timestamp: { $gte: startTime },
