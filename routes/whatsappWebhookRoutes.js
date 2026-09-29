@@ -26,6 +26,7 @@ const {
 } = require('../utils/contactIdentity');
 const { logConsentEvent } = require('../services/whatsappConsentLogService');
 const broadcastService = require('../services/broadcastService');
+const { resolveMetaConfigFromHierarchy } = require('../services/metaAuthService');
 const { invalidateInboxConversation } = require('../utils/teamInboxCache');
 const {
   syncConversationSummaryFromConversation,
@@ -227,9 +228,38 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
   app.get('/webhook', handleWebhookVerification);
   app.get('/webhooks/whatsapp', handleWebhookVerification);
 
-  const verifyMetaSignature = (req) => {
+  const resolveWebhookAppSecret = async (req) => {
+    const fallbackSecret = process.env.WHATSAPP_APP_SECRET || process.env.META_APP_SECRET || '';
+    const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
+
+    for (const entry of entries) {
+      for (const change of Array.isArray(entry?.changes) ? entry.changes : []) {
+        const phoneNumberId = String(change?.value?.metadata?.phone_number_id || '').trim();
+        if (!phoneNumberId) continue;
+
+        try {
+          const userId = await resolveUserIdByPhoneNumberId(phoneNumberId);
+          if (!userId) continue;
+          const metaConfig = await resolveMetaConfigFromHierarchy({ userId });
+          const appSecret = String(metaConfig?.appSecret || '').trim();
+          if (appSecret) return { secret: appSecret, source: 'super_admin' };
+        } catch (error) {
+          console.warn('[WhatsAppWebhook] Could not load Meta App Secret from Super Admin', {
+            phoneNumberId,
+            error: error?.message || 'Credential lookup failed'
+          });
+        }
+      }
+    }
+
+    return {
+      secret: String(fallbackSecret).trim(),
+      source: fallbackSecret ? 'backend_environment' : 'missing'
+    };
+  };
+
+  const verifyMetaSignature = (req, secret) => {
     const signature = req.headers['x-hub-signature-256'];
-    const secret = process.env.WHATSAPP_APP_SECRET || process.env.META_APP_SECRET || '';
     if (!signature || !secret || !req.rawBody) return false;
     const expected = `sha256=${crypto
       .createHmac('sha256', secret)
@@ -1496,11 +1526,13 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
     }
   };
 
-  app.post('/webhooks/whatsapp', (req, res) => {
-    if (!verifyMetaSignature(req)) {
+  app.post('/webhooks/whatsapp', async (req, res) => {
+    const { secret, source } = await resolveWebhookAppSecret(req);
+    if (!verifyMetaSignature(req, secret)) {
       console.warn('[WhatsAppWebhook] POST rejected: invalid Meta signature', {
         signaturePresent: Boolean(req.headers['x-hub-signature-256']),
-        appSecretConfigured: Boolean(process.env.WHATSAPP_APP_SECRET || process.env.META_APP_SECRET),
+        appSecretConfigured: Boolean(secret),
+        appSecretSource: source,
         rawBodyAvailable: Boolean(req.rawBody),
         contentType: String(req.headers['content-type'] || '')
       });
