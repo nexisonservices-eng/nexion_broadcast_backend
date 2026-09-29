@@ -3503,6 +3503,10 @@ class BroadcastService {
         });
         conversation.lastMessage = message;
         conversation.lastMessageTime = new Date();
+        // A new outbound broadcast message makes a resolved/archived thread
+        // active again so the agent can continue the conversation in Inbox.
+        conversation.status = "active";
+        conversation.resolvedAt = null;
         conversation.lastMessageMediaType = "";
         conversation.lastMessageAttachmentName = "";
         conversation.lastMessageAttachmentPages = null;
