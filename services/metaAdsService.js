@@ -4994,10 +4994,10 @@ const fetchInsightsDashboard = async ({ userId, range = '30d', campaignId, adSet
   const demographicErrors = [];
   const filtering = buildInsightsFilteringParam({ campaignId, adSetId });
 
-  for (const account of adAccounts) {
+  await Promise.all(adAccounts.map(async (account) => {
     const insightsPath = buildAdAccountPath(account.id, 'insights');
-    try {
-      const timeseriesResponse = await requestMetaAcrossTokens({
+    const [timeseriesResult, demographicsResult] = await Promise.allSettled([
+      requestMetaAcrossTokens({
         path: insightsPath,
         params: {
           fields: 'date_start,reach,impressions,spend,clicks',
@@ -5008,16 +5008,8 @@ const fetchInsightsDashboard = async ({ userId, range = '30d', campaignId, adSet
           limit: 500
         },
         tokenCandidates
-      });
-      insightRows.push(...(Array.isArray(timeseriesResponse?.data) ? timeseriesResponse.data : []));
-    } catch (error) {
-      const message = extractApiErrorMessage(error);
-      timeseriesErrors.push({ accountId: account.id, message });
-      console.warn('[Meta Insights] Timeseries fetch failed:', message);
-    }
-
-    try {
-      const demographicsResponse = await requestMetaAcrossTokens({
+      }),
+      requestMetaAcrossTokens({
         path: insightsPath,
         params: {
           fields: 'reach',
@@ -5028,14 +5020,25 @@ const fetchInsightsDashboard = async ({ userId, range = '30d', campaignId, adSet
           limit: 500
         },
         tokenCandidates
-      });
-      demographicRows.push(...(Array.isArray(demographicsResponse?.data) ? demographicsResponse.data : []));
-    } catch (error) {
-      const message = extractApiErrorMessage(error);
+      })
+    ]);
+
+    if (timeseriesResult.status === 'fulfilled') {
+      insightRows.push(...(Array.isArray(timeseriesResult.value?.data) ? timeseriesResult.value.data : []));
+    } else {
+      const message = extractApiErrorMessage(timeseriesResult.reason);
+      timeseriesErrors.push({ accountId: account.id, message });
+      console.warn('[Meta Insights] Timeseries fetch failed:', message);
+    }
+
+    if (demographicsResult.status === 'fulfilled') {
+      demographicRows.push(...(Array.isArray(demographicsResult.value?.data) ? demographicsResult.value.data : []));
+    } else {
+      const message = extractApiErrorMessage(demographicsResult.reason);
       demographicErrors.push({ accountId: account.id, message });
       console.warn('[Meta Insights] Demographics fetch failed:', message);
     }
-  }
+  }));
 
   if (!insightRows.length && timeseriesErrors.length > 0) {
     throw buildStageErrorWithDetails(
