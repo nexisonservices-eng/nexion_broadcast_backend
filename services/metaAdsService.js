@@ -2159,54 +2159,66 @@ const getAdAccountBillingSummary = async ({ userId } = {}) => {
   };
   let availableFunds = null;
 
-  // `balance` is Meta's amount due. Prepaid available funds come from the
-  // account's stored-balance funding sources (plus any available coupons).
+  // Meta's `balance` field is the bill amount due. The prepaid funds shown in
+  // Payment settings are represented by the account's funding_source_details.
+  // This is an AdAccount field (MANAGE permission required), not a guaranteed
+  // funding_source_details edge. Read it from the account response first.
   if (adAccount?.is_prepay_account === true) {
-    try {
-      const fundingResponse = await graphRequest({
-        path: `${buildAdAccountPath(selectedAdAccountId)}/funding_source_details`,
-        params: {
-          fields: 'id,type,amount,currency,display_amount,coupon,coupons'
-        },
-        accessToken: accessContext.accessToken
-      });
-      const fundingSources = Array.isArray(fundingResponse?.data)
-        ? fundingResponse.data
-        : Array.isArray(fundingResponse)
-          ? fundingResponse
-          : [];
-      const parseFundingAmount = (entry = {}) => {
-        const displayAmount = String(entry?.display_amount || '').trim();
-        if (displayAmount) {
-          const parsedDisplayAmount = parseMoney(displayAmount.replace(/[^0-9,.-]/g, '').replace(/,/g, ''));
-          if (parsedDisplayAmount !== null) return parsedDisplayAmount;
-        }
-        return parseMoney(entry?.amount);
-      };
-      const sourceType = (entry = {}) => String(entry?.type ?? '').trim().toUpperCase();
-      const isStoredBalance = (entry = {}) =>
-        sourceType(entry) === 'STORED_BALANCE' || Number(entry?.type) === 20;
-      const storedBalance = fundingSources
-        .filter(isStoredBalance)
-        .map(parseFundingAmount)
-        .filter((amount) => amount !== null)
-        .reduce((total, amount) => total + amount, 0);
-      const couponEntries = fundingSources.flatMap((entry) => [
-        ...(Array.isArray(entry?.coupons) ? entry.coupons : []),
-        ...(entry?.coupon && typeof entry.coupon === 'object' ? [entry.coupon] : [])
-      ]);
-      const couponBalance = couponEntries
-        .map(parseFundingAmount)
-        .filter((amount) => amount !== null)
-        .reduce((total, amount) => total + amount, 0);
-
-      if (storedBalance > 0 || couponBalance > 0) {
-        availableFunds = storedBalance + couponBalance;
-      } else if (fundingSources.some(isStoredBalance)) {
-        availableFunds = 0;
+    const parseFundingAmount = (entry = {}) => {
+      const displayAmount = String(entry?.display_amount || '').trim();
+      if (displayAmount) {
+        const parsedDisplayAmount = parseMoney(displayAmount.replace(/[^0-9,.-]/g, '').replace(/,/g, ''));
+        if (parsedDisplayAmount !== null) return parsedDisplayAmount;
       }
-    } catch {
-      // Keep unavailable if Meta denies access to funding-source details.
+      return parseMoney(entry?.amount);
+    };
+    const sourceType = (entry = {}) => String(entry?.type ?? '').trim().toUpperCase();
+    const isStoredBalance = (entry = {}) =>
+      sourceType(entry) === 'STORED_BALANCE' || Number(entry?.type) === 20;
+    const accountFundingDetails = adAccount?.funding_source_details;
+    let fundingSources = Array.isArray(accountFundingDetails)
+      ? accountFundingDetails
+      : accountFundingDetails && typeof accountFundingDetails === 'object'
+        ? (Array.isArray(accountFundingDetails.data) ? accountFundingDetails.data : [accountFundingDetails])
+        : [];
+
+    // Some Graph API responses expose the details through this edge instead
+    // of including the field payload. Keep it as a fallback only.
+    if (!fundingSources.length) {
+      try {
+        const fundingResponse = await graphRequest({
+          path: `${buildAdAccountPath(selectedAdAccountId)}/funding_source_details`,
+          params: { fields: 'id,type,amount,currency,display_amount,coupon,coupons' },
+          accessToken: accessContext.accessToken
+        });
+        fundingSources = Array.isArray(fundingResponse?.data)
+          ? fundingResponse.data
+          : Array.isArray(fundingResponse)
+            ? fundingResponse
+            : [];
+      } catch {
+        // Missing MANAGE permission leaves available funds unavailable.
+      }
+    }
+
+    const storedBalance = fundingSources
+      .filter(isStoredBalance)
+      .map(parseFundingAmount)
+      .filter((amount) => amount !== null)
+      .reduce((total, amount) => total + amount, 0);
+    const couponEntries = fundingSources.flatMap((entry) => [
+      ...(Array.isArray(entry?.coupons) ? entry.coupons : []),
+      ...(entry?.coupon && typeof entry.coupon === 'object' ? [entry.coupon] : [])
+    ]);
+    const couponBalance = couponEntries
+      .map(parseFundingAmount)
+      .filter((amount) => amount !== null)
+      .reduce((total, amount) => total + amount, 0);
+
+    if (storedBalance > 0 || couponBalance > 0) {
+      availableFunds = storedBalance + couponBalance;
+    } else if (fundingSources.some(isStoredBalance)) {
+      availableFunds = 0;
     }
   }
 
