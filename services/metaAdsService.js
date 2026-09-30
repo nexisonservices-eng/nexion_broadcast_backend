@@ -2195,9 +2195,15 @@ console.log(
     String(adAccount?.is_prepay_account || '').trim().toLowerCase() === 'true';
   if (isPrepayAccount) {
     const parseFundingAmount = (entry = {}) => {
-      const displayAmount = String(entry?.display_amount || '').trim();
-      if (displayAmount) {
-        const parsedDisplayAmount = parseMoney(displayAmount.replace(/[^0-9,.-]/g, '').replace(/,/g, ''));
+      const parseFormattedAmount = (value) => {
+        const normalized = String(value || '').replace(/[\u00a0\u202f]/g, ' ').trim();
+        if (!normalized) return null;
+        const match = normalized.match(/-?\d[\d,]*(?:\.\d+)?/);
+        return match ? parseMoney(match[0].replace(/,/g, '')) : null;
+      };
+
+      for (const candidate of [entry?.display_amount, entry?.display_string]) {
+        const parsedDisplayAmount = parseFormattedAmount(candidate);
         if (parsedDisplayAmount !== null) return parsedDisplayAmount;
       }
       return parseMoney(entry?.amount);
