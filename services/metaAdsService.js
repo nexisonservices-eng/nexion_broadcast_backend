@@ -2159,6 +2159,11 @@ const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {})
     accessToken: accessContext.accessToken
   });
 
+  console.log(
+  '[META FUNDING SOURCE]',
+  JSON.stringify(adAccount?.funding_source_details, null, 2)
+);
+
   const normalizedCurrency = String(adAccount?.currency || 'INR').trim() || 'INR';
   const parseMoney = (value) => {
     if (value === null || value === undefined || String(value).trim() === '') return null;
