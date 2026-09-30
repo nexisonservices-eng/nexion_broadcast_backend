@@ -355,10 +355,17 @@ router.get('/billing-summary', auth, async (req, res) => {
     });
     res.json({ success: true, billing });
   } catch (error) {
+    const metaError = error?.response?.data?.error || error?.response?.data || {};
+    const hasMetaError = Boolean(metaError?.message || metaError?.code || metaError?.error_subcode);
     res.status(error.status || 500).json({
       success: false,
-      error: error.message,
-      details: error.details || null
+      error: String(metaError?.message || error.message || 'Unable to load Meta billing.'),
+      details: error.details || (hasMetaError ? {
+        type: metaError?.type || null,
+        code: metaError?.code ?? null,
+        error_subcode: metaError?.error_subcode ?? null,
+        fbtrace_id: metaError?.fbtrace_id || null
+      } : null)
     });
   }
 });

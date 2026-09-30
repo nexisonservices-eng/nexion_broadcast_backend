@@ -2154,7 +2154,7 @@ const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {})
     path: buildAdAccountPath(selectedAdAccountId),
     params: {
       fields:
-        'id,name,account_status,currency,amount_spent,balance,spend_cap,funding_source_details{id,type,amount,currency,display_amount,display_string,coupon,coupons},is_prepay_account,business,owner'
+        'id,name,account_status,currency,amount_spent,balance,spend_cap,funding_source_details,is_prepay_account,business,owner'
     },
     accessToken: accessContext.accessToken
   });
@@ -2215,23 +2215,21 @@ const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {})
 
     const storedBalanceSources = fundingSources.filter(isStoredBalance);
     const availableBalanceSources = storedBalanceSources.length ? storedBalanceSources : fundingSources;
-    const storedBalance = availableBalanceSources
+    const storedBalanceAmounts = availableBalanceSources
       .map(parseFundingAmount)
-      .filter((amount) => amount !== null)
-      .reduce((total, amount) => total + amount, 0);
+      .filter((amount) => amount !== null);
+    const storedBalance = storedBalanceAmounts.reduce((total, amount) => total + amount, 0);
     const couponEntries = fundingSources.flatMap((entry) => [
       ...(Array.isArray(entry?.coupons) ? entry.coupons : []),
       ...(entry?.coupon && typeof entry.coupon === 'object' ? [entry.coupon] : [])
     ]);
-    const couponBalance = couponEntries
+    const couponAmounts = couponEntries
       .map(parseFundingAmount)
-      .filter((amount) => amount !== null)
-      .reduce((total, amount) => total + amount, 0);
+      .filter((amount) => amount !== null);
+    const couponBalance = couponAmounts.reduce((total, amount) => total + amount, 0);
 
-    if (storedBalance > 0 || couponBalance > 0) {
+    if (storedBalanceAmounts.length || couponAmounts.length) {
       availableFunds = storedBalance + couponBalance;
-    } else if (storedBalanceSources.length) {
-      availableFunds = 0;
     }
   }
 
