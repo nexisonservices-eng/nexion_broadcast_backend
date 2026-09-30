@@ -2153,6 +2153,7 @@ const getAdAccountBillingSummary = async ({ userId } = {}) => {
 
   const normalizedCurrency = String(adAccount?.currency || 'INR').trim() || 'INR';
   const parseMoney = (value) => {
+    if (value === null || value === undefined || String(value).trim() === '') return null;
     const amount = Number(value);
     return Number.isFinite(amount) ? amount : null;
   };
