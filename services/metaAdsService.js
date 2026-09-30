@@ -2159,9 +2159,22 @@ const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {})
     accessToken: accessContext.accessToken
   });
 
-  console.log(
-  '[META FUNDING SOURCE]',
-  JSON.stringify(adAccount?.funding_source_details, null, 2)
+console.log(
+  '[META BILLING ACCOUNT RESPONSE]',
+  JSON.stringify(
+    {
+      id: adAccount?.id,
+      name: adAccount?.name,
+      currency: adAccount?.currency,
+      amount_spent: adAccount?.amount_spent,
+      balance: adAccount?.balance,
+      spend_cap: adAccount?.spend_cap,
+      is_prepay_account: adAccount?.is_prepay_account,
+      funding_source_details: adAccount?.funding_source_details
+    },
+    null,
+    2
+  )
 );
 
   const normalizedCurrency = String(adAccount?.currency || 'INR').trim() || 'INR';
