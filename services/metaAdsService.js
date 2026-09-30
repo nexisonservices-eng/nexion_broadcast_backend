@@ -2146,7 +2146,7 @@ const getAdAccountBillingSummary = async ({ userId } = {}) => {
     path: buildAdAccountPath(selectedAdAccountId),
     params: {
       fields:
-        'id,name,account_status,currency,amount_spent,balance,spend_cap,funding_source_details,business,owner'
+        'id,name,account_status,currency,amount_spent,balance,spend_cap,funding_source_details,is_prepay_account,business,owner'
     },
     accessToken: accessContext.accessToken
   });
@@ -2157,6 +2157,58 @@ const getAdAccountBillingSummary = async ({ userId } = {}) => {
     const amount = Number(value);
     return Number.isFinite(amount) ? amount : null;
   };
+  let availableFunds = null;
+
+  // `balance` is Meta's amount due. Prepaid available funds come from the
+  // account's stored-balance funding sources (plus any available coupons).
+  if (adAccount?.is_prepay_account === true) {
+    try {
+      const fundingResponse = await graphRequest({
+        path: `${buildAdAccountPath(selectedAdAccountId)}/funding_source_details`,
+        params: {
+          fields: 'id,type,amount,currency,display_amount,coupon,coupons'
+        },
+        accessToken: accessContext.accessToken
+      });
+      const fundingSources = Array.isArray(fundingResponse?.data)
+        ? fundingResponse.data
+        : Array.isArray(fundingResponse)
+          ? fundingResponse
+          : [];
+      const parseFundingAmount = (entry = {}) => {
+        const displayAmount = String(entry?.display_amount || '').trim();
+        if (displayAmount) {
+          const parsedDisplayAmount = parseMoney(displayAmount.replace(/[^0-9,.-]/g, '').replace(/,/g, ''));
+          if (parsedDisplayAmount !== null) return parsedDisplayAmount;
+        }
+        return parseMoney(entry?.amount);
+      };
+      const sourceType = (entry = {}) => String(entry?.type ?? '').trim().toUpperCase();
+      const isStoredBalance = (entry = {}) =>
+        sourceType(entry) === 'STORED_BALANCE' || Number(entry?.type) === 20;
+      const storedBalance = fundingSources
+        .filter(isStoredBalance)
+        .map(parseFundingAmount)
+        .filter((amount) => amount !== null)
+        .reduce((total, amount) => total + amount, 0);
+      const couponEntries = fundingSources.flatMap((entry) => [
+        ...(Array.isArray(entry?.coupons) ? entry.coupons : []),
+        ...(entry?.coupon && typeof entry.coupon === 'object' ? [entry.coupon] : [])
+      ]);
+      const couponBalance = couponEntries
+        .map(parseFundingAmount)
+        .filter((amount) => amount !== null)
+        .reduce((total, amount) => total + amount, 0);
+
+      if (storedBalance > 0 || couponBalance > 0) {
+        availableFunds = storedBalance + couponBalance;
+      } else if (fundingSources.some(isStoredBalance)) {
+        availableFunds = 0;
+      }
+    } catch {
+      // Keep unavailable if Meta denies access to funding-source details.
+    }
+  }
 
   return {
     adAccount: {
@@ -2169,6 +2221,7 @@ const getAdAccountBillingSummary = async ({ userId } = {}) => {
     },
     billing: {
       amountSpent: parseMoney(adAccount?.amount_spent),
+      availableFunds,
       currentBalance: parseMoney(adAccount?.balance),
       spendCap: parseMoney(adAccount?.spend_cap),
       fundingSourceType: String(adAccount?.funding_source_details?.type || ''),
@@ -2180,8 +2233,7 @@ const getAdAccountBillingSummary = async ({ userId } = {}) => {
     },
     meta: {
       source: 'meta-graph',
-      note:
-        'Depending on your Meta billing model, currentBalance may represent billed balance or may be unavailable.'
+      note: 'availableFunds is derived from prepaid stored-balance funding sources and coupons; currentBalance is Meta amount due.'
     }
   };
 };
