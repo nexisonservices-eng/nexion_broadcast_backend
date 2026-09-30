@@ -2129,7 +2129,7 @@ const getAdPreviews = async ({ userId, adId, placements = [] } = {}) => {
   };
 };
 
-const getAdAccountBillingSummary = async ({ userId } = {}) => {
+const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {}) => {
   const accessContext = await ensureConnectedMetaUser(userId, 'Meta billing');
   const selectedAdAccountId = toCanonicalAdAccountId(accessContext?.connection?.selectedAdAccountId || '');
 
@@ -2140,6 +2140,14 @@ const getAdAccountBillingSummary = async ({ userId } = {}) => {
       { userId: userId || '' },
       400
     );
+  }
+
+  if (forceRefresh) {
+    invalidateMetaGraphCacheEntries({
+      accessToken: accessContext.accessToken,
+      apiVersion: accessContext.apiVersion,
+      paths: [buildAdAccountPath(selectedAdAccountId)]
+    });
   }
 
   const adAccount = await graphRequest({
@@ -2201,8 +2209,9 @@ const getAdAccountBillingSummary = async ({ userId } = {}) => {
       }
     }
 
-    const storedBalance = fundingSources
-      .filter(isStoredBalance)
+    const storedBalanceSources = fundingSources.filter(isStoredBalance);
+    const availableBalanceSources = storedBalanceSources.length ? storedBalanceSources : fundingSources;
+    const storedBalance = availableBalanceSources
       .map(parseFundingAmount)
       .filter((amount) => amount !== null)
       .reduce((total, amount) => total + amount, 0);
@@ -2217,7 +2226,7 @@ const getAdAccountBillingSummary = async ({ userId } = {}) => {
 
     if (storedBalance > 0 || couponBalance > 0) {
       availableFunds = storedBalance + couponBalance;
-    } else if (fundingSources.some(isStoredBalance)) {
+    } else if (storedBalanceSources.length) {
       availableFunds = 0;
     }
   }

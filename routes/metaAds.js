@@ -349,7 +349,10 @@ router.get('/diagnostics', auth, async (req, res) => {
 
 router.get('/billing-summary', auth, async (req, res) => {
   try {
-    const billing = await metaAdsService.getAdAccountBillingSummary({ userId: req.user.id });
+    const billing = await metaAdsService.getAdAccountBillingSummary({
+      userId: req.user.id,
+      forceRefresh: String(req.query.refresh || '').trim() === '1'
+    });
     res.json({ success: true, billing });
   } catch (error) {
     res.status(error.status || 500).json({
