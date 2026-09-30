@@ -2154,7 +2154,7 @@ const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {})
     path: buildAdAccountPath(selectedAdAccountId),
     params: {
       fields:
-        'id,name,account_status,currency,amount_spent,balance,spend_cap,funding_source_details,is_prepay_account,business,owner'
+        'id,name,account_status,currency,amount_spent,balance,spend_cap,funding_source_details{id,type,amount,currency,display_amount,display_string,coupon,coupons},is_prepay_account,business,owner'
     },
     accessToken: accessContext.accessToken
   });
@@ -2171,7 +2171,11 @@ const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {})
   // Payment settings are represented by the account's funding_source_details.
   // This is an AdAccount field (MANAGE permission required), not a guaranteed
   // funding_source_details edge. Read it from the account response first.
-  if (adAccount?.is_prepay_account === true) {
+  const isPrepayAccount =
+    adAccount?.is_prepay_account === true ||
+    adAccount?.is_prepay_account === 1 ||
+    String(adAccount?.is_prepay_account || '').trim().toLowerCase() === 'true';
+  if (isPrepayAccount) {
     const parseFundingAmount = (entry = {}) => {
       const displayAmount = String(entry?.display_amount || '').trim();
       if (displayAmount) {
@@ -2254,6 +2258,8 @@ const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {})
     },
     meta: {
       source: 'meta-graph',
+      isPrepayAccount,
+      fundingDetailsReturned: Boolean(adAccount?.funding_source_details),
       note: 'availableFunds is derived from prepaid stored-balance funding sources and coupons; currentBalance is Meta amount due.'
     }
   };
