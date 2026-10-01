@@ -41,7 +41,10 @@ const toBoolean = (value) => {
 function normalizeMetaLeadConfig(metaConfig = {}) {
   return {
     leadFormId: normalizeText(metaConfig?.leadFormId),
-    pageAccessToken: normalizeText(metaConfig?.pageAccessToken)
+    pageAccessToken: normalizeText(metaConfig?.pageAccessToken),
+    userAccessToken: normalizeText(metaConfig?.userAccessToken),
+    adAccountId: normalizeText(metaConfig?.adAccountId),
+    apiVersion: normalizeText(metaConfig?.apiVersion)
   };
 }
 
@@ -187,7 +190,7 @@ const getMetaLeads = async (req, res) => {
       formId,
       limit: 100
     });
-    const leads = Array.isArray(leadsResult?.leads) ? leadsResult.leads : [];
+    const leads = Array.isArray(leadsResult?.leads) ? leadsResult.leads.map(formatLead) : [];
     const adCampaignLookups = await Promise.all(
       leads
         .map((lead) => normalizeText(lead?.campaignId) ? null : normalizeText(lead?.adId))

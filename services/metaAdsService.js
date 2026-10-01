@@ -1780,20 +1780,16 @@ const getPageLeads = async ({ userId, formId = '', limit = 25 } = {}) => {
 
   const fetchLeadForms = async () => {
     if (!selectedPageId) return [];
-    try {
-      const response = await graphRequest({
-        path: `${selectedPageId}/leadgen_forms`,
-        params: {
-          fields: 'id,name,created_time',
-          limit: 100
-        },
-        accessToken: pageAccessToken
-      });
-      return Array.isArray(response?.data) ? response.data : [];
-    } catch (error) {
-      console.warn('[Meta Leads] Failed to load lead forms:', error?.message || error);
-      return [];
-    }
+    const response = await graphRequest({
+      path: `${selectedPageId}/leadgen_forms`,
+      params: {
+        fields: 'id,name,created_time',
+        limit: 100
+      },
+      accessToken: pageAccessToken,
+      apiVersion: accessContext.apiVersion
+    });
+    return Array.isArray(response?.data) ? response.data : [];
   };
 
   const isInvalidLeadFormError = (error = {}) => {
@@ -1823,8 +1819,26 @@ const getPageLeads = async ({ userId, formId = '', limit = 25 } = {}) => {
         fields: 'id,created_time,field_data,ad_id,form_id,campaign_id',
         limit: Math.max(1, Math.min(Number(limit) || 25, 100))
       },
-      accessToken: pageAccessToken
+      accessToken: pageAccessToken,
+      apiVersion: accessContext.apiVersion
     });
+
+  // A configured form can be read even when Page form discovery is unavailable.
+  let lastError = null;
+  if (resolvedFormId) {
+    try {
+      const response = await tryFetchLeadsForForm(resolvedFormId);
+      return {
+        formId: resolvedFormId,
+        resolvedFormId,
+        leads: Array.isArray(response?.data) ? response.data : [],
+        paging: response?.paging || null
+      };
+    } catch (error) {
+      if (!isInvalidLeadFormError(error) || !selectedPageId) throw error;
+      lastError = error;
+    }
+  }
 
   const leadForms = await fetchLeadForms();
   const fallbackFormIds = leadForms
@@ -1836,7 +1850,7 @@ const getPageLeads = async ({ userId, formId = '', limit = 25 } = {}) => {
     .sort((left, right) => new Date(right.createdTime || 0).getTime() - new Date(left.createdTime || 0).getTime())
     .map((form) => form.id);
 
-  const candidateFormIds = Array.from(new Set([resolvedFormId, ...fallbackFormIds].filter(Boolean)));
+  const candidateFormIds = Array.from(new Set(fallbackFormIds.filter((id) => id !== resolvedFormId)));
 
   console.log('[Meta Leads] Lead form resolution context:', {
     selectedPageId,
@@ -1846,7 +1860,6 @@ const getPageLeads = async ({ userId, formId = '', limit = 25 } = {}) => {
 
   let response = null;
   let effectiveFormId = '';
-  let lastError = null;
 
   for (const candidateFormId of candidateFormIds) {
     try {
@@ -1863,6 +1876,7 @@ const getPageLeads = async ({ userId, formId = '', limit = 25 } = {}) => {
   }
 
   if (!response) {
+    if (lastError) throw lastError;
     if (!candidateFormIds.length) {
       const error = new Error(
         selectedPageId
