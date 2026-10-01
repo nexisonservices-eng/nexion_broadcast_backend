@@ -510,24 +510,6 @@ const continueCampaignMetaCreation = async ({
     }
 };
 
-const continueCampaignMetaArchive = async ({ userId, campaignId, adSetId, adId }) => {
-    try {
-        await metaAdsService.archiveMetaCrudAssets({
-            userId,
-            campaignId,
-            adSetId,
-            adId
-        });
-    } catch (metaError) {
-        console.error('Background Meta campaign archive failed:', {
-            campaignId,
-            adSetId,
-            adId,
-            message: metaError?.message || metaError
-        });
-    }
-};
-
 const getUploadedCreativeFiles = (req = {}) => {
     const imageFromFields = Array.isArray(req.files?.creativeImage) ? req.files.creativeImage[0] : null;
     const videoFromFields = Array.isArray(req.files?.creativeVideo) ? req.files.creativeVideo[0] : null;
@@ -1184,24 +1166,13 @@ exports.deleteCampaign = async (req, res) => {
         await campaign.save();
         mark('local_archive_done');
 
-        if (campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId) {
-            mark('meta_archive_queued');
-            void continueCampaignMetaArchive({
-                userId: req.user.id,
-                campaignId: campaign.metaCampaignId,
-                adSetId: campaign.metaAdSetId,
-                adId: campaign.metaAdId
-            });
-        }
-
+        // Archiving a local record must not change delivery of its linked Meta assets.
         res.setHeader('X-Campaign-Delete-Request-Id', requestId);
         res.setHeader('X-Campaign-Delete-Duration-Ms', String(Date.now() - requestStartedAt));
-        res.setHeader('X-Campaign-Delete-Phase', campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId ? 'archived-plus-meta-background' : 'archived');
+        res.setHeader('X-Campaign-Delete-Phase', 'archived');
         res.status(200).json({
             success: true,
-            message: (campaign.metaCampaignId || campaign.metaAdSetId || campaign.metaAdId)
-                ? 'Campaign archived successfully. Meta cleanup continues in the background.'
-                : 'Campaign archived successfully',
+            message: 'Campaign archived successfully',
             meta: null,
             data: serializeCampaignRecord(campaign)
         });
