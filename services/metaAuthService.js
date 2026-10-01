@@ -174,12 +174,13 @@ const getLoginDialogUrl = ({ redirectUri, state, appId, apiVersion }) => {
   const resolvedAppId = String(appId || '').trim();
   const scopes = [
     'public_profile',
-   
     'business_management',
     'ads_management',
     'ads_read',
+    'pages_show_list',
     'pages_read_engagement',
-    
+    'pages_manage_ads',
+    'leads_retrieval'
   ].join(',');
   const resolvedRedirectUri = resolveMetaOAuthRedirectUri(redirectUri);
 
@@ -187,7 +188,7 @@ const getLoginDialogUrl = ({ redirectUri, state, appId, apiVersion }) => {
     resolvedAppId
   )}&redirect_uri=${encodeURIComponent(resolvedRedirectUri)}&scope=${encodeURIComponent(
     scopes
-  )}&response_type=code&state=${encodeURIComponent(String(state || ''))}`;
+  )}&auth_type=rerequest&response_type=code&state=${encodeURIComponent(String(state || ''))}`;
 };
 
 const saveUserConnection = async ({ userId, accessToken, scopes = [], graphRequest }) => {
