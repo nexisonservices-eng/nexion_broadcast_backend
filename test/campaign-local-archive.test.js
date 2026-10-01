@@ -4,13 +4,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-const runArchive = async ({ linked = true, viaMetaId = false, allowed = true, saveFails = false } = {}) => {
+const runArchive = async ({ linked = true, viaMetaId = false, allowed = true, saveFails = false, endDate } = {}) => {
     let saves = 0;
     const metaCalls = [];
+    const logs = [];
     const campaign = {
         _id: 'local-id', companyId: 'tenant', createdBy: 'user',
         status: 'active', lifecycleStatus: 'active', localStatus: 'active',
         metaStatus: 'ACTIVE',
+        endDate,
         ...(linked ? { metaCampaignId: '123', metaAdSetId: '456', metaAdId: '789' } : {}),
         async save() {
             saves += 1;
@@ -22,9 +24,9 @@ const runArchive = async ({ linked = true, viaMetaId = false, allowed = true, sa
             findById: async () => campaign,
             findOne: async () => campaign
         },
-        '../services/metaAdsService': {
-            archiveMetaCrudAssets: async (args) => { metaCalls.push(args); }
-        },
+        '../services/metaAdsService': new Proxy({}, {
+            get: (_target, method) => async (args) => { metaCalls.push({ method, args }); }
+        }),
         '../utils/campaignContract': { shapeCampaignContract: () => ({}) },
         '../utils/accessControl': {
             normalizeRole: (role) => role,
@@ -34,7 +36,7 @@ const runArchive = async ({ linked = true, viaMetaId = false, allowed = true, sa
     };
     const context = {
         exports: {}, process: { env: { NODE_ENV: 'test' } },
-        console: { info() {}, error() {} },
+        console: { info(...args) { logs.push(args); }, error() {} },
         require: (name) => dependencies[name] || {}
     };
     vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../controllers/campaigncontroller.js'), 'utf8'), context);
@@ -49,7 +51,7 @@ const runArchive = async ({ linked = true, viaMetaId = false, allowed = true, sa
         body: linked ? { metaCampaignId: '123' } : {},
         user: { id: 'user', role: 'admin' }, companyId: 'tenant'
     }, response);
-    return { response, saves, metaCalls, campaign };
+    return { response, saves, metaCalls, campaign, logs };
 };
 
 for (const options of [{ linked: true }, { linked: false }, { viaMetaId: true }]) {
@@ -76,7 +78,21 @@ test('unauthorized archive neither saves nor contacts Meta', async () => {
 });
 
 test('failed local save does not contact Meta or report success', async () => {
-    const { response, metaCalls } = await runArchive({ saveFails: true });
+    const { response, metaCalls, logs } = await runArchive({ saveFails: true });
     assert.equal(response.code, 500);
     assert.equal(metaCalls.length, 0);
+    assert.equal(logs.some(([, entry]) => entry.event === 'local_campaign_archived'), false);
+});
+
+test('archiving an expired campaign preserves its date and logs no Meta action', async () => {
+    const endDate = new Date('2020-09-29T00:00:00.000Z');
+    const { response, campaign, metaCalls, logs } = await runArchive({ endDate });
+    assert.equal(response.code, 200);
+    assert.equal(campaign.endDate, endDate);
+    assert.equal(metaCalls.length, 0);
+    const entry = logs.find(([, entry]) => entry.event === 'local_campaign_archived')[1];
+    assert.equal(entry.metaAction, 'none');
+    assert.equal(entry.userId, 'user');
+    assert.equal(entry.localCampaignId, 'local-id');
+    assert.equal(entry.metaCampaignId, '123');
 });

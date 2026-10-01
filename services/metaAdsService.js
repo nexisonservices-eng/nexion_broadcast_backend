@@ -742,6 +742,21 @@ const graphRequest = async ({
 
     try {
       const response = await axios(requestConfig);
+      // Audit only object IDs and actions, never request payloads or credentials.
+      // Creation endpoints (e.g. act_123/campaigns) are not delivery mutations.
+      const mutationStatus = requestMethod === 'DELETE' ? 'DELETED' : String(data?.status || '').toUpperCase();
+      if (/^\d+$/.test(normalizedPath) &&
+          ['POST', 'DELETE'].includes(requestMethod) &&
+          ['ARCHIVED', 'DELETED', 'PAUSED'].includes(mutationStatus)) {
+        console.info('[meta-asset-action]', {
+          event: `meta_object_intentionally_${mutationStatus.toLowerCase()}`,
+          outcome: 'api_request_succeeded',
+          requestId,
+          objectId: normalizedPath,
+          method: requestMethod,
+          status: mutationStatus
+        });
+      }
       clearMetaRateLimitState(tokenKey);
 
       if (cacheable) {

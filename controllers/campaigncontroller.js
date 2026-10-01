@@ -1164,7 +1164,14 @@ exports.deleteCampaign = async (req, res) => {
         campaign.localStatus = 'archived';
         campaign.reviewNotes = campaign.reviewNotes || 'Archived from campaign manager';
         await campaign.save();
-        mark('local_archive_done');
+        mark('local_archive_done', {
+            event: 'local_campaign_archived',
+            localCampaignId: String(campaign._id),
+            userId: String(req.user.id),
+            companyId: String(req.companyId || ''),
+            metaCampaignId: String(campaign.metaCampaignId || ''),
+            metaAction: 'none'
+        });
 
         // Archiving a local record must not change delivery of its linked Meta assets.
         res.setHeader('X-Campaign-Delete-Request-Id', requestId);
