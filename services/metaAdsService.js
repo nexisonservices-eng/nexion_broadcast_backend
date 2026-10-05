@@ -1777,7 +1777,7 @@ const getSetupBundle = async ({ userId } = {}) => {
   return fallback;
 };
 
-const getPageLeads = async ({ userId, formId = '', limit = 25 } = {}) => {
+const getPageLeads = async ({ userId, formId = '', limit = 25, fetchAll = false } = {}) => {
   const accessContext = await getAccessContextForUser(userId);
   const selectedPageId = String(accessContext?.connection?.selectedPageId || '').trim();
   const resolvedFormId = String(formId || accessContext?.adminMetaConfig?.leadFormId || '').trim();
@@ -1827,16 +1827,31 @@ const getPageLeads = async ({ userId, formId = '', limit = 25 } = {}) => {
     );
   };
 
-  const tryFetchLeadsForForm = async (candidateFormId) =>
-    graphRequest({
+  const tryFetchLeadsForForm = async (candidateFormId) => {
+    const collected = [];
+    const seenCursors = new Set();
+    let after;
+    let response;
+    do {
+      response = await graphRequest({
       path: `${candidateFormId}/leads`,
       params: {
         fields: 'id,created_time,field_data,ad_id,form_id,campaign_id',
-        limit: Math.max(1, Math.min(Number(limit) || 25, 100))
+        limit: Math.max(1, Math.min(Number(limit) || 25, 100)),
+        ...(after ? { after } : {})
       },
       accessToken: pageAccessToken,
       apiVersion: accessContext.apiVersion
-    });
+      });
+      collected.push(...(Array.isArray(response?.data) ? response.data : []));
+      after = response?.paging?.next ? response?.paging?.cursors?.after : null;
+      if (fetchAll && after && seenCursors.has(after)) {
+        throw new Error('Unable to retrieve all Meta leads: repeated pagination cursor.');
+      }
+      if (after) seenCursors.add(after);
+    } while (fetchAll && after);
+    return { ...response, data: collected };
+  };
 
   // A configured form can be read even when Page form discovery is unavailable.
   let lastError = null;

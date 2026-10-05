@@ -188,7 +188,8 @@ const getMetaLeads = async (req, res) => {
     const leadsResult = await metaAdsService.getPageLeads({
       userId,
       formId,
-      limit: 100
+      limit: 100,
+      fetchAll: true
     });
     const leads = Array.isArray(leadsResult?.leads) ? leadsResult.leads.map(formatLead) : [];
     const adCampaignLookups = await Promise.all(
