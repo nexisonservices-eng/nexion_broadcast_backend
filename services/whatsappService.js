@@ -889,6 +889,48 @@ class WhatsAppService {
     }
   }
 
+  async uploadTemplateImage(file, credentials) {
+    try {
+      if (!file?.buffer?.length || !['image/jpeg', 'image/png'].includes(file.mimetype)) {
+        return { success: false, error: 'Select a JPEG or PNG template image.' };
+      }
+      if (file.buffer.length > 5 * 1024 * 1024) {
+        return { success: false, error: 'Template images must be 5 MB or smaller.' };
+      }
+      // Capture request credentials before awaiting; this service is shared across tenants.
+      const accessToken = credentials?.accessToken;
+      if (!accessToken) return { success: false, error: 'WhatsApp access token is required.' };
+      const apiUrl = this.apiUrl;
+      const session = await axios.post(`${apiUrl}/app/uploads`, null, {
+        params: {
+          file_name: file.originalname || 'template-image',
+          file_length: file.buffer.length,
+          file_type: file.mimetype
+        },
+        headers: { Authorization: `Bearer ${accessToken}` },
+        timeout: META_REQUEST_TIMEOUT_MS
+      });
+      if (!session.data?.id) throw new Error('Meta did not return an image upload session.');
+      const uploaded = await axios.post(`${apiUrl}/${session.data.id}`, file.buffer, {
+        headers: {
+          Authorization: `OAuth ${accessToken}`,
+          'Content-Type': file.mimetype,
+          file_offset: '0'
+        },
+        timeout: META_REQUEST_TIMEOUT_MS,
+        maxBodyLength: 5 * 1024 * 1024
+      });
+      if (!uploaded.data?.h) throw new Error('Meta did not return an uploaded image handle.');
+      return { success: true, data: { headerHandle: uploaded.data.h } };
+    } catch (error) {
+      return {
+        success: false,
+        error: error.response?.data?.error?.error_user_msg || error.response?.data?.error?.message || error.message,
+        details: error.response?.data || null
+      };
+    }
+  }
+
   async createTemplate(templateData, credentials = null) {
     if (credentials) {
       this.initialize(credentials);

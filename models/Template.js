@@ -34,7 +34,8 @@ const TemplateSchema = new mongoose.Schema({
 
       text: String,
 
-      mediaUrl: String
+      mediaUrl: String,
+      mediaHandle: String
 
     },
 

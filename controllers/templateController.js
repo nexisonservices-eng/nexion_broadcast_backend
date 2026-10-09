@@ -2,6 +2,8 @@ const Template = require('../models/Template');
 const { buildTenantResourceFilter } = require('../utils/accessControl');
 const whatsappService = require('../services/whatsappService');
 const { getWhatsAppCredentialsForUser } = require('../services/userWhatsAppCredentialsService');
+const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
+const { resolveCompanyFolders } = require('../services/cloudinaryCompanyFolders');
 
 const normalizeTemplateLookupValue = (value = '') => String(value || '').trim().toLowerCase();
 
@@ -99,6 +101,24 @@ const prepareMetaTemplateText = (value = '') => {
 };
 
 class TemplateController {
+  async uploadTemplateImage(req, res) {
+    try {
+      if (!req.file) return res.status(400).json({ success: false, error: 'Template image file is required.' });
+      const result = await whatsappService.uploadTemplateImage(req.file, req.whatsappCredentials);
+      if (!result.success) return res.status(400).json(result);
+      const folder = resolveCompanyFolders({
+        companyId: req.companyId || req.user?.companyId,
+        companyName: req.user?.companyName || '',
+        companySlug: req.user?.companySlug || '',
+        cloudinaryFolderRoot: req.user?.cloudinaryFolderRoot || ''
+      }).metaTemplateImagesFolder;
+      const mediaUrl = await uploadCampaignCreative(req.file, { folder, resourceType: 'image' });
+      return res.json({ success: true, data: { ...result.data, mediaUrl } });
+    } catch (error) {
+      return res.status(error.status || 500).json({ success: false, error: error.message });
+    }
+  }
+
     // Helper function to extract variables from template text
   extractVariables(text) {
         if (!text) return [];
@@ -190,7 +210,8 @@ class TemplateController {
           header: {
             type: headerComponent ? (headerComponent.format || 'text').toLowerCase() : 'text',
             text: headerComponent?.text || '',
-            mediaUrl: headerComponent?.format === 'IMAGE' ? (headerComponent.example?.header_handle?.[0] || '') : ''
+            mediaUrl: content?.header?.mediaUrl || '',
+            mediaHandle: headerComponent?.format === 'IMAGE' ? (headerComponent.example?.header_handle?.[0] || '') : ''
           },
           body: bodyText,
           footer: footerComponent?.text || '',
@@ -202,10 +223,14 @@ class TemplateController {
         templateContent.buttons = normalizeTemplateButtons(templateContent.buttons);
       }
 
-      if (templateContent?.header && templateContent.header.type === 'image' && !templateContent.header.mediaUrl) {
+      const imageHeader = Array.isArray(components)
+        ? components.find(component => String(component?.type).toUpperCase() === 'HEADER' && String(component?.format).toUpperCase() === 'IMAGE')
+        : null;
+      const imageHandle = imageHeader?.example?.header_handle?.[0] || templateContent?.header?.mediaHandle;
+      if (templateContent?.header?.type === 'image' && !/^\d+:.+/.test(String(imageHandle || ''))) {
         return res.status(400).json({
           success: false,
-          error: 'Header image URL is required when header type is image'
+          error: 'Upload a JPEG or PNG image first and use the returned Meta headerHandle for the image header.'
         });
       }
 
@@ -276,7 +301,9 @@ class TemplateController {
             })
             .filter(Boolean)
         : [
-            ...(templateContent?.header?.text
+            ...(templateContent?.header?.type === 'image'
+              ? [{ type: 'HEADER', format: 'IMAGE', example: { header_handle: [imageHandle] } }]
+              : templateContent?.header?.text
               ? [{
                   type: 'HEADER',
                   format: 'TEXT',
