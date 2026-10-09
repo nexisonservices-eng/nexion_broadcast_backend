@@ -4,6 +4,7 @@ const whatsappService = require('../services/whatsappService');
 const { getWhatsAppCredentialsForUser } = require('../services/userWhatsAppCredentialsService');
 const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
 const { resolveCompanyFolders } = require('../services/cloudinaryCompanyFolders');
+const { normalizeTemplateMediaHandle } = require('../utils/templateMediaHandle');
 
 const normalizeTemplateLookupValue = (value = '') => String(value || '').trim().toLowerCase();
 
@@ -226,14 +227,17 @@ class TemplateController {
       const imageHeader = Array.isArray(components)
         ? components.find(component => String(component?.type).toUpperCase() === 'HEADER' && String(component?.format).toUpperCase() === 'IMAGE')
         : null;
-      const imageHandle = imageHeader?.example?.header_handle?.[0] || templateContent?.header?.mediaHandle;
-      if (templateContent?.header?.type === 'image' && !/^\d+:.+/.test(String(imageHandle || ''))) {
+      const imageHandle = normalizeTemplateMediaHandle(imageHeader?.example?.header_handle || templateContent?.header?.mediaHandle);
+      if (templateContent?.header?.type === 'image' && !imageHandle) {
         return res.status(400).json({
           success: false,
           error: 'Upload a JPEG or PNG image first and use the returned Meta headerHandle for the image header.'
         });
       }
 
+      if (templateContent?.header?.type === 'image') {
+        templateContent.header.mediaHandle = imageHandle;
+      }
       const preparedBody = prepareMetaTemplateText(templateContent?.body || bodyText);
       const bodyForVariables = preparedBody.text;
       const variables = this.extractVariables(bodyForVariables).map((variable, index) => ({
@@ -280,6 +284,7 @@ class TemplateController {
                   ...component,
                   type: 'HEADER',
                   ...(headerFormat ? { format: headerFormat } : {}),
+                  ...(headerFormat === 'IMAGE' ? { example: { header_handle: [imageHandle] } } : {}),
                   ...(headerFormat === 'TEXT'
                     ? { text: String(component?.text || '').trim() }
                     : {})
@@ -335,7 +340,7 @@ class TemplateController {
         name: normalizedName
       };
 
-      const existingTemplate = await Template.findOne(templateScopeFilter);
+      const existingTemplate = req.templateToRetry || await Template.findOne(templateScopeFilter);
       let template;
 
       if (existingTemplate) {
@@ -397,7 +402,8 @@ class TemplateController {
       // Preserve failed submissions locally, but mark them explicitly so they do
       // not remain indefinitely as pending records without a Meta template ID.
       const savedTemplate = await Template.findOneAndUpdate(
-        { userId: req.user.id, companyId: req.companyId, name: normalizedName },
+        { userId: req.user.id, companyId: req.companyId,
+          ...(req.templateToRetry ? { _id: req.templateToRetry._id } : { name: normalizedName }) },
         {
           ...templateData,
           whatsappTemplateId: metaTemplateId || null
@@ -461,6 +467,33 @@ class TemplateController {
   async updateTemplate(req, res) {
     try {
       const updateData = { ...req.body };
+      const existingTemplate = await Template.findOne({
+        _id: req.params.id, userId: req.user.id, companyId: req.companyId
+      });
+      if (!existingTemplate) {
+        return res.status(404).json({ success: false, error: 'Template not found' });
+      }
+      // Failed/draft local templates have never reached Meta; submit their correction.
+      if (!existingTemplate.whatsappTemplateId && ['failed', 'draft'].includes(existingTemplate.status)) {
+        if (!req.whatsappCredentials) {
+          req.whatsappCredentials = await getWhatsAppCredentialsForUser({
+            authHeader: req.headers?.authorization || '', userId: req.user.id
+          });
+        }
+        if (!req.whatsappCredentials) {
+          return res.status(400).json({ success: false, error: 'Connect WhatsApp before resubmitting this template.' });
+        }
+        req.templateToRetry = existingTemplate;
+        req.body = {
+          name: existingTemplate.name,
+          category: existingTemplate.category,
+          language: existingTemplate.language,
+          type: existingTemplate.type,
+          content: existingTemplate.content,
+          ...updateData
+        };
+        return await this.createTemplate(req, res);
+      }
       if (updateData.content && typeof updateData.content === 'object') {
         updateData.content = {
           ...updateData.content,

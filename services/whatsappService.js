@@ -1,5 +1,6 @@
 ﻿const axios = require('axios');
 const FormData = require('form-data');
+const { normalizeTemplateMediaHandle } = require('../utils/templateMediaHandle');
 const { isDebugLoggingEnabled } = require('../utils/securityConfig');
 const META_REQUEST_TIMEOUT_MS = Number(process.env.WHATSAPP_META_REQUEST_TIMEOUT_MS || 12000);
 const debugLog = (...args) => {
@@ -920,8 +921,9 @@ class WhatsAppService {
         timeout: META_REQUEST_TIMEOUT_MS,
         maxBodyLength: 5 * 1024 * 1024
       });
-      if (!uploaded.data?.h) throw new Error('Meta did not return an uploaded image handle.');
-      return { success: true, data: { headerHandle: uploaded.data.h } };
+      const headerHandle = normalizeTemplateMediaHandle(uploaded.data?.h);
+      if (!headerHandle) throw new Error('Meta did not return a valid uploaded image handle.');
+      return { success: true, data: { headerHandle } };
     } catch (error) {
       return {
         success: false,
