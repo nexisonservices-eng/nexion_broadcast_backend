@@ -1027,6 +1027,16 @@ class WhatsAppService {
 
       return { success: true, data: response.data };
     } catch (error) {
+      const metaError = error.response?.data?.error;
+      // Deletion is complete when Meta confirms that the template is already absent.
+      // Do not hide other invalid-parameter, authentication, or permission failures.
+      if (
+        Number(error.response?.status) === 400 &&
+        Number(metaError?.code) === 100 &&
+        Number(metaError?.error_subcode) === 2593002
+      ) {
+        return { success: true, alreadyDeleted: true };
+      }
       return {
         success: false,
         error: [...new Set([

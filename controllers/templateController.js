@@ -579,7 +579,12 @@ class TemplateController {
       }
 
       await Template.deleteOne({ _id: template._id });
-      return res.json({ success: true, message: 'Template deleted from Meta and local database' });
+      return res.json({
+        success: true,
+        message: metaDeleteResult.alreadyDeleted
+          ? 'Template was already absent from Meta; local template deleted successfully'
+          : 'Template deleted from Meta and local database'
+      });
     } catch (error) {
       console.error('[TEMPLATE_DELETE] Unexpected deletion error:', error);
       if (error?.name === 'CastError') {
@@ -617,7 +622,9 @@ class TemplateController {
 
       res.json({
         success: true,
-        message: 'Template deleted from Meta and local database',
+        message: metaDeleteResult.alreadyDeleted
+          ? 'Template was already absent from Meta; local templates deleted successfully'
+          : 'Template deleted from Meta and local database',
         deletedLocalCount: localDeleteResult.deletedCount || 0
       });
     } catch (error) {
