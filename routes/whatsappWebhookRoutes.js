@@ -922,12 +922,14 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         serviceWindowClosesAt: serviceWindowClosesAt.toISOString()
       });
 
-      const incomingScoreResult = await applyIncomingMessageScore({
-        messageId: message._id,
-        userId,
-        companyId,
-        text: scoringText
-      });
+      let incomingScoreResult = null;
+      try {
+        incomingScoreResult = await applyIncomingMessageScore({
+          messageId: message._id, userId, companyId, text: scoringText
+        });
+      } catch (scoreError) {
+        console.error('[WhatsAppInbound] Lead scoring failed; continuing inbox delivery:', scoreError);
+      }
 
       if (incomingScoreResult?.contact) {
         emitRealtimeEvent(userId, {
@@ -949,80 +951,85 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         });
       }
 
-      const broadcast = await Broadcast.findOne({
-        ...(companyId ? { companyId } : { createdById: userId }),
-        'recipients.phone': { $in: phoneCandidates },
-        status: { $in: ['sending', 'completed'] },
-        startedAt: { $exists: true, $lte: inboundActivityAt }
-      }).sort({ startedAt: -1 });
+      try {
+        const broadcast = await Broadcast.findOne({
+          ...(companyId ? { companyId } : { createdById: userId }),
+          'recipients.phone': { $in: phoneCandidates },
+          status: { $in: ['sending', 'completed', 'completed_with_errors'] },
+          startedAt: { $exists: true, $lte: inboundActivityAt }
+        }).sort({ startedAt: -1 });
 
-      if (broadcast) {
-        const broadcastCreatorId = String(broadcast.createdById || '').trim();
-        const creatorRole = String(broadcast.createdByWorkspaceRole || '').trim().toLowerCase();
-        const broadcastOwnerId = ['agent', 'user'].includes(creatorRole)
-          ? broadcast.createdById
-          : null;
-        const previousReplies = await Message.countDocuments({
-          conversationId: conversation._id,
-          sender: 'contact',
-          timestamp: {
-            $gte: broadcast.startedAt,
-            $lte: new Date()
-          }
-        });
-
-        if (previousReplies === 1) {
-          await Broadcast.updateOne(
-            { _id: broadcast._id },
-            { $inc: { 'stats.replied': 1 } }
-          );
-
-          const updatedBroadcast = await Broadcast.findById(broadcast._id);
-
-          const statsUpdate = {
-            type: 'broadcast_stats_updated',
-            broadcastId: broadcast._id.toString(),
-            stats: {
-              ...updatedBroadcast.stats,
-              repliedPercentage: updatedBroadcast.repliedPercentage,
-              repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal
+        if (broadcast) {
+          const broadcastCreatorId = String(broadcast.createdById || '').trim();
+          const creatorRole = String(broadcast.createdByWorkspaceRole || '').trim().toLowerCase();
+          const broadcastOwnerId = ['agent', 'user'].includes(creatorRole)
+            ? broadcast.createdById
+            : null;
+          const previousReplies = await Message.countDocuments({
+            conversationId: conversation._id,
+            sender: 'contact',
+            timestamp: {
+              $gte: broadcast.startedAt,
+              $lte: new Date()
             }
-          };
-          emitRealtimeEvent(userId, statsUpdate);
-          if (broadcastCreatorId && broadcastCreatorId !== String(userId)) {
-            emitRealtimeEvent(broadcastCreatorId, statsUpdate);
+          });
+
+          if (previousReplies === 1) {
+            await Broadcast.updateOne(
+              { _id: broadcast._id },
+              { $inc: { 'stats.replied': 1 } }
+            );
+
+            const updatedBroadcast = await Broadcast.findById(broadcast._id);
+
+            const statsUpdate = {
+              type: 'broadcast_stats_updated',
+              broadcastId: broadcast._id.toString(),
+              stats: {
+                ...updatedBroadcast.stats,
+                repliedPercentage: updatedBroadcast.repliedPercentage,
+                repliedPercentageOfTotal: updatedBroadcast.repliedPercentageOfTotal
+              }
+            };
+            emitRealtimeEvent(userId, statsUpdate);
+            if (broadcastCreatorId && broadcastCreatorId !== String(userId)) {
+              emitRealtimeEvent(broadcastCreatorId, statsUpdate);
+            }
+
+            console.log(
+              `Updated replied count for broadcast "${broadcast.name}": ${updatedBroadcast.stats.replied} (${updatedBroadcast.repliedPercentage}% of sent)`
+            );
           }
 
-          console.log(
-            `Updated replied count for broadcast "${broadcast.name}": ${updatedBroadcast.stats.replied} (${updatedBroadcast.repliedPercentage}% of sent)`
-          );
+          let conversationChanged = false;
+          if (String(conversation.channel || '').trim() !== 'broadcast_reply') {
+            conversation.channel = resolveConversationChannel({ broadcast });
+            conversationChanged = true;
+          }
+          if (broadcastCreatorId && String(conversation.createdBy || '') !== broadcastCreatorId) {
+            conversation.createdBy = broadcast.createdById;
+            conversationChanged = true;
+          }
+          if (String(conversation.broadcastOwnerId || '') !== String(broadcastOwnerId || '')) {
+            conversation.broadcastOwnerId = broadcastOwnerId;
+            conversationChanged = true;
+          }
+          if (conversationChanged) {
+            await conversation.save();
+            await syncConversationSummaryFromConversation(conversation);
+            await Promise.all([...new Set([String(userId), broadcastCreatorId].filter(Boolean))].map((participantUserId) =>
+              invalidateInboxConversation({
+                userId: participantUserId,
+                companyId,
+                conversationId: conversation._id
+              })
+            ));
+          }
+
         }
 
-        let conversationChanged = false;
-        if (String(conversation.channel || '').trim() !== 'broadcast_reply') {
-          conversation.channel = resolveConversationChannel({ broadcast });
-          conversationChanged = true;
-        }
-        if (broadcastCreatorId && String(conversation.createdBy || '') !== broadcastCreatorId) {
-          conversation.createdBy = broadcast.createdById;
-          conversationChanged = true;
-        }
-        if (String(conversation.broadcastOwnerId || '') !== String(broadcastOwnerId || '')) {
-          conversation.broadcastOwnerId = broadcastOwnerId;
-          conversationChanged = true;
-        }
-        if (conversationChanged) {
-          await conversation.save();
-          await syncConversationSummaryFromConversation(conversation);
-          await Promise.all([...new Set([String(userId), broadcastCreatorId].filter(Boolean))].map((participantUserId) =>
-            invalidateInboxConversation({
-              userId: participantUserId,
-              companyId,
-              conversationId: conversation._id
-            })
-          ));
-        }
-
+      } catch (broadcastError) {
+        console.error('[WhatsAppInbound] Broadcast reply attribution failed; continuing inbox delivery:', broadcastError);
       }
 
       const inboundMessageEvent = {
@@ -1032,6 +1039,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         message: message.toObject()
       };
       const eventRecipients = new Set([
+        ...collectConversationParticipantUserIds(conversation, userId).map(String),
         String(userId || '').trim(),
         String(conversation?.broadcastOwnerId || '').trim(),
         String(conversation?.createdBy || '').trim()
@@ -1114,6 +1122,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         }
       }
 
+      const oldStatus = message.status;
+      const nextStatus = chooseMonotonicStatus(oldStatus, status);
       const matchedBroadcastId =
         String(message?.broadcastId || '').trim() ||
         (await resolveBroadcastIdForStatusMessage(message));
@@ -1164,8 +1174,6 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         });
       }
 
-      const oldStatus = message.status;
-      const nextStatus = chooseMonotonicStatus(oldStatus, status);
       const statusAt = normalizeStatusTimestamp(statusData.timestamp);
       const updateData = {
         status: nextStatus,
@@ -1332,9 +1340,11 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         conversationId: updatedMessage.conversationId
       });
 
+      let syncedBroadcast = null;
       if (resolvedBroadcastId) {
         try {
-          await broadcastService.syncBroadcastStats(resolvedBroadcastId);
+          const synced = await broadcastService.syncBroadcastStats(resolvedBroadcastId);
+          if (synced?.success) syncedBroadcast = synced.data;
         } catch (syncError) {
           console.error('Error syncing broadcast stats from webhook:', syncError);
         }
@@ -1352,6 +1362,21 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         previousStatus: oldStatus,
         mediaPipelineRequestId: mediaPipelineRequestId || null
       });
+
+      // The reconciliation already counts this saved status; do not increment it again.
+      if (syncedBroadcast?.stats) {
+        const statsEvent = {
+          type: 'broadcast_stats_updated',
+          broadcastId: resolvedBroadcastId,
+          stats: syncedBroadcast.stats,
+          statusChange: `${oldStatus} -> ${nextStatus}`
+        };
+        const recipients = new Set([
+          String(effectiveUserId || ''),
+          String(syncedBroadcast.broadcast?.createdById || '')
+        ].filter(Boolean));
+        for (const recipientUserId of recipients) emitRealtimeEvent(recipientUserId, statsEvent);
+      }
 
       if (nextStatus === 'read' && oldStatus !== 'read') {
         const readScoreResult = await applyReadScoreForMessage({
@@ -1375,93 +1400,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         }
       }
 
-      if (resolvedBroadcastId && oldStatus !== updatedMessage.status) {
-        try {
-          const broadcast = await Broadcast.findOne({
-            _id: resolvedBroadcastId,
-            createdById: effectiveUserId,
-            companyId: effectiveCompanyId,
-            status: { $in: ['sending', 'completed', 'completed_with_errors', 'failed'] }
-          });
 
-          if (!broadcast) {
-            if (debugEnabled) {
-              console.log('[WhatsApp Status Debug] Broadcast not eligible for increment', {
-                resolvedBroadcastId,
-                effectiveUserId: effectiveUserId || null,
-                effectiveCompanyId: effectiveCompanyId || null,
-                currentMessageStatus: String(updatedMessage.status || '').trim() || null
-              });
-            }
-            return;
-          }
-
-          const newStatus = updatedMessage.status;
-          const update = {};
-
-          if (newStatus === 'delivered' && oldStatus === 'sent') {
-            update['stats.delivered'] = 1;
-          } else if (newStatus === 'read' && oldStatus !== 'read') {
-            update['stats.read'] = 1;
-            if (oldStatus !== 'delivered') {
-              update['stats.delivered'] = 1;
-            }
-          } else if (newStatus === 'failed' && oldStatus !== 'failed') {
-            update['stats.failed'] = 1;
-            if (oldStatus === 'sent') {
-              update['stats.sent'] = -1;
-            }
-          }
-
-          if (Object.keys(update).length > 0) {
-            if (debugEnabled) {
-              console.log('[WhatsApp Status Debug] Applying broadcast stat increment', {
-                broadcastId: String(broadcast._id || ''),
-                oldStatus,
-                newStatus,
-                update
-              });
-            }
-            await Broadcast.updateOne({ _id: broadcast._id }, { $inc: update });
-            const updatedBroadcast = await Broadcast.findById(broadcast._id);
-
-            if (updatedBroadcast) {
-              let clamped = false;
-              ['sent', 'delivered', 'read', 'failed', 'replied'].forEach((k) => {
-                if ((updatedBroadcast.stats?.[k] || 0) < 0) {
-                  updatedBroadcast.stats[k] = 0;
-                  clamped = true;
-                }
-              });
-              if (clamped) {
-                await updatedBroadcast.save();
-              }
-
-              emitRealtimeEvent(effectiveUserId, {
-                type: 'broadcast_stats_updated',
-                broadcastId: broadcast._id.toString(),
-                stats: updatedBroadcast.stats,
-                statusChange: `${oldStatus} -> ${newStatus}`
-              });
-              if (debugEnabled) {
-                console.log('[WhatsApp Status Debug] Broadcast stats updated', {
-                  broadcastId: String(updatedBroadcast._id || ''),
-                  stats: updatedBroadcast.stats,
-                  statusChange: `${oldStatus} -> ${newStatus}`
-                });
-              }
-            }
-          } else if (debugEnabled) {
-            console.log('[WhatsApp Status Debug] No stat increment required', {
-              broadcastId: String(broadcast._id || ''),
-              oldStatus,
-              newStatus
-            });
-          }
-        } catch (broadcastError) {
-          console.error('Error updating broadcast stats:', broadcastError);
-        }
-      }
     } catch (error) {
       console.error('Error handling message status:', error);
     }
@@ -1510,12 +1449,20 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
 
         for (const messageData of messageList) {
           if (messageData && userId && companyId) {
-            await handleIncomingMessage(messageData, value, userId, companyId);
-            console.info('[WhatsAppWebhook] Inbound message processed', {
-              messageId: String(messageData.id || ''),
-              userId: String(userId),
-              companyId: String(companyId)
-            });
+            try {
+              await handleIncomingMessage(messageData, value, userId, companyId);
+              console.info('[WhatsAppWebhook] Inbound message processed', {
+                messageId: String(messageData.id || ''),
+                userId: String(userId),
+                companyId: String(companyId)
+              });
+            } catch (error) {
+              console.error('[WhatsAppWebhook] Inbound message failed', {
+                messageId: String(messageData.id || ''),
+                userId: String(userId), companyId: String(companyId),
+                error: error?.message || String(error)
+              });
+            }
           }
         }
 
@@ -1566,6 +1513,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       console.error('Webhook error (async):', error);
     });
   });
+  return { processWebhookPayload };
 };
 
 module.exports = {
