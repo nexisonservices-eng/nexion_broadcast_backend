@@ -1473,7 +1473,18 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
     }
   };
 
+  const logWebhookArrival = (req, path) => {
+    console.info('[WhatsAppWebhook] POST received', {
+      path,
+      object: String(req.body?.object || ''),
+      entries: Array.isArray(req.body?.entry) ? req.body.entry.length : 0,
+      signaturePresent: Boolean(req.headers?.['x-hub-signature-256']),
+      rawBodyAvailable: Boolean(req.rawBody)
+    });
+  };
+
   app.post('/webhooks/whatsapp', async (req, res) => {
+    logWebhookArrival(req, '/webhooks/whatsapp');
     const { secret, source } = await resolveWebhookAppSecret(req);
     if (!verifyMetaSignature(req, secret)) {
       console.warn('[WhatsAppWebhook] POST rejected: invalid Meta signature', {
@@ -1496,6 +1507,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
   });
 
   app.post('/webhook', (req, res) => {
+    logWebhookArrival(req, '/webhook');
     const data = req.body;
 
     console.log('Webhook received:', {
