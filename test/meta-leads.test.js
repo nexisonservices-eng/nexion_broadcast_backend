@@ -16,6 +16,7 @@ const load = (file, dependencies) => {
 
 const service = (request) => load('services/metaAdsService.js', {
   axios: request,
+  './metaAdCreation': require('../services/metaAdCreation'),
   '../config/metaAdsConfig': { getMetaAdsConfig: () => ({ apiVersion: 'v23.0' }) },
   './metaAuthService': {
     GRAPH_BASE_URL: 'https://graph.facebook.com',

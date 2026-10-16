@@ -527,14 +527,14 @@ const setMetaRateLimitState = ({ tokenKey, error, requestKey }) => {
   console.warn(
     '[Meta API Rate Limit]',
     JSON.stringify({
-      tokenKey: tokenKey ? `${tokenKey.slice(0, 12)}...` : '',
+      hasToken: Boolean(tokenKey),
       blockedUntil: blockedUntil.toISOString(),
       retryAfterMs: retryAfterMs || null,
       backoffMs,
       retryCount,
       code: rateLimitError.code,
       errorSubcode: rateLimitError.errorSubcode,
-      requestKey: requestKey ? requestKey.slice(0, 120) : ''
+      hasRequestKey: Boolean(requestKey)
     })
   );
 
@@ -594,7 +594,9 @@ const graphRequest = async ({
   headers,
   accessToken: overrideToken,
   apiVersion: overrideApiVersion,
-  returnResponse = false
+  returnResponse = false,
+  bypassCache = false,
+  timeout
 }) => {
   const { apiVersion } = getEnvConfig();
   const resolvedAccessToken = String(overrideToken || '').trim();
@@ -619,7 +621,7 @@ const graphRequest = async ({
     apiVersion: resolvedApiVersion
   });
   const tokenKey = getMetaTokenKey({ accessToken: resolvedAccessToken, apiVersion: resolvedApiVersion });
-  const cacheable = requestMethod === 'GET';
+  const cacheable = requestMethod === 'GET' && !bypassCache;
   const cachedResponse = cacheable ? getCachedMetaGraphResponse(requestKey) : null;
   const blockedState = getMetaRateLimitState(tokenKey);
   const blockedUntil = blockedState?.blockedUntil ? new Date(blockedState.blockedUntil) : null;
@@ -630,7 +632,7 @@ const graphRequest = async ({
     logMetaGraphEvent('cache-hit', {
       method: requestMethod,
       path: normalizedPath,
-      tokenKey: tokenKey ? `${tokenKey.slice(0, 12)}...` : ''
+      hasToken: Boolean(tokenKey)
     });
     return returnResponse ? cachedResponse : cachedResponse.data;
   }
@@ -640,7 +642,7 @@ const graphRequest = async ({
     logMetaGraphEvent('cooldown-skip', {
       method: requestMethod,
       path: normalizedPath,
-      tokenKey: tokenKey ? `${tokenKey.slice(0, 12)}...` : '',
+      hasToken: Boolean(tokenKey),
       blockedUntil: blockedUntil?.toISOString() || null
     });
 
@@ -655,7 +657,7 @@ const graphRequest = async ({
         code: blockedState?.code || 17,
         errorSubcode: blockedState?.errorSubcode || 2446079,
         blockedUntil: blockedUntil?.toISOString() || null,
-        requestKey: requestKey.slice(0, 120)
+        endpoint: normalizedPath
       },
       429
     );
@@ -668,14 +670,15 @@ const graphRequest = async ({
     throw blockedError;
   }
 
-  if (metaGraphRequestInflight.has(requestKey)) {
+  if (!bypassCache && metaGraphRequestInflight.has(requestKey)) {
     metaGraphRequestStats.duplicateSkips += 1;
     logMetaGraphEvent('duplicate-skip', {
       method: requestMethod,
       path: normalizedPath,
-      tokenKey: tokenKey ? `${tokenKey.slice(0, 12)}...` : ''
+      hasToken: Boolean(tokenKey)
     });
-    return metaGraphRequestInflight.get(requestKey);
+    const response = await metaGraphRequestInflight.get(requestKey);
+    return returnResponse ? cloneMetaResponse(response) : cloneMetaValue(response.data);
   }
 
   const url = `${GRAPH_BASE_URL}/${resolvedApiVersion}/${normalizedPath}`;
@@ -687,7 +690,8 @@ const graphRequest = async ({
       ...(params || {})
     },
     data,
-    headers
+    headers,
+    timeout
   };
 
   const requestPromise = enqueueMetaGraphRequest(async () => {
@@ -703,10 +707,10 @@ const graphRequest = async ({
           logMetaGraphEvent('cache-hit-stale', {
             method: requestMethod,
             path: normalizedPath,
-            tokenKey: tokenKey ? `${tokenKey.slice(0, 12)}...` : '',
+            hasToken: Boolean(tokenKey),
             blockedUntil: currentBlockedUntil.toISOString()
           });
-          return returnResponse ? staleCachedResponse : staleCachedResponse.data;
+          return staleCachedResponse;
         }
       }
 
@@ -717,7 +721,7 @@ const graphRequest = async ({
           code: currentBlockedState?.code || 17,
           errorSubcode: currentBlockedState?.errorSubcode || 2446079,
           blockedUntil: currentBlockedUntil?.toISOString() || null,
-          requestKey: requestKey.slice(0, 120)
+          endpoint: normalizedPath
         },
         429
       );
@@ -770,7 +774,7 @@ const graphRequest = async ({
         status: response?.status || null
       });
 
-      return returnResponse ? cloneMetaResponse(response) : cloneMetaValue(response.data);
+      return cloneMetaResponse(response);
     } catch (error) {
       const metaRateLimited = isMetaRateLimitError(error);
       const errorInfo = normalizeMetaRateLimitError(error);
@@ -779,9 +783,10 @@ const graphRequest = async ({
         JSON.stringify({
           method: requestMethod,
           path: normalizedPath,
-          message: errorInfo.message || error?.message || 'Meta API request failed',
           status: error?.response?.status || null,
-          details: error?.response?.data || null
+          responseType: Array.isArray(error?.response?.data) ? 'array' : typeof error?.response?.data,
+          metaErrorCode: errorInfo.code || null,
+          metaErrorSubcode: errorInfo.errorSubcode || null
         })
       );
 
@@ -801,7 +806,7 @@ const graphRequest = async ({
               path: normalizedPath,
               blockedUntil: rateLimitState?.blockedUntil?.toISOString() || null
             });
-            return returnResponse ? staleCachedResponse : staleCachedResponse.data;
+            return staleCachedResponse;
           }
         }
 
@@ -813,7 +818,7 @@ const graphRequest = async ({
             errorSubcode: errorInfo.errorSubcode || 2446079,
             retryAfterMs: errorInfo.retryAfterMs,
             blockedUntil: rateLimitState?.blockedUntil?.toISOString() || null,
-            requestKey: requestKey.slice(0, 120)
+            endpoint: normalizedPath
           },
           429
         );
@@ -829,12 +834,13 @@ const graphRequest = async ({
 
       throw error;
     } finally {
-      metaGraphRequestInflight.delete(requestKey);
+      if (!bypassCache) metaGraphRequestInflight.delete(requestKey);
     }
   });
 
-  metaGraphRequestInflight.set(requestKey, requestPromise);
-  return requestPromise;
+  if (!bypassCache) metaGraphRequestInflight.set(requestKey, requestPromise);
+  const response = await requestPromise;
+  return returnResponse ? cloneMetaResponse(response) : cloneMetaValue(response.data);
 };
 
 const normalizePreviewPlacements = (placements = []) => {
@@ -947,12 +953,7 @@ const logMetaApiRequest = ({
       stage: String(stage || '').trim(),
       endpoint: String(endpoint || '').trim(),
       normalizedAdAccountId: normalizeAdAccountId(adAccountId),
-      requestPayload: payload || null,
-      httpStatus: response?.status ?? error?.response?.status ?? null,
-      metaResponse: response?.data ?? null,
-      metaErrorCode: metaError.code,
-      metaErrorSubcode: metaError.error_subcode,
-      metaErrorMessage: metaError.message,
+      ...require('./metaAdCreation').diagnostic(response, error),
       fbtrace_id: metaError.fbtrace_id
     })
   );
@@ -3109,80 +3110,9 @@ const normalizeMetaScheduleTime = (value, boundary = 'start') => {
   return date.toISOString();
 };
 
-const resolveAdIdFromCreation = async ({
-  createdAd,
-  createdAdSetId,
-  createdCreativeId,
-  effectiveAdAccountId,
-  resolvedAccessToken,
-  campaignName
-}) => {
-  const directId =
-    String(
-      createdAd?.id ||
-      createdAd?.ad_id ||
-      createdAd?.data?.id ||
-      createdAd?.result?.id ||
-      ''
-    ).trim();
-
-  if (directId) {
-    return directId;
-  }
-
-  const adName = `${campaignName} - Ad`;
-  for (const waitMs of [0, 800, 1500, 2500, 4000]) {
-    if (waitMs > 0) {
-      await delay(waitMs);
-    }
-
-    const lookupCandidates = [];
-
-    try {
-      const adSetAdsResponse = await graphRequest({
-        path: `${String(createdAdSetId).trim()}/ads`,
-        params: {
-          fields: 'id,name,creative{id},adset{id}',
-          limit: 50
-        },
-        accessToken: resolvedAccessToken
-      });
-
-      lookupCandidates.push(...(Array.isArray(adSetAdsResponse?.data) ? adSetAdsResponse.data : []));
-    } catch (error) {
-      console.warn('[Meta Ads] Unable to resolve ad id from ad set lookup:', extractApiErrorMessage(error));
-    }
-
-    if (!lookupCandidates.length) {
-      try {
-        const accountAdsResponse = await graphRequest({
-          path: buildAdAccountPath(effectiveAdAccountId, 'ads'),
-          params: {
-            fields: 'id,name,adset{id},creative{id}',
-            limit: 100
-          },
-          accessToken: resolvedAccessToken
-        });
-
-        lookupCandidates.push(...(Array.isArray(accountAdsResponse?.data) ? accountAdsResponse.data : []));
-      } catch (error) {
-        console.warn('[Meta Ads] Unable to resolve ad id from ad account lookup:', extractApiErrorMessage(error));
-      }
-    }
-
-    const matchedAd =
-      lookupCandidates.find((item) => String(item?.creative?.id || '') === String(createdCreativeId || '')) ||
-      lookupCandidates.find((item) => String(item?.name || '').trim() === adName) ||
-      lookupCandidates.find((item) => String(item?.adset?.id || item?.adset_id || '') === String(createdAdSetId || ''));
-
-    const resolvedId = String(matchedAd?.id || '').trim();
-    if (resolvedId) {
-      return resolvedId;
-    }
-  }
-
-  return '';
-};
+const adCreation = require('./metaAdCreation').createAdCreation({
+  graphRequest, buildAdAccountPath, buildStageError, buildStageErrorWithDetails
+});
 
 const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken }) => {
   const env = getEnvConfig();
@@ -3206,6 +3136,16 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken
       mediaHash: creativeUpload?.mediaHash || `mock_${now}`,
       videoId: creativeUpload?.videoId || ''
     };
+  }
+
+  if (campaign?.meta?.campaignId) {
+    const adId = await adCreation.create({
+      partialData: { metaCampaignId: campaign.meta.campaignId, metaAdSetId: campaign.meta.adSetId,
+        metaCreativeId: campaign.meta.creativeId },
+      effectiveAdAccountId: campaign.meta.adAccountId || effectiveAdAccountId,
+      resolvedAccessToken, reconciliationOnly: true
+    });
+    return { apiMode: 'live', ...campaign.meta, adId };
   }
 
   if (!effectiveAdAccountId) {
@@ -3308,7 +3248,6 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken
       },
       accessToken: resolvedAccessToken
     });
-    console.log('Meta API response:', createdCampaign);
   } catch (error) {
     throw buildStageError('Campaign creation', error);
   }
@@ -3383,10 +3322,6 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken
     for (let index = 0; index < adSetPayloadVariants.length; index += 1) {
       const variant = adSetPayloadVariants[index];
       try {
-        console.log(
-          `[Meta Ads] Ad set variant ${index + 1}/${adSetPayloadVariants.length} for campaign "${campaign.campaignName}":`,
-          JSON.stringify(variant)
-        );
         createdAdSet = await graphRequest({
           method: 'POST',
           path: buildAdAccountPath(effectiveAdAccountId, 'adsets'),
@@ -3413,7 +3348,7 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken
         });
         console.error(
           `[Meta Ads] Ad set variant ${index + 1} failed:`,
-          JSON.stringify(variantFailures[variantFailures.length - 1])
+          require('./metaAdCreation').diagnostic(error?.response, error)
         );
       }
     }
@@ -3461,45 +3396,23 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken
     throw buildStageError('Creative creation', error);
   }
 
-  let createdAd;
-  try {
-    createdAd = await graphRequest({
-      method: 'POST',
-      path: buildAdAccountPath(effectiveAdAccountId, 'ads'),
-      data: {
-        name: `${campaign.campaignName} - Ad`,
-        adset_id: createdAdSet.id,
-        creative: { creative_id: createdCreative.id },
-        status: campaign.status === 'ACTIVE' ? 'ACTIVE' : 'PAUSED'
-      },
-      accessToken: resolvedAccessToken
-    });
-  } catch (error) {
-    throw buildStageError('Ad creation', error);
-  }
-
-  const resolvedAdId = await resolveAdIdFromCreation({
-    createdAd,
-    createdAdSetId: createdAdSet.id,
-    createdCreativeId: createdCreative.id,
-    effectiveAdAccountId,
-    resolvedAccessToken,
-    campaignName: campaign.campaignName
+  const partialData = {
+    metaCampaignId: createdCampaign.id, metaAdSetId: createdAdSet.id, metaCreativeId: createdCreative.id
+  };
+  const resolvedAdId = await adCreation.create({
+    partialData, effectiveAdAccountId, resolvedAccessToken,
+    payload: {
+      name: campaign.campaignName + ' - Ad', adset_id: createdAdSet.id,
+      creative: { creative_id: createdCreative.id }, status: initialDeliveryStatus
+    },
+    onPending: campaign?._id ? async () => {
+      const saved = await MetaAdCampaign.findByIdAndUpdate(campaign._id, { $set: {
+        'meta.campaignId': createdCampaign.id, 'meta.adSetId': createdAdSet.id,
+        'meta.creativeId': createdCreative.id, 'meta.adAccountId': effectiveAdAccountId
+      } });
+      if (!saved) throw new Error('Local campaign no longer exists; ad creation was stopped.');
+    } : undefined
   });
-
-  if (!resolvedAdId) {
-    throw buildStageErrorWithDetails(
-      'Ad creation',
-      'Meta ad was created but its id could not be resolved from the API response.',
-      {
-        createdAd,
-        adSetId: createdAdSet.id,
-        creativeId: createdCreative.id,
-        adAccountId: effectiveAdAccountId
-      },
-      400
-    );
-  }
 
   return {
     apiMode: 'live',
@@ -3829,6 +3742,8 @@ const createMetaAdStackFromCrud = async ({
   videoFileName,
   status,
   onCampaignCreated,
+  onAdCreationPending,
+  resumePartialData,
   logMetaRequest
 }) => {
   const env = getEnvConfig();
@@ -3862,6 +3777,16 @@ const createMetaAdStackFromCrud = async ({
       { userId: userId || '' },
       400
     );
+  }
+
+  if (resumePartialData?.metaCampaignId) {
+    const savedAccountId = resumePartialData.adAccountId || resolvedAdAccountId;
+    const adId = await adCreation.create({ partialData: resumePartialData,
+      effectiveAdAccountId: savedAccountId, resolvedAccessToken, reconciliationOnly: true });
+    return { apiMode: 'live', adAccountId: savedAccountId, campaignId: resumePartialData.metaCampaignId,
+      adSetId: resumePartialData.metaAdSetId, creativeId: resumePartialData.metaCreativeId, adId,
+      campaignStatus: resumePartialData.campaignStatus || normalizedStatus,
+      adSetStatus: resumePartialData.adSetStatus || normalizedStatus, adStatus: normalizedStatus };
   }
 
   const normalizedMediaType = String(mediaType || '').trim().toLowerCase() === 'video' ? 'video' : 'image';
@@ -4155,53 +4080,12 @@ const createMetaAdStackFromCrud = async ({
     creative: { creative_id: partialData.metaCreativeId },
     status: normalizedStatus
   };
-  const adPath = buildAdAccountPath(resolvedAdAccountId, 'ads');
 
-  let createdAdResponse;
-  try {
-    createdAdResponse = await graphRequest({
-      method: 'POST',
-      path: adPath,
-      data: adPayload,
-      accessToken: resolvedAccessToken,
-      returnResponse: true
-    });
-    logMetaRequest?.({
-      stage: 'ad',
-      endpoint: adPath,
-      adAccountId: resolvedAdAccountId,
-      payload: adPayload,
-      response: createdAdResponse
-    });
-  } catch (error) {
-    logMetaRequest?.({
-      stage: 'ad',
-      endpoint: adPath,
-      adAccountId: resolvedAdAccountId,
-      payload: adPayload,
-      error
-    });
-    const wrappedError = buildStageError('Ad creation', error);
-    wrappedError.partialData = partialData;
-    throw wrappedError;
-  }
-
-  const createdAd = createdAdResponse?.data || {};
-  partialData.metaAdId = String(createdAd.id || '').trim();
-  partialData.adStatus = String(createdAd.status || createdAd.effective_status || normalizedStatus || 'PAUSED')
-    .trim()
-    .toUpperCase() || 'PAUSED';
-
-  if (!partialData.metaAdId) {
-    const wrappedError = buildStageErrorWithDetails(
-      'Ad creation',
-      'Meta ad was created but its id could not be resolved from the API response.',
-      { partialData },
-      400
-    );
-    wrappedError.partialData = partialData;
-    throw wrappedError;
-  }
+  partialData.metaAdId = await adCreation.create({
+    partialData, effectiveAdAccountId: resolvedAdAccountId, resolvedAccessToken,
+    payload: adPayload, onPending: onAdCreationPending
+  });
+  partialData.adStatus = normalizedStatus;
 
   await invalidateMetaCampaignCache({
     accessToken: resolvedAccessToken,

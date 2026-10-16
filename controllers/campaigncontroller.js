@@ -442,6 +442,16 @@ const continueCampaignMetaCreation = async ({
             videoFileBuffer: videoFile?.buffer,
             videoFileName: videoFile?.originalname,
             status: normalizedPayload.status,
+            onAdCreationPending: async (partialData) => {
+                const saved = await Campaign.findByIdAndUpdate(campaignId, { $set: {
+                    metaCampaignId: partialData.metaCampaignId,
+                    metaAdSetId: partialData.metaAdSetId,
+                    metaCreativeId: partialData.metaCreativeId,
+                    adAccountId: partialData.adAccountId,
+                    metaResponse: { reconciliationRequired: true, partialData }
+                } });
+                if (!saved) throw new Error('Local campaign no longer exists; ad creation was stopped.');
+            },
             onCampaignCreated: async (metaCampaignId) => {
                 await Campaign.findByIdAndUpdate(campaignId, { $set: { metaCampaignId } });
             }
@@ -493,11 +503,16 @@ const continueCampaignMetaCreation = async ({
             campaignId,
             {
                 $set: {
+                    ...(metaError.partialData?.metaCampaignId ? { metaCampaignId: metaError.partialData.metaCampaignId } : {}),
+                    ...(metaError.partialData?.metaAdSetId ? { metaAdSetId: metaError.partialData.metaAdSetId } : {}),
+                    ...(metaError.partialData?.metaCreativeId ? { metaCreativeId: metaError.partialData.metaCreativeId } : {}),
                     lifecycleStatus: 'rejected',
                     reviewStatus: 'rejected',
                     deliveryStatus: 'rejected',
                     reviewNotes,
                     metaResponse: {
+                        reconciliationRequired: Boolean(metaError.reconciliationRequired),
+                        partialData: metaError.partialData || null,
                         stage: normalizeMetaStage(metaError.stage),
                         message: metaError?.message || 'Meta campaign creation failed',
                         details: metaError?.details || null,
@@ -1482,6 +1497,9 @@ exports.publishCampaign = async (req, res) => {
     try {
         const campaign = await Campaign.findById(req.params.id);
         if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to publish this campaign')) return;
+        if (campaign.lifecycleStatus === 'publishing') {
+            return res.status(409).json({ success: false, message: 'Campaign publishing is already in progress. Reconcile its outcome before retrying.' });
+        }
 
         const requestMetaAccessToken = String(
             req.body?.metaAccessToken ||
@@ -1515,16 +1533,43 @@ exports.publishCampaign = async (req, res) => {
             });
         }
 
+        const claimed = await Campaign.findOneAndUpdate({
+            _id: campaign._id, lifecycleStatus: { $ne: 'publishing' }
+        }, { $set: { lifecycleStatus: 'publishing', deliveryStatus: 'publishing' } });
+        if (!claimed) {
+            return res.status(409).json({ success: false, message: 'Campaign publishing is already in progress.' });
+        }
         campaign.lifecycleStatus = 'publishing';
         campaign.deliveryStatus = 'publishing';
-        await campaign.save();
 
-        if (!campaign.metaCampaignId) {
+        if (!campaign.metaAdId) {
             let metaCampaign = null;
             try {
+                const partialData = campaign.metaResponse?.partialData || {
+                    metaCampaignId: campaign.metaCampaignId, metaAdSetId: campaign.metaAdSetId,
+                    metaCreativeId: campaign.metaCreativeId, adAccountId: campaign.adAccountId
+                };
+                if (campaign.metaCampaignId && (!partialData.metaAdSetId || !partialData.metaCreativeId)) {
+                    throw Object.assign(new Error('The partial Meta campaign requires reconciliation before publishing.'), {
+                        status: 409, stage: 'Ad creation', reconciliationRequired: true, partialData
+                    });
+                }
                 metaCampaign = await metaAdsService.createMetaAdStackFromCrud({
                     userId: req.user.id,
                     accessToken: requestMetaAccessToken,
+                    adAccountId: campaign.adAccountId,
+                    resumePartialData: partialData,
+                    onCampaignCreated: async (metaCampaignId) => {
+                        campaign.metaCampaignId = metaCampaignId;
+                        await Campaign.findByIdAndUpdate(campaign._id, { $set: { metaCampaignId } });
+                    },
+                    onAdCreationPending: async (pending) => {
+                        campaign.metaCampaignId = pending.metaCampaignId;
+                        campaign.metaAdSetId = pending.metaAdSetId;
+                        campaign.metaCreativeId = pending.metaCreativeId;
+                        campaign.metaResponse = { reconciliationRequired: true, partialData: pending };
+                        await campaign.save();
+                    },
                     campaignName: campaign.name,
                     objective: campaign.objective,
                     dailyBudget: campaign.dailyBudget,
@@ -1551,6 +1596,13 @@ exports.publishCampaign = async (req, res) => {
                     status: 'ACTIVE'
                 });
             } catch (metaError) {
+                const partial = metaError.partialData;
+                if (partial) {
+                    campaign.metaCampaignId = partial.metaCampaignId || campaign.metaCampaignId;
+                    campaign.metaAdSetId = partial.metaAdSetId || campaign.metaAdSetId;
+                    campaign.metaCreativeId = partial.metaCreativeId || campaign.metaCreativeId;
+                    campaign.metaResponse = { reconciliationRequired: Boolean(metaError.reconciliationRequired), partialData: partial };
+                }
                 campaign.lifecycleStatus = 'draft';
                 campaign.deliveryStatus = 'not_published';
                 await campaign.save();
