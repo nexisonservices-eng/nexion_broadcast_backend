@@ -3405,13 +3405,17 @@ const createFullAdStack = async ({ campaign, creativeUpload, userId, accessToken
       name: campaign.campaignName + ' - Ad', adset_id: createdAdSet.id,
       creative: { creative_id: createdCreative.id }, status: initialDeliveryStatus
     },
-    onPending: campaign?._id ? async () => {
-      const saved = await MetaAdCampaign.findByIdAndUpdate(campaign._id, { $set: {
-        'meta.campaignId': createdCampaign.id, 'meta.adSetId': createdAdSet.id,
-        'meta.creativeId': createdCreative.id, 'meta.adAccountId': effectiveAdAccountId
-      } });
-      if (!saved) throw new Error('Local campaign no longer exists; ad creation was stopped.');
-    } : undefined
+    onPending: async () => {
+      if (campaign?._id) {
+        const saved = await MetaAdCampaign.findByIdAndUpdate(campaign._id, { $set: {
+          'meta.campaignId': createdCampaign.id, 'meta.adSetId': createdAdSet.id,
+          'meta.creativeId': createdCreative.id, 'meta.adAccountId': effectiveAdAccountId
+        } });
+        if (!saved) throw new Error('Local campaign no longer exists; ad creation was stopped.');
+      }
+      campaign.meta = { ...campaign.meta, campaignId: createdCampaign.id, adSetId: createdAdSet.id,
+        creativeId: createdCreative.id, adAccountId: effectiveAdAccountId };
+    }
   });
 
   return {

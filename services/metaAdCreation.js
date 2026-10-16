@@ -89,6 +89,8 @@ const createAdCreation = ({ graphRequest, buildAdAccountPath, buildStageError, b
         // occur after creation and must be reconciled without sending another POST.
         if (error.metaRateLimited || (error?.response?.data?.error && error.response.status < 500)) {
           const wrapped = buildStageError('Ad creation', error);
+          wrapped.status = error.status || wrapped.status;
+          wrapped.details = error.details || wrapped.details;
           wrapped.partialData = { ...partialData, adAccountId: effectiveAdAccountId };
           throw wrapped;
         }
