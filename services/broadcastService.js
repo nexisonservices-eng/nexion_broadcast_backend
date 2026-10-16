@@ -1,5 +1,6 @@
 ﻿const Broadcast = require("../models/Broadcast");
 const Message = require("../models/Message");
+const { extractRecipientVariables } = require("../utils/broadcastRecipientVariables");
 const { preserveBroadcastCreator } = require('../utils/broadcastCreator');
 const Conversation = require("../models/Conversation");
 const Contact = require("../models/Contact");
@@ -271,9 +272,7 @@ class BroadcastService {
         String(rawRecipient?.sourceType || "").trim() ||
         String(rawRecipient?.type || "").trim() ||
         "imported",
-      variables: Array.isArray(rawRecipient?.variables)
-        ? this.normalizeTemplateVariables(rawRecipient.variables)
-        : [],
+      variables: this.normalizeTemplateVariables(extractRecipientVariables(rawRecipient)),
       attributes:
         rawRecipient?.attributes && typeof rawRecipient.attributes === "object"
           ? rawRecipient.attributes
@@ -2826,8 +2825,14 @@ class BroadcastService {
       const requiredTemplateVariableCount = this.extractTemplateVariableCount(
         broadcast?.templateContent || templatePreviewText || "",
       );
-      const hasAnyRecipientVariables = Array.isArray(broadcast?.recipients)
-        ? broadcast.recipients.some(
+      const recipients = await this.resolveBroadcastAudienceRecipients({
+        broadcast,
+        userId: broadcast.createdById,
+        companyId: broadcast.companyId,
+        recipientSubset,
+      });
+      const hasAnyRecipientVariables = Array.isArray(recipients)
+        ? recipients.some(
             (recipient) =>
               Array.isArray(recipient?.variables) &&
               recipient.variables.length > 0,
@@ -2846,12 +2851,6 @@ class BroadcastService {
         };
       }
 
-      const recipients = await this.resolveBroadcastAudienceRecipients({
-        broadcast,
-        userId: broadcast.createdById,
-        companyId: broadcast.companyId,
-        recipientSubset,
-      });
       for (
         let batchStart = 0;
         batchStart < recipients.length;
