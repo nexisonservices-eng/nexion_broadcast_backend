@@ -45,7 +45,7 @@ const getBridgeConfig = () => {
 
   return {
     enabled: Boolean(baseUrl && apiKey),
-    url: `${baseUrl.replace(/\/+$/, '')}/${trimSlashes(statusPath)}`,
+    url: baseUrl ? `${baseUrl.replace(/\/+$/, '')}/${trimSlashes(statusPath)}` : '',
     apiKey
   };
 };

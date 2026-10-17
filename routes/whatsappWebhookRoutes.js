@@ -1099,7 +1099,14 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       const statusError =
         statusErrorParts.length > 0 ? statusErrorParts.join(' • ') : '';
 
-      await forwardIvrNotificationStatus(statusData);
+      try {
+        await forwardIvrNotificationStatus(statusData);
+      } catch (bridgeError) {
+        console.warn('[WhatsAppWebhook] IVR status forwarding failed; continuing message status update', {
+          messageId,
+          error: bridgeError?.message || String(bridgeError)
+        });
+      }
 
       let message = null;
       if (companyId) {
