@@ -1055,7 +1055,29 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
     }
   };
 
+  const saveStatusProcessingIssue = async (message, issue) => {
+    try {
+      const broadcastId = await resolveBroadcastIdForStatusMessage(message);
+      if (!broadcastId) return;
+      const broadcast = await Broadcast.findById(broadcastId);
+      if (!broadcast) return;
+      if (!issue && !broadcast.statusProcessingIssue) return;
+      await Broadcast.updateOne(
+        { _id: broadcastId },
+        { $set: { statusProcessingIssue: issue } }
+      );
+      for (const recipient of new Set([message?.userId, broadcast.createdById].filter(Boolean).map(String))) {
+        emitRealtimeEvent(recipient, { type: 'broadcast_updated', broadcastId });
+      }
+    } catch (error) {
+      console.error('[WhatsAppWebhook] Could not save status processing diagnostic:', error);
+    }
+  };
+
   const handleMessageStatus = async (statusData, userId, companyId) => {
+    let diagnosticMessage = null;
+    let bridgeIssue = null;
+    let statsSyncFailed = false;
     try {
       const messageId = firstNonEmpty(
         statusData.id,
@@ -1100,8 +1122,22 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         statusErrorParts.length > 0 ? statusErrorParts.join(' • ') : '';
 
       try {
-        await forwardIvrNotificationStatus(statusData);
+        const bridgeResult = await forwardIvrNotificationStatus(statusData);
+        if (bridgeResult?.success === false && !bridgeResult.skipped) {
+          bridgeIssue = {
+            severity: 'warning', code: 'IVR_STATUS_FORWARDING_FAILED',
+            message: 'IVR status forwarding failed. WhatsApp status processing continued. Check the IVR service URL and availability.',
+            receiptStatus: String(statusData.status || '').toLowerCase(), occurredAt: new Date()
+          };
+        }
       } catch (bridgeError) {
+        bridgeIssue = {
+          severity: 'warning',
+          code: 'IVR_STATUS_FORWARDING_FAILED',
+          message: 'IVR status forwarding failed. WhatsApp status processing continued. Check the IVR service URL and availability.',
+          receiptStatus: String(statusData.status || '').toLowerCase(),
+          occurredAt: new Date()
+        };
         console.warn('[WhatsAppWebhook] IVR status forwarding failed; continuing message status update', {
           messageId,
           error: bridgeError?.message || String(bridgeError)
@@ -1111,6 +1147,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       let message = null;
       if (companyId) {
         message = await Message.findOne({ whatsappMessageId: messageId, companyId });
+        diagnosticMessage = message;
       }
       if (!message) {
         console.log('No message found for whatsappMessageId:', messageId, 'attempting repair from dispatch');
@@ -1130,6 +1167,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       }
 
       const oldStatus = message.status;
+      diagnosticMessage = message;
       const nextStatus = chooseMonotonicStatus(oldStatus, status);
       const matchedBroadcastId =
         String(message?.broadcastId || '').trim() ||
@@ -1351,9 +1389,12 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       if (resolvedBroadcastId) {
         try {
           const synced = await broadcastService.syncBroadcastStats(resolvedBroadcastId);
+          if (!synced?.success) throw new Error('Broadcast statistics reconciliation failed');
           if (synced?.success) syncedBroadcast = synced.data;
         } catch (syncError) {
           console.error('Error syncing broadcast stats from webhook:', syncError);
+          statsSyncFailed = true;
+          throw syncError;
         }
       }
 
@@ -1385,6 +1426,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         for (const recipientUserId of recipients) emitRealtimeEvent(recipientUserId, statsEvent);
       }
 
+      await saveStatusProcessingIssue(message, bridgeIssue);
+
       if (nextStatus === 'read' && oldStatus !== 'read') {
         const readScoreResult = await applyReadScoreForMessage({
           messageId: updatedMessage._id,
@@ -1410,6 +1453,17 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
 
     } catch (error) {
       console.error('Error handling message status:', error);
+      if (diagnosticMessage) {
+        await saveStatusProcessingIssue(diagnosticMessage, {
+          severity: 'error', code: statsSyncFailed ? 'BROADCAST_STATS_SYNC_FAILED' : 'WHATSAPP_STATUS_PROCESSING_FAILED',
+          message: statsSyncFailed
+            ? 'The message status was saved, but campaign totals could not be updated. Check backend database connectivity.'
+            : error instanceof TypeError && /Cannot read properties of (null|undefined) \(reading '[a-zA-Z]+'\)/.test(error.message)
+            ? `Status processing failed: ${error.message}. Check backend configuration.`
+            : 'WhatsApp sent a status receipt, but the backend could not finish processing it. Check backend configuration and database connectivity.',
+          receiptStatus: String(statusData.status || '').toLowerCase(), occurredAt: new Date()
+        });
+      }
     }
   };
 

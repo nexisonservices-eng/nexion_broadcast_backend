@@ -43,6 +43,16 @@ const BroadcastSchema = new mongoose.Schema({
   queueJobId: { type: String, default: '' },
   queueQueuedAt: { type: Date, default: null },
   queueLastError: { type: String, default: '' },
+  statusProcessingIssue: {
+    type: new mongoose.Schema({
+      severity: { type: String, enum: ['error', 'warning'] },
+      code: String,
+      message: String,
+      receiptStatus: String,
+      occurredAt: Date
+    }, { _id: false }),
+    default: null
+  },
   scheduledAt: Date,
   startedAt: Date,
   completedAt: Date,

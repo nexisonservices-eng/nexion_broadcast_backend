@@ -4076,7 +4076,7 @@ class BroadcastService {
       }
 
       const projection =
-        "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource createdBy createdByName createdById createdByEmail createdByWorkspaceRole retryPolicy deliveryPolicy compliancePolicy analytics";
+        "name status scheduledAt startedAt completedAt createdAt updatedAt recipientCount stats messageType templateName language audienceSource createdBy createdByName createdById createdByEmail createdByWorkspaceRole retryPolicy deliveryPolicy compliancePolicy analytics statusProcessingIssue";
 
       if (hasPagination) {
         const rows = await Broadcast.find(query)
