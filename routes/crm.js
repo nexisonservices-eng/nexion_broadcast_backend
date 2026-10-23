@@ -45,7 +45,8 @@ const { encryptGoogleToken, decryptGoogleToken } = require('../utils/googleToken
 const { normalizeRole } = require('../utils/accessControl');
 const { fetchWorkspaceUsers } = require('../services/adminAuthService');
 const { isWorkspaceAssignee } = require('../utils/crmTaskAssignment');
-const { buildLegacyCrmContactFilter } = require('../utils/crmContactScope');
+const { buildLegacyCrmContactFilter, buildLegacyCrmContactScope } = require('../utils/crmContactScope');
+const { buildCrmContactSearchFilter } = require('../utils/crmContactSearch');
 
 const router = express.Router();
 router.use(auth);
@@ -1012,21 +1013,7 @@ const buildCrmContactScopedFilter = async (req, query = {}, options = {}) => {
     ];
   }
 
-  const normalizedSearch = toCleanString(search);
-  const searchFilter = normalizedSearch
-    ? {
-        $or: [
-          { name: { $regex: normalizedSearch, $options: 'i' } },
-          { phone: { $regex: normalizedSearch, $options: 'i' } },
-          { email: { $regex: normalizedSearch, $options: 'i' } },
-          { source: { $regex: normalizedSearch, $options: 'i' } },
-          { ownerId: { $regex: normalizedSearch, $options: 'i' } },
-          { stage: { $regex: normalizedSearch, $options: 'i' } },
-          { notes: { $regex: normalizedSearch, $options: 'i' } },
-          { tags: { $in: [new RegExp(normalizedSearch, 'i')] } }
-        ]
-      }
-    : {};
+  const searchFilter = buildCrmContactSearchFilter(search);
 
   const queueFilter = buildContactQueueFilter(req, normalizedQueue);
   if (normalizedQueue === 'today_calls') {
@@ -1052,7 +1039,17 @@ const buildCrmContactScopedFilter = async (req, query = {}, options = {}) => {
     };
   }
 
-  return buildScopedFilter(req, mergeFiltersWithAnd(extraFilter, searchFilter, queueFilter || {}));
+  const contactFilters = mergeFiltersWithAnd(extraFilter, searchFilter, queueFilter || {});
+  const primaryFilter = buildScopedFilter(req, contactFilters);
+  const legacyScope = buildLegacyCrmContactScope(
+    {
+      companyId: req?.companyId,
+      role: normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+    },
+    contactFilters
+  );
+
+  return legacyScope ? { $or: [primaryFilter, legacyScope] } : primaryFilter;
 };
 
 const buildTaskBucketFilter = (bucket) => {
