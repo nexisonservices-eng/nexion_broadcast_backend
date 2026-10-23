@@ -684,6 +684,144 @@ exports.getCampaigns = async (req, res) => {
 // @desc    Get single campaign
 // @route   GET /api/campaigns/:id
 // @access  Private
+const classifyMetaDeliveryRefreshError = (error) => {
+    const status = Number(error?.status || error?.response?.status || 0);
+    if (status === 429 || error?.metaRateLimited) return 'rate_limited';
+    if (status === 401 || status === 403) return 'authorization_error';
+    if (status === 404) return 'not_found';
+    if (status >= 500) return 'provider_error';
+    if (error?.response) return 'request_rejected';
+    return 'connection_error';
+};
+
+exports.refreshMetaDeliveryStatus = async (req, res) => {
+    const now = new Date();
+    const forceRefresh = String(req.query?.refresh || '').toLowerCase() === 'true';
+    try {
+        const campaign = await Campaign.findById(req.params.id);
+        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to view this campaign')) return;
+
+        const metaCampaignId = String(campaign.metaCampaignId || '').trim();
+        if (!metaCampaignId || /^[a-f\d]{24}$/i.test(metaCampaignId)) {
+            return res.status(409).json({
+                success: false,
+                message: 'This campaign has not been published to Meta.',
+                data: {
+                    publicationStatus: campaign.lifecycleStatus || campaign.status,
+                    snapshot: campaign.metaDeliverySnapshot || null,
+                    syncedAt: campaign.metaDeliveryStatusSyncedAt || null,
+                    stale: true
+                }
+            });
+        }
+
+        const syncedAt = campaign.metaDeliveryStatusSyncedAt
+            ? new Date(campaign.metaDeliveryStatusSyncedAt)
+            : null;
+        const ageMs = syncedAt ? now.getTime() - syncedAt.getTime() : Infinity;
+        if (!forceRefresh && !campaign.metaDeliveryStatusStale && ageMs < 60_000) {
+            return res.status(200).json({
+                success: true,
+                cached: true,
+                data: {
+                    publicationStatus: campaign.lifecycleStatus || campaign.status,
+                    snapshot: campaign.metaDeliverySnapshot || null,
+                    syncedAt,
+                    stale: false
+                }
+            });
+        }
+
+        const lastAttemptAt = campaign.metaDeliveryStatusAttemptedAt
+            ? new Date(campaign.metaDeliveryStatusAttemptedAt)
+            : null;
+        if (!forceRefresh && campaign.metaDeliveryStatusStale && lastAttemptAt && now - lastAttemptAt < 30_000) {
+            return res.status(502).json({
+                success: false,
+                message: 'Meta status refresh recently failed. Showing the last confirmed status.',
+                data: {
+                    publicationStatus: campaign.lifecycleStatus || campaign.status,
+                    snapshot: campaign.metaDeliverySnapshot || null,
+                    syncedAt,
+                    stale: true,
+                    errorCategory: campaign.metaDeliveryStatusError || 'provider_error'
+                }
+            });
+        }
+
+        try {
+            const result = await metaAdsService.fetchMetaDeliverySnapshot({
+                userId: req.user.id,
+                campaignId: metaCampaignId
+            });
+            const previous = campaign.metaDeliverySnapshot || {};
+            const partialErrors = Array.isArray(result.partialErrors) ? result.partialErrors : [];
+            const adSetsFailed = partialErrors.some((item) => String(item.entity || '').startsWith('adset'));
+            const adsFailed = partialErrors.some((item) => String(item.entity || '').startsWith('ads'));
+            campaign.metaDeliverySnapshot = {
+                campaign: result.campaign,
+                adSets: adSetsFailed ? (previous.adSets || []) : (result.adSets || []),
+                ads: adsFailed ? (previous.ads || []) : (result.ads || []),
+                apiVersion: result.apiVersion
+            };
+            campaign.metaDeliveryStatusSyncedAt = now;
+            campaign.metaDeliveryStatusAttemptedAt = now;
+            campaign.metaDeliveryStatusStale = partialErrors.length > 0;
+            campaign.metaDeliveryStatusError = partialErrors.length ? 'partial_sync' : '';
+            campaign.metaStatus = String(result.campaign.effective_status || result.campaign.status || '').toUpperCase();
+            if (result.adSets?.[0]) {
+                campaign.metaAdSetStatus = String(result.adSets[0].effective_status || result.adSets[0].status || '').toUpperCase();
+            }
+            if (result.ads?.[0]) {
+                campaign.metaAdStatus = String(result.ads[0].effective_status || result.ads[0].status || '').toUpperCase();
+            }
+            await campaign.save();
+
+            return res.status(200).json({
+                success: true,
+                partial: partialErrors.length > 0,
+                message: partialErrors.length ? 'Some Meta statuses could not be refreshed.' : 'Meta statuses refreshed.',
+                data: {
+                    publicationStatus: campaign.lifecycleStatus || campaign.status,
+                    snapshot: campaign.metaDeliverySnapshot,
+                    syncedAt: now,
+                    stale: partialErrors.length > 0,
+                    errorCategory: partialErrors.length ? 'partial_sync' : ''
+                }
+            });
+        } catch (refreshError) {
+            const category = classifyMetaDeliveryRefreshError(refreshError);
+            campaign.metaDeliveryStatusAttemptedAt = now;
+            campaign.metaDeliveryStatusStale = true;
+            campaign.metaDeliveryStatusError = category;
+            try {
+                await campaign.save();
+            } catch (saveError) {
+                console.error('[campaign-meta-status] stale marker save failed', saveError?.message || 'unknown error');
+            }
+            console.warn('[campaign-meta-status] refresh failed', JSON.stringify({
+                campaignId: String(campaign._id),
+                category
+            }));
+            const status = category === 'rate_limited' ? 429 : category === 'authorization_error' ? 403 : category === 'not_found' ? 404 : 502;
+            return res.status(status).json({
+                success: false,
+                message: 'Meta status could not be refreshed. Showing the last confirmed status.',
+                data: {
+                    publicationStatus: campaign.lifecycleStatus || campaign.status,
+                    snapshot: campaign.metaDeliverySnapshot || null,
+                    syncedAt: campaign.metaDeliveryStatusSyncedAt || null,
+                    stale: true,
+                    errorCategory: category
+                }
+            });
+        }
+    } catch (error) {
+        console.error('[campaign-meta-status] request failed', error?.message || 'unknown error');
+        return res.status(500).json({ success: false, message: 'Unable to load campaign Meta status.' });
+    }
+};
+
 exports.getCampaign = async (req, res) => {
     try {
         const campaign = await Campaign.findById(req.params.id);

@@ -307,6 +307,21 @@ router.post(
 // ==================== SINGLE CAMPAIGN ROUTES ====================
 
 /**
+ * @route   GET /api/campaigns/:id/meta-status
+ * @desc    Read cached or refresh confirmed Meta delivery statuses.
+ * @access  Private
+ */
+router.get(
+    '/:id/meta-status',
+    [
+        param('id').isMongoId().withMessage('Invalid campaign ID'),
+        query('refresh').optional().isBoolean().withMessage('Refresh must be true or false')
+    ],
+    validate,
+    campaignController.refreshMetaDeliveryStatus
+);
+
+/**
  * @route   GET /api/campaigns/:id
  * @desc    Get single campaign by ID
  * @access  Private

@@ -4284,6 +4284,104 @@ const updateMetaCampaignFromCrud = async ({ userId, campaignId, name, status }) 
   }
 };
 
+const fetchMetaDeliverySnapshot = async ({ userId, campaignId } = {}) => {
+  const resolvedCampaignId = String(campaignId || '').trim();
+  if (!resolvedCampaignId || /^[a-f\d]{24}$/i.test(resolvedCampaignId)) {
+    throw buildStageErrorWithDetails(
+      'Campaign status refresh',
+      'A valid Meta campaign ID is required.',
+      {},
+      400
+    );
+  }
+  if (shouldUseMockMode()) {
+    throw buildStageErrorWithDetails(
+      'Campaign status refresh',
+      'Live Meta status is unavailable while the Meta API is in mock mode.',
+      {},
+      503
+    );
+  }
+
+  const accessContext = await ensureConnectedMetaUser(userId, 'Campaign status refresh');
+  const apiVersion = String(getEnvConfig().apiVersion || 'v23.0').trim();
+  const request = (path, fields, limit) => graphRequest({
+    path,
+    params: { fields, ...(limit ? { limit } : {}) },
+    accessToken: accessContext.accessToken,
+    apiVersion,
+    bypassCache: true
+  });
+  const unwrap = (response) => response?.data && !Array.isArray(response.data) ? response.data : response;
+
+  // Core fields are required for an authoritative refresh. Optional campaign fields
+  // are fetched separately so one unavailable Graph field does not hide all statuses.
+  const campaign = unwrap(await request(
+    resolvedCampaignId,
+    'id,name,status,effective_status,start_time,stop_time'
+  ));
+  const partialErrors = [];
+  let optionalCampaignFields = {};
+  try {
+    optionalCampaignFields = unwrap(await request(resolvedCampaignId, 'configured_status,issues_info')) || {};
+  } catch (error) {
+    partialErrors.push({ entity: 'campaign_optional_fields', category: classifyMetaStatusError(error) });
+  }
+
+  let adSets = [];
+  try {
+    const response = unwrap(await request(
+      `${resolvedCampaignId}/adsets`,
+      'id,name,status,effective_status,start_time,end_time',
+      100
+    ));
+    adSets = Array.isArray(response?.data) ? response.data : [];
+    if (response?.paging?.next) partialErrors.push({ entity: 'adsets', category: 'result_limit_reached' });
+  } catch (error) {
+    partialErrors.push({ entity: 'adsets', category: classifyMetaStatusError(error) });
+  }
+
+  let ads = [];
+  try {
+    const response = unwrap(await request(
+      `${resolvedCampaignId}/ads`,
+      'id,name,status,effective_status,configured_status',
+      100
+    ));
+    ads = Array.isArray(response?.data) ? response.data : [];
+    if (response?.paging?.next) partialErrors.push({ entity: 'ads', category: 'result_limit_reached' });
+  } catch (error) {
+    partialErrors.push({ entity: 'ads', category: classifyMetaStatusError(error) });
+  }
+
+  if (!campaign?.id || String(campaign.id) !== resolvedCampaignId) {
+    throw buildStageErrorWithDetails(
+      'Campaign status refresh',
+      'Meta returned an invalid campaign status response.',
+      {},
+      502
+    );
+  }
+
+  return {
+    campaign: { ...campaign, ...optionalCampaignFields },
+    adSets,
+    ads,
+    partialErrors,
+    apiVersion
+  };
+};
+
+const classifyMetaStatusError = (error) => {
+  const status = Number(error?.status || error?.response?.status || 0);
+  if (status === 429 || error?.metaRateLimited) return 'rate_limited';
+  if (status === 401 || status === 403) return 'authorization_error';
+  if (status === 404) return 'not_found';
+  if (status >= 500) return 'provider_error';
+  if (error?.response) return 'request_rejected';
+  return 'connection_error';
+};
+
 const updateCampaign = async ({ userId, campaignId, name, status }) =>
   updateMetaCampaignFromCrud({ userId, campaignId, name, status });
 
@@ -5136,6 +5234,7 @@ module.exports = {
   createMetaCampaignFromCrud,
   createMetaAdStackFromCrud,
   updateCampaign,
+  fetchMetaDeliverySnapshot,
   pauseCampaign,
   resumeCampaign,
   archiveMetaCrudAssets,

@@ -291,6 +291,27 @@ const campaignSchema = new mongoose.Schema({
         trim: true,
         default: ''
     },
+    metaDeliverySnapshot: {
+        type: mongoose.Schema.Types.Mixed,
+        default: null
+    },
+    metaDeliveryStatusSyncedAt: {
+        type: Date,
+        default: null
+    },
+    metaDeliveryStatusAttemptedAt: {
+        type: Date,
+        default: null
+    },
+    metaDeliveryStatusStale: {
+        type: Boolean,
+        default: true
+    },
+    metaDeliveryStatusError: {
+        type: String,
+        trim: true,
+        default: ''
+    },
     metaCreativeId: {
         type: String,
         sparse: true
