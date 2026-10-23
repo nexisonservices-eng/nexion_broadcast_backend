@@ -1218,98 +1218,93 @@ exports.deleteCampaign = async (req, res) => {
     }
 };
 
-// @desc    Pause campaign
-// @route   PUT /api/campaigns/:id/pause
-// @access  Private
-exports.pauseCampaign = async (req, res) => {
+const setMetaCampaignDeliveryStatus = async (req, res, targetStatus) => {
+    const action = targetStatus === 'PAUSED' ? 'pause' : 'resume';
+    const localStatus = targetStatus.toLowerCase();
+    let campaign;
+    let metaConfirmed = false;
+
     try {
-        const campaign = await Campaign.findById(req.params.id);
+        campaign = await Campaign.findById(req.params.id);
+        if (!ensureCampaignOwnership(campaign, req, res, `Not authorized to ${action} this campaign`)) return;
 
-        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to pause this campaign')) return;
-
-        if (campaign.metaCampaignId) {
-            try {
-                const metaUpdate = await metaAdsService.pauseCampaign({
-                    userId: req.user.id,
-                    campaignId: campaign.metaCampaignId,
-                    adSetId: campaign.metaAdSetId,
-                    adId: campaign.metaAdId
-                });
-                campaign.metaResponse = metaUpdate;
-            } catch (metaError) {
-                return sendMetaError(res, metaError, 'Meta campaign pause failed');
-            }
-        }
-
-        campaign.status = 'paused';
-        campaign.lifecycleStatus = 'paused';
-        campaign.deliveryStatus = campaign.metaCampaignId ? 'paused' : campaign.deliveryStatus;
-        await campaign.save();
-
-        res.status(200).json({
-            success: true,
-            message: 'Campaign paused successfully',
-            data: campaign
-        });
-    } catch (error) {
-        console.error('Error pausing campaign:', error);
-        res.status(500).json({
-            success: false,
-            message: 'Error pausing campaign',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
-        });
-    }
-};
-
-// @desc    Resume campaign
-// @route   PUT /api/campaigns/:id/resume
-// @access  Private
-exports.resumeCampaign = async (req, res) => {
-    try {
-        const campaign = await Campaign.findById(req.params.id);
-
-        if (!ensureCampaignOwnership(campaign, req, res, 'Not authorized to resume this campaign')) return;
-
-        if (!campaign.metaCampaignId) {
-            return res.status(400).json({
-                success: false,
-                message: 'Publish the campaign before running it.'
+        if (String(campaign.status || '').toLowerCase() === localStatus) {
+            return res.status(200).json({
+                success: true,
+                message: `Campaign is already ${localStatus}`,
+                idempotent: true,
+                data: campaign
             });
         }
 
-        if (campaign.metaCampaignId) {
-            try {
-                const metaUpdate = await metaAdsService.resumeCampaign({
-                    userId: req.user.id,
-                    campaignId: campaign.metaCampaignId,
-                    adSetId: campaign.metaAdSetId,
-                    adId: campaign.metaAdId
-                });
-                campaign.metaResponse = metaUpdate;
-            } catch (metaError) {
-                return sendMetaError(res, metaError, 'Meta campaign resume failed');
-            }
+        const metaCampaignId = String(campaign.metaCampaignId || '').trim();
+        if (!metaCampaignId || /^[a-f\d]{24}$/i.test(metaCampaignId)) {
+            return res.status(409).json({
+                success: false,
+                message: 'Publish the campaign to Meta before changing its delivery status.'
+            });
         }
 
-        campaign.status = 'active';
-        campaign.lifecycleStatus = 'running';
-        campaign.deliveryStatus = 'active';
+        let metaUpdate;
+        try {
+            // This updates only the Meta campaign; child ad sets and ads retain their statuses.
+            metaUpdate = await metaAdsService.updateCampaign({
+                userId: req.user.id,
+                campaignId: metaCampaignId,
+                status: targetStatus
+            });
+        } catch (metaError) {
+            return sendMetaError(res, metaError, `Meta campaign ${action} failed`);
+        }
+
+        if (metaUpdate?.apiMode !== 'live' || metaUpdate?.skipped) {
+            return res.status(503).json({
+                success: false,
+                message: 'Meta did not confirm the campaign status change. Local status was not changed.'
+            });
+        }
+        metaConfirmed = true;
+
+        campaign.status = localStatus;
+        campaign.lifecycleStatus = targetStatus === 'PAUSED' ? 'paused' : 'running';
+        campaign.deliveryStatus = localStatus;
+        campaign.metaStatus = targetStatus;
+        campaign.metaResponse = metaUpdate;
         await campaign.save();
 
-        res.status(200).json({
+        return res.status(200).json({
             success: true,
-            message: 'Campaign resumed successfully',
+            message: `Campaign ${localStatus} successfully`,
             data: campaign
         });
     } catch (error) {
-        console.error('Error resuming campaign:', error);
-        res.status(500).json({
+        console.error(`Error ${action}ing campaign:`, error?.message || 'Unknown error');
+        if (metaConfirmed) {
+            return res.status(500).json({
+                success: false,
+                message: `Meta confirmed the campaign is ${localStatus}, but the local campaign record could not be updated. Retry to synchronize local status.`,
+                partialSuccess: true,
+                metaStatusConfirmed: targetStatus,
+                localStatusUpdated: false,
+                reconciliationRequired: true
+            });
+        }
+        return res.status(500).json({
             success: false,
-            message: 'Error resuming campaign',
-            error: process.env.NODE_ENV === 'development' ? error.message : undefined
+            message: `Could not ${action} campaign`
         });
     }
 };
+
+// @desc    Pause only the Meta campaign and then persist its confirmed local state.
+// @route   PUT /api/campaigns/:id/pause
+// @access  Private
+exports.pauseCampaign = (req, res) => setMetaCampaignDeliveryStatus(req, res, 'PAUSED');
+
+// @desc    Resume only the Meta campaign and then persist its confirmed local state.
+// @route   PUT /api/campaigns/:id/resume
+// @access  Private
+exports.resumeCampaign = (req, res) => setMetaCampaignDeliveryStatus(req, res, 'ACTIVE');
 
 // @desc    Duplicate campaign
 // @route   POST /api/campaigns/:id/duplicate
