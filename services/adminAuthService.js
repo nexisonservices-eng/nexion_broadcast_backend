@@ -31,6 +31,43 @@ const fetchUserContext = async (authHeader) => {
   return null;
 };
 
+const fetchWorkspaceUsers = async (authHeader, { superAdmin = false, companyId = '' } = {}) => {
+  const normalizedCompanyId = String(companyId || '').trim();
+  const endpoint = superAdmin
+    ? normalizedCompanyId
+      ? `/api/admin/users/roster?companyId=${encodeURIComponent(normalizedCompanyId)}`
+      : ''
+    : '/api/crm/ops/users';
+  if (!endpoint) return [];
+  let lastError = null;
+
+  for (const baseUrl of ADMIN_API_BASE_URLS) {
+    try {
+      const response = await axios.get(`${baseUrl.replace(/\/+$/, '')}${endpoint}`, {
+        headers: { Authorization: authHeader },
+        timeout: 10000
+      });
+      const payload = response?.data?.data || response?.data || {};
+      const users = Array.isArray(payload?.users)
+        ? payload.users
+        : Array.isArray(payload)
+          ? payload
+          : [];
+      if (!superAdmin) return users;
+
+      return users.filter((user) => String(user?.companyId || '').trim() === normalizedCompanyId);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const error = new Error('Unable to verify the task assignee against the workspace user directory.');
+  error.status = 503;
+  error.cause = lastError;
+  throw error;
+};
+
 module.exports = {
-  fetchUserContext
+  fetchUserContext,
+  fetchWorkspaceUsers
 };

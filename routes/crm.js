@@ -43,6 +43,9 @@ const {
 const { getLeadScoringSettings } = require('../services/leadScoringService');
 const { encryptGoogleToken, decryptGoogleToken } = require('../utils/googleTokenCrypto');
 const { normalizeRole } = require('../utils/accessControl');
+const { fetchWorkspaceUsers } = require('../services/adminAuthService');
+const { isWorkspaceAssignee } = require('../utils/crmTaskAssignment');
+const { buildLegacyCrmContactFilter } = require('../utils/crmContactScope');
 
 const router = express.Router();
 router.use(auth);
@@ -172,6 +175,39 @@ const upload = multer({
 
 const toCleanString = (value) => String(value || '').trim();
 const toObjectIdIfValid = (value) => (mongoose.Types.ObjectId.isValid(value) ? value : null);
+
+const resolveTaskAssignee = async (req, value) => {
+  const assigneeId = toCleanString(value);
+  if (!assigneeId) return null;
+
+  if (!toObjectIdIfValid(assigneeId)) {
+    const error = new Error('Invalid task assignee');
+    error.status = 400;
+    throw error;
+  }
+
+  const currentUserId = toCleanString(req?.user?.id);
+  if (assigneeId === currentUserId) return assigneeId;
+
+  let users;
+  try {
+    users = await fetchWorkspaceUsers(req?.headers?.authorization || '', {
+      superAdmin: normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role) === 'superadmin',
+      companyId: req?.companyId
+    });
+  } catch (error) {
+    error.status = error.status || 503;
+    throw error;
+  }
+
+  if (!isWorkspaceAssignee(users, assigneeId)) {
+    const error = new Error('Task assignee is not an active user in this workspace');
+    error.status = 403;
+    throw error;
+  }
+
+  return assigneeId;
+};
 const toFiniteNumber = (value) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
@@ -662,6 +698,29 @@ const buildScopedFilter = (req, extra = {}) => {
   if (conditions.length === 0) return {};
   if (conditions.length === 1) return conditions[0];
   return { $and: conditions };
+};
+
+const findScopedContactById = async (req, contactId, selectFields = '') => {
+  const normalizedId = toObjectIdIfValid(contactId);
+  if (!normalizedId) return null;
+
+  const load = async (filter) => {
+    let query = Contact.findOne(filter);
+    if (selectFields && typeof query?.select === 'function') query = query.select(selectFields);
+    return query;
+  };
+
+  const contact = await load(buildScopedFilter(req, { _id: normalizedId }));
+  if (contact) return contact;
+
+  const legacyFilter = buildLegacyCrmContactFilter(
+    {
+      companyId: req?.companyId,
+      role: normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role)
+    },
+    normalizedId
+  );
+  return legacyFilter ? load(legacyFilter) : null;
 };
 
 const hydrateDocsWithContacts = async (docs = [], req, selectFields = '') => {
@@ -1541,7 +1600,7 @@ const syncContactDealSnapshot = async (req, contactId) => {
   if (!toObjectIdIfValid(contactId)) return null;
 
   try {
-    const contact = await Contact.findOne(buildScopedFilter(req, { _id: contactId }));
+    const contact = await findScopedContactById(req, contactId);
     if (!contact) return null;
 
     const dealSummary = await buildDealSummary(req, { contactId });
@@ -1855,7 +1914,7 @@ const loadAuthorizedContact = async (req, contactId) => {
     throw error;
   }
 
-  const contact = await Contact.findOne(buildScopedFilter(req, { _id: contactId }));
+  const contact = await findScopedContactById(req, contactId);
   if (!contact) {
     const error = new Error('Contact not found');
     error.status = 404;
@@ -2816,7 +2875,7 @@ router.get('/contacts/:id', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid contact id' });
     }
 
-    const contact = await Contact.findOne(buildScopedFilter(req, { _id: id }));
+    const contact = await findScopedContactById(req, id);
     if (!contact) {
       return res.status(404).json({ success: false, error: 'Contact not found' });
     }
@@ -2931,7 +2990,7 @@ router.patch('/contacts/:id/stage', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid stage' });
     }
 
-    const contact = await Contact.findOne(buildScopedFilter(req, { _id: id }));
+    const contact = await findScopedContactById(req, id);
     if (!contact) {
       return res.status(404).json({ success: false, error: 'Contact not found' });
     }
@@ -2981,7 +3040,7 @@ router.patch('/contacts/:id/profile', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid contact id' });
     }
 
-    const contact = await Contact.findOne(buildScopedFilter(req, { _id: id }));
+    const contact = await findScopedContactById(req, id);
     if (!contact) {
       return res.status(404).json({ success: false, error: 'Contact not found' });
     }
@@ -3096,7 +3155,7 @@ router.patch('/contacts/:id/owner', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Admin access required to reassign leads.' });
     }
 
-    const contact = await Contact.findOne(buildScopedFilter(req, { _id: id }));
+    const contact = await findScopedContactById(req, id);
     if (!contact) {
       return res.status(404).json({ success: false, error: 'Contact not found' });
     }
@@ -3148,7 +3207,7 @@ router.post('/contacts/:id/notes', async (req, res) => {
       return res.status(400).json({ success: false, error: 'note is required' });
     }
 
-    const contact = await Contact.findOne(buildScopedFilter(req, { _id: id }));
+    const contact = await findScopedContactById(req, id);
     if (!contact) {
       return res.status(404).json({ success: false, error: 'Contact not found' });
     }
@@ -3778,10 +3837,12 @@ router.post('/tasks', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid task type' });
     }
 
-    const contact = await Contact.findOne(buildScopedFilter(req, { _id: contactId })).select('_id');
+    const contact = await findScopedContactById(req, contactId, '_id');
     if (!contact) {
       return res.status(404).json({ success: false, error: 'Contact not found' });
     }
+
+    const normalizedAssignee = await resolveTaskAssignee(req, assignedTo);
 
     const parsedDueAt = safeDate(dueAt);
     const parsedReminderAt = safeDate(reminderAt);
@@ -3792,9 +3853,21 @@ router.post('/tasks', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid reminderAt date' });
     }
 
-    const finalConversationId = toObjectIdIfValid(conversationId)
-      ? conversationId
-      : await findRecentConversationIdForContact(req, contact._id);
+    let finalConversationId = null;
+    if (conversationId !== undefined && conversationId !== null && toCleanString(conversationId)) {
+      if (!toObjectIdIfValid(conversationId)) {
+        return res.status(400).json({ success: false, error: 'Invalid conversationId' });
+      }
+      const conversation = await Conversation.findOne(
+        buildScopedFilter(req, { _id: conversationId, contactId: contact._id })
+      ).select('_id');
+      if (!conversation) {
+        return res.status(404).json({ success: false, error: 'Conversation not found for contact' });
+      }
+      finalConversationId = conversation._id;
+    } else {
+      finalConversationId = await findRecentConversationIdForContact(req, contact._id);
+    }
     const normalizedRecurrence = normalizeTaskRecurrence(recurrence);
     const initialComment = toCleanString(comment);
 
@@ -3810,7 +3883,7 @@ router.post('/tasks', async (req, res) => {
       reminderAt: parsedReminderAt,
       priority: normalizedPriority,
       status: normalizedStatus,
-      assignedTo: toCleanString(assignedTo) || null,
+      assignedTo: normalizedAssignee,
       createdBy: req.user.id || null,
       recurrence: normalizedRecurrence,
       comments: initialComment
@@ -3854,7 +3927,7 @@ router.post('/tasks', async (req, res) => {
 
     res.status(201).json({ success: true, data: task });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error?.status || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -4090,6 +4163,10 @@ router.patch('/tasks/:id', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Task not found' });
     }
 
+    const normalizedAssignee = req.body?.assignedTo !== undefined
+      ? await resolveTaskAssignee(req, req.body.assignedTo)
+      : task.assignedTo;
+
     const previousTask = {
       title: task.title,
       description: task.description,
@@ -4166,7 +4243,7 @@ router.patch('/tasks/:id', async (req, res) => {
     }
 
     if (req.body?.assignedTo !== undefined) {
-      task.assignedTo = toCleanString(req.body.assignedTo) || null;
+      task.assignedTo = normalizedAssignee;
     }
 
     if (req.body?.recurrence !== undefined) {
@@ -4274,7 +4351,7 @@ router.patch('/tasks/:id', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error?.status || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -4344,6 +4421,10 @@ router.post('/tasks/bulk', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid bulk action' });
     }
 
+    const bulkAssignee = action === 'assign'
+      ? await resolveTaskAssignee(req, req.body?.assignedTo)
+      : null;
+
     const bulkFilter = matchAll
       ? await buildTaskBulkScopedFilter(req, criteria || {})
       : buildScopedFilter(req, { _id: { $in: validTaskIds } });
@@ -4402,7 +4483,7 @@ router.post('/tasks/bulk', async (req, res) => {
         task.reminderAt = req.body?.reminderAt ? bulkReminderAt : null;
       }
       if (action === 'assign') {
-        task.assignedTo = toCleanString(req.body?.assignedTo) || null;
+        task.assignedTo = bulkAssignee;
       }
 
       await task.save();
@@ -4449,7 +4530,7 @@ router.post('/tasks/bulk', async (req, res) => {
       taskIds: [...updatedTaskIds, ...deletedTaskIds]
     });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(error?.status || 500).json({ success: false, error: error.message });
   }
 });
 
