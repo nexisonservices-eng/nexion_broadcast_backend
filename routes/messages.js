@@ -1413,16 +1413,19 @@ router.post(
         });
       }
 
+      const templateRecord = isValidObjectId(req.user.id)
+        ? await Template.findOne({
+            userId: req.user.id,
+            companyId: req.companyId || null,
+            name: String(templateName || '').trim(),
+            language: String(language || 'en_US').trim()
+          })
+            .sort({ updatedAt: -1, createdAt: -1 })
+            .select('category content')
+            .lean()
+        : null;
       let normalizedTemplateCategory = toCleanString(templateCategory).toLowerCase();
-      if (!normalizedTemplateCategory && isValidObjectId(req.user.id)) {
-        const templateRecord = await Template.findOne({
-          userId: req.user.id,
-          name: String(templateName || '').trim()
-        })
-          .sort({ updatedAt: -1, createdAt: -1 })
-          .select('category')
-          .lean();
-
+      if (!normalizedTemplateCategory) {
         normalizedTemplateCategory = toCleanString(templateRecord?.category).toLowerCase() || 'utility';
       }
       if (!normalizedTemplateCategory) {
@@ -1459,27 +1462,26 @@ router.post(
         result?.data?.messages?.[0]?.id || result?.data?.messageId || null;
 
       const messageCompanyId = conversation.companyId || req.companyId || null;
-      const templateRecord = await Template.findOne({
-        userId: req.user.id,
-        name: String(templateName || '').trim(),
-        ...(messageCompanyId ? { companyId: messageCompanyId } : {})
-      })
-        .select('content.body')
-        .lean();
-      const templateBody = String(templateRecord?.content?.body || '').trim();
+      const templateBody = String(templateRecord?.content?.body || '');
       let templatePlaceholderIndex = 0;
-      const previewText = templateBody
-        ? templateBody.replace(/{{\s*([^{}]+?)\s*}}/g, (placeholder, key) => {
-            const numericIndex = Number(key) - 1;
-            const variableIndex = Number.isInteger(numericIndex) && numericIndex >= 0
+      const renderTemplatePart = (part) =>
+        String(part || '').replace(/{{\s*([^{}]+?)\s*}}|\{var(\d+)\}/g, (placeholder, key, namedIndex) => {
+            const normalizedKey = namedIndex || key;
+            const numericIndex = Number(normalizedKey) - 1;
+            const variableIndex = namedIndex || (Number.isInteger(numericIndex) && numericIndex >= 0)
               ? numericIndex
               : templatePlaceholderIndex;
             templatePlaceholderIndex += 1;
             return variableIndex >= 0 && normalizedVariables[variableIndex] !== undefined
               ? normalizedVariables[variableIndex]
               : placeholder;
-          })
-        : `Template: ${templateName}`;
+        });
+      const previewParts = [
+        templateRecord?.content?.header?.type === 'text' ? renderTemplatePart(templateRecord.content.header.text) : '',
+        renderTemplatePart(templateBody),
+        renderTemplatePart(templateRecord?.content?.footer || '')
+      ].map((part) => String(part || '').trim()).filter(Boolean);
+      const previewText = previewParts.join('\n') || `Template: ${templateName}`;
       const messageTimestamp = new Date();
 
       const message = await Message.create({
