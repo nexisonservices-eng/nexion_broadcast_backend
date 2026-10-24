@@ -982,20 +982,47 @@ class WhatsAppService {
         };
       }
       debugLog(`Fetching templates from: ${this.apiUrl}/${this.wabaId}/message_templates`);
-      const response = await axios.get(
-        `${this.apiUrl}/${this.wabaId}/message_templates`,
-        {
+      const endpoint = `${this.apiUrl}/${this.wabaId}/message_templates`;
+      const params = {
+        fields: 'id,name,language,status,category,components',
+        limit: 200
+      };
+      let response = await axios.get(endpoint, {
+        headers: this.getHeaders(),
+        timeout: META_REQUEST_TIMEOUT_MS,
+        params
+      });
+      const firstPage = response.data || {};
+      const templates = Array.isArray(firstPage.data) ? [...firstPage.data] : [];
+      const seenCursors = new Set();
+      let cursor = firstPage.paging?.cursors?.after || '';
+      let pageCount = 1;
+
+      // Meta paginates large WABAs. Follow cursor pages so callers receive the
+      // complete catalog rather than only the first 200 templates.
+      while (cursor && !seenCursors.has(cursor) && pageCount < 25) {
+        seenCursors.add(cursor);
+        response = await axios.get(endpoint, {
           headers: this.getHeaders(),
           timeout: META_REQUEST_TIMEOUT_MS,
-          params: {
-            fields: 'id,name,language,status,category,components',
-            limit: 200
-          }
-        }
-      );
-      debugLog('Raw Meta API Response:', JSON.stringify(response.data, null, 2));
-      debugLog('Templates found:', response.data.data?.length || 0);
-      return { success: true, data: response.data };
+          params: { ...params, after: cursor }
+        });
+        const page = response.data || {};
+        const pageTemplates = Array.isArray(page.data) ? page.data : [];
+        templates.push(...pageTemplates);
+        pageCount += 1;
+        cursor = page.paging?.cursors?.after || '';
+        if (pageTemplates.length === 0) break;
+      }
+
+      const lastPage = response.data || firstPage;
+      const data = {
+        ...firstPage,
+        data: templates,
+        paging: lastPage.paging || firstPage.paging
+      };
+      debugLog('Templates found across Meta pages:', templates.length);
+      return { success: true, data };
     } catch (error) {
       console.error('Error fetching templates:', error.response?.data || error.message);
       return { 
