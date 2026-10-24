@@ -194,7 +194,9 @@ const getWhatsAppMessagingPolicy = (contact = {}, options = {}) => {
   const templateCategory = toCleanString(options?.templateCategory).toLowerCase();
   const recentlyInteracted = serviceWindowOpen;
   const marketingTemplateAllowed =
-    !optedOut && (normalizedOptInStatus === 'opted_in' || hasOptInEvidence(contact) || recentlyInteracted);
+    !optedOut &&
+    marketingScopeAllowed(normalizedOptInScope) &&
+    (normalizedOptInStatus === 'opted_in' || hasOptInEvidence(contact));
   const marketingRateState = getMarketingRateLimitState(contact, {
     now,
     max: options?.marketingLimit,
@@ -295,7 +297,7 @@ const validateTemplateOutboundSend = (contact = {}, { templateCategory = '' } = 
       policy,
       statusCode: 403,
       error:
-        'Marketing template messages require a WhatsApp opt-in or a recent customer interaction.'
+        'Marketing template messages require a recorded WhatsApp opt-in with marketing consent.'
     };
   }
 
@@ -384,7 +386,7 @@ const buildBroadcastAudienceValidation = ({
             : 'missing_contact',
         error:
           normalizedMessageType === 'template' && normalizedTemplateCategory === 'marketing'
-            ? 'Marketing template messages require a WhatsApp opt-in or a recent customer interaction.'
+            ? 'Marketing template messages require a recorded WhatsApp opt-in with marketing consent.'
             : 'Contact record not found for this phone number.'
       });
       continue;
