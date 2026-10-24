@@ -240,6 +240,12 @@ class TemplateController {
       }
       const preparedBody = prepareMetaTemplateText(templateContent?.body || bodyText);
       const bodyForVariables = preparedBody.text;
+      if (!bodyForVariables.replace(/\{\{\d+\}\}/g, '').trim()) {
+        return res.status(400).json({
+          success: false,
+          error: 'Template body must include regular text in addition to variables.'
+        });
+      }
       const variables = this.extractVariables(bodyForVariables).map((variable, index) => ({
         ...variable,
         example: preparedBody.examples[index] || variable.example
