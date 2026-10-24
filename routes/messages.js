@@ -1459,11 +1459,27 @@ router.post(
         result?.data?.messages?.[0]?.id || result?.data?.messageId || null;
 
       const messageCompanyId = conversation.companyId || req.companyId || null;
-      const previewSuffix =
-        normalizedVariables.filter(Boolean).length > 0
-          ? ` (${normalizedVariables.filter(Boolean).join(', ')})`
-          : '';
-      const previewText = `Template: ${templateName}${previewSuffix}`;
+      const templateRecord = await Template.findOne({
+        userId: req.user.id,
+        name: String(templateName || '').trim(),
+        ...(messageCompanyId ? { companyId: messageCompanyId } : {})
+      })
+        .select('content.body')
+        .lean();
+      const templateBody = String(templateRecord?.content?.body || '').trim();
+      let templatePlaceholderIndex = 0;
+      const previewText = templateBody
+        ? templateBody.replace(/{{\s*([^{}]+?)\s*}}/g, (placeholder, key) => {
+            const numericIndex = Number(key) - 1;
+            const variableIndex = Number.isInteger(numericIndex) && numericIndex >= 0
+              ? numericIndex
+              : templatePlaceholderIndex;
+            templatePlaceholderIndex += 1;
+            return variableIndex >= 0 && normalizedVariables[variableIndex] !== undefined
+              ? normalizedVariables[variableIndex]
+              : placeholder;
+          })
+        : `Template: ${templateName}`;
       const messageTimestamp = new Date();
 
       const message = await Message.create({
