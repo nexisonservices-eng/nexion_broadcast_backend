@@ -1496,6 +1496,7 @@ router.post(
         result?.data?.messages?.[0]?.id || result?.data?.messageId || null;
 
       const messageCompanyId = conversation.companyId || req.companyId || null;
+<<<<<<< HEAD
       const bodyText = String(templatePreviewContent?.body || '');
       const renderedBody = bodyText.replace(/\{\{\s*(\d+)\s*\}\}|\{var(\d+)\}/g, (match, numbered, named) => {
         const variableIndex = Number(numbered || named) - 1;
@@ -1507,6 +1508,26 @@ router.post(
         templatePreviewContent?.header?.type === 'text' ? templatePreviewContent.header.text : '',
         renderedBody,
         templatePreviewContent?.footer || ''
+=======
+      const templateBody = String(templateRecord?.content?.body || '');
+      let templatePlaceholderIndex = 0;
+      const renderTemplatePart = (part) =>
+        String(part || '').replace(/{{\s*([^{}]+?)\s*}}|\{var(\d+)\}/g, (placeholder, key, namedIndex) => {
+            const normalizedKey = namedIndex || key;
+            const numericIndex = Number(normalizedKey) - 1;
+            const variableIndex = namedIndex || (Number.isInteger(numericIndex) && numericIndex >= 0)
+              ? numericIndex
+              : templatePlaceholderIndex;
+            templatePlaceholderIndex += 1;
+            return variableIndex >= 0 && normalizedVariables[variableIndex] !== undefined
+              ? normalizedVariables[variableIndex]
+              : placeholder;
+        });
+      const previewParts = [
+        templateRecord?.content?.header?.type === 'text' ? renderTemplatePart(templateRecord.content.header.text) : '',
+        renderTemplatePart(templateBody),
+        renderTemplatePart(templateRecord?.content?.footer || '')
+>>>>>>> ddfb296116c40d533cad5e90c074497e1c36b451
       ].map((part) => String(part || '').trim()).filter(Boolean);
       const previewText = previewParts.join('\n') || `Template: ${templateName}`;
       const messageTimestamp = new Date();
