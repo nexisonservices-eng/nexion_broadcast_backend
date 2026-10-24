@@ -30,7 +30,8 @@ const TemplateSchema = new mongoose.Schema({
 
     header: {
 
-      type: { type: String, enum: ['text', 'image', 'video', 'document'] },
+      // `none` is the editor's explicit value for templates without a header.
+      type: { type: String, enum: ['none', 'text', 'image', 'video', 'document'] },
 
       text: String,
 
