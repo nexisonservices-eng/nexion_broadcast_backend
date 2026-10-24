@@ -1413,16 +1413,19 @@ router.post(
         });
       }
 
+      const templateRecord = isValidObjectId(req.user.id)
+        ? await Template.findOne({
+            userId: req.user.id,
+            companyId: req.companyId || null,
+            name: String(templateName || '').trim(),
+            language: String(language || 'en_US').trim()
+          })
+            .sort({ updatedAt: -1, createdAt: -1 })
+            .select('category content')
+            .lean()
+        : null;
       let normalizedTemplateCategory = toCleanString(templateCategory).toLowerCase();
-      if (!normalizedTemplateCategory && isValidObjectId(req.user.id)) {
-        const templateRecord = await Template.findOne({
-          userId: req.user.id,
-          name: String(templateName || '').trim()
-        })
-          .sort({ updatedAt: -1, createdAt: -1 })
-          .select('category')
-          .lean();
-
+      if (!normalizedTemplateCategory) {
         normalizedTemplateCategory = toCleanString(templateRecord?.category).toLowerCase() || 'utility';
       }
       if (!normalizedTemplateCategory) {
@@ -1459,11 +1462,19 @@ router.post(
         result?.data?.messages?.[0]?.id || result?.data?.messageId || null;
 
       const messageCompanyId = conversation.companyId || req.companyId || null;
-      const previewSuffix =
-        normalizedVariables.filter(Boolean).length > 0
-          ? ` (${normalizedVariables.filter(Boolean).join(', ')})`
-          : '';
-      const previewText = `Template: ${templateName}${previewSuffix}`;
+      const bodyText = String(templateRecord?.content?.body || '');
+      const renderedBody = bodyText.replace(/\{\{\s*(\d+)\s*\}\}|\{var(\d+)\}/g, (match, numbered, named) => {
+        const variableIndex = Number(numbered || named) - 1;
+        return variableIndex >= 0 && variableIndex < normalizedVariables.length
+          ? normalizedVariables[variableIndex]
+          : match;
+      });
+      const previewParts = [
+        templateRecord?.content?.header?.type === 'text' ? templateRecord.content.header.text : '',
+        renderedBody,
+        templateRecord?.content?.footer || ''
+      ].map((part) => String(part || '').trim()).filter(Boolean);
+      const previewText = previewParts.join('\n') || `Template: ${templateName}`;
       const messageTimestamp = new Date();
 
       const message = await Message.create({
