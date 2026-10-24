@@ -240,10 +240,19 @@ class TemplateController {
       }
       const preparedBody = prepareMetaTemplateText(templateContent?.body || bodyText);
       const bodyForVariables = preparedBody.text;
+      const bodyVariableCount = (bodyForVariables.match(/\{\{\d+\}\}/g) || []).length;
+      const fixedBodyWordCount = bodyForVariables.trim().split(/\s+/).filter(Boolean).length - bodyVariableCount;
+      const minimumFixedBodyWords = (2 * bodyVariableCount) + 1;
       if (!bodyForVariables.replace(/\{\{\d+\}\}/g, '').trim()) {
         return res.status(400).json({
           success: false,
           error: 'Template body must include regular text in addition to variables.'
+        });
+      }
+      if (bodyVariableCount > 0 && fixedBodyWordCount < minimumFixedBodyWords) {
+        return res.status(400).json({
+          success: false,
+          error: `Template body has too many variables for its length. Add more regular words or use fewer variables (aim for at least ${minimumFixedBodyWords} non-variable words for ${bodyVariableCount} variables).`
         });
       }
       const variables = this.extractVariables(bodyForVariables).map((variable, index) => ({
