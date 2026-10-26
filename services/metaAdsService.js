@@ -4399,6 +4399,45 @@ const fetchMetaDeliverySnapshot = async ({ userId, campaignId } = {}) => {
   };
 };
 
+const fetchMetaCampaignStatus = async ({ userId, campaignId } = {}) => {
+  const resolvedCampaignId = String(campaignId || '').trim();
+  if (!resolvedCampaignId || /^[a-f\d]{24}$/i.test(resolvedCampaignId)) {
+    throw buildStageErrorWithDetails(
+      'Campaign status refresh',
+      'A valid Meta campaign ID is required.',
+      {},
+      400
+    );
+  }
+  if (shouldUseMockMode()) {
+    throw buildStageErrorWithDetails(
+      'Campaign status refresh',
+      'Live Meta status is unavailable while the Meta API is in mock mode.',
+      {},
+      503
+    );
+  }
+
+  const accessContext = await ensureConnectedMetaUser(userId, 'Campaign status refresh');
+  const response = await graphRequest({
+    path: resolvedCampaignId,
+    params: { fields: 'id,name,status,effective_status' },
+    accessToken: accessContext.accessToken,
+    apiVersion: String(getEnvConfig().apiVersion || 'v23.0').trim(),
+    bypassCache: true
+  });
+  const campaign = response?.data && !Array.isArray(response.data) ? response.data : response;
+  if (!campaign?.id || String(campaign.id) !== resolvedCampaignId) {
+    throw buildStageErrorWithDetails(
+      'Campaign status refresh',
+      'Meta returned an invalid campaign status response.',
+      {},
+      502
+    );
+  }
+  return campaign;
+};
+
 const classifyMetaStatusError = (error) => {
   const status = Number(error?.status || error?.response?.status || 0);
   if (status === 429 || error?.metaRateLimited) return 'rate_limited';
@@ -5262,6 +5301,7 @@ module.exports = {
   createMetaAdStackFromCrud,
   updateCampaign,
   fetchMetaDeliverySnapshot,
+  fetchMetaCampaignStatus,
   pauseCampaign,
   resumeCampaign,
   archiveMetaCrudAssets,
