@@ -4421,7 +4421,7 @@ const fetchMetaCampaignStatus = async ({ userId, campaignId } = {}) => {
   const accessContext = await ensureConnectedMetaUser(userId, 'Campaign status refresh');
   const response = await graphRequest({
     path: resolvedCampaignId,
-    params: { fields: 'id,name,status,effective_status' },
+    params: { fields: 'id,name,status,effective_status,start_time,stop_time' },
     accessToken: accessContext.accessToken,
     apiVersion: String(getEnvConfig().apiVersion || 'v23.0').trim(),
     bypassCache: true

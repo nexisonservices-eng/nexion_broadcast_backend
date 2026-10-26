@@ -20,14 +20,57 @@ const isMetaCampaign = (campaign = {}) => {
   return Boolean(metaCampaignId && !/^[a-f\d]{24}$/i.test(metaCampaignId));
 };
 
+const META_STATUS_LABELS = {
+  ACTIVE: 'Active',
+  PAUSED: 'Paused',
+  DELETED: 'Deleted',
+  ARCHIVED: 'Archived',
+  COMPLETED: 'Completed',
+  PENDING_REVIEW: 'In review',
+  IN_REVIEW: 'In review',
+  PREPARING: 'Preparing',
+  PREPARATION: 'Preparing',
+  PROCESSING: 'Processing',
+  IN_PROCESS: 'Processing',
+  DISAPPROVED: 'Disapproved',
+  REJECTED: 'Rejected',
+  PREAPPROVED: 'Preapproved',
+  PENDING_BILLING_INFO: 'Pending billing info',
+  CAMPAIGN_PAUSED: 'Campaign paused',
+  ADSET_PAUSED: 'Ad set paused',
+  AD_PAUSED: 'Ad paused',
+  WITH_ISSUES: 'With issues',
+  SCHEDULED: 'Scheduled',
+  LEARNING: 'Learning',
+  LEARNING_LIMITED: 'Learning limited',
+  NOT_DELIVERING: 'Not delivering'
+};
+
+const formatMetaCampaignStatus = (campaign = {}) => {
+  const rawStatus = String(
+    campaign.metaStatus ||
+    campaign.metaDeliverySnapshot?.campaign?.effective_status ||
+    campaign.metaDeliverySnapshot?.campaign?.status ||
+    ''
+  ).trim();
+  const normalizedStatus = rawStatus.toUpperCase().replace(/[\s-]+/g, '_');
+  const metaCampaign = campaign.metaDeliverySnapshot?.campaign || {};
+  const stopTime = metaCampaign.stop_time || metaCampaign.end_time;
+  const stopTimeMs = stopTime ? new Date(stopTime).getTime() : NaN;
+
+  // Meta's effective_status can remain ACTIVE after a campaign's scheduled stop time.
+  if (normalizedStatus === 'ACTIVE' && Number.isFinite(stopTimeMs) && stopTimeMs <= Date.now()) {
+    return 'Completed';
+  }
+
+  return META_STATUS_LABELS[normalizedStatus] ||
+    normalizedStatus.toLowerCase().replace(/\b\w/g, (letter) => letter.toUpperCase()) ||
+    'Unknown';
+};
+
 const campaignStatus = (campaign = {}) => {
   if (isMetaCampaign(campaign)) {
-    return String(
-      campaign.metaStatus ||
-      campaign.metaDeliverySnapshot?.campaign?.effective_status ||
-      campaign.metaDeliverySnapshot?.campaign?.status ||
-      'UNKNOWN'
-    ).toUpperCase();
+    return formatMetaCampaignStatus(campaign);
   }
   return campaign.deliveryStatus || campaign.lifecycleStatus || campaign.status || 'unknown';
 };
@@ -88,6 +131,9 @@ const campaignRow = (campaign = {}) => ({
   id: String(campaign._id || ''),
   name: campaign.name || 'Untitled campaign',
   status: campaignStatus(campaign),
+  metaStatus: isMetaCampaign(campaign)
+    ? String(campaign.metaStatus || campaign.metaDeliverySnapshot?.campaign?.effective_status || campaign.metaDeliverySnapshot?.campaign?.status || '')
+    : '',
   statusSource: isMetaCampaign(campaign) ? 'meta' : 'local',
   statusStale: isMetaCampaign(campaign) && Boolean(campaign.metaDeliveryStatusStale),
   createdAt: campaign.createdAt || null,
@@ -109,7 +155,7 @@ router.get('/customers', async (req, res) => {
 
     const companyIds = [...adminsByCompany.keys()];
     const campaigns = companyIds.length
-      ? await Campaign.find({ companyId: { $in: companyIds }, status: { $ne: 'archived' } })
+      ? await Campaign.find({ companyId: { $in: companyIds } })
         .select('companyId createdAt updatedAt')
         .sort({ updatedAt: -1, createdAt: -1 })
         .lean()
@@ -158,7 +204,7 @@ router.get('/customers/:companyId/campaigns', async (req, res) => {
     );
     if (!customer) return res.status(404).json({ success: false, error: 'Customer not found.' });
 
-    const campaigns = await Campaign.find({ companyId, status: { $ne: 'archived' } })
+    const campaigns = await Campaign.find({ companyId })
       .select('name status lifecycleStatus deliveryStatus metaStatus metaCampaignId createdBy metaDeliverySnapshot metaDeliveryStatusStale createdAt updatedAt')
       .sort({ createdAt: -1 })
       .lean();
@@ -183,7 +229,7 @@ router.get('/customers/:companyId/campaigns/:campaignId', async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(companyId) || !mongoose.Types.ObjectId.isValid(campaignId)) {
       return res.status(400).json({ success: false, error: 'Invalid customer or campaign ID.' });
     }
-    let campaign = await Campaign.findOne({ _id: campaignId, companyId, status: { $ne: 'archived' } }).lean();
+    let campaign = await Campaign.findOne({ _id: campaignId, companyId }).lean();
     if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found for this customer.' });
     campaign = await refreshMetaCampaignStatus(campaign);
 
