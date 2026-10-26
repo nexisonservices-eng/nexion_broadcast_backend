@@ -294,7 +294,7 @@ class BroadcastController {
       const resolved = resolveBroadcastCreators(result, req.user);
       const rows = Array.isArray(result.data) ? result.data : result.data?.items || [];
       const resolvedRows = Array.isArray(resolved.data) ? resolved.data : resolved.data?.items || [];
-      console.info('[BroadcastCreator] admin-list', JSON.stringify({
+      if (process.env.DEBUG_BROADCAST_CREATORS === 'true') console.info('[BroadcastCreator] admin-list', JSON.stringify({
         viewerId: String(req.user.id || ''),
         viewerRole: normalizedRole,
         directoryCount: req.user.workspaceCreators?.length || 0,

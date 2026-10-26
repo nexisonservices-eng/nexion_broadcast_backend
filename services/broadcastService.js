@@ -4087,67 +4087,6 @@ class BroadcastService {
         const getAudienceBase = (broadcast = {}) =>
           Number(broadcast?.recipientCount || broadcast?.stats?.sent || 0);
 
-        const needsStatsRepair = (broadcast = {}) => {
-          const status = String(broadcast?.status || "").toLowerCase();
-          const stats = broadcast?.stats || {};
-          const sent = Number(stats.sent || 0);
-          const delivered = Number(stats.delivered || 0);
-          const read = Number(stats.read || 0);
-          const failed = Number(stats.failed || 0);
-          const replied = Number(stats.replied || 0);
-          const recipientCount = Number(broadcast?.recipientCount || 0);
-          const hasAnyStats =
-            sent > 0 ||
-            delivered > 0 ||
-            read > 0 ||
-            failed > 0 ||
-            replied > 0;
-          const deliveryStatsMissing =
-            sent > 0 && delivered === 0 && read === 0 && failed === 0;
-          const statsLookIncomplete =
-            recipientCount > 0 &&
-            (sent === 0 ||
-              sent > recipientCount ||
-              delivered > recipientCount ||
-              read > recipientCount ||
-              failed > recipientCount ||
-              replied > recipientCount ||
-              sent < delivered ||
-              sent < read ||
-              sent < failed ||
-              delivered < read ||
-              delivered < failed ||
-              deliveryStatsMissing);
-          const statusRepairNeeded =
-            status === "completed_with_errors" && failed > 0;
-
-          return (
-            ["completed", "completed_with_errors", "failed"].includes(status) &&
-            (statsLookIncomplete ||
-              (recipientCount > 0 && !hasAnyStats) ||
-              statusRepairNeeded)
-          );
-        };
-
-        const staleRows = Array.isArray(rows)
-          ? rows.filter((broadcast) => needsStatsRepair(broadcast))
-          : [];
-
-        if (staleRows.length > 0) {
-          for (const staleBroadcast of staleRows) {
-            try {
-              const repairResult = await this.syncBroadcastStats(
-                staleBroadcast._id,
-              );
-              if (repairResult?.success && repairResult?.data?.stats) {
-                staleBroadcast.stats = repairResult.data.stats;
-              }
-            } catch (_repairError) {
-              // Best-effort repair only; keep list endpoint responsive.
-            }
-          }
-        }
-
         const hasMore = rows.length > limit;
         const items = rows.slice(0, limit).map((broadcast) => ({
           ...broadcast,
@@ -4206,66 +4145,6 @@ class BroadcastService {
         .select(projection)
         .sort({ createdAt: -1 })
         .lean();
-
-      const staleCandidates = Array.isArray(broadcasts)
-        ? broadcasts.filter((broadcast) => {
-            const status = String(broadcast?.status || "").toLowerCase();
-            const stats = broadcast?.stats || {};
-            const sent = Number(stats.sent || 0);
-            const delivered = Number(stats.delivered || 0);
-            const read = Number(stats.read || 0);
-            const failed = Number(stats.failed || 0);
-            const replied = Number(stats.replied || 0);
-            const recipientCount = Number(broadcast?.recipientCount || 0);
-            const hasAnyStats =
-              sent > 0 ||
-              delivered > 0 ||
-              read > 0 ||
-              failed > 0 ||
-              replied > 0;
-            const deliveryStatsMissing =
-              sent > 0 && delivered === 0 && read === 0 && failed === 0;
-            const statsLookIncomplete =
-              recipientCount > 0 &&
-              (sent === 0 ||
-                sent > recipientCount ||
-                delivered > recipientCount ||
-                read > recipientCount ||
-                failed > recipientCount ||
-                replied > recipientCount ||
-                sent < delivered ||
-                sent < read ||
-                sent < failed ||
-                delivered < read ||
-                delivered < failed ||
-                deliveryStatsMissing);
-            const statusRepairNeeded =
-              status === "completed_with_errors" && failed > 0;
-            return (
-              ["completed", "completed_with_errors", "failed"].includes(
-                status,
-              ) &&
-              (statsLookIncomplete ||
-                (recipientCount > 0 && !hasAnyStats) ||
-                statusRepairNeeded)
-            );
-          })
-        : [];
-
-      if (staleCandidates.length > 0) {
-        for (const staleBroadcast of staleCandidates) {
-          try {
-            const repairResult = await this.syncBroadcastStats(
-              staleBroadcast._id,
-            );
-            if (repairResult?.success && repairResult?.data?.stats) {
-              staleBroadcast.stats = repairResult.data.stats;
-            }
-          } catch (_repairError) {
-            // Best-effort repair only; keep list endpoint responsive.
-          }
-        }
-      }
 
       const normalizedBroadcasts = broadcasts.map((broadcast) => ({
         ...broadcast,

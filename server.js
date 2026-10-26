@@ -596,6 +596,7 @@ server.listen(PORT, async () => {
 
   try {
     await Promise.all([
+      Broadcast.createIndexes(),
       Contact.syncIndexes(),
       Template.syncIndexes(),
       Conversation.syncIndexes(),
@@ -612,7 +613,7 @@ server.listen(PORT, async () => {
       ConsentExportJob.syncIndexes(),
       CsvImportJob.syncIndexes()
     ]);
-    console.log('MongoDB indexes synced for all models including Campaigns.');
+    console.log('MongoDB indexes checked for all configured models.');
   } catch (indexError) {
     console.error('Failed to sync MongoDB indexes:', indexError.message);
   }
