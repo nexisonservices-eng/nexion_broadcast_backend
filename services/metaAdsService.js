@@ -3746,6 +3746,7 @@ const createMetaAdStackFromCrud = async ({
   videoFileName,
   status,
   onCampaignCreated,
+  onTargetingResolved,
   onAdCreationPending,
   resumePartialData,
   logMetaRequest
@@ -3914,9 +3915,11 @@ const createMetaAdStackFromCrud = async ({
   // Link the local record before creating the remaining ad assets.
   await onCampaignCreated?.(partialData.metaCampaignId);
 
+  const targetingCountries = parseTargetingCountriesFromCrud(targeting);
+  const targetingLocationTerms = parseDelimitedTerms(targeting);
   const simpleTargeting = {
     geo_locations: {
-      countries: parseTargetingCountriesFromCrud(targeting)
+      countries: targetingCountries
     },
     age_min: Math.max(13, Number(ageMin || 18)),
     age_max: Math.min(65, Number(ageMax || 65)),
@@ -3939,6 +3942,30 @@ const createMetaAdStackFromCrud = async ({
     }
     simpleTargeting.flexible_spec = [flexibleSpec];
   }
+
+  await onTargetingResolved?.({
+    locations: targetingCountries.map((countryCode) => ({
+      name: targetingLocationTerms.find((term) => {
+        const normalized = String(term || '').trim().toUpperCase();
+        return normalized === countryCode || COUNTRY_NAME_TO_CODE[normalizeCountryToken(term)] === countryCode;
+      }) || countryCode,
+      countryCode,
+      metaId: ''
+    })),
+    interests: resolvedInterests.map((entry) => ({
+      name: String(entry?.name || '').trim(),
+      metaId: String(entry?.id || '').trim()
+    })),
+    behaviors: resolvedBehaviors.map((entry) => ({
+      name: String(entry?.name || '').trim(),
+      metaId: String(entry?.id || '').trim()
+    })),
+    ageMin: simpleTargeting.age_min,
+    ageMax: simpleTargeting.age_max,
+    gender: genders.length === 1 ? (genders[0] === 1 ? 'male' : 'female') : 'all',
+    metaTargeting: simpleTargeting,
+    capturedAt: new Date()
+  });
 
   const adSetPayload = {
     name: `${String(campaignName || 'Campaign').trim()} - Ad Set`,

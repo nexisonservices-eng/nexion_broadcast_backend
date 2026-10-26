@@ -67,7 +67,33 @@ const fetchWorkspaceUsers = async (authHeader, { superAdmin = false, companyId =
   throw error;
 };
 
+const fetchSuperAdminCustomers = async (authHeader) => {
+  if (ADMIN_API_BASE_URLS.length === 0) {
+    const error = new Error('The admin service is not configured for the customer directory.');
+    error.status = 503;
+    throw error;
+  }
+  let lastError = null;
+  for (const baseUrl of ADMIN_API_BASE_URLS) {
+    try {
+      const response = await axios.get(`${baseUrl.replace(/\/+$/, '')}/api/admin/users`, {
+        headers: { Authorization: authHeader },
+        timeout: 15000
+      });
+      const payload = response?.data?.data || response?.data || {};
+      return Array.isArray(payload) ? payload : Array.isArray(payload?.users) ? payload.users : [];
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  const error = new Error('Unable to load the customer directory from the admin service.');
+  error.status = 503;
+  error.cause = lastError;
+  throw error;
+};
+
 module.exports = {
   fetchUserContext,
-  fetchWorkspaceUsers
+  fetchWorkspaceUsers,
+  fetchSuperAdminCustomers
 };

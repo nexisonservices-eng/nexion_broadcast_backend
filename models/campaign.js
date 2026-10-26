@@ -140,6 +140,12 @@ const campaignSchema = new mongoose.Schema({
         trim: true,
         maxlength: [500, 'Targeting description cannot exceed 500 characters']
     },
+    // Per-campaign audience snapshot for Super Admin review. Existing
+    // targeting fields remain the source used by the campaign creation flow.
+    targetingSnapshot: {
+        type: mongoose.Schema.Types.Mixed,
+        default: null
+    },
     audience: {
         segmentId: {
             type: String,

@@ -125,6 +125,28 @@ const normalizeCampaignCreatePayload = (payload = {}) => {
     return normalized;
 };
 
+const splitTargetingTerms = (value) => String(value || '')
+    .split(/[\n,;]+/)
+    .map((term) => term.trim())
+    .filter(Boolean)
+    .map((name) => ({ name, metaId: '' }));
+
+const optionalTargetingNumber = (value) => {
+    if (value === null || value === undefined || value === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+};
+
+const buildCampaignTargetingSnapshot = (payload = {}) => ({
+    locations: splitTargetingTerms(payload.targeting),
+    interests: splitTargetingTerms(payload.interests),
+    behaviors: splitTargetingTerms(payload.behaviors),
+    ageMin: optionalTargetingNumber(payload.ageMin),
+    ageMax: optionalTargetingNumber(payload.ageMax),
+    gender: String(payload.gender || 'all').trim().toLowerCase(),
+    capturedAt: new Date()
+});
+
 const validateMetaBackedCampaignCreatePayload = (payload = {}) => {
     const errors = [];
     if (!payload.name) {
@@ -427,6 +449,20 @@ const continueCampaignMetaCreation = async ({
             gender: normalizedPayload.gender,
             interests: normalizedPayload.interests,
             behaviors: normalizedPayload.behaviors,
+            onTargetingResolved: async (targetingSnapshot) => {
+                const selectedTargeting = normalizedPayload.targetingSnapshot;
+                const saved = await Campaign.findByIdAndUpdate(campaignId, {
+                    $set: {
+                        targetingSnapshot: {
+                            ...targetingSnapshot,
+                            selectedLocations: selectedTargeting.locations,
+                            selectedInterests: selectedTargeting.interests,
+                            selectedBehaviors: selectedTargeting.behaviors
+                        }
+                    }
+                });
+                if (!saved) throw new Error('Local campaign no longer exists; targeting could not be saved.');
+            },
             primaryText: normalizedPayload.primaryText,
             headline: normalizedPayload.headline,
             description: normalizedPayload.description,
@@ -871,6 +907,7 @@ exports.createCampaign = async (req, res) => {
         req.body.updatedBy = req.user.id;
 
         const normalizedPayload = normalizeCampaignCreatePayload(req.body);
+        normalizedPayload.targetingSnapshot = buildCampaignTargetingSnapshot(normalizedPayload);
         const validationErrors = validateMetaBackedCampaignCreatePayload(normalizedPayload);
         if (validationErrors.length > 0) {
             return res.status(400).json({
