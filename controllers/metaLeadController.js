@@ -172,7 +172,20 @@ const buildCampaignNameLookup = async ({ userId, campaignIds = [], adAccountId =
 
 const getMetaLeads = async (req, res) => {
   try {
-    const userId = normalizeText(req.query?.userId || req.query?.adminId);
+    const authenticatedUserId = normalizeText(req.user?.id || req.user?._id || req.user?.userId);
+    const requestedUserId = normalizeText(req.query?.userId || req.query?.adminId);
+    const authorizedUserIds = new Set([
+      authenticatedUserId,
+      ...(Array.isArray(req.user?.workspaceReadUserIds) ? req.user.workspaceReadUserIds : []),
+      ...(Array.isArray(req.user?.workspaceCreators) ? req.user.workspaceCreators : [])
+    ].map(normalizeText).filter(Boolean));
+    if (!authenticatedUserId) {
+      return res.status(401).json({ success: false, error: 'Authentication is required to access Meta leads.' });
+    }
+    if (requestedUserId && !authorizedUserIds.has(requestedUserId)) {
+      return res.status(403).json({ success: false, error: 'You are not authorized to access these Meta leads.' });
+    }
+    const userId = requestedUserId || authenticatedUserId;
     const requestedFormId = normalizeText(req.params?.formId || req.query?.formId || req.query?.form_id);
 
     if (!userId) {

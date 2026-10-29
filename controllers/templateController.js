@@ -199,7 +199,10 @@ class TemplateController {
       let templateContent = content;
       let bodyText = '';
 
-      if (components && Array.isArray(components)) {
+      // The editor sends `components: []` when it is retrying a saved template.
+      // Treat an empty array as absent so the saved content is used to build
+      // the Meta components instead of replacing the body with an empty string.
+      if (Array.isArray(components) && components.length > 0) {
         const bodyComponent = components.find(comp => comp.type === 'BODY');
         bodyText = bodyComponent ? bodyComponent.text : '';
 

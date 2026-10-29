@@ -76,6 +76,7 @@ const ivrRoutes = require('./routes/ivr');
 const crmRoutes = require('./routes/crm');
 const googleCalendarRoutes = require('./routes/googleCalendar');
 const campaignRoutes = require('./routes/campaignroutes');
+const superAdminCustomerTargetingRoutes = require('./routes/superAdminCustomerTargeting');
 const usageRoutes = require('./routes/usage');
 const internalCleanupRoutes = require('./routes/internalCleanup');
 const internalIvrRoutes = require('./routes/internalIvr');
@@ -276,6 +277,7 @@ app.use('/api/ivr', ivrRoutes);
 app.use('/api/crm', crmRoutes);
 app.use('/api/google-calendar', googleCalendarRoutes);
 app.use('/api/campaigns', campaignRoutes);
+app.use('/api/super-admin/customer-targeting', superAdminCustomerTargetingRoutes);
 app.use('/api/usage', usageRoutes);
 app.use('/internal/cleanup', internalCleanupRoutes);
 app.use('/internal/ivr', internalIvrRoutes);
@@ -594,6 +596,7 @@ server.listen(PORT, async () => {
 
   try {
     await Promise.all([
+      Broadcast.createIndexes(),
       Contact.syncIndexes(),
       Template.syncIndexes(),
       Conversation.syncIndexes(),
@@ -610,7 +613,7 @@ server.listen(PORT, async () => {
       ConsentExportJob.syncIndexes(),
       CsvImportJob.syncIndexes()
     ]);
-    console.log('MongoDB indexes synced for all models including Campaigns.');
+    console.log('MongoDB indexes checked for all configured models.');
   } catch (indexError) {
     console.error('Failed to sync MongoDB indexes:', indexError.message);
   }

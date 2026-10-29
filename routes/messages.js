@@ -1424,9 +1424,43 @@ router.post(
             .select('category content')
             .lean()
         : null;
+      let templatePreviewContent = templateRecord?.content || null;
+      let metaTemplate = null;
+      if (!String(templatePreviewContent?.body || '').trim()) {
+        try {
+          const listResult = await whatsappService.getTemplateList(req.whatsappCredentials);
+          if (listResult?.success) {
+            const metaTemplates = listResult.data?.data || [];
+            const requestedName = String(templateName || '').trim().toLowerCase();
+            const requestedLanguage = String(language || 'en_US').trim().toLowerCase();
+            metaTemplate = metaTemplates.find((item) =>
+              String(item?.name || '').trim().toLowerCase() === requestedName &&
+              String(item?.language || '').trim().toLowerCase() === requestedLanguage
+            ) || metaTemplates.find((item) =>
+              String(item?.name || '').trim().toLowerCase() === requestedName
+            ) || null;
+            const components = Array.isArray(metaTemplate?.components) ? metaTemplate.components : [];
+            const header = components.find((item) => String(item?.type || '').toUpperCase() === 'HEADER');
+            const body = components.find((item) => String(item?.type || '').toUpperCase() === 'BODY');
+            const footer = components.find((item) => String(item?.type || '').toUpperCase() === 'FOOTER');
+            if (body?.text) {
+              templatePreviewContent = {
+                header: {
+                  type: String(header?.format || 'text').toLowerCase(),
+                  text: header?.text || ''
+                },
+                body: body.text,
+                footer: footer?.text || ''
+              };
+            }
+          }
+        } catch (lookupError) {
+          console.warn('Could not load Meta template content for inbox preview:', lookupError.message);
+        }
+      }
       let normalizedTemplateCategory = toCleanString(templateCategory).toLowerCase();
       if (!normalizedTemplateCategory) {
-        normalizedTemplateCategory = toCleanString(templateRecord?.category).toLowerCase() || 'utility';
+        normalizedTemplateCategory = toCleanString(templateRecord?.category || metaTemplate?.category).toLowerCase() || 'utility';
       }
       if (!normalizedTemplateCategory) {
         normalizedTemplateCategory = 'utility';
@@ -1462,24 +1496,23 @@ router.post(
         result?.data?.messages?.[0]?.id || result?.data?.messageId || null;
 
       const messageCompanyId = conversation.companyId || req.companyId || null;
-      const templateBody = String(templateRecord?.content?.body || '');
       let templatePlaceholderIndex = 0;
       const renderTemplatePart = (part) =>
-        String(part || '').replace(/{{\s*([^{}]+?)\s*}}|\{var(\d+)\}/g, (placeholder, key, namedIndex) => {
-            const normalizedKey = namedIndex || key;
-            const numericIndex = Number(normalizedKey) - 1;
-            const variableIndex = namedIndex || (Number.isInteger(numericIndex) && numericIndex >= 0)
-              ? numericIndex
-              : templatePlaceholderIndex;
-            templatePlaceholderIndex += 1;
-            return variableIndex >= 0 && normalizedVariables[variableIndex] !== undefined
-              ? normalizedVariables[variableIndex]
-              : placeholder;
+        String(part || '').replace(/\{\{\s*([^{}]+?)\s*\}\}|\{var(\d+)\}/g, (placeholder, key, namedIndex) => {
+          const normalizedKey = String(namedIndex || key || '').trim();
+          const variableIndex = /^\d+$/.test(normalizedKey)
+            ? Number(normalizedKey) - 1
+            : templatePlaceholderIndex++;
+          return variableIndex >= 0 && normalizedVariables[variableIndex] !== undefined
+            ? normalizedVariables[variableIndex]
+            : placeholder;
         });
       const previewParts = [
-        templateRecord?.content?.header?.type === 'text' ? renderTemplatePart(templateRecord.content.header.text) : '',
-        renderTemplatePart(templateBody),
-        renderTemplatePart(templateRecord?.content?.footer || '')
+        templatePreviewContent?.header?.type === 'text'
+          ? renderTemplatePart(templatePreviewContent.header.text)
+          : '',
+        renderTemplatePart(templatePreviewContent?.body || ''),
+        renderTemplatePart(templatePreviewContent?.footer || '')
       ].map((part) => String(part || '').trim()).filter(Boolean);
       const previewText = previewParts.join('\n') || `Template: ${templateName}`;
       const messageTimestamp = new Date();
