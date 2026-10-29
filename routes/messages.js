@@ -1269,7 +1269,7 @@ router.post(
         conversationUpdate: {
           lastMessageTime: threadTimestamp,
           lastMessage: reactionText,
-          lastMessageMediaType: '',
+          lastMessageMediaType: templateImageUrl ? 'image' : '',
           lastMessageAttachmentName: '',
           lastMessageAttachmentPages: null,
           lastMessageFrom: 'agent',
@@ -1483,6 +1483,10 @@ router.post(
       ].map((part) => String(part || '').trim()).filter(Boolean);
       const previewText = previewParts.join('\n') || `Template: ${templateName}`;
       const messageTimestamp = new Date();
+      const imageHeaderParameter = normalizedComponents
+        .find((component) => String(component?.type || '').toUpperCase() === 'HEADER')
+        ?.parameters?.find((parameter) => String(parameter?.type || '').toLowerCase() === 'image');
+      const templateImageUrl = String(imageHeaderParameter?.image?.link || '').trim();
 
       const message = await Message.create({
         userId: req.user.id,
@@ -1491,6 +1495,7 @@ router.post(
         sender: 'agent',
         ...resolveOutboundSenderMeta(req.user),
         text: previewText,
+        ...(templateImageUrl ? { mediaType: 'image', mediaUrl: templateImageUrl } : {}),
         whatsappMessageId,
         status: 'sent',
         timestamp: messageTimestamp
@@ -1521,7 +1526,7 @@ router.post(
         conversationUpdate: {
           lastMessageTime: messageTimestamp,
           lastMessage: previewText,
-          lastMessageMediaType: '',
+          lastMessageMediaType: templateImageUrl ? 'image' : '',
           lastMessageAttachmentName: '',
           lastMessageAttachmentPages: null,
           lastMessageFrom: 'agent',
