@@ -542,6 +542,7 @@ if (enableBroadcastInboxWorker && canStartBullWorkers) {
       companyId,
       phoneNumber,
       message,
+      mediaUrl = '',
       whatsappResponse,
       broadcastDispatchKey = '',
       templateCategory = '',
@@ -571,7 +572,9 @@ if (enableBroadcastInboxWorker && canStartBullWorkers) {
       broadcastId,
       userId,
       companyId,
-      broadcastDispatchKey
+      broadcastDispatchKey,
+      null,
+      mediaUrl
     );
 
     if (!conversation || !savedMessage) {

@@ -3152,6 +3152,7 @@ class BroadcastService {
                   companyId: broadcast.companyId,
                   phoneNumber,
                   message: messageTextForInbox,
+                  mediaUrl: templateHeaderMediaType === "image" ? templateHeaderMediaUrl : "",
                   whatsappResponse: result.data,
                   broadcastDispatchKey,
                   templateCategory,
@@ -3166,6 +3167,7 @@ class BroadcastService {
                       broadcast.companyId,
                       broadcastDispatchKey,
                       broadcastSenderMeta,
+                      templateHeaderMediaType === "image" ? templateHeaderMediaUrl : "",
                     );
 
                     if (
@@ -3221,6 +3223,7 @@ class BroadcastService {
                   broadcast.companyId,
                   broadcastDispatchKey,
                   broadcastSenderMeta,
+                  templateHeaderMediaType === "image" ? templateHeaderMediaUrl : "",
                 );
 
                 if (
@@ -3420,9 +3423,11 @@ class BroadcastService {
     companyId,
     broadcastDispatchKey = "",
     senderMeta = null,
+    mediaUrl = "",
   ) {
     try {
       const whatsappMessageId = whatsappResponse?.messages?.[0]?.id;
+      const normalizedMediaUrl = String(mediaUrl || "").trim();
       const resolvedSenderMeta =
         senderMeta && typeof senderMeta === "object"
           ? senderMeta
@@ -3486,7 +3491,7 @@ class BroadcastService {
           assignedToId: assignmentPatch.assignedToId || resolvedAssignee || null,
           lastMessage: message,
           lastMessageTime: new Date(),
-          lastMessageMediaType: "",
+          lastMessageMediaType: normalizedMediaUrl ? "image" : "",
           lastMessageAttachmentName: "",
           lastMessageAttachmentPages: null,
           lastMessageFrom: "agent",
@@ -3506,7 +3511,7 @@ class BroadcastService {
         // active again so the agent can continue the conversation in Inbox.
         conversation.status = "active";
         conversation.resolvedAt = null;
-        conversation.lastMessageMediaType = "";
+        conversation.lastMessageMediaType = normalizedMediaUrl ? "image" : "";
         conversation.lastMessageAttachmentName = "";
         conversation.lastMessageAttachmentPages = null;
         conversation.lastMessageFrom = "agent";
@@ -3552,6 +3557,7 @@ class BroadcastService {
         senderRole: normalizedSenderRole,
         senderName: normalizedSenderName,
         text: message,
+        ...(normalizedMediaUrl ? { mediaType: "image", mediaUrl: normalizedMediaUrl } : {}),
         whatsappMessageId,
         status: "sent",
         sentAt: new Date(),
@@ -3597,6 +3603,7 @@ class BroadcastService {
     companyId,
     phoneNumber,
     message,
+    mediaUrl = "",
     whatsappResponse,
     broadcastDispatchKey = "",
     templateCategory = "",
@@ -3609,6 +3616,7 @@ class BroadcastService {
       companyId,
       phoneNumber,
       message,
+      mediaUrl,
       whatsappResponse,
       broadcastDispatchKey,
       templateCategory,
