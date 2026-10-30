@@ -1,4 +1,9 @@
 const WebSocket = require('ws');
+const Conversation = require('../models/Conversation');
+const Contact = require('../models/Contact');
+const authMiddleware = require('../middleware/auth');
+const { isTenantWideRole } = require('../utils/accessControl');
+const { buildScopedFilter: buildCrmScopedFilter } = require('../utils/crmAccess');
 const {
   publishRealtimeEvent,
   subscribeRealtimeEvents
@@ -8,12 +13,50 @@ const {
 } = require('./broadcastEventBus');
 const {
   setUserPresence,
-  clearUserPresence,
   setTypingState,
   clearTypingState
 } = require('./presenceStore');
 
-const createWebSocketHub = ({ wss }) => {
+const buildConversationRealtimeFilter = (context, conversationId) => {
+  const filter = { _id: conversationId };
+  if (context.companyId) filter.companyId = context.companyId;
+  else if (!isTenantWideRole(context.normalizedRole)) return null;
+  if (!isTenantWideRole(context.normalizedRole)) {
+    const userId = String(context.userId || '');
+    filter.$or = [
+      { broadcastOwnerId: userId },
+      {
+        $and: [
+          { $or: [{ broadcastOwnerId: null }, { broadcastOwnerId: { $exists: false } }] },
+          { $or: [{ userId }, { createdBy: userId }, { assignedTo: userId }, { assignedToId: userId }, { assignedAgent: userId }] }
+        ]
+      }
+    ];
+  }
+  return filter;
+};
+
+const createWebSocketHub = ({
+  wss,
+  conversationExists = (filter) => Conversation.exists(filter),
+  contactExists = (filter) => Contact.exists(filter),
+  publishRealtimeEventFn = publishRealtimeEvent,
+  subscribeRealtimeEventsFn = subscribeRealtimeEvents,
+  subscribeBroadcastEventsFn = subscribeBroadcastEvents,
+  setUserPresenceFn = setUserPresence,
+  setTypingStateFn = setTypingState,
+  clearTypingStateFn = clearTypingState,
+  sessionRevalidationIntervalMs = Math.min(
+    5 * 60_000,
+    Math.max(30_000, Number(process.env.WS_AUTH_REVALIDATION_INTERVAL_MS || 60_000))
+  ),
+  authenticateToken = authMiddleware.authenticateBearerToken,
+  authorizeConversation = async (context, conversationId) => {
+    const filter = buildConversationRealtimeFilter(context, conversationId);
+    if (!filter) return false;
+    return Boolean(await conversationExists(filter));
+  }
+}) => {
   const clients = new Map();
   const roomMembers = new Map();
   const clientMeta = new Map();
@@ -254,17 +297,6 @@ const createWebSocketHub = ({ wss }) => {
     sendToLocalRoom(getRoomKey('user', normalizedUserId), data);
   };
 
-  const broadcastLocal = (data) => {
-    const message = JSON.stringify(data);
-    clients.forEach((socketSet) => {
-      socketSet.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(message);
-        }
-      });
-    });
-  };
-
   const syncConversationRoom = (ws, nextConversationId = '') => {
     if (!(ws.joinedRooms instanceof Set)) {
       ws.joinedRooms = new Set();
@@ -302,7 +334,7 @@ const createWebSocketHub = ({ wss }) => {
   const deliverEvent = (event = {}) => {
     const scope = String(event?.scope || '').trim().toLowerCase();
     if (scope === 'broadcast') {
-      broadcastLocal(event.data || {});
+      sendToLocalRoom('global-admins', event.data || {});
       return;
     }
 
@@ -310,10 +342,6 @@ const createWebSocketHub = ({ wss }) => {
       const targetUserId = String(event?.userId || '').trim();
       if (targetUserId) {
         sendToLocalUser(targetUserId, event.data || {});
-      }
-      const targetCompanyId = String(event?.companyId || resolveDataCompanyId(event?.data || {})).trim();
-      if (targetCompanyId) {
-        sendToLocalRoom(getRoomKey('company', targetCompanyId), event.data || {});
       }
       resolveDataConversationIds(event?.data || {}, event?.conversationId).forEach((conversationId) => {
         sendToLocalRoom(getRoomKey('conversation', conversationId), event.data || {});
@@ -323,7 +351,15 @@ const createWebSocketHub = ({ wss }) => {
 
     if (scope === 'company') {
       const targetCompanyId = String(event?.companyId || resolveDataCompanyId(event?.data || {})).trim();
-      if (targetCompanyId) {
+      const data = event?.data || {};
+      const targetedUserId = String(event?.userId || data?.userId || '').trim();
+      if (targetedUserId) {
+        sendToLocalUser(targetedUserId, data);
+      } else if (
+        targetCompanyId &&
+        (data.type === 'user_list' ||
+          (data.type === 'team_inbox_cache_invalidated' && !data.conversationId && !data.conversationIds?.length))
+      ) {
         sendToLocalRoom(getRoomKey('company', targetCompanyId), event.data || {});
       }
       return;
@@ -344,11 +380,11 @@ const createWebSocketHub = ({ wss }) => {
     }
   };
 
-  subscribeRealtimeEvents((event) => {
+  subscribeRealtimeEventsFn((event) => {
     deliverEvent(event);
   });
 
-  subscribeBroadcastEvents((event) => {
+  subscribeBroadcastEventsFn((event) => {
     const targetUserId = String(event?.userId || '').trim();
     const payload = event?.payload || {};
 
@@ -365,12 +401,16 @@ const createWebSocketHub = ({ wss }) => {
   });
 
   const broadcast = async (data) => {
+    if (String(process.env.WS_ENABLE_GLOBAL_BROADCASTS || '').toLowerCase() !== 'true') {
+      throw new Error('Global WebSocket broadcasts are disabled');
+    }
     const payload = {
-      scope: 'broadcast',
+      scope: 'room',
+      room: 'global-admins',
       data
     };
-    broadcastLocal(data);
-    await publishRealtimeEvent(payload);
+    sendToLocalRoom('global-admins', data);
+    await publishRealtimeEventFn(payload);
   };
 
   const sendToUser = async (userId, data) => {
@@ -388,13 +428,10 @@ const createWebSocketHub = ({ wss }) => {
     };
 
     sendToLocalUser(normalizedUserId, data);
-    if (companyId) {
-      sendToLocalRoom(getRoomKey('company', companyId), data);
-    }
     resolveDataConversationIds(data || {}, conversationId).forEach((targetConversationId) => {
       sendToLocalRoom(getRoomKey('conversation', targetConversationId), data);
     });
-    await publishRealtimeEvent(payload);
+    await publishRealtimeEventFn(payload);
   };
 
   const emitRealtimeEvent = async (userId, data) => {
@@ -430,8 +467,23 @@ const createWebSocketHub = ({ wss }) => {
       });
     });
 
-    const userList = Array.from(seen.values());
-    broadcastLocal({ type: 'user_list', users: userList });
+    const usersByCompany = new Map();
+    seen.forEach((user) => {
+      if (!user.companyId) return;
+      if (!usersByCompany.has(user.companyId)) usersByCompany.set(user.companyId, []);
+      usersByCompany.get(user.companyId).push(user);
+    });
+    usersByCompany.forEach((users, companyId) => {
+      sendToLocalRoom(getRoomKey('company', companyId), { type: 'user_list', users });
+    });
+    const globalAdmins = Array.from(seen.values()).filter((user) => !user.companyId);
+    if (globalAdmins.length) {
+      clientMeta.forEach((meta) => {
+        if (!meta.companyId && isTenantWideRole(meta.role)) {
+          sendJson(meta.ws, { type: 'user_list', users: Array.from(seen.values()) });
+        }
+      });
+    }
   };
 
   const broadcastCrmChannel = (channel, data, exceptKey = '') => {
@@ -473,13 +525,16 @@ const createWebSocketHub = ({ wss }) => {
     online,
     socketCount,
     lastSeen,
-    activeConversationId
+    activeConversationId,
+    role
   }) => {
     const normalizedUserId = String(userId || '').trim();
     if (!normalizedUserId) return;
 
+    if (!companyId && !isTenantWideRole(role)) return false;
     const payload = {
-      scope: companyId ? 'company' : 'broadcast',
+      scope: companyId ? 'company' : 'room',
+      ...(!companyId ? { room: 'global-admins' } : {}),
       companyId: String(companyId || '').trim() || null,
       data: {
         type: 'presence:update',
@@ -509,9 +564,9 @@ const createWebSocketHub = ({ wss }) => {
     if (payload.companyId) {
       sendToLocalRoom(getRoomKey('company', payload.companyId), payload.data);
     } else {
-      broadcastLocal(payload.data);
+      sendToLocalRoom('global-admins', payload.data);
     }
-    await publishRealtimeEvent(payload);
+    await publishRealtimeEventFn(payload);
   };
 
   const publishTypingUpdate = async ({
@@ -526,7 +581,7 @@ const createWebSocketHub = ({ wss }) => {
     if (!normalizedUserId || !normalizedConversationId) return;
 
     const payload = {
-      scope: companyId ? 'conversation' : 'broadcast',
+      scope: 'conversation',
       companyId: String(companyId || '').trim() || null,
       conversationId: normalizedConversationId,
       data: {
@@ -556,73 +611,158 @@ const createWebSocketHub = ({ wss }) => {
     if (payload.conversationId) {
       sendToLocalRoom(getRoomKey('conversation', payload.conversationId), payload.data);
     }
-    await publishRealtimeEvent(payload);
+    await publishRealtimeEventFn(payload);
+  };
+
+  const rejectSocket = (ws, { code = 1008, reason = 'Authentication failed', type = 'auth_error', error = 'Authentication required' } = {}) => {
+    if (ws.authState === 'rejected') return;
+    ws.authState = 'rejected';
+    ['authTimeoutTimer', 'authExpiryTimer', 'authRevalidationTimer'].forEach((key) => {
+      if (ws[key]) clearTimeout(ws[key]);
+      if (ws[key]) clearInterval(ws[key]);
+      ws[key] = null;
+    });
+    if (ws.readyState === WebSocket.OPEN) sendJson(ws, { type, error });
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(code, reason);
+  };
+
+  const scheduleTokenExpiry = (ws, exp) => {
+    if (ws.authExpiryTimer) clearTimeout(ws.authExpiryTimer);
+    if (!exp) return;
+    const expiresInMs = exp * 1000 - Date.now();
+    if (expiresInMs <= 0) {
+      rejectSocket(ws, { reason: 'Authentication expired', error: 'Invalid or expired session' });
+      return;
+    }
+    ws.authExpiryTimer = setTimeout(() => {
+      rejectSocket(ws, { reason: 'Authentication expired', error: 'Invalid or expired session' });
+    }, expiresInMs);
+    ws.authExpiryTimer.unref?.();
+  };
+
+  const startSessionRevalidation = (ws) => {
+    ws.authRevalidationTimer = setInterval(async () => {
+      if (ws.authState !== 'authenticated' || ws.authRevalidationInProgress) return;
+      ws.authRevalidationInProgress = true;
+      try {
+        const latest = await authenticateToken(ws.authToken);
+        if (ws.authState !== 'authenticated') return;
+        if (
+          String(latest.userId || '') !== String(ws.authContext.userId || '') ||
+          String(latest.companyId || '') !== String(ws.authContext.companyId || '')
+        ) {
+          rejectSocket(ws, { reason: 'Session identity changed', error: 'Session is no longer valid' });
+          return;
+        }
+        ws.authContext = latest;
+        scheduleTokenExpiry(ws, latest.exp);
+      } catch (error) {
+        if (error?.authFailure === 'transient') {
+          rejectSocket(ws, {
+            code: 1013,
+            reason: 'Authentication service temporarily unavailable',
+            type: 'auth_unavailable',
+            error: 'Authentication service temporarily unavailable'
+          });
+        } else {
+          rejectSocket(ws, { reason: 'Session revoked or expired', error: 'Session is no longer valid' });
+        }
+      } finally {
+        ws.authRevalidationInProgress = false;
+      }
+    }, sessionRevalidationIntervalMs);
+    ws.authRevalidationTimer.unref?.();
   };
 
   const handleWebSocketMessage = async (data, userId, ws) => {
+    if (ws.authState !== 'authenticated') {
+      if (ws.authState !== 'unauthenticated') {
+        rejectSocket(ws, { error: 'Duplicate or premature authentication event' });
+        return;
+      }
+      if (data?.type !== 'authenticate' || typeof data.token !== 'string') {
+        rejectSocket(ws, { error: 'Authentication required before application events' });
+        return;
+      }
+      if (data.token.length > 16_384) {
+        rejectSocket(ws, { code: 1009, reason: 'Authentication frame too large', error: 'Authentication frame too large' });
+        return;
+      }
+      ws.authState = 'authenticating';
+      try {
+        const context = await authenticateToken(data.token);
+        if (ws.readyState !== WebSocket.OPEN || ws.authState !== 'authenticating') return;
+        if (!context?.userId) throw new Error('Invalid auth context');
+        const companyId = String(context.companyId || '').trim();
+        if (!companyId && !isTenantWideRole(context.normalizedRole)) {
+          throw new Error('Authenticated tenant scope is missing');
+        }
+        scheduleTokenExpiry(ws, context.exp);
+        if (ws.authState !== 'authenticating') return;
+        userId = String(context.userId);
+        ws.lastSeenAt = new Date();
+        await setUserPresenceFn({ userId, online: true, socketCount: (clients.get(userId)?.size || 0) + 1, lastSeen: ws.lastSeenAt, companyId });
+        await publishPresenceUpdate({ userId, companyId, online: true, socketCount: (clients.get(userId)?.size || 0) + 1, lastSeen: ws.lastSeenAt.toISOString(), role: context.normalizedRole });
+        if (ws.readyState !== WebSocket.OPEN || ws.authState !== 'authenticating') return;
+
+        if (ws.authTimeoutTimer) clearTimeout(ws.authTimeoutTimer);
+        ws.authContext = context;
+        ws.authToken = data.token;
+        ws.userId = userId;
+        ws.companyId = companyId;
+        ws.__clientKey = `${userId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+        ws.authState = 'authenticated';
+        const nextSocketSet = getSocketSet(userId);
+        nextSocketSet?.add(ws);
+        clientMeta.set(getClientKey(ws, userId), {
+          ws, userId, companyId,
+          displayName: context.username || null,
+          email: context.email || null,
+          role: context.normalizedRole || context.role || null,
+          lastSeenAt: ws.lastSeenAt.toISOString()
+        });
+        joinRoom(getRoomKey('user', userId), ws);
+        if (companyId) syncCompanyRoom(ws, companyId);
+        else if (isTenantWideRole(context.normalizedRole)) joinRoom('global-admins', ws);
+        startSessionRevalidation(ws);
+        sendJson(ws, { type: 'authenticated', userId, companyId: companyId || null });
+        broadcastUserList();
+      } catch (error) {
+        if (ws.authState !== 'authenticating') return;
+        console.warn('WebSocket authentication rejected', { reason: error?.authFailure || error?.name || 'AuthError' });
+        if (error?.authFailure === 'transient') {
+          rejectSocket(ws, {
+            code: 1013,
+            reason: 'Authentication service temporarily unavailable',
+            type: 'auth_unavailable',
+            error: 'Authentication service temporarily unavailable'
+          });
+        } else {
+          rejectSocket(ws, { error: 'Invalid or expired session' });
+        }
+      }
+      return;
+    }
+    if (data?.type === 'authenticate' || data?.type === 'identify') {
+      rejectSocket(ws, { error: 'Identity is established by the authenticated session' });
+      return;
+    }
+    userId = ws.authContext.userId;
     switch (data.type) {
       case 'identify': {
-        if (!data.userId) return;
-        removeSocket(userId, ws);
-        const nextUserId = String(data.userId || '').trim();
-        const nextSocketSet = getSocketSet(nextUserId);
-        if (!nextSocketSet) return;
-
-        const nextDisplayName = String(data.displayName || data.name || data.userName || '').trim();
-        const nextEmail = String(data.email || '').trim();
-        const nextRole = String(data.role || data.companyRole || '').trim();
-
-        nextSocketSet.add(ws);
-        ws.userId = nextUserId;
-        clientMeta.set(getClientKey(ws, nextUserId), {
-          ws,
-          userId: nextUserId,
-          companyId: String(data.companyId || ws.companyId || '').trim(),
-          displayName: nextDisplayName || null,
-          email: nextEmail || null,
-          role: nextRole || null,
-          lastSeenAt: new Date().toISOString()
-        });
-        joinRoom(getRoomKey('user', nextUserId), ws);
-        syncCompanyRoom(ws, data.companyId || ws.companyId || '');
-        syncConversationRoom(ws, data.activeConversationId || ws.activeConversationId || '');
-        ws.lastSeenAt = new Date();
-        console.log(`Client identified: ${nextUserId}`);
-
-        const socketCount = nextSocketSet.size;
-        await setUserPresence({
-          userId: nextUserId,
-          online: true,
-          socketCount,
-          lastSeen: ws.lastSeenAt,
-          activeConversationId: ws.activeConversationId || '',
-          companyId: ws.companyId || ''
-        });
-        await publishPresenceUpdate({
-          userId: nextUserId,
-          companyId: ws.companyId || '',
-          online: true,
-          socketCount,
-          lastSeen: ws.lastSeenAt.toISOString(),
-          activeConversationId: ws.activeConversationId || ''
-        });
-        broadcastUserList();
         break;
       }
       case 'presence:ping': {
         const activeConversationId = String(data.conversationId || data.activeConversationId || '').trim();
-        const companyId = String(data.companyId || ws.companyId || '').trim();
+        const companyId = String(ws.authContext.companyId || '').trim();
         ws.lastSeenAt = new Date();
-        if (companyId) {
-          syncCompanyRoom(ws, companyId);
-        }
         if (activeConversationId) {
-          syncConversationRoom(ws, activeConversationId);
+          if (await authorizeConversation(ws.authContext, activeConversationId)) syncConversationRoom(ws, activeConversationId);
         }
 
         const socketSet = clients.get(String(userId || '').trim());
         const socketCount = socketSet ? socketSet.size : 1;
-        await setUserPresence({
+        await setUserPresenceFn({
           userId,
           online: true,
           socketCount,
@@ -656,8 +796,11 @@ const createWebSocketHub = ({ wss }) => {
       }
       case 'conversation:subscribe': {
         const conversationId = String(data.conversationId || '').trim();
-        if (conversationId) {
+        if (conversationId && await authorizeConversation(ws.authContext, conversationId)) {
           syncConversationRoom(ws, conversationId);
+          sendJson(ws, { type: 'conversation:subscribed', conversationId });
+        } else {
+          sendJson(ws, { type: 'conversation:subscription_rejected', conversationId });
         }
         break;
       }
@@ -671,6 +814,29 @@ const createWebSocketHub = ({ wss }) => {
       }
       case 'crm_subscribe': {
         const channel = String(data.channel || data.contactId || 'crm').trim() || 'crm';
+        if (channel !== 'crm') {
+          const contactId = channel.startsWith('contact:') ? channel.slice('contact:'.length) : channel;
+          if (data.contactId && String(data.contactId).trim() !== contactId) {
+            sendJson(ws, { type: 'crm_subscription_rejected', channel });
+            break;
+          }
+          const contactFilter = buildCrmScopedFilter({
+            user: {
+              id: ws.authContext.userId,
+              role: ws.authContext.role,
+              companyRole: ws.authContext.companyRole,
+              normalizedRole: ws.authContext.normalizedRole
+            },
+            companyId: ws.authContext.companyId
+          }, { _id: contactId });
+          if (!(await contactExists(contactFilter))) {
+            sendJson(ws, { type: 'crm_subscription_rejected', channel });
+            break;
+          }
+        } else if (ws.authContext.companyId || !isTenantWideRole(ws.authContext.normalizedRole)) {
+          sendJson(ws, { type: 'crm_subscription_rejected', channel });
+          break;
+        }
         if (!crmSubscriptions.has(channel)) crmSubscriptions.set(channel, new Set());
         crmSubscriptions.get(channel).add(getClientKey(ws, userId));
         sendJson(ws, {
@@ -702,6 +868,7 @@ const createWebSocketHub = ({ wss }) => {
         const channel = String(data.channel || data.contactId || 'crm').trim() || 'crm';
         const clientKey = getClientKey(ws, userId);
         const subscribers = crmSubscriptions.get(channel);
+        if (!subscribers?.has(clientKey)) break;
 
         if (data.type === 'crm_presence_leave') {
           if (subscribers) {
@@ -739,15 +906,13 @@ const createWebSocketHub = ({ wss }) => {
         const conversationId = String(data.conversationId || '').trim();
         const isTyping =
           data.type === 'typing:start' ? true : data.type === 'typing:stop' ? false : Boolean(data.isTyping);
-        const displayName = String(data.displayName || data.userName || '').trim();
-        const companyId = String(data.companyId || ws.companyId || '').trim();
+        const displayName = String(clientMeta.get(getClientKey(ws, userId))?.displayName || '').trim();
+        const companyId = String(ws.authContext.companyId || '').trim();
 
         ws.lastSeenAt = new Date();
-        if (conversationId) {
-          syncConversationRoom(ws, conversationId);
-        }
+        if (!conversationId || !(await authorizeConversation(ws.authContext, conversationId))) break;
 
-        await setTypingState({
+        await setTypingStateFn({
           userId,
           conversationId,
           isTyping,
@@ -767,51 +932,44 @@ const createWebSocketHub = ({ wss }) => {
     }
   };
 
-  wss.on('connection', (ws, req) => {
+  wss.on('connection', (ws) => {
     console.log('WebSocket connection established');
-    const initialUserId = String(req.headers['user-id'] || 'anonymous').trim() || 'anonymous';
-    let userId = initialUserId;
-    ws.__clientKey = `${initialUserId}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    let userId = '';
+    ws.__clientKey = `pending:${Date.now()}:${Math.random().toString(36).slice(2)}`;
     ws.lastSeenAt = new Date();
+    ws.authState = 'unauthenticated';
     ws.activeConversationId = '';
-
-    console.log('User ID:', userId);
-    getSocketSet(userId)?.add(ws);
     ws.joinedRooms = ws.joinedRooms instanceof Set ? ws.joinedRooms : new Set();
-    joinRoom(getRoomKey('user', userId), ws);
-    clientMeta.set(getClientKey(ws, userId), { ws, userId, companyId: '' });
-
-    console.log('Total connected users:', clients.size);
-
-    broadcastUserList();
-
-    setUserPresence({
-        userId,
-        online: true,
-        socketCount: clients.get(userId)?.size || 1,
-        lastSeen: ws.lastSeenAt,
-        activeConversationId: '',
-        companyId: ws.companyId || ''
-      }).catch((error) => {
-        console.error('Failed to mark presence online:', error.message);
-      });
+    ws.authTimeoutTimer = setTimeout(() => {
+      rejectSocket(ws, { reason: 'Authentication timeout', error: 'Authentication required' });
+    }, 30_000);
+    ws.authTimeoutTimer.unref?.();
 
     ws.on('message', (message) => {
+      const messageBytes = Buffer.isBuffer(message) ? message.length : Buffer.byteLength(String(message || ''));
+      if (messageBytes > 256 * 1024) {
+        rejectSocket(ws, { code: 1009, reason: 'WebSocket frame too large', error: 'WebSocket frame too large' });
+        return;
+      }
       try {
         const data = JSON.parse(message);
-        console.log('WebSocket message received:', data);
-        handleWebSocketMessage(data, userId, ws).catch((error) => {
+        handleWebSocketMessage(data, userId, ws).then(() => {
+          if (ws.authContext) userId = ws.authContext.userId;
+        }).catch((error) => {
           console.error('WebSocket message handler failed:', error);
         });
-        if (ws.userId) {
-          userId = ws.userId;
-        }
       } catch (error) {
-        console.error('WebSocket message parse error:', error);
+        rejectSocket(ws, { code: 1007, reason: 'Malformed WebSocket frame', error: 'Malformed WebSocket frame' });
       }
     });
 
     ws.on('close', () => {
+        if (ws.authTimeoutTimer) clearTimeout(ws.authTimeoutTimer);
+        if (ws.authExpiryTimer) clearTimeout(ws.authExpiryTimer);
+        if (ws.authRevalidationTimer) clearInterval(ws.authRevalidationTimer);
+        if (!ws.authContext) return;
+        const authenticatedContext = ws.authContext;
+        const authenticatedCompanyId = String(authenticatedContext.companyId || '').trim();
         removeSocket(userId, ws);
         const clientKey = getClientKey(ws, userId);
         removeClientFromCrmChannels(clientKey);
@@ -819,18 +977,19 @@ const createWebSocketHub = ({ wss }) => {
         const socketCount = clients.get(userId)?.size || 0;
         const lastSeenAt = ws.lastSeenAt || new Date();
 
-        setUserPresence({
+        setUserPresenceFn({
           userId,
           online: socketCount > 0,
           socketCount,
           lastSeen: lastSeenAt,
-          activeConversationId: ws.activeConversationId || ''
+          activeConversationId: ws.activeConversationId || '',
+          companyId: authenticatedCompanyId
         }).catch((error) => {
           console.error('Failed to update presence on close:', error.message);
         });
 
       if (socketCount === 0) {
-        clearTypingState({
+        clearTypingStateFn({
           userId,
           conversationId: ws.activeConversationId || ''
         }).catch((error) => {
@@ -845,7 +1004,9 @@ const createWebSocketHub = ({ wss }) => {
         online: socketCount > 0,
         socketCount,
         lastSeen: lastSeenAt.toISOString(),
-        activeConversationId: ws.activeConversationId || ''
+        activeConversationId: ws.activeConversationId || '',
+        companyId: authenticatedCompanyId,
+        role: authenticatedContext.normalizedRole
       }).catch((error) => {
         console.error('Failed to publish presence close event:', error.message);
       });
@@ -861,5 +1022,6 @@ const createWebSocketHub = ({ wss }) => {
 };
 
 module.exports = {
-  createWebSocketHub
+  createWebSocketHub,
+  buildConversationRealtimeFilter
 };

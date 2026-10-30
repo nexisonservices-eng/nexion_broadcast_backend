@@ -11,7 +11,55 @@ const normalizeIdLike = (value) => {
   return normalized;
 };
 
-module.exports = (req, res, next) => {
+// WebSocket clients cannot set an Authorization header in the browser API. The
+// raw socket hub uses this same JWT + Admin credentials contract on its first
+// frame, before it accepts any application event.
+const createBearerAuthenticator = ({ fetchContext = fetchUserContext, verifyToken = jwt.verify } = {}) => async (token) => {
+  if (!token || typeof token !== 'string') throw new Error('Missing bearer token');
+  let decoded;
+  try {
+    decoded = verifyToken(token, requireJwtSecret('auth token verification'), { algorithms: ['HS256'] });
+  } catch (error) {
+    error.authFailure = 'invalid';
+    throw error;
+  }
+  let context;
+  try {
+    context = await fetchContext(`Bearer ${token}`);
+  } catch (error) {
+    const status = Number(error?.response?.status || error?.status || 0);
+    if (!status || status === 429 || status >= 500) error.authFailure = 'transient';
+    else error.authFailure = 'invalid';
+    throw error;
+  }
+  if (!context || !(context.userId || context.id || context.email)) {
+    const error = new Error('Unable to resolve authenticated user');
+    error.authFailure = 'invalid';
+    throw error;
+  }
+  const userId = normalizeIdLike(context.userId || context.id || decoded.userId || decoded.id);
+  if (!userId) {
+    const error = new Error('Invalid authenticated user');
+    error.authFailure = 'invalid';
+    throw error;
+  }
+  const companyId = normalizeIdLike(context.companyId || decoded.companyId);
+  return {
+    id: userId,
+    userId,
+    email: String(context.email || decoded.email || '').trim(),
+    role: context.role || decoded.role,
+    companyRole: context.companyRole || decoded.companyRole,
+    username: context.username || decoded.username,
+    normalizedRole: normalizeRole(context.companyRole || context.role || decoded.companyRole || decoded.role),
+    companyId: companyId || null,
+    workspaceReadUserIds: context.workspaceReadUserIds || [],
+    exp: decoded.exp
+  };
+};
+const authenticateBearerToken = createBearerAuthenticator();
+
+const authMiddleware = (req, res, next) => {
   const isContactDocumentsRequest = /^\/api\/crm\/contacts\/[^/]+\/documents(?:\?|$)/.test(
     String(req.originalUrl || '')
   );
@@ -143,3 +191,7 @@ module.exports = (req, res, next) => {
 
   run();
 };
+
+authMiddleware.authenticateBearerToken = authenticateBearerToken;
+authMiddleware.createBearerAuthenticator = createBearerAuthenticator;
+module.exports = authMiddleware;

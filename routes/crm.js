@@ -48,6 +48,7 @@ const { fetchWorkspaceUsers } = require('../services/adminAuthService');
 const { isWorkspaceAssignee } = require('../utils/crmTaskAssignment');
 const { buildLegacyCrmContactFilter, buildLegacyCrmContactScope } = require('../utils/crmContactScope');
 const { buildCrmContactSearchFilter } = require('../utils/crmContactSearch');
+const { buildScopedFilter } = require('../utils/crmAccess');
 
 const router = express.Router();
 router.use(auth);
@@ -657,49 +658,6 @@ const normalizeDealLifecycle = ({
     wonAt: resolvedStatus === 'won' ? existingWonAt || new Date() : null,
     lostAt: resolvedStatus === 'lost' ? existingLostAt || new Date() : null
   };
-};
-
-const buildScopedFilter = (req, extra = {}) => {
-  const conditions = [];
-  const normalizedRole = normalizeRole(req?.user?.normalizedRole || req?.user?.companyRole || req?.user?.role);
-  const isAdminLikeRole = ['superadmin', 'admin', 'manager'].includes(normalizedRole);
-  const normalizedCompanyId = toObjectIdIfValid(req?.companyId);
-  const normalizedUserId = toCleanString(req?.user?.id);
-
-  if (isAdminLikeRole) {
-    if (normalizedCompanyId) {
-      conditions.push({ companyId: normalizedCompanyId });
-    } else if (req?.companyId) {
-      conditions.push({ companyId: req.companyId });
-    }
-  } else {
-    const agentScope = normalizedUserId
-      ? {
-          $or: [
-            { userId: normalizedUserId },
-            { ownerId: normalizedUserId },
-            { assignedTo: normalizedUserId },
-            { assignedAgent: normalizedUserId },
-            { createdBy: normalizedUserId }
-          ]
-        }
-      : null;
-
-    if (req?.companyId) {
-      conditions.push({ companyId: req.companyId });
-    }
-    if (agentScope) {
-      conditions.push(agentScope);
-    }
-  }
-
-  if (extra && Object.keys(extra).length > 0) {
-    conditions.push(extra);
-  }
-
-  if (conditions.length === 0) return {};
-  if (conditions.length === 1) return conditions[0];
-  return { $and: conditions };
 };
 
 const findScopedContactById = async (req, contactId, selectFields = '') => {

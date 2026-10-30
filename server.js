@@ -88,7 +88,7 @@ const { startAppScheduler } = require('./jobs/appScheduler');
 const app = express();
 app.set("trust proxy", 1);
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ server, maxPayload: 256 * 1024 });
 const HEARTBEAT_INTERVAL_MS = Number(process.env.WS_HEARTBEAT_INTERVAL_MS || 30000);
 const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS || 10000);
 const ENABLE_LEGACY_CORE_ROUTES =

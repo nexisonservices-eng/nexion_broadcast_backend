@@ -2293,6 +2293,27 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
       });
     }
 
+    const perfLoggingEnabled = String(process.env.TEAM_INBOX_PERF_LOGS || '').trim() === '1';
+    const requestId = String(req.headers?.['x-request-id'] || '').trim().slice(0, 128) || crypto.randomUUID();
+    const requestStartedAt = performance.now();
+    let mongoQueryDurationMs = 0;
+    let returnedMessageCount = 0;
+    let cacheLoaderRan = false;
+    if (perfLoggingEnabled) {
+      res.once('finish', () => {
+        console.info('[team-inbox-perf]', {
+          phase: 'messages_api_request_finished',
+          requestId,
+          conversationId,
+          status: res.statusCode,
+          cacheHit: !cacheLoaderRan,
+          mongoQueryDurationMs: Math.round(mongoQueryDurationMs * 100) / 100,
+          returnedMessageCount,
+          totalDurationMs: Math.round((performance.now() - requestStartedAt) * 100) / 100
+        });
+      });
+    }
+
     const rawCursor = String(req.query?.cursor || '').trim();
     const cursor = rawCursor ? decodeMessageIdCursor(rawCursor) : null;
     if (rawCursor && !cursor) {
@@ -2318,6 +2339,7 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
     const cursorFilter = cursor ? buildMessageIdCursorFilter(cursor) : {};
 
     const loadMessagePage = async () => {
+      cacheLoaderRan = true;
       const filters = buildScopedMessageFilters(
         req,
         {
@@ -2330,6 +2352,7 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
 
       Object.assign(filters, cursorFilter);
 
+      const queryStartedAt = performance.now();
       const messages = await Message.find(filters)
         .sort({ _id: -1 })
         .limit(limit + 1)
@@ -2337,6 +2360,8 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
           '_id conversationId sender senderRole senderName senderId text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment attachments replyTo replyToMessageId errorMessage deliveredTo readBy'
         )
         .lean();
+      mongoQueryDurationMs = performance.now() - queryStartedAt;
+      returnedMessageCount = Array.isArray(messages) ? Math.min(messages.length, limit) : 0;
 
       return buildThreadPageResponse({
         documents: Array.isArray(messages) ? messages : [],
@@ -2355,6 +2380,14 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
           loader: loadMessagePage
         })
       : await loadMessagePage();
+
+    if (!cacheLoaderRan) {
+      returnedMessageCount = Array.isArray(response?.messages)
+        ? response.messages.length
+        : Array.isArray(response?.data)
+          ? response.data.length
+          : 0;
+    }
 
     return res.json(response);
   } catch (error) {
