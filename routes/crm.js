@@ -1,5 +1,6 @@
 const express = require('express');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const multer = require('multer');
 const axios = require('axios');
 const auth = require('../middleware/auth');
@@ -3247,6 +3248,12 @@ router.post('/contacts/:id/notes', async (req, res) => {
 
 router.get('/contacts/:id/documents', async (req, res) => {
   try {
+    const requestIdHeader = String(req.headers?.['x-request-id'] || '').trim();
+    const requestId = /^[a-zA-Z0-9._:-]{1,100}$/.test(requestIdHeader)
+      ? requestIdHeader
+      : crypto.randomUUID();
+    const requestStartedAt = req.performanceTimings?.startedAt || process.hrtime.bigint();
+    const contactLookupStartedAt = process.hrtime.bigint();
     let contact = null;
     try {
       contact = await loadAuthorizedContact(req, req.params.id);
@@ -3291,21 +3298,43 @@ router.get('/contacts/:id/documents', async (req, res) => {
       }
     }
 
+    const contactLookupMs = Number(process.hrtime.bigint() - contactLookupStartedAt) / 1_000_000;
+
+    const documentQueryStartedAt = process.hrtime.bigint();
     const documents = await ContactDocument.find(
       buildScopedFilter(req, {
         contactId: contact._id,
         status: { $ne: 'deleted' }
       })
     ).sort({ createdAt: -1, updatedAt: -1 });
+    const documentQueryMs = Number(process.hrtime.bigint() - documentQueryStartedAt) / 1_000_000;
 
-    res.json({
+    const responseBody = {
       success: true,
       data: documents,
       meta: {
         documentTypes: CONTACT_DOCUMENT_TYPES,
         verificationStatuses: CONTACT_DOCUMENT_VERIFICATION_STATUSES
       }
-    });
+    };
+    const serializationStartedAt = process.hrtime.bigint();
+    const response = res.json(responseBody);
+    const serializationMs = Number(process.hrtime.bigint() - serializationStartedAt) / 1_000_000;
+    console.info(JSON.stringify({
+      event: 'team_inbox_performance',
+      phase: 'crm_contact_documents_response',
+      requestId,
+      conversationId: String(req.query?.conversationId || '').trim() || null,
+      statusCode: res.statusCode,
+      adminContextLookupMs: Number(req.performanceTimings?.adminContextLookupMs || 0),
+      contactLookupMs: Math.round(contactLookupMs * 100) / 100,
+      documentQueryMs: Math.round(documentQueryMs * 100) / 100,
+      serializationMs: Math.round(serializationMs * 100) / 100,
+      responseBytes: Number(res.getHeader('Content-Length') || 0) || null,
+      documentCount: documents.length,
+      totalBackendMs: Math.round((Number(process.hrtime.bigint() - requestStartedAt) / 1_000_000) * 100) / 100
+    }));
+    return response;
   } catch (error) {
     const status = getCrmRouteErrorStatus(error);
     if (status === 404 && String(req.query?.conversationId || '').trim()) {

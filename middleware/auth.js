@@ -12,6 +12,14 @@ const normalizeIdLike = (value) => {
 };
 
 module.exports = (req, res, next) => {
+  const isContactDocumentsRequest = /^\/api\/crm\/contacts\/[^/]+\/documents(?:\?|$)/.test(
+    String(req.originalUrl || '')
+  );
+  if (isContactDocumentsRequest) {
+    req.performanceTimings = {
+      startedAt: process.hrtime.bigint()
+    };
+  }
   const run = async () => {
     try {
       const authHeader = req.headers.authorization || '';
@@ -29,7 +37,17 @@ module.exports = (req, res, next) => {
 
       // Preferred: resolve from admin backend
       try {
-        const context = await fetchUserContext(authHeader);
+        const authLookupStartedAt = isContactDocumentsRequest ? process.hrtime.bigint() : null;
+        let context;
+        try {
+          context = await fetchUserContext(authHeader);
+        } finally {
+          if (authLookupStartedAt) {
+            req.performanceTimings.adminContextLookupMs = Number(
+              process.hrtime.bigint() - authLookupStartedAt
+            ) / 1_000_000;
+          }
+        }
         if (context?.userId || context?.email) {
           const fallback = decodedFallback || {};
           const contextUserId = normalizeIdLike(context.userId || context.id);
