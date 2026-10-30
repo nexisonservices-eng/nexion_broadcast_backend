@@ -459,11 +459,44 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       const location = messageData?.location || {};
       const name = String(location?.name || '').trim();
       const address = String(location?.address || '').trim();
-      text = [name, address].filter(Boolean).join(' - ') || '[Location]';
+      const latitude = Number(location?.latitude);
+      const longitude = Number(location?.longitude);
+      const coordinates = Number.isFinite(latitude) && Number.isFinite(longitude)
+        ? `${latitude}, ${longitude}`
+        : '';
+      text = [name, address, coordinates ? `Location: ${coordinates}` : '']
+        .filter(Boolean).join(' - ') || '[Location]';
+      interactionMeta.interactionType = 'location';
+      interactionMeta.interactionTitle = name || address || coordinates || 'Location';
+      interactionMeta.interactionId = coordinates
+        ? `https://www.google.com/maps?q=${encodeURIComponent(`${latitude},${longitude}`)}`
+        : '';
     } else if (type === 'contacts') {
-      text = '[Contact card]';
+      const contacts = Array.isArray(messageData?.contacts) ? messageData.contacts : [];
+      text = contacts.map((contact) => {
+        const name = String(contact?.name?.formatted_name || contact?.name?.first_name || '').trim();
+        const phones = (Array.isArray(contact?.phones) ? contact.phones : [])
+          .map((phone) => String(phone?.phone || phone?.wa_id || '').trim()).filter(Boolean);
+        return [name || 'Contact', ...phones].join(' — ');
+      }).filter(Boolean).join('\n') || '[Contact card]';
+      interactionMeta.interactionType = 'contacts';
     } else if (type === 'order') {
-      text = '[Order message]';
+      const order = messageData?.order || {};
+      const productLines = (Array.isArray(order?.product_items) ? order.product_items : [])
+        .map((item) => {
+          const name = String(item?.product_retailer_id || item?.name || 'Item').trim();
+          const quantity = Number(item?.quantity || 0);
+          const price = item?.item_price != null ? ` — ${item?.currency || ''} ${item.item_price}`.trim() : '';
+          return `${name}${quantity > 0 ? ` × ${quantity}` : ''}${price}`;
+        });
+      text = ['Order', ...productLines].join('\n');
+      interactionMeta.interactionType = 'order';
+      interactionMeta.interactionId = String(order?.catalog_id || '').trim();
+    } else if (type === 'system') {
+      const system = messageData?.system || {};
+      text = [system?.body, system?.type]
+        .map((value) => String(value || '').trim()).filter(Boolean).join(' — ') || '[WhatsApp system message]';
+      interactionMeta.interactionType = 'system';
     }
 
     if (!text && fallbackReplyText) {
@@ -472,7 +505,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
     }
 
     if (!text) {
-      text = type ? `[${toTitleCase(type)}]` : '[Unsupported message]';
+      text = type ? `[${toTitleCase(type)} message]` : '[Unknown WhatsApp message]';
     }
 
     return {
@@ -512,6 +545,17 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       const incomingMediaPayload = mediaType ? messageData?.[mediaType] || {} : {};
       const incomingMediaId = String(incomingMediaPayload?.id || '').trim();
       const incomingMimeType = String(incomingMediaPayload?.mime_type || '').trim();
+      const knownMessageTypes = new Set([
+        'text', 'button', 'interactive', 'image', 'video', 'audio', 'document', 'sticker',
+        'location', 'contacts', 'reaction', 'order', 'system', 'unknown'
+      ]);
+      if (!knownMessageTypes.has(String(rawMessageType || '').toLowerCase())) {
+        console.warn('[WhatsAppInbound] unknown_message_type', JSON.stringify({
+          event: 'unknown_whatsapp_message_type',
+          originalMessageType: String(rawMessageType || '').slice(0, 80) || null,
+          messageId: String(messageId || '').slice(0, 120) || null
+        }));
+      }
       const incomingMediaFileName = String(
         incomingMediaPayload?.filename || `${mediaType || 'attachment'}-${messageId || Date.now()}`
       ).trim();
@@ -813,6 +857,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         mediaUrl: storedIncomingAttachment?.secureUrl || undefined,
         mediaType,
         mediaCaption: mediaCaption || undefined,
+        mediaId: incomingMediaId || undefined,
+        mimeType: incomingMimeType || storedIncomingAttachment?.mimeType || undefined,
         attachment: storedIncomingAttachment || undefined,
         rawMessageType: rawMessageType || undefined,
         reactionEmoji: reactionEmoji || undefined,

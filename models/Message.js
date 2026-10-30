@@ -18,6 +18,8 @@ const MessageSchema = new mongoose.Schema({
   mediaUrl: String,
   mediaType: { type: String, enum: ['image', 'video', 'audio', 'document', 'sticker'] },
   mediaCaption: String,
+  mediaId: String,
+  mimeType: String,
   mediaPipelineRequestId: { type: String, index: true },
   attachment: {
     storageProvider: { type: String, default: 'cloudinary' },

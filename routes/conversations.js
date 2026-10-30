@@ -838,7 +838,7 @@ router.get('/:id/messages', inboxThreadRateLimit, async (req, res) => {
     const loadMessages = async (filters) =>
       Message.find(filters)
         .select(
-          '_id conversationId sender senderRole senderName senderId text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment attachments deliveredTo readBy replyTo replyToMessageId errorMessage'
+          '_id conversationId sender senderRole senderName senderId text mediaUrl mediaType mediaCaption mediaId mimeType status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji interactionType interactionId interactionTitle attachment attachments deliveredTo readBy replyTo replyToMessageId errorMessage'
         )
         .sort({ timestamp: -1, _id: -1 })
         .limit(limit + 1)
