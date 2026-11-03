@@ -2286,6 +2286,7 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
           cacheHit: !cacheLoaderRan,
           mongoQueryDurationMs: Math.round(mongoQueryDurationMs * 100) / 100,
           returnedMessageCount,
+          responsePayloadBytes: Number(res.getHeader('content-length') || 0) || null,
           returnedConversationIds,
           hasPaginationCursor: Boolean(rawCursor),
           totalDurationMs: Math.round((performance.now() - requestStartedAt) * 100) / 100
@@ -2357,11 +2358,23 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
         });
       }
 
-      return buildThreadPageResponse({
+      const normalizationStartedAt = performance.now();
+      const page = buildThreadPageResponse({
         documents: exactMessages,
         limit,
         encodeCursor: encodeMessageIdCursor
       });
+      if (perfLoggingEnabled) {
+        console.info('[team-inbox-perf]', {
+          phase: 'message_page_normalization',
+          requestId,
+          conversationDiagnosticId,
+          tenantDiagnosticId,
+          messageCount: returnedMessageCount,
+          durationMs: Math.round((performance.now() - normalizationStartedAt) * 100) / 100
+        });
+      }
+      return page;
     };
 
     const response = cacheKeyScope
