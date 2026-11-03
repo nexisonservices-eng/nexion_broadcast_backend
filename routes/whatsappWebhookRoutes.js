@@ -363,6 +363,9 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
   };
 
   const extractIncomingMessagePayload = (messageData = {}) => {
+    messageData = messageData?.message ||
+      (messageData?.payload?.type ? messageData.payload : null) ||
+      messageData;
     const type = String(messageData?.type || '').trim().toLowerCase();
     const mediaTypes = new Set(['image', 'video', 'audio', 'document', 'sticker']);
     const reactionTargetMessageId = firstNonEmpty(messageData?.reaction?.message_id);
@@ -372,6 +375,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
     let mediaType = null;
     let mediaCaption = '';
     let reactionEmoji = '';
+    let contentPayload = {};
     const whatsappContextMessageId = firstNonEmpty(
       reactionTargetMessageId,
       messageData?.context?.id
@@ -391,14 +395,13 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       messageData?.interactive?.list_reply?.id,
       summarizeNfmReply(messageData?.interactive?.nfm_reply?.response_json),
       messageData?.referral?.headline,
-      messageData?.referral?.body,
-      reactionTargetMessageId,
-      messageData?.context?.id
+      messageData?.referral?.body
     );
 
     if (type === 'text') {
       text = String(messageData?.text?.body || '').trim();
       scoringText = text;
+      contentPayload = { text: { body: text } };
     } else if (type === 'button') {
       interactionMeta.interactionType = 'button';
       interactionMeta.interactionId = firstNonEmpty(messageData?.button?.payload);
@@ -408,6 +411,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       );
       text = String(messageData?.button?.text || messageData?.button?.payload || '').trim();
       scoringText = text;
+      contentPayload = { button: { text: interactionMeta.interactionTitle, payload: interactionMeta.interactionId } };
     } else if (type === 'interactive') {
       const buttonReply = messageData?.interactive?.button_reply || null;
       const listReply = messageData?.interactive?.list_reply || null;
@@ -447,14 +451,33 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           ''
       ).trim();
       scoringText = text;
+      contentPayload = {
+        interactive: buttonReply
+          ? { button_reply: { id: buttonReply.id || '', title: buttonReply.title || '' } }
+          : listReply
+            ? { list_reply: { id: listReply.id || '', title: listReply.title || '', description: listReply.description || '' } }
+            : nfmReply
+              ? { nfm_reply: { name: nfmReply.name || '', response_json: nfmReply.response_json || '' } }
+              : {}
+      };
     } else if (mediaTypes.has(type)) {
       mediaType = type;
       mediaCaption = String(messageData?.[type]?.caption || '').trim();
       text = mediaCaption || `[${toTitleCase(type)}]`;
       scoringText = mediaCaption;
+      contentPayload = {
+        [type]: {
+          id: String(messageData?.[type]?.id || '').trim(),
+          caption: mediaCaption,
+          mime_type: String(messageData?.[type]?.mime_type || '').trim(),
+          filename: String(messageData?.[type]?.filename || '').trim(),
+          voice: Boolean(messageData?.[type]?.voice)
+        }
+      };
     } else if (type === 'reaction') {
       reactionEmoji = String(messageData?.reaction?.emoji || '').trim();
       text = reactionEmoji ? `Reacted with ${reactionEmoji}` : '[Reaction removed]';
+      contentPayload = { reaction: { emoji: reactionEmoji, message_id: reactionTargetMessageId } };
     } else if (type === 'location') {
       const location = messageData?.location || {};
       const name = String(location?.name || '').trim();
@@ -471,6 +494,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       interactionMeta.interactionId = coordinates
         ? `https://www.google.com/maps?q=${encodeURIComponent(`${latitude},${longitude}`)}`
         : '';
+      contentPayload = { location: { latitude: Number.isFinite(latitude) ? latitude : null, longitude: Number.isFinite(longitude) ? longitude : null, name, address } };
     } else if (type === 'contacts') {
       const contacts = Array.isArray(messageData?.contacts) ? messageData.contacts : [];
       text = contacts.map((contact) => {
@@ -480,6 +504,20 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         return [name || 'Contact', ...phones].join(' — ');
       }).filter(Boolean).join('\n') || '[Contact card]';
       interactionMeta.interactionType = 'contacts';
+      contentPayload = {
+        contacts: contacts.map((contact) => ({
+          name: {
+            formatted_name: String(contact?.name?.formatted_name || '').trim(),
+            first_name: String(contact?.name?.first_name || '').trim(),
+            last_name: String(contact?.name?.last_name || '').trim()
+          },
+          phones: (Array.isArray(contact?.phones) ? contact.phones : []).map((phone) => ({
+            phone: String(phone?.phone || '').trim(),
+            wa_id: String(phone?.wa_id || '').trim(),
+            type: String(phone?.type || '').trim()
+          }))
+        }))
+      };
     } else if (type === 'order') {
       const order = messageData?.order || {};
       const productLines = (Array.isArray(order?.product_items) ? order.product_items : [])
@@ -492,11 +530,13 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       text = ['Order', ...productLines].join('\n');
       interactionMeta.interactionType = 'order';
       interactionMeta.interactionId = String(order?.catalog_id || '').trim();
+      contentPayload = { order: { catalog_id: String(order?.catalog_id || '').trim(), product_items: productLines } };
     } else if (type === 'system') {
       const system = messageData?.system || {};
       text = [system?.body, system?.type]
         .map((value) => String(value || '').trim()).filter(Boolean).join(' — ') || '[WhatsApp system message]';
       interactionMeta.interactionType = 'system';
+      contentPayload = { system: { type: String(system?.type || '').trim(), body: String(system?.body || '').trim() } };
     }
 
     if (!text && fallbackReplyText) {
@@ -518,7 +558,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       whatsappContextMessageId: whatsappContextMessageId || '',
       interactionType: interactionMeta.interactionType,
       interactionId: interactionMeta.interactionId,
-      interactionTitle: interactionMeta.interactionTitle
+      interactionTitle: interactionMeta.interactionTitle,
+      contentPayload
     };
   };
 
@@ -861,6 +902,7 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         mimeType: incomingMimeType || storedIncomingAttachment?.mimeType || undefined,
         attachment: storedIncomingAttachment || undefined,
         rawMessageType: rawMessageType || undefined,
+        contentPayload: Object.keys(contentPayload || {}).length ? contentPayload : undefined,
         reactionEmoji: reactionEmoji || undefined,
         whatsappContextMessageId: whatsappContextMessageId || undefined,
         interactionType: interactionType || undefined,
@@ -1632,7 +1674,10 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       console.error('Webhook error (async):', error);
     });
   });
-  return { processWebhookPayload };
+  return {
+    processWebhookPayload,
+    normalizeIncomingMessagePayload: extractIncomingMessagePayload
+  };
 };
 
 module.exports = {
