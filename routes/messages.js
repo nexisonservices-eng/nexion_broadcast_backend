@@ -103,6 +103,7 @@ const {
 } = require('../services/whatsappOutreach/policy');
 const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
 const { resolveCompanyFolders } = require('../services/cloudinaryCompanyFolders');
+const { filterMessagesForConversation } = require('../utils/conversationMessageScope');
 
 router.use(auth);
 router.use(
@@ -138,62 +139,22 @@ router.get('/conversation/:id', threadReadRateLimit, async (req, res) => {
     })
       .select('_id contactPhone contactId assignedTo assignedToId assignedAgent')
       .lean();
-    const relatedConversationIds = await resolveRelatedConversationIds({
-      Conversation,
-      ConversationSummary,
-      req,
-      conversation: conversationRecord || { _id: conversationId },
-      includeAllIdentityMatches: true
-    });
-    const familyScopeKey = relatedConversationIds
-      .map((id) => String(id || '').trim())
-      .filter(Boolean)
-      .sort()
-      .join('|');
-    const threadScope = scope ? `${scope}:${conversationId}:${familyScopeKey}` : '';
+    const threadScope = scope ? `${scope}:${conversationId}` : '';
 
     const loadMessages = async (filters) =>
       Message.find(filters)
         .select(
-          '_id conversationId sender senderRole senderName senderId text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage'
+          '_id conversationId sender senderRole senderName senderId text mediaUrl mediaType mediaCaption mediaId mimeType status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType contentPayload reactionEmoji interactionType interactionId interactionTitle attachment replyTo replyToMessageId errorMessage'
         )
         .sort({ timestamp: -1, _id: -1 })
         .limit(limit + 1)
         .lean();
 
     const loadScopedMessages = async () => {
-      const scopedMessages = await loadMessages({
-        ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
-        ...(relatedConversationIds.length > 0
-          ? { conversationId: { $in: relatedConversationIds } }
-          : { conversationId })
-      });
-
-      if (scopedMessages.length > 0 || !normalizedCompanyId) {
-        return scopedMessages;
-      }
-
-      const companyWideMessages = await loadMessages({
-        ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
-        ...(relatedConversationIds.length > 0
-          ? { conversationId: { $in: relatedConversationIds } }
-          : { conversationId }),
-        ...(cursor ? buildMessageCursorFilter(cursor) : {})
-      });
-
-      if (companyWideMessages.length > 0) {
-        return companyWideMessages;
-      }
-
       return loadMessages({
-        ...(relatedConversationIds.length > 0
-          ? { conversationId: { $in: relatedConversationIds } }
-          : { conversationId }),
-        ...(cursor ? buildMessageCursorFilter(cursor) : {}),
-        $or: [
-          { companyId: { $exists: false } },
-          { companyId: null }
-        ]
+        ...(normalizedCompanyId ? { companyId: normalizedCompanyId } : {}),
+        conversationId,
+        ...(cursor ? buildMessageCursorFilter(cursor) : {})
       });
     };
 
@@ -232,8 +193,19 @@ router.get('/conversation/:id', threadReadRateLimit, async (req, res) => {
 
     if (cachedResponse) {
       const cachedItems = Array.isArray(cachedResponse?.data) ? cachedResponse.data : [];
-      if (cachedItems.length > 0) {
+      const exactCachedItems = filterMessagesForConversation(cachedItems, conversationId);
+      if (cachedItems.length > 0 && exactCachedItems.length === cachedItems.length) {
         return res.json(cachedResponse);
+      }
+
+      if (cachedItems.length !== exactCachedItems.length) {
+        console.error('[team-inbox-isolation] rejected mismatched compatibility-cache records', {
+          requestedConversationId: crypto.createHash('sha256').update(conversationId).digest('hex').slice(0, 12),
+          tenantDiagnosticId: normalizedCompanyId
+            ? crypto.createHash('sha256').update(normalizedCompanyId).digest('hex').slice(0, 12)
+            : 'unscoped',
+          rejectedCount: cachedItems.length - exactCachedItems.length
+        });
       }
 
       await invalidateInboxConversation({
@@ -2293,6 +2265,34 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
       });
     }
 
+    const perfLoggingEnabled = String(process.env.TEAM_INBOX_PERF_LOGS || '').trim() === '1';
+    const toDiagnosticId = (value) =>
+      crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 12);
+    const conversationDiagnosticId = toDiagnosticId(conversationId);
+    const requestId = String(req.headers?.['x-request-id'] || '').trim().slice(0, 128) || crypto.randomUUID();
+    const requestStartedAt = performance.now();
+    let mongoQueryDurationMs = 0;
+    let returnedMessageCount = 0;
+    let returnedConversationIds = [];
+    let cacheLoaderRan = false;
+    if (perfLoggingEnabled) {
+      res.once('finish', () => {
+        console.info('[team-inbox-perf]', {
+          phase: 'messages_api_request_finished',
+          requestId,
+          conversationDiagnosticId,
+          tenantDiagnosticId,
+          status: res.statusCode,
+          cacheHit: !cacheLoaderRan,
+          mongoQueryDurationMs: Math.round(mongoQueryDurationMs * 100) / 100,
+          returnedMessageCount,
+          returnedConversationIds,
+          hasPaginationCursor: Boolean(rawCursor),
+          totalDurationMs: Math.round((performance.now() - requestStartedAt) * 100) / 100
+        });
+      });
+    }
+
     const rawCursor = String(req.query?.cursor || '').trim();
     const cursor = rawCursor ? decodeMessageIdCursor(rawCursor) : null;
     if (rawCursor && !cursor) {
@@ -2309,6 +2309,9 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
     const normalizedScope = String(req.query?.scope || 'team').trim().toLowerCase() || 'team';
     const normalizedCompanyId = String(req.companyId || req.user?.companyId || '').trim();
     const normalizedUserId = String(req.user?.id || '').trim();
+    const tenantDiagnosticId = normalizedCompanyId
+      ? crypto.createHash('sha256').update(normalizedCompanyId).digest('hex').slice(0, 12)
+      : 'unscoped';
     const scopeVariants = getInboxScopeVariants({
       companyId: normalizedCompanyId,
       userId: normalizedUserId
@@ -2318,6 +2321,7 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
     const cursorFilter = cursor ? buildMessageIdCursorFilter(cursor) : {};
 
     const loadMessagePage = async () => {
+      cacheLoaderRan = true;
       const filters = buildScopedMessageFilters(
         req,
         {
@@ -2330,16 +2334,31 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
 
       Object.assign(filters, cursorFilter);
 
+      const queryStartedAt = performance.now();
       const messages = await Message.find(filters)
         .sort({ _id: -1 })
         .limit(limit + 1)
         .select(
-          '_id conversationId sender senderRole senderName senderId text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment attachments replyTo replyToMessageId errorMessage deliveredTo readBy'
+          '_id conversationId sender senderRole senderName senderId text mediaUrl mediaType mediaCaption mediaId mimeType status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType contentPayload reactionEmoji interactionType interactionId interactionTitle attachment attachments replyTo replyToMessageId errorMessage deliveredTo readBy'
         )
         .lean();
+      mongoQueryDurationMs = performance.now() - queryStartedAt;
+      const exactMessages = filterMessagesForConversation(messages, conversationId);
+      returnedConversationIds = Array.from(
+        new Set(exactMessages.map((message) => toDiagnosticId(message.conversationId)))
+      );
+      returnedMessageCount = Math.min(exactMessages.length, limit);
+      if (exactMessages.length !== (Array.isArray(messages) ? messages.length : 0)) {
+        console.error('[team-inbox-isolation] rejected mismatched conversation records', {
+          requestId,
+          requestedConversationId: conversationDiagnosticId,
+          tenantDiagnosticId,
+          rejectedCount: messages.length - exactMessages.length
+        });
+      }
 
       return buildThreadPageResponse({
-        documents: Array.isArray(messages) ? messages : [],
+        documents: exactMessages,
         limit,
         encodeCursor: encodeMessageIdCursor
       });
@@ -2355,6 +2374,46 @@ router.get('/:conversationId', threadReadRateLimit, async (req, res) => {
           loader: loadMessagePage
         })
       : await loadMessagePage();
+
+    const responseItems = Array.isArray(response?.messages)
+      ? response.messages
+      : Array.isArray(response?.data)
+        ? response.data
+        : [];
+    const responseConversationIds = Array.from(
+      new Set(responseItems.map((message) => String(message?.conversationId || '').trim()).filter(Boolean))
+    ).map(toDiagnosticId);
+    returnedConversationIds = responseConversationIds;
+    const exactResponseItems = filterMessagesForConversation(responseItems, conversationId);
+    const hasMismatchedResponse = exactResponseItems.length !== responseItems.length;
+    if (hasMismatchedResponse) {
+      console.error('[team-inbox-isolation] rejected mismatched cached conversation records', {
+        requestId,
+        requestedConversationId: conversationDiagnosticId,
+        returnedConversationIds: responseConversationIds,
+        tenantDiagnosticId,
+        rejectedCount: responseItems.length - exactResponseItems.length
+      });
+      await invalidateInboxConversation({ companyId: normalizedCompanyId, userId: normalizedUserId, conversationId });
+      const freshPage = await loadMessagePage();
+      return res.json({
+        ...freshPage,
+        ...(Array.isArray(freshPage?.data)
+          ? { data: filterMessagesForConversation(freshPage.data, conversationId) }
+          : {}),
+        ...(Array.isArray(freshPage?.messages)
+          ? { messages: filterMessagesForConversation(freshPage.messages, conversationId) }
+          : {})
+      });
+    }
+
+    if (!cacheLoaderRan) {
+      returnedMessageCount = Array.isArray(response?.messages)
+        ? response.messages.length
+        : Array.isArray(response?.data)
+          ? response.data.length
+          : 0;
+    }
 
     return res.json(response);
   } catch (error) {

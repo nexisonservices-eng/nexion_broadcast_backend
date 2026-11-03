@@ -18,6 +18,8 @@ const MessageSchema = new mongoose.Schema({
   mediaUrl: String,
   mediaType: { type: String, enum: ['image', 'video', 'audio', 'document', 'sticker'] },
   mediaCaption: String,
+  mediaId: String,
+  mimeType: String,
   mediaPipelineRequestId: { type: String, index: true },
   attachment: {
     storageProvider: { type: String, default: 'cloudinary' },
@@ -64,6 +66,7 @@ const MessageSchema = new mongoose.Schema({
   broadcastId: { type: mongoose.Schema.Types.ObjectId, ref: 'Broadcast', index: true },
   broadcastDispatchKey: { type: String, unique: true, sparse: true, index: true },
   rawMessageType: String,
+  contentPayload: { type: mongoose.Schema.Types.Mixed, default: undefined },
   reactionEmoji: String,
   whatsappContextMessageId: { type: String, index: true },
   interactionType: String,
