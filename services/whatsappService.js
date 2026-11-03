@@ -9,6 +9,11 @@ const debugLog = (...args) => {
   }
 };
 
+const maskPhoneNumber = (value) => {
+  const digits = String(value || '').replace(/\D/g, '');
+  return digits ? `***${digits.slice(-4)}` : null;
+};
+
 const truncateMediaDebugValue = (value, max = 120) => {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -406,11 +411,35 @@ class WhatsAppService {
         payload.template.components = components;
       }
 
+      const diagnostic = {
+        event: 'whatsapp_template_send',
+        phase: 'request',
+        wabaId: this.wabaId || null,
+        phoneNumberId: this.phoneNumberId || null,
+        recipient: maskPhoneNumber(normalizedPhone),
+        templateName: normalizedTemplateName,
+        language,
+        componentTypes: components.map((component) => component.type),
+        componentParameterCounts: components.map((component) => ({
+          type: component.type,
+          parameters: Array.isArray(component.parameters) ? component.parameters.length : 0
+        }))
+      };
+      debugLog(JSON.stringify(diagnostic));
+
       const response = await axios.post(
         `${this.apiUrl}/${this.phoneNumberId}/messages`,
         payload,
         { headers: this.getHeaders() }
       );
+
+      debugLog(JSON.stringify({
+        ...diagnostic,
+        phase: 'response',
+        httpStatus: response.status,
+        messageId: response.data?.messages?.[0]?.id || null,
+        recipientWaId: maskPhoneNumber(response.data?.contacts?.[0]?.wa_id)
+      }));
 
       return {
         success: true,
@@ -418,9 +447,26 @@ class WhatsAppService {
         providerMessageId: String(response.data?.messages?.[0]?.id || response.data?.messageId || '').trim()
       };
     } catch (error) {
+      const metaError = error.response?.data?.error || {};
+      debugLog(JSON.stringify({
+        event: 'whatsapp_template_send',
+        phase: 'meta_error',
+        wabaId: this.wabaId || null,
+        phoneNumberId: this.phoneNumberId || null,
+        recipient: maskPhoneNumber(to),
+        templateName: normalizedTemplateName,
+        language,
+        httpStatus: error.response?.status || null,
+        metaCode: metaError.code || null,
+        metaSubcode: metaError.error_subcode || null,
+        metaType: metaError.type || null,
+        message: metaError.message || error.message || 'Unknown Meta error',
+        userMessage: metaError.error_user_msg || null,
+        fbtraceId: metaError.fbtrace_id || null
+      }));
       const metaMessage =
-        error.response?.data?.error?.message ||
-        error.response?.data?.error?.error_user_msg ||
+        metaError.message ||
+        metaError.error_user_msg ||
         '';
       const metaCode = Number(error.response?.data?.error?.code || 0);
 
