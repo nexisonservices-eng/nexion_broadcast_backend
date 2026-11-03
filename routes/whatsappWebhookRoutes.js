@@ -46,6 +46,11 @@ const BroadcastDispatch = require('../models/BroadcastDispatch');
 const isWhatsAppStatusDebugEnabled = () =>
   String(process.env.WHATSAPP_STATUS_DEBUG || '').trim().toLowerCase() === 'true';
 
+const maskStatusRecipient = (value) => {
+  const digits = String(value || '').replace(/\D/g, '');
+  return digits ? `***${digits.slice(-4)}` : null;
+};
+
 const truncateMediaDebugValue = (value, max = 120) => {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -1209,6 +1214,20 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       const statusError =
         statusErrorParts.length > 0 ? statusErrorParts.join(' • ') : '';
 
+      // Log every provider receipt before local message lookup/repair. This lets
+      // us distinguish a missing Meta callback from a receipt that failed to
+      // match a local broadcast message.
+      console.info('[WHATSAPP_STATUS_RECEIVED]', JSON.stringify({
+        ts: new Date().toISOString(),
+        wamid: messageId || null,
+        status: status || null,
+        recipient: maskStatusRecipient(recipient),
+        errorCode: statusData?.errors?.[0]?.code || statusData?.errors?.[0]?.error_data?.code || null,
+        error: statusError || null,
+        userResolved: Boolean(userId),
+        companyResolved: Boolean(companyId)
+      }));
+
       try {
         const bridgeResult = await forwardIvrNotificationStatus(statusData);
         if (bridgeResult?.success === false && !bridgeResult.skipped) {
@@ -1249,7 +1268,14 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           }
         }
         if (!message) {
-          console.log('No message found after repair attempt for whatsappMessageId:', messageId);
+          console.warn('[WHATSAPP_STATUS_UNMATCHED]', JSON.stringify({
+            ts: new Date().toISOString(),
+            wamid: messageId || null,
+            status: status || null,
+            recipient: maskStatusRecipient(recipient),
+            repairAttempted: true,
+            repairSucceeded: Boolean(repairResult?.success)
+          }));
           return;
         }
       }
@@ -1271,26 +1297,19 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
           whatsappMessageId: String(message?.whatsappMessageId || '').trim() || null
         });
       }
-      console.log(
-        '[WHATSAPP_STATUS_WEBHOOK]',
-        JSON.stringify(
-          {
-            wamid: messageId || null,
-            status: status || null,
-            recipient_id: recipient || null,
-            errors: statusError || null,
-            matchedBroadcastId: matchedBroadcastId || null,
-            matchedRecipient: {
-              messageId: String(message?._id || '').trim() || null,
-              conversationId: String(message?.conversationId || '').trim() || null,
-              broadcastDispatchKey: String(message?.broadcastDispatchKey || '').trim() || null,
-              whatsappMessageId: String(message?.whatsappMessageId || '').trim() || messageId || null
-            }
-          },
-          null,
-          2
-        )
-      );
+      console.info('[WHATSAPP_STATUS_MATCHED]', JSON.stringify({
+        ts: new Date().toISOString(),
+        wamid: messageId || null,
+        status: status || null,
+        recipient: maskStatusRecipient(recipient),
+        matchedBroadcastId: matchedBroadcastId || null,
+        localMessageId: String(message?._id || '').trim() || null,
+        conversationId: String(message?.conversationId || '').trim() || null,
+        broadcastDispatchKey: String(message?.broadcastDispatchKey || '').trim() || null,
+        previousStatus: String(message?.status || '').trim() || null,
+        nextStatus,
+        error: statusError || null
+      }));
 
       const effectiveUserId = message.userId || userId;
       const effectiveCompanyId = message.companyId || companyId;
