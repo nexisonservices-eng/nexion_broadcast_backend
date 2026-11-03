@@ -7,7 +7,7 @@ const Conversation = require('../models/Conversation');
 const Contact = require('../models/Contact');
 const Message = require('../models/Message');
 const { buildInboxSearchPlan } = require('../utils/inboxSearchPlan');
-const { buildMessageCursorFilter, decodeMessageCursor, normalizePageLimit } = require('../utils/threadPagination');
+const { decodeMessageIdCursor, normalizePageLimit } = require('../utils/threadPagination');
 
 const readArg = (names = []) => {
   const args = process.argv.slice(2);
@@ -76,12 +76,21 @@ const printPlan = async (label, query) => {
 const run = async () => {
   await connectDB();
 
+  const messageIndexes = await Message.collection.indexes();
+  console.log('\n## Existing message indexes');
+  console.log(JSON.stringify(messageIndexes.map(({ name, key, unique, sparse }) => ({
+    name,
+    key,
+    ...(unique ? { unique } : {}),
+    ...(sparse ? { sparse } : {})
+  })), null, 2));
+
   const companyId = parseObjectId(readArg(['--company-id', '--companyId']), 'companyId');
   const userId = parseObjectId(readArg(['--user-id', '--userId']), 'userId');
   const conversationId = parseObjectId(readArg(['--conversation-id', '--conversationId']), 'conversationId');
   const search = String(readArg(['--search']) || '').trim();
-  const cursor = decodeMessageCursor(readArg(['--cursor']) || '');
-  const limit = normalizePageLimit(readArg(['--limit']) || 20);
+  const cursor = decodeMessageIdCursor(readArg(['--cursor']) || '');
+  const limit = Math.min(normalizePageLimit(readArg(['--limit']) || 20), 20);
 
   const tenantFilter = {};
   if (companyId) tenantFilter.companyId = companyId;
@@ -140,16 +149,18 @@ const run = async () => {
       );
     }
 
+    // Match GET /api/messages/:conversationId in team scope exactly: tenant + thread,
+    // descending ObjectId keyset cursor, and the same sort/projection used by the route.
     const threadFilters = {
-      ...tenantFilter,
+      ...(companyId ? { companyId } : {}),
       conversationId,
-      ...(cursor ? buildMessageCursorFilter(cursor) : {})
+      ...(cursor ? { _id: { $lt: new mongoose.Types.ObjectId(cursor.id) } } : {})
     };
     await printPlan(
       'Conversation thread page',
       Message.find(threadFilters)
-        .select('_id conversationId sender senderName text mediaUrl mediaType mediaCaption status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType reactionEmoji attachment replyTo replyToMessageId errorMessage')
-        .sort({ timestamp: -1, _id: -1 })
+        .select('_id conversationId sender senderRole senderName senderId text mediaUrl mediaType mediaCaption mediaId mimeType status timestamp createdAt whatsappTimestamp whatsappMessageId whatsappContextMessageId rawMessageType contentPayload reactionEmoji interactionType interactionId interactionTitle attachment attachments replyTo replyToMessageId errorMessage deliveredTo readBy')
+        .sort({ _id: -1 })
         .limit(limit + 1)
     );
   }
