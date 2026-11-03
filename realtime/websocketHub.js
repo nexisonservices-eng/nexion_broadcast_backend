@@ -690,7 +690,15 @@ const createWebSocketHub = ({
       }
       ws.authState = 'authenticating';
       try {
-        const context = await authenticateToken(data.token);
+        console.info('WebSocket authentication frame received');
+        let context;
+        try {
+          context = await authenticateToken(data.token);
+          console.info('WebSocket JWT and session verification succeeded');
+        } catch (authError) {
+          console.warn('WebSocket JWT and session verification failed', { reason: authError?.authFailure || authError?.name || 'AuthError' });
+          throw authError;
+        }
         if (ws.readyState !== WebSocket.OPEN || ws.authState !== 'authenticating') return;
         if (!context?.userId) throw new Error('Invalid auth context');
         const companyId = String(context.companyId || '').trim();
@@ -726,6 +734,7 @@ const createWebSocketHub = ({
         else if (isTenantWideRole(context.normalizedRole)) joinRoom('global-admins', ws);
         startSessionRevalidation(ws);
         sendJson(ws, { type: 'authenticated', userId, companyId: companyId || null });
+        console.info('WebSocket authentication acknowledgement sent');
         broadcastUserList();
       } catch (error) {
         if (ws.authState !== 'authenticating') return;
@@ -963,7 +972,13 @@ const createWebSocketHub = ({
       }
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code, reason) => {
+        console.info('WebSocket closed', {
+          authenticated: Boolean(ws.authContext),
+          beforeAuthentication: !ws.authContext,
+          code: Number(code || 0),
+          reason: Buffer.isBuffer(reason) ? reason.toString('utf8').slice(0, 160) : String(reason || '').slice(0, 160)
+        });
         if (ws.authTimeoutTimer) clearTimeout(ws.authTimeoutTimer);
         if (ws.authExpiryTimer) clearTimeout(ws.authExpiryTimer);
         if (ws.authRevalidationTimer) clearInterval(ws.authRevalidationTimer);
