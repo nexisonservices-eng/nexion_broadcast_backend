@@ -363,11 +363,82 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
   };
 
   const extractIncomingMessagePayload = (messageData = {}) => {
-    messageData = messageData?.message ||
-      (messageData?.payload?.type ? messageData.payload : null) ||
-      messageData;
-    const type = String(messageData?.type || '').trim().toLowerCase();
+    const rootMessageData = messageData && typeof messageData === 'object' ? messageData : {};
+    const candidateQueue = [{ value: rootMessageData, depth: 0 }];
+    const candidates = [];
+    const visited = new Set();
+    const nestedMessageKeys = ['message', 'payload', 'data', 'content'];
+    while (candidateQueue.length) {
+      const candidate = candidateQueue.shift();
+      const value = candidate?.value;
+      if (!value || typeof value !== 'object' || visited.has(value) || candidate.depth > 4) continue;
+      visited.add(value);
+      candidates.push(candidate);
+      nestedMessageKeys.forEach((key) => {
+        const child = value[key];
+        if (child && typeof child === 'object' && !Array.isArray(child)) {
+          candidateQueue.push({ value: child, depth: candidate.depth + 1 });
+        }
+      });
+      if (Array.isArray(value.messages)) {
+        value.messages.slice(0, 3).forEach((child) => {
+          if (child && typeof child === 'object') candidateQueue.push({ value: child, depth: candidate.depth + 1 });
+        });
+      }
+    }
+
     const mediaTypes = new Set(['image', 'video', 'audio', 'document', 'sticker']);
+    const supportedTypes = new Set([
+      'text', 'button', 'interactive', 'image', 'video', 'audio', 'document', 'sticker',
+      'reaction', 'location', 'contacts', 'order', 'system', 'template_button', 'template_button_reply'
+    ]);
+    const aliases = {
+      button_reply: 'interactive',
+      list_reply: 'interactive',
+      interactive_button_reply: 'interactive',
+      interactive_list_reply: 'interactive',
+      template_button: 'button',
+      template_button_reply: 'button'
+    };
+    const payloadFieldNames = [
+      'text', 'button', 'button_reply', 'list_reply', 'interactive', 'image', 'video', 'audio',
+      'document', 'sticker', 'reaction', 'location', 'contacts', 'order', 'system',
+      'template_button', 'template_button_reply'
+    ];
+    const candidateInfo = candidates.map((candidate) => {
+      const value = candidate.value;
+      const declaredType = String(value?.type || value?.messageType || value?.message_type || '').trim().toLowerCase();
+      const canonicalType = aliases[declaredType] || declaredType;
+      const payloadFieldsPresent = payloadFieldNames.filter((field) =>
+        Object.prototype.hasOwnProperty.call(value, field) && value[field] != null
+      );
+      const inferredField = payloadFieldsPresent.find((field) => supportedTypes.has(aliases[field] || field));
+      const normalizedType = supportedTypes.has(canonicalType)
+        ? canonicalType
+        : inferredField
+          ? aliases[inferredField] || inferredField
+          : '';
+      const score = (normalizedType ? 5 : 0) + (payloadFieldsPresent.length ? 3 : 0) + (declaredType ? 1 : 0);
+      return { ...candidate, declaredType, normalizedType, payloadFieldsPresent, score };
+    });
+    candidateInfo.sort((left, right) => right.score - left.score || left.depth - right.depth);
+    const resolvedCandidate = candidateInfo[0] || { value: rootMessageData, declaredType: '', normalizedType: '', payloadFieldsPresent: [] };
+    messageData = resolvedCandidate.value || rootMessageData;
+    const rootDeclaredType = String(
+      rootMessageData?.type || rootMessageData?.messageType || rootMessageData?.message_type || ''
+    ).trim().toLowerCase();
+    const originalType = rootDeclaredType && (supportedTypes.has(aliases[rootDeclaredType] || rootDeclaredType) || rootDeclaredType === 'unsupported')
+      ? rootDeclaredType
+      : resolvedCandidate.declaredType || rootDeclaredType;
+    const type = resolvedCandidate.normalizedType || 'unknown';
+    if (type === 'interactive' && !messageData?.interactive) {
+      if (messageData?.button_reply) messageData = { ...messageData, interactive: { button_reply: messageData.button_reply } };
+      else if (messageData?.list_reply) messageData = { ...messageData, interactive: { list_reply: messageData.list_reply } };
+    }
+    if (type === 'button' && !messageData?.button) {
+      const buttonPayload = messageData?.template_button_reply || messageData?.template_button || messageData?.button_reply;
+      if (buttonPayload) messageData = { ...messageData, button: buttonPayload };
+    }
     const reactionTargetMessageId = firstNonEmpty(messageData?.reaction?.message_id);
 
     let text = '';
@@ -545,7 +616,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
     }
 
     if (!text) {
-      text = type ? `[${toTitleCase(type)} message]` : '[Unknown WhatsApp message]';
+      const fallbackType = originalType && originalType !== 'unsupported' ? originalType : type;
+      text = fallbackType ? `[${toTitleCase(fallbackType)} message]` : '[Unknown WhatsApp message]';
     }
 
     return {
@@ -554,7 +626,12 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
       mediaType,
       mediaCaption,
       reactionEmoji,
-      rawMessageType: type || '',
+      rawMessageType: originalType || '',
+      normalizedType: type,
+      payloadFieldsPresent: resolvedCandidate.payloadFieldsPresent || [],
+      messageId: firstNonEmpty(messageData?.id, rootMessageData?.id),
+      timestamp: firstNonEmpty(messageData?.timestamp, rootMessageData?.timestamp),
+      from: firstNonEmpty(messageData?.from, rootMessageData?.from),
       whatsappContextMessageId: whatsappContextMessageId || '',
       interactionType: interactionMeta.interactionType,
       interactionId: interactionMeta.interactionId,
@@ -567,7 +644,8 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
     try {
       console.log('Processing incoming message...');
 
-      const from = messageData.from;
+      const extracted = extractIncomingMessagePayload(messageData);
+      const from = firstNonEmpty(messageData?.from, extracted.from);
       const normalizedFrom = normalizePhoneDigits(from);
       const phoneCandidates = buildPhoneCandidates(from);
       const {
@@ -577,24 +655,43 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         mediaCaption,
         reactionEmoji,
         rawMessageType,
+        normalizedType,
+        payloadFieldsPresent,
+        contentPayload,
+        messageId: extractedMessageId,
+        timestamp: extractedTimestamp,
         whatsappContextMessageId,
         interactionType,
         interactionId,
         interactionTitle
-      } = extractIncomingMessagePayload(messageData);
-      const messageId = messageData.id;
-      const incomingMediaPayload = mediaType ? messageData?.[mediaType] || {} : {};
+      } = extracted;
+      const messageId = firstNonEmpty(messageData?.id, extractedMessageId);
+      const incomingMediaPayload = mediaType
+        ? contentPayload?.[mediaType] || messageData?.[mediaType] || {}
+        : {};
       const incomingMediaId = String(incomingMediaPayload?.id || '').trim();
       const incomingMimeType = String(incomingMediaPayload?.mime_type || '').trim();
+      const normalizedWebhookType = String(normalizedType || 'unknown').toLowerCase();
+      const typeDiagnosticsEnabled = String(process.env.TEAM_INBOX_MESSAGE_TYPE_DIAGNOSTICS || '').trim() === '1';
+      if (typeDiagnosticsEnabled || String(rawMessageType || '').toLowerCase() !== normalizedWebhookType) {
+        console.info('[WhatsAppInbound] message_type_normalized', {
+          messageDiagnosticId: crypto.createHash('sha256').update(String(messageId || '')).digest('hex').slice(0, 12),
+          originalType: String(rawMessageType || '').slice(0, 80) || null,
+          normalizedType: normalizedWebhookType,
+          payloadFieldsPresent: Array.isArray(payloadFieldsPresent) ? payloadFieldsPresent : []
+        });
+      }
       const knownMessageTypes = new Set([
         'text', 'button', 'interactive', 'image', 'video', 'audio', 'document', 'sticker',
         'location', 'contacts', 'reaction', 'order', 'system', 'unknown'
       ]);
-      if (!knownMessageTypes.has(String(rawMessageType || '').toLowerCase())) {
+      if (!knownMessageTypes.has(normalizedWebhookType)) {
         console.warn('[WhatsAppInbound] unknown_message_type', JSON.stringify({
           event: 'unknown_whatsapp_message_type',
           originalMessageType: String(rawMessageType || '').slice(0, 80) || null,
-          messageId: String(messageId || '').slice(0, 120) || null
+          normalizedType: normalizedWebhookType,
+          messageDiagnosticId: crypto.createHash('sha256').update(String(messageId || '')).digest('hex').slice(0, 12),
+          payloadFieldsPresent: Array.isArray(payloadFieldsPresent) ? payloadFieldsPresent : []
         }));
       }
       const incomingMediaFileName = String(
@@ -911,7 +1008,9 @@ const registerWhatsAppWebhookRoutes = (app, deps) => {
         replyTo: replyToMessageId || undefined,
         whatsappMessageId: messageId,
         status: 'received',
-        whatsappTimestamp: new Date(messageData.timestamp * 1000),
+        whatsappTimestamp: Number.isFinite(Number(extractedTimestamp))
+          ? new Date(Number(extractedTimestamp) * 1000)
+          : new Date(),
         timestamp: new Date()
       });
       console.info('[WhatsAppInbound] message_saved', JSON.stringify({
