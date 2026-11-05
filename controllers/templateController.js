@@ -627,6 +627,29 @@ class TemplateController {
           error: 'hsm_id is required to delete a specific language version safely'
         });
       }
+      let freshCredentials;
+      try {
+        freshCredentials = await getWhatsAppCredentialsForUser({
+          authHeader: req.headers?.authorization || '',
+          userId: req.user?.id || null,
+          forceRefresh: true
+        });
+      } catch (error) {
+        console.error('[TEMPLATE_DELETE_DEBUG] Fresh credential retrieval failed', {
+          userId: req.user?.id || null,
+          message: error.message
+        });
+        return res.status(502).json({
+          success: false,
+          error: 'Unable to retrieve fresh WhatsApp credentials for template deletion'
+        });
+      }
+      if (!freshCredentials?.accessToken || !freshCredentials?.businessAccountId) {
+        return res.status(502).json({
+          success: false,
+          error: 'Fresh WhatsApp credentials are missing a valid access token or WABA ID'
+        });
+      }
       const template = await Template.findOne({
         userId: req.user.id,
         companyId: req.companyId,
@@ -635,11 +658,13 @@ class TemplateController {
       });
       const metaDeleteResult = await whatsappService.deleteTemplateByName(
         templateName,
-        req.whatsappCredentials,
+        freshCredentials,
         metaTemplateId,
         {
           userId: req.user?.id || null,
-          credentialSource: req.whatsappCredentials?.credentialSource || 'unspecified'
+          credentialSource: freshCredentials.credentialSource || 'unspecified',
+          credentialsFromCache: freshCredentials.credentialSource === 'admin_user_credentials_cache',
+          credentialsFromFreshApi: freshCredentials.credentialSource === 'admin_user_credentials_api'
         }
       );
 

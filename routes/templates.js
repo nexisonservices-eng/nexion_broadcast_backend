@@ -33,7 +33,7 @@ router.get('/sync', requireWhatsAppCredentials, (req, res) => templateController
 // Meta-specific routes (must come before /:id)
 router.get('/meta', requireWhatsAppCredentials, (req, res) => templateController.getMetaTemplates(req, res));
 router.post('/meta/sync', requireWhatsAppCredentials, (req, res) => templateController.syncMetaTemplates(req, res));
-router.delete('/meta/:name', requireWhatsAppCredentials, (req, res) => templateController.deleteMetaTemplate(req, res));
+router.delete('/meta/:name', (req, res) => templateController.deleteMetaTemplate(req, res));
 
 // Other routes
 router.get('/:id', (req, res) => templateController.getTemplateById(req, res));

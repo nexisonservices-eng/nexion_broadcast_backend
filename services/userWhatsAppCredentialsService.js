@@ -136,6 +136,7 @@ const normalizeCredentials = (data) => {
   return {
     username,
     email,
+    credentialOwnerUserId: trimOrNull(data.credentialOwnerUserId),
     accessToken,
     businessAccountId,
     phoneNumberId,
@@ -173,7 +174,7 @@ const getCachedCredentials = (cacheKey) => {
   return cached.value;
 };
 
-const fetchCredentialsFromAdminApi = async ({ authHeader, userId, token }) => {
+const fetchCredentialsFromAdminApi = async ({ authHeader, userId, token, forceRefresh = false }) => {
   let lastError = null;
 
   for (const baseUrl of ADMIN_API_BASE_URLS) {
@@ -191,7 +192,9 @@ const fetchCredentialsFromAdminApi = async ({ authHeader, userId, token }) => {
       if (!normalized) return null;
 
       const cacheKey = toCacheKey(userId, token);
-      userCredentialCache.set(cacheKey, { value: normalized, fetchedAt: Date.now() });
+      if (forceRefresh || !userCredentialCache.has(cacheKey)) {
+        userCredentialCache.set(cacheKey, { value: normalized, fetchedAt: Date.now() });
+      }
 
       if (userId) {
         phoneNumberToUserIdCache.set(String(normalized.phoneNumberId), String(userId));
@@ -219,17 +222,19 @@ const fetchCredentialsFromAdminApi = async ({ authHeader, userId, token }) => {
   throw lastError || new Error('Unable to reach admin backend for user credentials');
 };
 
-const getWhatsAppCredentialsForUser = async ({ authHeader = '', userId = null }) => {
+const getWhatsAppCredentialsForUser = async ({ authHeader = '', userId = null, forceRefresh = false } = {}) => {
   if (!authHeader.startsWith('Bearer ')) return null;
 
   const token = authHeader.slice(7).trim();
   if (!token) return null;
 
   const cacheKey = toCacheKey(userId, token);
-  const cached = getCachedCredentials(cacheKey);
-  if (cached) return { ...cached, credentialSource: 'admin_user_credentials_cache' };
+  if (!forceRefresh) {
+    const cached = getCachedCredentials(cacheKey);
+    if (cached) return { ...cached, credentialSource: 'admin_user_credentials_cache' };
+  }
 
-  const credentials = await fetchCredentialsFromAdminApi({ authHeader, userId, token });
+  const credentials = await fetchCredentialsFromAdminApi({ authHeader, userId, token, forceRefresh });
   return credentials ? { ...credentials, credentialSource: 'admin_user_credentials_api' } : null;
 };
 
