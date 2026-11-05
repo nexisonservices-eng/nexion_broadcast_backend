@@ -583,7 +583,7 @@ class TemplateController {
         name: template.name,
         status: template.status
       });
-      const metaDeleteResult = await whatsappService.deleteTemplateByName(template.name, credentials);
+      const metaDeleteResult = await whatsappService.deleteTemplateByName(template.name, credentials, metaTemplateId);
       if (!metaDeleteResult.success) {
         console.error('[TEMPLATE_DELETE] Meta deletion failed', {
           templateId: String(template._id),
@@ -592,7 +592,8 @@ class TemplateController {
         });
         return res.status(502).json({
           success: false,
-          error: metaDeleteResult.error || 'Failed to delete template from Meta'
+          error: metaDeleteResult.error || 'Failed to delete template from Meta',
+          meta: metaDeleteResult.details || null
         });
       }
 
@@ -619,23 +620,38 @@ class TemplateController {
       if (!templateName) {
         return res.status(400).json({ success: false, error: 'Template name is required' });
       }
-
+      const metaTemplateId = String(req.query.hsm_id || '').trim();
+      if (!metaTemplateId) {
+        return res.status(400).json({
+          success: false,
+          error: 'hsm_id is required to delete a specific language version safely'
+        });
+      }
+      const template = await Template.findOne({
+        userId: req.user.id,
+        companyId: req.companyId,
+        name: templateName,
+        whatsappTemplateId: metaTemplateId
+      });
       const metaDeleteResult = await whatsappService.deleteTemplateByName(
         templateName,
-        req.whatsappCredentials
+        req.whatsappCredentials,
+        metaTemplateId
       );
 
       if (!metaDeleteResult.success) {
-        return res.status(400).json({
+        return res.status(502).json({
           success: false,
-          error: metaDeleteResult.error || 'Failed to delete template from Meta'
+          error: metaDeleteResult.error || 'Failed to delete template from Meta',
+          meta: metaDeleteResult.details || null
         });
       }
 
-      const localDeleteResult = await Template.deleteMany({
+      const localDeleteResult = await Template.deleteOne({
         userId: req.user.id,
         companyId: req.companyId,
-        name: templateName
+        name: templateName,
+        whatsappTemplateId: metaTemplateId
       });
 
       res.json({

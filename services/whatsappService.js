@@ -1078,49 +1078,53 @@ class WhatsAppService {
     }
   }
 
-  async deleteTemplateByName(templateName, credentials = null) {
-    if (credentials) {
-      this.initialize(credentials);
-    }
-
+  async deleteTemplateByName(templateName, credentials = null, metaTemplateId = '') {
     try {
       const normalizedName = String(templateName || '').trim();
       if (!normalizedName) {
         return { success: false, error: 'Template name is required' };
       }
+      // Keep tenant credentials request-local; this service is a shared singleton.
+      const wabaId = credentials?.businessAccountId;
+      const accessToken = credentials?.accessToken;
+      if (!wabaId || !accessToken) {
+        return { success: false, error: 'Tenant WhatsApp Business Account ID and access token are required' };
+      }
+      const templateId = String(metaTemplateId || '').trim();
+      if (!templateId) {
+        return { success: false, error: 'Meta template ID (hsm_id) is required to safely delete one language version' };
+      }
 
       const response = await axios.delete(
-        `${this.apiUrl}/${this.wabaId}/message_templates`,
+        `${this.apiUrl}/${wabaId}/message_templates`,
         {
-          headers: this.getHeaders(),
-          params: { name: normalizedName },
+          headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+          params: { name: normalizedName, hsm_id: templateId },
           timeout: META_REQUEST_TIMEOUT_MS
         }
       );
 
+      if (response.data?.success !== true) {
+        return { success: false, error: 'Meta did not confirm template deletion', details: response.data };
+      }
       return { success: true, data: response.data };
     } catch (error) {
       const metaError = error.response?.data?.error;
-      // Deletion is complete when Meta confirms that the template is already absent.
-      // Do not hide other invalid-parameter, authentication, or permission failures.
-      if (
-        Number(error.response?.status) === 400 &&
-        Number(metaError?.code) === 100 &&
-        Number(metaError?.error_subcode) === 2593002
-      ) {
-        return { success: true, alreadyDeleted: true };
-      }
+      console.error('[META_TEMPLATE_DELETE] Meta API error', {
+        message: metaError?.message || error.message,
+        code: metaError?.code ?? null,
+        error_subcode: metaError?.error_subcode ?? null,
+        details: metaError?.error_data?.details ?? null
+      });
       return {
         success: false,
-        error: [...new Set([
-          error.response?.data?.error?.error_user_msg,
-          error.response?.data?.error?.error_data?.details,
-          error.response?.data?.error?.message || error.message,
-          error.response?.data?.error?.code != null
-            ? `Meta code: ${error.response.data.error.code}` : '',
-          error.response?.data?.error?.error_subcode != null
-            ? `subcode: ${error.response.data.error.error_subcode}` : ''
-        ].filter(Boolean))].join(' | ')
+        error: metaError?.message || error.response?.data?.message || error.message || 'Meta template deletion failed',
+        details: {
+          message: metaError?.message || null,
+          code: metaError?.code ?? null,
+          error_subcode: metaError?.error_subcode ?? null,
+          error_data: { details: metaError?.error_data?.details ?? null }
+        }
       };
     }
   }
