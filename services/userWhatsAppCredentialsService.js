@@ -227,9 +227,10 @@ const getWhatsAppCredentialsForUser = async ({ authHeader = '', userId = null })
 
   const cacheKey = toCacheKey(userId, token);
   const cached = getCachedCredentials(cacheKey);
-  if (cached) return cached;
+  if (cached) return { ...cached, credentialSource: 'admin_user_credentials_cache' };
 
-  return fetchCredentialsFromAdminApi({ authHeader, userId, token });
+  const credentials = await fetchCredentialsFromAdminApi({ authHeader, userId, token });
+  return credentials ? { ...credentials, credentialSource: 'admin_user_credentials_api' } : null;
 };
 
 const resolveUserIdByPhoneNumberId = async (phoneNumberId) => {

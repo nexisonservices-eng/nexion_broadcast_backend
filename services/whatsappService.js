@@ -1078,7 +1078,7 @@ class WhatsAppService {
     }
   }
 
-  async deleteTemplateByName(templateName, credentials = null, metaTemplateId = '') {
+  async deleteTemplateByName(templateName, credentials = null, metaTemplateId = '', debugContext = {}) {
     try {
       const normalizedName = String(templateName || '').trim();
       if (!normalizedName) {
@@ -1095,8 +1095,24 @@ class WhatsAppService {
         return { success: false, error: 'Meta template ID (hsm_id) is required to safely delete one language version' };
       }
 
+      // TEMPORARY TEMPLATE_DELETE_DEBUG: remove after tenant credential investigation.
+      const endpointUrl = `${this.apiUrl}/${wabaId}/message_templates`;
+      console.log('[TEMPLATE_DELETE_DEBUG]', {
+        userId: debugContext.userId || null,
+        businessName: credentials?.companyName || credentials?.username || null,
+        wabaId,
+        phoneNumberId: credentials?.phoneNumberId || null,
+        tokenConfigured: Boolean(accessToken),
+        tokenFingerprint: accessToken ? accessToken.slice(-6) : null,
+        templateName: normalizedName,
+        hsmId: templateId,
+        credentialSource: debugContext.credentialSource || credentials?.credentialSource || 'unspecified',
+        endpointUrl,
+        apiVersion: this.apiUrl.match(/graph\.facebook\.com\/(v[\d.]+)/)?.[1] || null
+      });
+
       const response = await axios.delete(
-        `${this.apiUrl}/${wabaId}/message_templates`,
+        endpointUrl,
         {
           headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
           params: { name: normalizedName, hsm_id: templateId },
@@ -1105,11 +1121,42 @@ class WhatsAppService {
       );
 
       if (response.data?.success !== true) {
+        // TEMPORARY TEMPLATE_DELETE_DEBUG: only allowlisted Meta error fields are logged.
+        console.error('[TEMPLATE_DELETE_DEBUG] Meta deletion failed', {
+          status: response.status ?? null,
+          body: {
+            success: response.data?.success ?? null,
+            message: response.data?.message || null,
+            error: response.data?.error ? {
+              message: response.data.error.message || null,
+              type: response.data.error.type || null,
+              code: response.data.error.code ?? null,
+              error_subcode: response.data.error.error_subcode ?? null,
+              error_data: response.data.error.error_data
+                ? { details: response.data.error.error_data.details || null }
+                : null
+            } : null
+          }
+        });
         return { success: false, error: 'Meta did not confirm template deletion', details: response.data };
       }
       return { success: true, data: response.data };
     } catch (error) {
       const metaError = error.response?.data?.error;
+      // TEMPORARY TEMPLATE_DELETE_DEBUG: allowlist fields so response payloads cannot expose credentials.
+      console.error('[TEMPLATE_DELETE_DEBUG] Meta deletion failed', {
+        status: error.response?.status ?? null,
+        body: {
+          message: error.response?.data?.message || null,
+          error: metaError ? {
+            message: metaError.message || null,
+            type: metaError.type || null,
+            code: metaError.code ?? null,
+            error_subcode: metaError.error_subcode ?? null,
+            error_data: metaError.error_data ? { details: metaError.error_data.details || null } : null
+          } : null
+        }
+      });
       console.error('[META_TEMPLATE_DELETE] Meta API error', {
         message: metaError?.message || error.message,
         code: metaError?.code ?? null,

@@ -636,7 +636,11 @@ class TemplateController {
       const metaDeleteResult = await whatsappService.deleteTemplateByName(
         templateName,
         req.whatsappCredentials,
-        metaTemplateId
+        metaTemplateId,
+        {
+          userId: req.user?.id || null,
+          credentialSource: req.whatsappCredentials?.credentialSource || 'unspecified'
+        }
       );
 
       if (!metaDeleteResult.success) {
