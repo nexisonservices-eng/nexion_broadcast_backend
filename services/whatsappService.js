@@ -1100,6 +1100,7 @@ class WhatsAppService {
       console.log('[TEMPLATE_DELETE_DEBUG]', {
         userId: debugContext.userId || null,
         businessName: credentials?.companyName || credentials?.username || null,
+        credentialOwnerUserId: credentials?.credentialOwnerUserId || null,
         wabaId,
         phoneNumberId: credentials?.phoneNumberId || null,
         tokenConfigured: Boolean(accessToken),
@@ -1107,6 +1108,8 @@ class WhatsAppService {
         templateName: normalizedName,
         hsmId: templateId,
         credentialSource: debugContext.credentialSource || credentials?.credentialSource || 'unspecified',
+        credentialsFromCache: debugContext.credentialsFromCache ?? null,
+        credentialsFromFreshApi: debugContext.credentialsFromFreshApi ?? null,
         endpointUrl,
         apiVersion: this.apiUrl.match(/graph\.facebook\.com\/(v[\d.]+)/)?.[1] || null
       });
