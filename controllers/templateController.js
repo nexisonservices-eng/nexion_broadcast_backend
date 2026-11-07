@@ -765,7 +765,13 @@ class TemplateController {
               buttons: normalizeTemplateButtons(buttons?.buttons || [])
             },
             // Extract only numbered placeholders present in Meta's BODY text.
-            variables: this.extractVariables(body?.text || ''),
+            variables: this.extractVariables(body?.text || '').map(variable => {
+              const variableNumber = Number(String(variable.name || '').match(/\d+/)?.[0] || 0);
+              const bodyExampleRows = Array.isArray(body?.example?.body_text) ? body.example.body_text : [];
+              const bodyExamples = Array.isArray(bodyExampleRows[0]) ? bodyExampleRows[0] : [];
+              const example = variableNumber > 0 ? String(bodyExamples[variableNumber - 1] || '').trim() : '';
+              return example ? { ...variable, example } : variable;
+            }),
             metaComponents,
             whatsappTemplateId: wt.id,
             businessAccountId,
