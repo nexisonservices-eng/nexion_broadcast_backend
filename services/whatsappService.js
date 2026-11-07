@@ -3,6 +3,7 @@ const FormData = require('form-data');
 const { normalizeTemplateMediaHandle } = require('../utils/templateMediaHandle');
 const { isDebugLoggingEnabled } = require('../utils/securityConfig');
 const META_REQUEST_TIMEOUT_MS = Number(process.env.WHATSAPP_META_REQUEST_TIMEOUT_MS || 12000);
+const TEMPLATE_LIST_TIMEOUT_MS = Number(process.env.WHATSAPP_TEMPLATE_LIST_TIMEOUT_MS || 45000);
 const debugLog = (...args) => {
   if (isDebugLoggingEnabled()) {
     console.log(...args);
@@ -1096,7 +1097,7 @@ class WhatsAppService {
       };
       let response = await axios.get(endpoint, {
         headers: this.getHeaders(),
-        timeout: META_REQUEST_TIMEOUT_MS,
+        timeout: TEMPLATE_LIST_TIMEOUT_MS,
         params
       });
       const firstPage = response.data || {};
@@ -1111,7 +1112,7 @@ class WhatsAppService {
         seenCursors.add(cursor);
         response = await axios.get(endpoint, {
           headers: this.getHeaders(),
-          timeout: META_REQUEST_TIMEOUT_MS,
+          timeout: TEMPLATE_LIST_TIMEOUT_MS,
           params: { ...params, after: cursor }
         });
         const page = response.data || {};
