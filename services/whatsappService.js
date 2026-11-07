@@ -142,6 +142,50 @@ const extractTemplateVariableCount = (text = '') => {
   }, 0);
 };
 
+const getNumberedVariableCount = (text = '') => {
+  const values = [...String(text || '').matchAll(/\{\{(\d+)\}\}/g)]
+    .map((match) => Number(match[1]))
+    .filter((value) => Number.isInteger(value) && value > 0);
+  if (values.length === 0) return 0;
+  const unique = [...new Set(values)].sort((a, b) => a - b);
+  for (let index = 0; index < unique.length; index += 1) {
+    if (unique[index] !== index + 1) {
+      throw new Error(`Non-sequential numbered placeholders: expected {{${index + 1}}}, found {{${unique[index]}}}`);
+    }
+  }
+  return unique.length;
+};
+
+const validateTemplateSendShape = (template, suppliedComponents, variables, templateName) => {
+  const definition = Array.isArray(template?.components) ? template.components : [];
+  const supplied = Array.isArray(suppliedComponents) ? suppliedComponents : [];
+  const headerDefinition = definition.find((component) => String(component?.type || '').toUpperCase() === 'HEADER');
+  const mediaType = String(headerDefinition?.format || '').toLowerCase();
+  if (['image', 'video', 'document'].includes(mediaType)) {
+    const headerPayload = supplied.find((component) => String(component?.type || '').toUpperCase() === 'HEADER');
+    const hasMedia = (Array.isArray(headerPayload?.parameters) ? headerPayload.parameters : []).some((parameter) =>
+      String(parameter?.type || '').toLowerCase() === mediaType &&
+      Boolean(parameter?.[mediaType]?.id || parameter?.[mediaType]?.link)
+    );
+    if (!hasMedia) {
+      throw new Error(`Template "${templateName}" HEADER component requires ${mediaType} media, but the send payload does not include it.`);
+    }
+  }
+  for (const type of ['HEADER', 'BODY']) {
+    const metaComponent = definition.find((component) => String(component?.type || '').toUpperCase() === type);
+    const expected = getNumberedVariableCount(metaComponent?.text || '');
+    const sentComponent = supplied.find((component) => String(component?.type || '').toUpperCase() === type);
+    const sentCount = sentComponent
+      ? (Array.isArray(sentComponent.parameters) ? sentComponent.parameters : []).filter((parameter) =>
+          String(parameter?.type || '').toLowerCase() === 'text'
+        ).length
+      : (type === 'BODY' ? variables.length : 0);
+    if (expected !== sentCount) {
+      throw new Error(`Template "${templateName}" ${type} component expects ${expected} text parameter(s), but the send payload contains ${sentCount}. Refresh the template mapping and try again.`);
+    }
+  }
+};
+
 const getHeaderRequirements = (template = {}) => {
   const headerComponent = Array.isArray(template?.components)
     ? template.components.find(
@@ -379,6 +423,23 @@ class WhatsAppService {
       if (!normalizedTemplateName) {
         return { success: false, error: 'Template name is required' };
       }
+
+      // Validate against the live Meta definition before making a send request.
+      // This catches stale campaign mappings before Meta returns error 132000.
+      const templateList = await this.getTemplateList(credentials || null);
+      if (!templateList?.success) {
+        return { success: false, error: `Could not validate template "${normalizedTemplateName}" against Meta: ${templateList?.error || 'template catalog unavailable'}` };
+      }
+      const requestedLanguage = String(language || '').trim().toLowerCase();
+      const approvedTemplate = (templateList.data?.data || []).find((candidate) =>
+        String(candidate?.name || '').trim().toLowerCase() === normalizedTemplateName.toLowerCase() &&
+        String(candidate?.language || '').trim().toLowerCase() === requestedLanguage &&
+        String(candidate?.status || '').trim().toUpperCase() === 'APPROVED'
+      );
+      if (!approvedTemplate) {
+        return { success: false, error: `Approved Meta template "${normalizedTemplateName}" (${language}) was not found in the connected WABA.` };
+      }
+      validateTemplateSendShape(approvedTemplate, normalizedProvidedComponents, variables, normalizedTemplateName);
 
       const normalizedPhone = normalizeWhatsAppPhone(to);
 

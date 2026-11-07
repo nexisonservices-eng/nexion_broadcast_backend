@@ -58,6 +58,9 @@ const TemplateSchema = new mongoose.Schema({
 
   },
 
+  // Keep Meta's approved definition intact for previews and send validation.
+  metaComponents: [mongoose.Schema.Types.Mixed],
+
   variables: [{ 
 
     name: String,

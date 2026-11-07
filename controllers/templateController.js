@@ -83,22 +83,9 @@ const prepareMetaTemplateText = (value = '') => {
   const normalized = collapsedLines.join('\n').trim();
   if (!normalized) return { text: '', examples: [] };
 
-  const explicitPlaceholderMatch = /\{\{\d+\}\}/.test(normalized);
-  if (explicitPlaceholderMatch) {
-    return { text: normalized, examples: [] };
-  }
-
-  const placeholderExamples = [];
-  let placeholderIndex = 1;
-  const metaBodyPattern = /(?:https?:\/\/[^\s]+|www\.[^\s]+|\+?\d[\d\s().-]{7,}\d)/g;
-  const text = normalized.replace(metaBodyPattern, (match) => {
-    placeholderExamples.push(match.trim());
-    const placeholder = `{{${placeholderIndex}}}`;
-    placeholderIndex += 1;
-    return placeholder;
-  });
-
-  return { text, examples: placeholderExamples };
+  // URLs and phone numbers are ordinary template text. Only explicit Meta
+  // placeholders are dynamic; never infer variables from static content.
+  return { text: normalized, examples: [] };
 };
 
 class TemplateController {
@@ -128,7 +115,10 @@ class TemplateController {
         const variables = [];
         let match;
         
+        const seenVariables = new Set();
         while ((match = variablePattern.exec(text)) !== null) {
+            if (seenVariables.has(match[1])) continue;
+            seenVariables.add(match[1]);
             variables.push({
                 name: `var${match[1]}`,
                 example: `Example ${match[1]}`,
@@ -727,123 +717,53 @@ class TemplateController {
 
       for (const wt of whatsappTemplates) {
         try {
-          // Check if template already exists
+          const businessAccountId = String(whatsappService.wabaId || '').trim();
+          // Meta template ids are scoped to a WABA. Keep tenant and WABA in the
+          // lookup so another connected account can never refresh this record.
           const existingTemplate = await Template.findOne({
             userId,
-            companyId: req.companyId,
+            companyId: req.companyId || null,
+            businessAccountId,
             whatsappTemplateId: wt.id
           });
-
-          // Extract template components (move outside the if block)
-          const components = [];
-          
-          if (wt.components) {
-            for (const component of wt.components) {
-              switch (component.type) {
-                case 'HEADER':
-                  components.push({
-                    type: 'header',
-                    format: component.format,
-                    text: component.text
-                  });
-                  break;
-                case 'BODY':
-                  components.push({
-                    type: 'body',
-                    text: component.text
-                  });
-                  break;
-                case 'FOOTER':
-                  components.push({
-                    type: 'footer',
-                    text: component.text
-                  });
-                  break;
-                case 'BUTTONS':
-                  // Handle buttons separately, not as content
-                  break;
-              }
-            }
-          }
-
-          if (!existingTemplate) {
-
-            // Create template object for our database
-            const headerComponent = components.find(c => c.type === 'header');
-            const templateData = {
-              userId,
-              companyId: req.companyId,
-              name: wt.name,
-              type: 'official',
-              category: wt.category || 'utility',
-              language: wt.language,
-              status: wt.status.toLowerCase(), // Convert to lowercase for database
-              isActive: wt.status.toLowerCase() === 'approved',
-              content: {
-                header: headerComponent ? {
-                  type: (headerComponent.format || 'text').toLowerCase(),
-                  text: headerComponent.text || ''
-                } : {
-                  type: 'text',
-                  text: ''
-                },
-                body: components.find(c => c.type === 'body')?.text || '',
-                footer: components.find(c => c.type === 'footer')?.text || ''
-              },
-              variables: this.extractVariables(components.find(c => c.type === 'body')?.text || ''),
-              whatsappTemplateId: wt.id,
-              businessAccountId: whatsappService.wabaId,
-              phoneNumberId: whatsappService.phoneNumberId,
-              createdAt: new Date(),
-              updatedAt: new Date(),
-              syncedAt: new Date(),
-              createdById: userId
-            };
-
-            const newTemplate = await Template.create(templateData);
-            syncedTemplates.push(newTemplate);
-            
-            console.log(` Synced new template: ${wt.name} (${wt.status})`);
-          } else {
-            // Update existing template if needed
-            const needsUpdate = existingTemplate.status !== wt.status || 
-                              existingTemplate.name !== wt.name ||
-                              existingTemplate.language !== wt.language;
-
-            if (needsUpdate) {
-              const headerComponent = components.find(c => c.type === 'header');
-              const updatedTemplate = await Template.findByIdAndUpdate(
-                existingTemplate._id,
-                {
-                  name: wt.name,
-                  category: wt.category || 'utility',
-                  language: wt.language,
-                  status: wt.status.toLowerCase(), // Convert to lowercase for database
-                  isActive: wt.status.toLowerCase() === 'approved',
-                  content: {
-                    header: headerComponent ? {
-                      type: (headerComponent.format || 'text').toLowerCase(),
-                      text: headerComponent.text || ''
-                    } : {
-                      type: 'text',
-                      text: ''
-                    },
-                    body: components.find(c => c.type === 'body')?.text || '',
-                    footer: components.find(c => c.type === 'footer')?.text || ''
-                  },
-                  variables: this.extractVariables(components.find(c => c.type === 'body')?.text || ''),
-                  updatedAt: new Date(),
-                  syncedAt: new Date()
-                },
-                { new: true }
-              );
-              syncedTemplates.push(updatedTemplate);
-              console.log(` Updated template: ${wt.name} (${wt.status})`);
-            } else {
-              syncedTemplates.push(existingTemplate);
-              console.log(` Template already exists: ${wt.name}`);
-            }
-          }
+          const metaComponents = Array.isArray(wt.components) ? wt.components : [];
+          const header = metaComponents.find(component => component.type === 'HEADER');
+          const body = metaComponents.find(component => component.type === 'BODY');
+          const footer = metaComponents.find(component => component.type === 'FOOTER');
+          const buttons = metaComponents.find(component => component.type === 'BUTTONS');
+          const now = new Date();
+          const templateData = {
+            userId,
+            companyId: req.companyId || null,
+            name: wt.name,
+            type: 'official',
+            category: wt.category || 'utility',
+            language: wt.language,
+            status: String(wt.status || '').toLowerCase(),
+            isActive: String(wt.status || '').toLowerCase() === 'approved',
+            content: {
+              header: header ? {
+                type: String(header.format || 'text').toLowerCase(),
+                text: header.text || ''
+              } : { type: 'text', text: '' },
+              body: body?.text || '',
+              footer: footer?.text || '',
+              buttons: normalizeTemplateButtons(buttons?.buttons || [])
+            },
+            // Extract only numbered placeholders present in Meta's BODY text.
+            variables: this.extractVariables(body?.text || ''),
+            metaComponents,
+            whatsappTemplateId: wt.id,
+            businessAccountId,
+            phoneNumberId: whatsappService.phoneNumberId,
+            updatedAt: now,
+            syncedAt: now,
+            createdById: userId
+          };
+          const syncedTemplate = existingTemplate
+            ? await Template.findByIdAndUpdate(existingTemplate._id, { $set: templateData }, { new: true })
+            : await Template.create({ ...templateData, createdAt: now });
+          syncedTemplates.push(syncedTemplate);
         } catch (error) {
           console.error(`❌ Error processing template ${wt.name}:`, error);
           console.error('❌ Template details:', {
