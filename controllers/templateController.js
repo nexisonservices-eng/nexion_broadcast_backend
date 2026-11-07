@@ -65,27 +65,9 @@ const buildLocalTemplateContentFromMeta = (components = []) => {
 };
 
 const prepareMetaTemplateText = (value = '') => {
-  const lines = String(value || '')
-    .replace(/\r\n/g, '\n')
-    .trim()
-    .split('\n')
-    .map((line) => line.trim());
-
-  const collapsedLines = [];
-  let previousWasBlank = false;
-
-  lines.forEach((line) => {
-    const isBlank = line === '';
-    if (isBlank && previousWasBlank) return;
-    collapsedLines.push(line);
-    previousWasBlank = isBlank;
-  });
-  const normalized = collapsedLines.join('\n').trim();
-  if (!normalized) return { text: '', examples: [] };
-
-  // URLs and phone numbers are ordinary template text. Only explicit Meta
-  // placeholders are dynamic; never infer variables from static content.
-  return { text: normalized, examples: [] };
+  // Preserve the submitted text exactly. Dynamic variables are recognized only
+  // from explicit numbered placeholders; phone numbers and URLs stay static.
+  return { text: String(value ?? ''), examples: [] };
 };
 
 class TemplateController {
@@ -248,10 +230,15 @@ class TemplateController {
           error: `Template body has too many variables for its length. Add more regular words or use fewer variables (aim for at least ${minimumFixedBodyWords} non-variable words for ${bodyVariableCount} variables).`
         });
       }
-      const variables = this.extractVariables(bodyForVariables).map((variable, index) => ({
-        ...variable,
-        example: preparedBody.examples[index] || variable.example
-      }));
+      const bodyExampleRows = Array.isArray(components)
+        ? (components.find(component => String(component?.type || '').toUpperCase() === 'BODY')?.example?.body_text || [])
+        : [];
+      const bodyExamples = Array.isArray(bodyExampleRows[0]) ? bodyExampleRows[0] : [];
+      const variables = this.extractVariables(bodyForVariables).map((variable, index) => {
+        const variableNumber = Number(String(variable.name || '').match(/\d+/)?.[0] || index + 1);
+        const example = String(bodyExamples[variableNumber - 1] || preparedBody.examples[index] || '').trim();
+        return example ? { ...variable, example } : variable;
+      });
       const preservedBody = bodyForVariables;
 
       const templateData = {
