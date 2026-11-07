@@ -28,11 +28,11 @@ router.post('/media', requireWhatsAppCredentials, (req, res) => {
 });
 
 router.get('/', (req, res) => templateController.getAllTemplates(req, res));
-router.get('/sync', requireWhatsAppCredentials, (req, res) => templateController.syncWhatsAppTemplates(req, res));
+router.get('/sync', requireWhatsAppCredentials.forceRefresh, (req, res) => templateController.syncWhatsAppTemplates(req, res));
 
 // Meta-specific routes (must come before /:id)
-router.get('/meta', requireWhatsAppCredentials, (req, res) => templateController.getMetaTemplates(req, res));
-router.post('/meta/sync', requireWhatsAppCredentials, (req, res) => templateController.syncMetaTemplates(req, res));
+router.get('/meta', requireWhatsAppCredentials.forceRefresh, (req, res) => templateController.getMetaTemplates(req, res));
+router.post('/meta/sync', requireWhatsAppCredentials.forceRefresh, (req, res) => templateController.syncMetaTemplates(req, res));
 router.delete('/meta/:name', (req, res) => templateController.deleteMetaTemplate(req, res));
 
 // Other routes

@@ -1082,21 +1082,31 @@ class WhatsAppService {
     if (credentials) {
       this.initialize(credentials);
     }
+    // This singleton serves multiple tenants. Snapshot request identity and
+    // headers before awaiting so a concurrent request cannot switch WABA/token.
+    const wabaId = String(credentials?.businessAccountId || this.wabaId || '').trim();
+    const phoneNumberId = String(credentials?.phoneNumberId || this.phoneNumberId || '').trim();
+    const accessToken = credentials?.accessToken || this.accessToken;
+    const apiUrl = this.apiUrl;
+    const headers = accessToken
+      ? { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' }
+      : null;
     try {
-      if (!this.wabaId) {
+      if (!wabaId || !accessToken) {
         return {
           success: false,
-          error: 'WHATSAPP_BUSINESS_ACCOUNT_ID (WABA ID) is not configured'
+          error: 'WhatsApp access token and WABA ID are required to fetch templates',
+          wabaId: wabaId || null
         };
       }
-      debugLog(`Fetching templates from: ${this.apiUrl}/${this.wabaId}/message_templates`);
-      const endpoint = `${this.apiUrl}/${this.wabaId}/message_templates`;
+      debugLog(`Fetching templates from: ${apiUrl}/${wabaId}/message_templates`);
+      const endpoint = `${apiUrl}/${wabaId}/message_templates`;
       const params = {
         fields: 'id,name,language,status,category,components',
         limit: 200
       };
       let response = await axios.get(endpoint, {
-        headers: this.getHeaders(),
+        headers,
         timeout: TEMPLATE_LIST_TIMEOUT_MS,
         params
       });
@@ -1111,7 +1121,7 @@ class WhatsAppService {
       while (cursor && !seenCursors.has(cursor) && pageCount < 25) {
         seenCursors.add(cursor);
         response = await axios.get(endpoint, {
-          headers: this.getHeaders(),
+          headers,
           timeout: TEMPLATE_LIST_TIMEOUT_MS,
           params: { ...params, after: cursor }
         });
@@ -1130,12 +1140,14 @@ class WhatsAppService {
         paging: lastPage.paging || firstPage.paging
       };
       debugLog('Templates found across Meta pages:', templates.length);
-      return { success: true, data };
+      return { success: true, data, wabaId, phoneNumberId };
     } catch (error) {
       console.error('Error fetching templates:', error.response?.data || error.message);
       return { 
         success: false, 
-        error: error.response?.data || error.message 
+        error: error.response?.data || error.message,
+        wabaId,
+        phoneNumberId
       };
     }
   }

@@ -116,7 +116,7 @@ TemplateSchema.pre('save', function(next) {
 
 
 TemplateSchema.index(
-  { userId: 1, companyId: 1, name: 1 },
+  { userId: 1, companyId: 1, businessAccountId: 1, whatsappTemplateId: 1, language: 1, name: 1 },
   {
     unique: true,
     partialFilterExpression: {

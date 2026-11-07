@@ -698,11 +698,17 @@ class TemplateController {
       }
 
       const credentials = req?.whatsappCredentials || null;
+      const companyId = req.companyId || req.user?.companyId || credentials?.companyId || null;
       
       // 1. Authenticate with Meta API and fetch templates
       const result = await whatsappService.getTemplateList(credentials);
       
       if (!result.success) {
+        console.error('[WHATSAPP_TEMPLATE_SYNC]', JSON.stringify({
+          outcome: 'failure', stage: 'meta_fetch',
+          wabaId: String(result.wabaId || req.whatsappCredentials?.businessAccountId || '').trim(),
+          error: String(result.error?.message || result.error || 'Meta template fetch failed')
+        }));
         return res.status(500).json({ 
           success: false, 
           error: result.error 
@@ -714,18 +720,26 @@ class TemplateController {
 
       // 2. Process and store templates in local database
       const syncedTemplates = [];
+      const failedTemplates = [];
+      const syncVersion = new Date().toISOString();
+      const businessAccountId = String(result.wabaId || credentials?.businessAccountId || '').trim();
+      const phoneNumberId = String(result.phoneNumberId || credentials?.phoneNumberId || '').trim();
 
       for (const wt of whatsappTemplates) {
+        const language = String(wt.language || '').trim();
+        let operation = 'create';
+        let databaseWriteCompleted = false;
         try {
-          const businessAccountId = String(whatsappService.wabaId || '').trim();
           // Meta template ids are scoped to a WABA. Keep tenant and WABA in the
-          // lookup so another connected account can never refresh this record.
+          // lookup together with language for language-specific definitions.
           const existingTemplate = await Template.findOne({
             userId,
-            companyId: req.companyId || null,
+            companyId,
             businessAccountId,
-            whatsappTemplateId: wt.id
+            whatsappTemplateId: wt.id,
+            language
           });
+          if (existingTemplate) operation = 'update';
           const metaComponents = Array.isArray(wt.components) ? wt.components : [];
           const header = metaComponents.find(component => component.type === 'HEADER');
           const body = metaComponents.find(component => component.type === 'BODY');
@@ -734,7 +748,7 @@ class TemplateController {
           const now = new Date();
           const templateData = {
             userId,
-            companyId: req.companyId || null,
+            companyId,
             name: wt.name,
             type: 'official',
             category: wt.category || 'utility',
@@ -755,7 +769,7 @@ class TemplateController {
             metaComponents,
             whatsappTemplateId: wt.id,
             businessAccountId,
-            phoneNumberId: whatsappService.phoneNumberId,
+            phoneNumberId: result.phoneNumberId || credentials?.phoneNumberId || '',
             updatedAt: now,
             syncedAt: now,
             createdById: userId
@@ -763,28 +777,84 @@ class TemplateController {
           const syncedTemplate = existingTemplate
             ? await Template.findByIdAndUpdate(existingTemplate._id, { $set: templateData }, { new: true })
             : await Template.create({ ...templateData, createdAt: now });
+          databaseWriteCompleted = Boolean(syncedTemplate);
+          const persistedBodyComponent = (syncedTemplate?.metaComponents || []).find(component => component?.type === 'BODY');
+          const expectedBody = String(body?.text || '');
+          if (
+            !syncedTemplate ||
+            String(syncedTemplate.content?.body || '') !== expectedBody ||
+            String(persistedBodyComponent?.text || '') !== expectedBody ||
+            JSON.stringify(syncedTemplate.metaComponents || []) !== JSON.stringify(metaComponents) ||
+            JSON.stringify((syncedTemplate.variables || []).map(variable => variable.name)) !==
+              JSON.stringify(templateData.variables.map(variable => variable.name)) ||
+            String(syncedTemplate.language || '') !== language ||
+            String(syncedTemplate.businessAccountId || '') !== businessAccountId ||
+            String(syncedTemplate.whatsappTemplateId || '') !== String(wt.id || '')
+          ) {
+            throw new Error('Persisted template definition does not match the Meta response');
+          }
           syncedTemplates.push(syncedTemplate);
+          console.info('[WHATSAPP_TEMPLATE_SYNC]', JSON.stringify({
+            outcome: 'success', operation,
+            templateName: wt.name || '', metaTemplateId: wt.id || '',
+            tenantId: String(userId), clientId: String(companyId || ''),
+            wabaId: businessAccountId, language,
+            phoneNumberId,
+            credentialOwnerUserId: String(credentials?.credentialOwnerUserId || userId),
+            credentialSource: credentials?.credentialSource || 'unknown',
+            extractedVariableCount: templateData.variables.length,
+            databaseUpdated: true, syncVersion
+          }));
         } catch (error) {
-          console.error(`❌ Error processing template ${wt.name}:`, error);
-          console.error('❌ Template details:', {
-            id: wt.id,
-            name: wt.name,
-            category: wt.category,
-            language: wt.language,
-            status: wt.status,
-            components: wt.components
-          });
+          const failure = {
+            templateName: String(wt.name || ''),
+            metaTemplateId: String(wt.id || ''),
+            tenantId: String(userId),
+            clientId: String(companyId || ''),
+            wabaId: businessAccountId,
+            phoneNumberId,
+            credentialOwnerUserId: String(credentials?.credentialOwnerUserId || userId),
+            credentialSource: credentials?.credentialSource || 'unknown',
+            language,
+            databaseWriteCompleted,
+            error: String(error?.message || 'Unknown template sync error')
+          };
+          failedTemplates.push(failure);
+          console.error('[WHATSAPP_TEMPLATE_SYNC]', JSON.stringify({
+            outcome: 'failure', operation, ...failure, databaseUpdated: databaseWriteCompleted, syncVersion
+          }));
         }
       }
 
-      console.log(` Successfully processed ${syncedTemplates.length} templates`);
+      console.info('[WHATSAPP_TEMPLATE_SYNC_SUMMARY]', JSON.stringify({
+        wabaId: businessAccountId,
+        tenantId: String(userId),
+        clientId: String(companyId || ''),
+        phoneNumberId,
+        credentialOwnerUserId: String(credentials?.credentialOwnerUserId || userId),
+        credentialSource: credentials?.credentialSource || 'unknown',
+        fetchedCount: whatsappTemplates.length,
+        syncedCount: syncedTemplates.length,
+        failedCount: failedTemplates.length,
+        syncVersion
+      }));
 
       // 3. Return success response with synced templates
       res.json({ 
-        success: true, 
-        message: `Successfully synced ${syncedTemplates.length} templates from Meta`,
+        success: failedTemplates.length === 0,
+        message: failedTemplates.length === 0
+          ? `Successfully synced ${syncedTemplates.length} templates from Meta`
+          : `Synced ${syncedTemplates.length} of ${whatsappTemplates.length} templates; ${failedTemplates.length} failed`,
         templates: syncedTemplates,
-        count: syncedTemplates.length
+        count: syncedTemplates.length,
+        failedTemplates,
+        syncVersion,
+        wabaId: businessAccountId,
+        phoneNumberId,
+        tenantId: String(userId),
+        clientId: String(companyId || ''),
+        credentialOwnerUserId: String(credentials?.credentialOwnerUserId || userId),
+        credentialSource: credentials?.credentialSource || 'unknown'
       });
 
     } catch (error) {
@@ -819,6 +889,11 @@ class TemplateController {
       const result = await whatsappService.getTemplateList(req.whatsappCredentials);
       
       if (!result.success) {
+        console.error('[WHATSAPP_TEMPLATE_CATALOG]', JSON.stringify({
+          outcome: 'failure', source: 'meta',
+          wabaId: String(result.wabaId || req.whatsappCredentials?.businessAccountId || '').trim(),
+          error: String(result.error?.message || result.error || 'Meta template fetch failed')
+        }));
         return res.status(500).json({ 
           success: false, 
           error: result.error 
@@ -826,12 +901,41 @@ class TemplateController {
       }
 
       const metaTemplates = result.data.data || [];
+      const fetchedAt = new Date().toISOString();
+      const businessAccountId = String(result.wabaId || req.whatsappCredentials?.businessAccountId || '').trim();
+      const phoneNumberId = String(result.phoneNumberId || req.whatsappCredentials?.phoneNumberId || '').trim();
+      const companyId = req.companyId || req.user?.companyId || req.whatsappCredentials?.companyId || null;
+      console.info('[WHATSAPP_TEMPLATE_CATALOG]', JSON.stringify({
+        outcome: 'success', source: 'meta', wabaId: businessAccountId, phoneNumberId,
+        tenantId: String(req.user?.id || ''), clientId: String(req.companyId || ''),
+        credentialOwnerUserId: String(req.whatsappCredentials?.credentialOwnerUserId || req.user?.id || ''),
+        credentialSource: req.whatsappCredentials?.credentialSource || 'unknown',
+        fetchedCount: metaTemplates.length, fetchedAt,
+        templates: metaTemplates.map(template => ({
+          name: String(template?.name || ''),
+          metaTemplateId: String(template?.id || ''),
+          language: String(template?.language || ''),
+          status: String(template?.status || ''),
+          extractedVariableCount: this.extractVariables(
+            template?.components?.find(component => component?.type === 'BODY')?.text || ''
+          ).length
+        }))
+      }));
       console.log(`📋 Retrieved ${metaTemplates.length} templates from Meta`);
 
       res.json({
         success: true,
         data: metaTemplates,
-        count: metaTemplates.length
+        count: metaTemplates.length,
+        source: 'meta',
+        wabaId: businessAccountId,
+        phoneNumberId,
+        tenantId: String(req.user?.id || ''),
+        clientId: String(companyId || ''),
+        credentialOwnerUserId: String(req.whatsappCredentials?.credentialOwnerUserId || req.user?.id || ''),
+        credentialSource: req.whatsappCredentials?.credentialSource || 'unknown',
+        fetchedAt,
+        catalogVersion: fetchedAt
       });
 
     } catch (error) {
