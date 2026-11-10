@@ -109,6 +109,24 @@ const emitMediaDebugLog = ({
 };
 
 const normalizeTemplateLookupValue = (value = '') => String(value || '').trim().toLowerCase();
+
+const normalizeMetaTemplateDeleteError = (body = {}, status = null) => {
+  const source = body?.error && typeof body.error === 'object' ? body.error : body || {};
+  return {
+    status: Number.isFinite(Number(status)) ? Number(status) : null,
+    message: String(source.message || body?.message || 'Meta template deletion failed'),
+    type: source.type || null,
+    code: source.code ?? null,
+    error_subcode: source.error_subcode ?? null,
+    error_user_title: source.error_user_title || null,
+    error_user_msg: source.error_user_msg || null,
+    is_transient: typeof source.is_transient === 'boolean' ? source.is_transient : null,
+    error_data: source.error_data
+      ? { details: source.error_data.details || null }
+      : null,
+    fbtrace_id: source.fbtrace_id || body?.fbtrace_id || null
+  };
+};
 const normalizeTemplateCompactKey = (value = '') =>
   normalizeTemplateLookupValue(value).replace(/[^a-z0-9]/g, '');
 
@@ -1216,7 +1234,6 @@ class WhatsAppService {
         wabaId,
         phoneNumberId: credentials?.phoneNumberId || null,
         tokenConfigured: Boolean(accessToken),
-        tokenFingerprint: accessToken ? accessToken.slice(-6) : null,
         templateName: normalizedName,
         hsmId: templateId,
         credentialSource: debugContext.credentialSource || credentials?.credentialSource || 'unspecified',
@@ -1236,27 +1253,16 @@ class WhatsAppService {
       );
 
       if (response.data?.success !== true) {
-        // TEMPORARY TEMPLATE_DELETE_DEBUG: only allowlisted Meta error fields are logged.
-        console.error('[TEMPLATE_DELETE_DEBUG] Meta deletion failed', {
-          status: response.status ?? null,
-          body: {
-            success: response.data?.success ?? null,
-            message: response.data?.message || null,
-            error: response.data?.error ? {
-              message: response.data.error.message || null,
-              type: response.data.error.type || null,
-              code: response.data.error.code ?? null,
-              error_subcode: response.data.error.error_subcode ?? null,
-              error_data: response.data.error.error_data
-                ? { details: response.data.error.error_data.details || null }
-                : null
-            } : null
-          }
-        });
-        return { success: false, error: 'Meta did not confirm template deletion', details: response.data };
+        const details = normalizeMetaTemplateDeleteError(response.data, response.status);
+        console.error('[TEMPLATE_DELETE] Meta did not confirm deletion', details);
+        return { success: false, error: details.message, details };
       }
       return { success: true, data: response.data };
     } catch (error) {
+      const details = normalizeMetaTemplateDeleteError(
+        error.response?.data || { message: error.message },
+        error.response?.status,
+      );
       const metaError = error.response?.data?.error;
       // TEMPORARY TEMPLATE_DELETE_DEBUG: allowlist fields so response payloads cannot expose credentials.
       console.error('[TEMPLATE_DELETE_DEBUG] Meta deletion failed', {
@@ -1280,13 +1286,8 @@ class WhatsAppService {
       });
       return {
         success: false,
-        error: metaError?.message || error.response?.data?.message || error.message || 'Meta template deletion failed',
-        details: {
-          message: metaError?.message || null,
-          code: metaError?.code ?? null,
-          error_subcode: metaError?.error_subcode ?? null,
-          error_data: { details: metaError?.error_data?.details ?? null }
-        }
+        error: details.message,
+        details
       };
     }
   }

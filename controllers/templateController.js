@@ -538,7 +538,8 @@ class TemplateController {
       try {
         credentials = await getWhatsAppCredentialsForUser({
           authHeader: req.headers.authorization || '',
-          userId: req.user?.id || null
+          userId: req.user?.id || null,
+          forceRefresh: true
         });
       } catch (credentialsError) {
         return res.status(Number(credentialsError.statusCode) || 502).json({
@@ -551,6 +552,37 @@ class TemplateController {
         return res.status(400).json({
           success: false,
           error: 'WhatsApp credentials are required to delete this Meta template'
+        });
+      }
+
+      const workspaceCompanyId = String(req.companyId || req.user?.companyId || '').trim();
+      const credentialCompanyId = String(credentials.companyId || '').trim();
+      const templateWabaId = String(template.businessAccountId || '').trim();
+      const credentialWabaId = String(credentials.businessAccountId || '').trim();
+      if (
+        workspaceCompanyId &&
+        credentialCompanyId &&
+        workspaceCompanyId !== credentialCompanyId
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: 'WhatsApp credentials do not belong to the active workspace.',
+          meta: {
+            credentialCompanyId,
+            workspaceCompanyId,
+            credentialOwnerUserId: credentials.credentialOwnerUserId || null
+          }
+        });
+      }
+      if (templateWabaId && templateWabaId !== credentialWabaId) {
+        return res.status(409).json({
+          success: false,
+          error: 'The saved template belongs to a different WhatsApp Business Account than the active credentials.',
+          meta: {
+            templateWabaId,
+            credentialWabaId,
+            credentialOwnerUserId: credentials.credentialOwnerUserId || null
+          }
         });
       }
 
@@ -633,6 +665,48 @@ class TemplateController {
         name: templateName,
         whatsappTemplateId: metaTemplateId
       });
+      const workspaceCompanyId = String(req.companyId || req.user?.companyId || '').trim();
+      const credentialCompanyId = String(freshCredentials.companyId || '').trim();
+      const templateWabaId = String(template?.businessAccountId || '').trim();
+      const credentialWabaId = String(freshCredentials.businessAccountId || '').trim();
+
+      if (
+        workspaceCompanyId &&
+        credentialCompanyId &&
+        workspaceCompanyId !== credentialCompanyId
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: 'WhatsApp credentials do not belong to the active workspace.',
+          meta: {
+            credentialCompanyId,
+            workspaceCompanyId,
+            credentialOwnerUserId: freshCredentials.credentialOwnerUserId || null
+          }
+        });
+      }
+      if (templateWabaId && templateWabaId !== credentialWabaId) {
+        return res.status(409).json({
+          success: false,
+          error: 'The saved template belongs to a different WhatsApp Business Account than the active credentials.',
+          meta: {
+            templateWabaId,
+            credentialWabaId,
+            credentialOwnerUserId: freshCredentials.credentialOwnerUserId || null
+          }
+        });
+      }
+
+      console.info('[TEMPLATE_DELETE_CREDENTIAL_SCOPE]', {
+        userId: req.user?.id || null,
+        credentialOwnerUserId: freshCredentials.credentialOwnerUserId || null,
+        credentialSource: freshCredentials.credentialSource || 'unspecified',
+        workspaceCompanyId: workspaceCompanyId || null,
+        credentialCompanyId: credentialCompanyId || null,
+        templateWabaId: templateWabaId || null,
+        credentialWabaId: credentialWabaId || null
+      });
+
       const metaDeleteResult = await whatsappService.deleteTemplateByName(
         templateName,
         freshCredentials,
