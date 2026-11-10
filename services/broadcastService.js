@@ -272,7 +272,9 @@ class BroadcastService {
         String(rawRecipient?.sourceType || "").trim() ||
         String(rawRecipient?.type || "").trim() ||
         "imported",
-      variables: this.normalizeTemplateVariables(extractRecipientVariables(rawRecipient)),
+      variables: this.normalizeRecipientTemplateVariables(
+        extractRecipientVariables(rawRecipient),
+      ),
       attributes:
         rawRecipient?.attributes && typeof rawRecipient.attributes === "object"
           ? rawRecipient.attributes
@@ -736,6 +738,25 @@ class BroadcastService {
         return String(value ?? "").trim();
       })
       .filter(Boolean);
+  }
+
+  normalizeRecipientTemplateVariables(variables = []) {
+    if (!Array.isArray(variables)) return [];
+    return variables.map((value) => {
+      if (typeof value === "string") return value.trim();
+      if (value && typeof value === "object") {
+        return String(
+          value.text ??
+            value.value ??
+            value.body ??
+            value.content ??
+            value.parameter ??
+            value.name ??
+            "",
+        ).trim();
+      }
+      return String(value ?? "").trim();
+    });
   }
 
   extractTemplateVariableCount(templateText = "") {
@@ -1395,22 +1416,16 @@ class BroadcastService {
         .trim()
         .toLowerCase();
 
-      const matchedTemplate =
-        templates.find(
-          (t) =>
-            String(t.name || "")
-              .trim()
-              .toLowerCase() === requested &&
-            String(t.language || "")
-              .trim()
-              .toLowerCase() === requestedLanguage,
-        ) ||
-        templates.find(
-          (t) =>
-            String(t.name || "")
-              .trim()
-              .toLowerCase() === requested,
-        );
+      const matchedTemplate = templates.find(
+        (t) =>
+          String(t.name || "")
+            .trim()
+            .toLowerCase() === requested &&
+          String(t.language || "")
+            .trim()
+            .toLowerCase() === requestedLanguage &&
+          String(t.status || "").trim().toUpperCase() === "APPROVED",
+      );
 
       if (!matchedTemplate || !Array.isArray(matchedTemplate.components)) {
         return null;
@@ -1419,12 +1434,7 @@ class BroadcastService {
       const bodyComponent = matchedTemplate.components.find(
         (component) => String(component.type || "").toUpperCase() === "BODY",
       );
-      const bodyText =
-        bodyComponent?.text ||
-        bodyComponent?.body_text ||
-        (Array.isArray(bodyComponent?.example?.body_text)
-          ? bodyComponent.example.body_text[0]
-          : "");
+      const bodyText = bodyComponent?.text || "";
       if (!bodyText) return null;
 
       return String(bodyText);
@@ -2765,10 +2775,7 @@ class BroadcastService {
           .map((phone) => this.normalizePhoneNumber(phone))
           .filter(Boolean),
       );
-      let templatePreviewText = broadcast.templateContent || null;
-      const broadcastTemplateVariables = this.normalizeTemplateVariables(
-        broadcast?.variables || broadcast?.templateParameters || [],
-      );
+      let templatePreviewText = null;
       const explicitTemplateCategory = toCleanString(
         broadcast?.templateCategory || "",
       ).toLowerCase();
@@ -2813,17 +2820,24 @@ class BroadcastService {
             ]
           : null;
 
-      // If templateContent is not stored, try to resolve from Meta
-      if (!templatePreviewText && broadcast.templateName) {
+      // The live approved Meta definition is authoritative for variables.
+      // Saved campaign content can be stale and must never define parameters.
+      if (broadcast.templateName) {
         templatePreviewText = await this.resolveTemplatePreviewTextFromMeta(
           broadcast.templateName,
           broadcast.language || "en_US",
           resolvedCredentials,
         );
+        if (templatePreviewText === null) {
+          return {
+            success: false,
+            error: `Could not load the approved Meta template "${broadcast.templateName}" to validate its variables. Refresh templates and try again.`,
+          };
+        }
       }
 
       const requiredTemplateVariableCount = this.extractTemplateVariableCount(
-        broadcast?.templateContent || templatePreviewText || "",
+        templatePreviewText || "",
       );
       const recipients = await this.resolveBroadcastAudienceRecipients({
         broadcast,
@@ -2838,12 +2852,10 @@ class BroadcastService {
               recipient.variables.length > 0,
           )
         : false;
-      const hasBroadcastVariables = broadcastTemplateVariables.length > 0;
       if (
         broadcast.templateName &&
         requiredTemplateVariableCount > 0 &&
-        !hasAnyRecipientVariables &&
-        !hasBroadcastVariables
+        !hasAnyRecipientVariables
       ) {
         return {
           success: false,
@@ -2862,11 +2874,10 @@ class BroadcastService {
         );
         for (const recipient of batchRecipients) {
           try {
-            const recipientVariables =
-              Array.isArray(recipient?.variables) &&
-              recipient.variables.length > 0
-                ? recipient.variables
-                : broadcastTemplateVariables;
+            const recipientVariables = requiredTemplateVariableCount > 0
+              ? (Array.isArray(recipient?.variables) ? recipient.variables : [])
+                  .slice(0, requiredTemplateVariableCount)
+              : [];
             let result;
             const phoneNumber = recipient.phone || recipient;
             const normalizedPhone = this.normalizePhoneNumber(phoneNumber);
@@ -2891,6 +2902,24 @@ class BroadcastService {
                 reason: dispatchClaim?.alreadyFinal
                   ? "already_dispatched"
                   : "locked_by_active_claim",
+              });
+              continue;
+            }
+            if (
+              recipientVariables.length !== requiredTemplateVariableCount ||
+              recipientVariables.some((value) => !String(value || "").trim())
+            ) {
+              failed++;
+              broadcast.stats.failed++;
+              await this.finalizeBroadcastDispatch({
+                broadcastDispatchKey,
+                status: "failed",
+                errorMessage: "template_variable_value_missing",
+              });
+              recordResult({
+                phone: phoneNumber,
+                success: false,
+                error: `Template "${broadcast.templateName}" requires ${requiredTemplateVariableCount} non-empty BODY variable value(s) for this recipient.`,
               });
               continue;
             }

@@ -184,6 +184,15 @@ const validateTemplateSendShape = (template, suppliedComponents, variables, temp
     if (expected !== sentCount) {
       throw new Error(`Template "${templateName}" ${type} component expects ${expected} text parameter(s), but the send payload contains ${sentCount}. Refresh the template mapping and try again.`);
     }
+    if (sentComponent) {
+      const emptyTextParameter = (sentComponent.parameters || []).some((parameter) =>
+        String(parameter?.type || '').toLowerCase() === 'text' &&
+        !String(parameter?.text || '').trim()
+      );
+      if (emptyTextParameter) {
+        throw new Error(`Template "${templateName}" ${type} component contains an empty text parameter. Provide a value for every template variable.`);
+      }
+    }
   }
 };
 
@@ -271,6 +280,45 @@ const normalizeTemplateComponents = (components = []) => {
       };
     })
     .filter(Boolean);
+};
+
+const buildTemplateMessageComponents = (
+  approvedTemplate = {},
+  templateComponents = [],
+  variables = [],
+) => {
+  const components = normalizeTemplateComponents(templateComponents);
+  const bodyExists = components.some(
+    (component) => String(component?.type || '').toUpperCase() === 'BODY'
+  );
+  const bodyDefinition = (Array.isArray(approvedTemplate?.components)
+    ? approvedTemplate.components
+    : []).find((component) => String(component?.type || '').toUpperCase() === 'BODY');
+  const expectedBodyVariableCount = getNumberedVariableCount(bodyDefinition?.text || '');
+  const bodyVariables = (Array.isArray(variables) ? variables : [])
+    .slice(0, expectedBodyVariableCount);
+  if (
+    !bodyExists &&
+    expectedBodyVariableCount > 0 &&
+    (bodyVariables.length !== expectedBodyVariableCount ||
+      bodyVariables.some((value) => !String(value ?? '').trim()))
+  ) {
+    throw new Error(`Template BODY requires ${expectedBodyVariableCount} non-empty text parameter(s).`);
+  }
+  if (!bodyExists && expectedBodyVariableCount > 0 && bodyVariables.length > 0) {
+    const bodyComponent = {
+      type: 'BODY',
+      parameters: bodyVariables.map((value) => ({
+        type: 'text',
+        text: String(value ?? '').trim()
+      }))
+    };
+    const headerIndex = components.findIndex(
+      (component) => String(component?.type || '').toUpperCase() === 'HEADER'
+    );
+    components.splice(headerIndex >= 0 ? headerIndex + 1 : components.length, 0, bodyComponent);
+  }
+  return components;
 };
 
 const countTextParameters = (components = [], type = 'BODY') =>
@@ -440,24 +488,14 @@ class WhatsAppService {
       if (!approvedTemplate) {
         return { success: false, error: `Approved Meta template "${normalizedTemplateName}" (${language}) was not found in the connected WABA.` };
       }
-      validateTemplateSendShape(approvedTemplate, normalizedProvidedComponents, variables, normalizedTemplateName);
+      const components = buildTemplateMessageComponents(
+        approvedTemplate,
+        normalizedProvidedComponents,
+        variables,
+      );
+      validateTemplateSendShape(approvedTemplate, components, [], normalizedTemplateName);
 
       const normalizedPhone = normalizeWhatsAppPhone(to);
-
-      let components = [];
-      if (normalizedProvidedComponents.length > 0) {
-        components = normalizedProvidedComponents;
-      } else if (variables.length > 0) {
-        components = [
-          {
-            type: 'BODY',
-            parameters: variables.map((value) => ({
-              type: 'text',
-              text: String(value ?? '').trim()
-            }))
-          }
-        ];
-      }
 
       const payload = {
         messaging_product: 'whatsapp',
@@ -1256,3 +1294,4 @@ class WhatsAppService {
 }
 
 module.exports = new WhatsAppService();
+module.exports.buildTemplateMessageComponents = buildTemplateMessageComponents;
