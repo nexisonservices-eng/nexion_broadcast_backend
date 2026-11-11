@@ -12,6 +12,17 @@ const BroadcastSchema = new mongoose.Schema({
   templateId: { type: mongoose.Schema.Types.ObjectId, ref: 'Template' },
   retryOfBroadcastId: { type: mongoose.Schema.Types.ObjectId, ref: 'Broadcast', index: true },
   retryAttempt: { type: Number, default: 0 },
+  activeRetryRunId: { type: String, default: '', index: true },
+  retryRuns: [{
+    runId: { type: String, required: true },
+    idempotencyKey: { type: String, default: '' },
+    status: { type: String, enum: ['queued', 'running', 'completed', 'failed'], default: 'queued' },
+    recipientPhones: { type: [String], default: [] },
+    recipientCount: { type: Number, default: 0 },
+    createdAt: { type: Date, default: Date.now },
+    completedAt: { type: Date, default: null },
+    error: { type: String, default: '' }
+  }],
   audienceSource: {
     mode: { type: String, default: 'contacts' },
     label: { type: String, default: '' },

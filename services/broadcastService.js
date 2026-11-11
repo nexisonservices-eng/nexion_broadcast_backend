@@ -1,4 +1,5 @@
-﻿const Broadcast = require("../models/Broadcast");
+const Broadcast = require("../models/Broadcast");
+const crypto = require("crypto");
 const Message = require("../models/Message");
 const { extractRecipientVariables } = require("../utils/broadcastRecipientVariables");
 const { preserveBroadcastCreator } = require('../utils/broadcastCreator');
@@ -13,6 +14,8 @@ const {
   syncConversationSummaryFromConversation,
 } = require("./conversationSummaryService");
 const { enqueueBroadcastSend } = require("../queues/broadcastQueue");
+const { acquireRetryRun, getRetryRun } = require("./broadcastRetryRun");
+const { claimBroadcastDispatch: claimDispatchRecord } = require("./broadcastDispatchClaim");
 const { enqueueBroadcastInboxWrite } = require("../queues/broadcastInboxQueue");
 const {
   getWhatsAppCredentialsForUser,
@@ -988,6 +991,8 @@ class BroadcastService {
         replied: false,
         replyCount: 0,
         status: "pending",
+        variables: Array.isArray(recipient?.variables) ? recipient.variables : [],
+        attributes: recipient?.attributes && typeof recipient.attributes === "object" ? recipient.attributes : {},
         lastSentAt: null,
         lastStatusAt: null,
         lastReplyAt: null,
@@ -1272,6 +1277,32 @@ class BroadcastService {
       });
     }
 
+    const dispatches = await BroadcastDispatch.find({ broadcastId: broadcast._id })
+      .select("recipientPhone status whatsappMessageId errorMessage lastFailureCode lastFailureReason retryCount lastAttemptAt sentAt attemptHistory")
+      .sort({ recipientIndex: 1, _id: 1 })
+      .lean();
+    dispatches.forEach((dispatch) => {
+      const detail = detailsByPhone.get(this.normalizePhoneNumber(dispatch.recipientPhone || ""));
+      if (!detail) return;
+      detail.dispatchKnown = true;
+      detail.whatsappMessageId = dispatch.whatsappMessageId || "";
+      detail.retryCount = Number(dispatch.retryCount || 0);
+      detail.attemptHistory = Array.isArray(dispatch.attemptHistory) ? dispatch.attemptHistory : [];
+      detail.lastAttemptAt = dispatch.lastAttemptAt || null;
+      const dispatchStatus = String(dispatch.status || "").toLowerCase();
+      if (["sent", "delivered", "read"].includes(dispatchStatus)) {
+        detail.sent = true;
+        if (this.getStatusScore(dispatchStatus) >= this.getStatusScore(detail.status)) detail.status = dispatchStatus;
+      } else if (dispatchStatus === "failed") {
+        detail.failed = true;
+        if (!detail.sent && !detail.delivered && !detail.read) detail.status = "failed";
+        detail.lastFailureReason = dispatch.lastFailureReason || dispatch.errorMessage || detail.lastFailureReason;
+        detail.lastFailureCode = dispatch.lastFailureCode || detail.lastFailureCode;
+      } else if (["pending", "sending"].includes(dispatchStatus)) {
+        detail.status = dispatchStatus;
+      }
+    });
+
     return Array.from(detailsByPhone.values()).map((detail) => ({
       ...detail,
       lastSentAt: detail.lastSentAt || null,
@@ -1304,10 +1335,18 @@ class BroadcastService {
 
       const detail = detailsByNormalizedPhone.get(normalized);
       const status = String(detail?.status || "").toLowerCase();
-      const shouldRetry =
-        status === "failed" ||
-        status === "pending" ||
-        (!detail?.sent && !detail?.delivered && !detail?.read);
+      // A missing status record is not proof that Meta rejected the message.
+      // Only explicit pending rows, or known temporary failures, are safe.
+      const failureCode = String(detail?.lastFailureCode || "").trim();
+      const failureReason = String(detail?.lastFailureReason || "").trim();
+      const retryableCodes = new Set(["131049", "131056", "131016", "131048", "63018"]);
+      const retryableFailure = status === "failed" && (
+        retryableCodes.has(failureCode) ||
+        /timeout|temporar|rate limit|try again/i.test(failureReason)
+      );
+      const shouldRetry = !detail?.sent && !detail?.delivered && !detail?.read && (
+        (status === "pending" && detail?.dispatchKnown === true) || retryableFailure
+      );
 
       if (!shouldRetry) return;
 
@@ -3052,6 +3091,7 @@ class BroadcastService {
                   status: "failed",
                   errorMessage:
                     errorMeta.errorMessage || "Template send failed",
+                errorCode: errorMeta.errorCode || "",
                 });
                 if (errorMeta.errorCode) {
                   failureCodeBreakdown[errorMeta.errorCode] =
@@ -3135,6 +3175,7 @@ class BroadcastService {
                   broadcastDispatchKey,
                   status: "failed",
                   errorMessage: errorMeta.errorMessage || "Message send failed",
+                errorCode: errorMeta.errorCode || "",
                 });
                 if (errorMeta.errorCode) {
                   failureCodeBreakdown[errorMeta.errorCode] =
@@ -3299,6 +3340,7 @@ class BroadcastService {
                 broadcastDispatchKey,
                 status: "failed",
                 errorMessage: errorMeta.errorMessage,
+                errorCode: errorMeta.errorCode || "",
               });
               console.error(
                 `❌ Failed to send to ${phoneNumber}:`,
@@ -3336,6 +3378,7 @@ class BroadcastService {
                 broadcastDispatchKey,
                 status: "failed",
                 errorMessage: errorMeta.errorMessage || error.message,
+                errorCode: errorMeta.errorCode || "",
               });
             } catch (_dispatchFinalizeError) {
               // best effort only
@@ -3387,11 +3430,7 @@ class BroadcastService {
               "analytics.suppressed": suppressed,
               "analytics.retried": retried,
             },
-            $set: {
-              status: finalStatus,
-              completedAt: new Date(),
-              updatedAt: new Date(),
-            },
+            $set: { updatedAt: new Date() },
           },
         );
       }
@@ -3668,85 +3707,13 @@ class BroadcastService {
     return result;
   }
 
-  async claimBroadcastDispatch({
-    broadcastDispatchKey,
-    broadcastId,
-    userId,
-    companyId,
-    recipientPhone,
-    chunkId = "",
-    chunkIndex = 0,
-    recipientIndex = 0,
-  }) {
-    const now = new Date();
-    const staleWindowMs = Math.max(
-      60_000,
-      Number(process.env.BROADCAST_DISPATCH_STALE_MS || 5 * 60 * 1000),
-    );
-    const staleBefore = new Date(now.getTime() - staleWindowMs);
-
-    const existing = await BroadcastDispatch.findOne({
-      broadcastDispatchKey,
-    }).lean();
-    if (
-      existing?.status === "sent" ||
-      existing?.status === "suppressed" ||
-      existing?.status === "skipped"
-    ) {
-      return { claimed: false, alreadyFinal: true, dispatch: existing };
-    }
-
-    if (
-      existing?.status === "sending" &&
-      existing?.claimedAt &&
-      new Date(existing.claimedAt) > staleBefore
-    ) {
-      return { claimed: false, locked: true, dispatch: existing };
-    }
-
-    const nextRetryCount = Number(existing?.retryCount || 0) + 1;
-    const nextStatus = existing ? "sending" : "pending";
-    const dispatch = await BroadcastDispatch.findOneAndUpdate(
-      { broadcastDispatchKey },
-      {
-        $setOnInsert: {
-          broadcastDispatchKey,
-          broadcastId,
-          userId,
-          companyId: companyId || null,
-          recipientPhone,
-          recipientPhoneNormalized: this.normalizePhoneNumber(recipientPhone),
-          recipientPhoneDigits: this.normalizePhoneNumber(recipientPhone),
-          chunkId,
-          chunkIndex,
-          recipientIndex,
-          createdAt: now,
-        },
-        $set: {
-          status: "sending",
-          claimedAt: now,
-          lastAttemptAt: now,
-          errorMessage: "",
-          updatedAt: now,
-        },
-        $inc: {
-          retryCount: existing ? 1 : 0,
-        },
-      },
-      {
-        new: true,
-        upsert: true,
-      },
-    ).lean();
-
-    return {
-      claimed: true,
-      dispatch,
-      previousStatus: nextStatus,
-      retryCount: nextRetryCount,
-    };
+  async claimBroadcastDispatch(options = {}) {
+    return claimDispatchRecord({
+      BroadcastDispatch,
+      normalizePhoneNumber: (phone) => this.normalizePhoneNumber(phone),
+      ...options,
+    });
   }
-
   async noteBroadcastDispatchPayload({
     broadcastDispatchKey,
     messageText = "",
@@ -3776,15 +3743,22 @@ class BroadcastService {
     conversationId = null,
     messageId = null,
     errorMessage = "",
+    errorCode = "",
   }) {
     const now = new Date();
     const normalizedStatus = String(status || "").toLowerCase();
+    const dispatch = await BroadcastDispatch.findOne({ broadcastDispatchKey })
+      .select("retryCount")
+      .lean();
+    const attemptNumber = Number(dispatch?.retryCount || 0);
     const update = {
       status: normalizedStatus,
       lastAttemptAt: now,
       updatedAt: now,
       errorMessage: String(errorMessage || "").trim(),
       lastStatusAt: now,
+      lastFailureCode: String(errorCode || "").trim(),
+      lastFailureReason: normalizedStatus === "failed" ? String(errorMessage || "").trim() : "",
     };
     if (normalizedStatus === "sent") {
       update.sentAt = now;
@@ -3793,17 +3767,26 @@ class BroadcastService {
       update.messageId = messageId || null;
     } else if (normalizedStatus === "failed") {
       update.failedAt = now;
-      update.lastFailureReason = String(errorMessage || "").trim();
     }
 
     await BroadcastDispatch.updateOne(
       { broadcastDispatchKey },
       {
         $set: update,
+        ...(attemptNumber ? {
+          $set: {
+            ...update,
+            "attemptHistory.$[attempt].status": normalizedStatus,
+            "attemptHistory.$[attempt].completedAt": now,
+            "attemptHistory.$[attempt].whatsappMessageId": String(whatsappMessageId || "").trim(),
+            "attemptHistory.$[attempt].errorCode": String(errorCode || "").trim(),
+            "attemptHistory.$[attempt].errorReason": normalizedStatus === "failed" ? String(errorMessage || "").trim() : "",
+          },
+        } : {}),
       },
+      attemptNumber ? { arrayFilters: [{ "attempt.attemptNumber": attemptNumber }] } : {},
     );
   }
-
   async repairBroadcastDispatchInbox({
     broadcastDispatchKey = "",
     whatsappMessageId = "",
@@ -4821,114 +4804,88 @@ class BroadcastService {
     }
   }
 
-  async retryFailedRecipients(broadcastId, broadcaster, credentials = null) {
+  async retryFailedRecipients(broadcastId, broadcaster, credentials = null, idempotencyKey = '') {
     try {
       const sourceBroadcast = await Broadcast.findById(broadcastId);
-      if (!sourceBroadcast) {
-        return { success: false, error: "Broadcast not found" };
+      if (!sourceBroadcast) return { success: false, error: "Broadcast not found" };
+
+      const normalizedIdempotencyKey = String(idempotencyKey || '').trim().slice(0, 160);
+      const existingRun = Array.isArray(sourceBroadcast.retryRuns)
+        ? sourceBroadcast.retryRuns.find((item) => normalizedIdempotencyKey && item.idempotencyKey === normalizedIdempotencyKey)
+        : null;
+      if (existingRun && existingRun.status !== 'queued' && existingRun.status !== 'running') {
+        return { success: true, duplicate: true, data: { sourceBroadcastId: sourceBroadcast._id, retryBroadcastId: sourceBroadcast._id, retryRunId: existingRun.runId, retriedRecipients: existingRun.recipientCount, queueStatus: existingRun.status } };
       }
 
-      if (
-        !["completed", "completed_with_errors", "failed"].includes(
-          String(sourceBroadcast.status || "").toLowerCase(),
-        )
-      ) {
-        return {
-          success: false,
-          error:
-            "Retry is allowed only after a completed, partially completed, or failed broadcast",
-        };
+      let retryRunId = String(existingRun?.runId || sourceBroadcast.activeRetryRunId || '');
+      let retryPhones = Array.isArray(existingRun?.recipientPhones) ? existingRun.recipientPhones : [];
+      if (!existingRun && retryRunId) {
+        const activeRun = getRetryRun(sourceBroadcast, retryRunId);
+        retryPhones = Array.isArray(activeRun?.recipientPhones) ? activeRun.recipientPhones : [];
+      }
+      let duplicateRun = Boolean(retryRunId);
+
+      if (!retryRunId) {
+        if (!["completed", "completed_with_errors", "failed"].includes(String(sourceBroadcast.status || '').toLowerCase())) {
+          return { success: false, error: "Retry is allowed only after a completed, partially completed, or failed broadcast" };
+        }
+        const recipientDetails = await this.buildRecipientStatusDetails(sourceBroadcast);
+        const retryCandidates = this.buildRetryCandidateList(sourceBroadcast, recipientDetails);
+        if (!retryCandidates.length) return { success: false, error: "No failed recipients available for retry" };
+        retryPhones = [...new Set(retryCandidates.map((candidate) => this.normalizePhoneNumber(candidate.phone)).filter(Boolean))];
+        retryRunId = crypto.randomUUID();
+        const claim = await acquireRetryRun({
+          Broadcast,
+          broadcastId: sourceBroadcast._id,
+          runId: retryRunId,
+          idempotencyKey: normalizedIdempotencyKey || retryRunId,
+          recipientPhones: retryPhones,
+        });
+        if (!claim.acquired) {
+          if (!claim.run) return { success: false, error: claim.error || "A retry is already in progress." };
+          retryRunId = String(claim.run.runId || '');
+          retryPhones = Array.isArray(claim.run.recipientPhones) ? claim.run.recipientPhones : [];
+          duplicateRun = true;
+        } else {
+          duplicateRun = false;
+        }
       }
 
-      const recipientDetails =
-        await this.buildRecipientStatusDetails(sourceBroadcast);
-      const retryCandidates = this.buildRetryCandidateList(
-        sourceBroadcast,
-        recipientDetails,
-      );
-      if (!retryCandidates.length) {
-        return {
-          success: false,
-          error: "No failed recipients available for retry",
-        };
+      const run = getRetryRun(await Broadcast.findById(broadcastId).lean(), retryRunId);
+      if (run && ['completed', 'failed'].includes(String(run.status || ''))) {
+        return { success: true, duplicate: true, data: { sourceBroadcastId: sourceBroadcast._id, retryBroadcastId: sourceBroadcast._id, retryRunId, retriedRecipients: run.recipientCount, queueStatus: run.status } };
       }
-
-      const priorRetryCount = await Broadcast.countDocuments({
-        $or: [
-          { _id: sourceBroadcast._id },
-          { retryOfBroadcastId: sourceBroadcast._id },
-        ],
-        createdById: sourceBroadcast.createdById,
-        companyId: sourceBroadcast.companyId,
-      });
-      const retryAttempt = Math.max(1, priorRetryCount);
-
-      const retryBroadcast = await Broadcast.create({
-        name: `${sourceBroadcast.name} - Retry ${retryAttempt}`,
-        companyId: sourceBroadcast.companyId || null,
-        messageType: sourceBroadcast.messageType,
-        message: sourceBroadcast.message || "",
-        templateName: sourceBroadcast.templateName || "",
-        templateCategory: sourceBroadcast.templateCategory || "",
-        templateContent: sourceBroadcast.templateContent || "",
-        language: sourceBroadcast.language || "en_US",
-        mediaUrl: sourceBroadcast.mediaUrl || "",
-        mediaType: sourceBroadcast.mediaType || "",
-        recipients: retryCandidates.map((candidate) => ({
-          phone: candidate.phone,
-          name: candidate.name,
-          variables: candidate.variables,
-          attributes: candidate.attributes,
-        })),
-        retryOfBroadcastId: sourceBroadcast._id,
-        retryAttempt,
-        deliveryPolicy: this.normalizeDeliveryPolicy(
-          sourceBroadcast.deliveryPolicy || {},
-        ),
-        retryPolicy: this.normalizeRetryPolicy(
-          sourceBroadcast.retryPolicy || {},
-        ),
-        compliancePolicy: this.normalizeCompliancePolicy(
-          sourceBroadcast.compliancePolicy || {},
-        ),
-        analytics: {
-          suppressed: 0,
-          deferred: 0,
-          retried: 0,
-          failureCodeBreakdown: {},
-        },
-        createdBy: sourceBroadcast.createdBy,
-        createdByName: sourceBroadcast.createdByName || sourceBroadcast.createdBy,
-        createdByWorkspaceRole: sourceBroadcast.createdByWorkspaceRole,
-        createdById: sourceBroadcast.createdById,
-        createdByEmail: sourceBroadcast.createdByEmail,
-        authHeaderSnapshot: sourceBroadcast.authHeaderSnapshot,
-        credentialsSnapshot: sourceBroadcast.credentialsSnapshot,
-      });
 
       const queueResult = await enqueueBroadcastSend({
-        broadcastId: retryBroadcast._id,
-        userId: retryBroadcast.createdById,
-        companyId: retryBroadcast.companyId || null,
+        broadcastId: sourceBroadcast._id,
+        userId: sourceBroadcast.createdById,
+        companyId: sourceBroadcast.companyId || null,
         delayMs: 0,
-        reason: "broadcast_retry",
-        fallbackProcess: () =>
-          this.sendBroadcast(retryBroadcast._id, broadcaster, credentials),
+        reason: 'broadcast_retry',
+        retryRunId,
+        retryRecipientPhones: retryPhones,
+        fallbackProcess: async () => {
+          const recipients = (Array.isArray(sourceBroadcast.recipients) ? sourceBroadcast.recipients : [])
+            .filter((recipient) => retryPhones.includes(this.normalizePhoneNumber(recipient?.phone || recipient)));
+          const result = await this.sendBroadcast(sourceBroadcast._id, broadcaster, credentials, { recipientSubset: recipients });
+          const { finishRetryRun } = require('./broadcastRetryRun');
+          await finishRetryRun({ Broadcast, broadcastId: sourceBroadcast._id, runId: retryRunId, status: result?.success ? 'completed' : 'failed', error: result?.error || '' });
+          return result;
+        },
       });
       if (!queueResult?.success) {
-        return {
-          success: false,
-          error: queueResult?.error || "Retry send failed",
-        };
+        return { success: false, error: queueResult?.error || 'Retry send could not be queued', retryRunId, retryRunActive: true };
       }
 
       return {
         success: true,
+        duplicate: duplicateRun,
         data: {
           sourceBroadcastId: sourceBroadcast._id,
-          retryBroadcastId: retryBroadcast._id,
-          retriedRecipients: retryCandidates.length,
-          retryAttempt,
+          retryBroadcastId: sourceBroadcast._id,
+          retryRunId,
+          retriedRecipients: retryPhones.length,
+          retryAttempt: Array.isArray(sourceBroadcast.retryRuns) ? sourceBroadcast.retryRuns.length + (duplicateRun ? 0 : 1) : 1,
           queueJobId: queueResult.data.jobId,
           queueStatus: queueResult.data.status,
         },
@@ -4937,7 +4894,6 @@ class BroadcastService {
       return { success: false, error: error.message };
     }
   }
-
   async repairBroadcastTemplateHeaderAndRetry(
     broadcastId,
     { mediaUrl = "", mediaType = "image" } = {},

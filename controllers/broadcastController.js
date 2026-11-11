@@ -841,6 +841,8 @@ class BroadcastController {
         id,
         broadcaster,
         req.whatsappCredentials || null,
+        String(req.get("Idempotency-Key") || req.body?.idempotencyKey || ""),
+        String(req.get("Idempotency-Key") || req.body?.idempotencyKey || ""),
       );
       if (result.success) {
         return res.json(result);
@@ -882,6 +884,7 @@ class BroadcastController {
           },
           broadcaster,
           req.whatsappCredentials || null,
+        String(req.get("Idempotency-Key") || req.body?.idempotencyKey || ""),
         );
       if (result.success) {
         return res.json(result);

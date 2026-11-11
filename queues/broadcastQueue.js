@@ -255,6 +255,8 @@ const enqueueBroadcastSend = async ({
   scheduledAt = null,
   delayMs = null,
   reason = 'manual',
+  retryRunId = '',
+  retryRecipientPhones = [],
   fallbackProcess = null
 }) => {
   const broadcast = await Broadcast.findById(broadcastId)
@@ -277,7 +279,10 @@ const enqueueBroadcastSend = async ({
     Number.isFinite(Number(delayMs)) && Number(delayMs) >= 0
       ? Math.max(0, Math.trunc(Number(delayMs)))
       : normalizeDelay(scheduledAt || broadcast.scheduledAt);
-  const jobId = `broadcast:${String(broadcastId)}:plan`;
+  const normalizedRetryRunId = String(retryRunId || '').trim();
+  const jobId = normalizedRetryRunId
+    ? `broadcast:${String(broadcastId)}:retry:${normalizedRetryRunId}:plan`
+    : `broadcast:${String(broadcastId)}:plan`;
 
   if (isRedisDisabled) {
     if (typeof fallbackProcess !== 'function') {
@@ -326,7 +331,11 @@ const enqueueBroadcastSend = async ({
       broadcastId: String(broadcastId),
       userId: String(userId || broadcast.createdById || ''),
       companyId: String(companyId || broadcast.companyId || ''),
-      reason
+      reason,
+      ...(normalizedRetryRunId ? {
+        retryRunId: normalizedRetryRunId,
+        retryRecipientPhones: Array.isArray(retryRecipientPhones) ? retryRecipientPhones : []
+      } : {})
     },
     {
       jobId,

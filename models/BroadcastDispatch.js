@@ -31,6 +31,15 @@ const BroadcastDispatchSchema = new mongoose.Schema({
   lastFailureCode: { type: String, default: '' },
   lastFailureReason: { type: String, default: '' },
   retryCount: { type: Number, default: 0 },
+  attemptHistory: [{
+    attemptNumber: { type: Number, required: true },
+    status: { type: String, enum: ['sending', 'sent', 'failed', 'suppressed', 'skipped'], default: 'sending' },
+    startedAt: { type: Date, default: Date.now },
+    completedAt: { type: Date, default: null },
+    whatsappMessageId: { type: String, default: '' },
+    errorCode: { type: String, default: '' },
+    errorReason: { type: String, default: '' }
+  }],
   lastAttemptAt: { type: Date, default: null },
   chunkId: { type: String, default: '' },
   chunkIndex: { type: Number, default: 0 },

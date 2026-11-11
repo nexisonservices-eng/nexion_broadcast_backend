@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const { Worker } = require('bullmq');
 const Broadcast = require('../models/Broadcast');
+const BroadcastDispatch = require('../models/BroadcastDispatch');
 const LeadActivity = require('../models/LeadActivity');
 const broadcastService = require('../services/broadcastService');
 const { isRedisDisabled, getRedisDisabledReason } = require('../config/redis');
@@ -19,6 +20,7 @@ const {
 } = require('../queues/broadcastInboxQueue');
 const { publishBroadcastEvent } = require('../realtime/broadcastEventBus');
 const { applyMarketingTemplateSent } = require('../services/whatsappOutreach/policy');
+const { finishRetryRun } = require('../services/broadcastRetryRun');
 
 const workerConcurrency = Math.max(1, Number(process.env.BROADCAST_WORKER_CONCURRENCY || 2));
 const workerLimiterMax = Math.max(1, Number(process.env.BROADCAST_WORKER_RATE_MAX || 10));
@@ -271,17 +273,20 @@ const flushAllLeadActivities = async () => {
   );
 };
 
-const finalizeBroadcastIfReady = async (broadcastId, userId) => {
-  const summary = await getBroadcastChunkProgressSummary(broadcastId);
+const finalizeBroadcastIfReady = async (broadcastId, userId, runId = '', progressId = broadcastId) => {
+  const summary = await getBroadcastChunkProgressSummary(progressId);
 
   if (!summary.complete) {
     return { complete: false, summary };
   }
 
-  const finalStatus = Number(summary.failed || 0) > 0 ? 'completed_with_errors' : 'completed';
+  const dispatchFailureCount = await BroadcastDispatch.countDocuments({ broadcastId, status: 'failed' });
+  const finalStatus = Number(summary.failed || 0) > 0 || dispatchFailureCount > 0
+    ? 'completed_with_errors'
+    : 'completed';
 
-  const broadcast = await Broadcast.findByIdAndUpdate(
-    broadcastId,
+  let broadcast = await Broadcast.findByIdAndUpdate(
+    { _id: broadcastId, ...(runId ? { activeRetryRunId: runId } : {}) },
     {
       $set: {
         status: finalStatus,
@@ -293,6 +298,16 @@ const finalizeBroadcastIfReady = async (broadcastId, userId) => {
   );
 
   if (broadcast) {
+    if (runId) {
+      await finishRetryRun({
+        Broadcast,
+        broadcastId,
+        runId,
+        status: finalStatus === 'completed' ? 'completed' : 'failed',
+        error: finalStatus === 'completed' ? '' : 'One or more retry chunks failed.',
+      });
+      broadcast = await Broadcast.findById(broadcastId);
+    }
     await publishBroadcastEvent({
       userId,
       payload: {
@@ -314,7 +329,7 @@ const finalizeBroadcastIfReady = async (broadcastId, userId) => {
     console.error('Broadcast inbox repair failed after completion:', error.message);
   }
 
-  await clearBroadcastChunkProgress(broadcastId);
+  await clearBroadcastChunkProgress(progressId);
   return { complete: true, summary, broadcast };
 };
 
@@ -325,6 +340,8 @@ if (enableBroadcastDispatchWorker && canStartBullWorkers) {
     async (job) => {
     const broadcastId = String(job.data?.broadcastId || '');
     const userId = String(job.data?.userId || '');
+    const retryRunId = String(job.data?.retryRunId || '').trim();
+    const progressId = retryRunId ? `${broadcastId}:retry:${retryRunId}` : broadcastId;
     if (!broadcastId) {
       throw new Error('Missing broadcastId');
     }
@@ -335,17 +352,26 @@ if (enableBroadcastDispatchWorker && canStartBullWorkers) {
         throw new Error(`Broadcast ${broadcastId} not found`);
       }
 
-      const recipients = await broadcastService.resolveBroadcastAudienceRecipients({
+      let recipients = await broadcastService.resolveBroadcastAudienceRecipients({
         broadcast,
         userId: broadcast.createdById,
         companyId: broadcast.companyId
       });
+      if (retryRunId) {
+        const retryPhones = new Set((job.data?.retryRecipientPhones || []).map((phone) => broadcastService.normalizePhoneNumber(phone)));
+        recipients = recipients.filter((recipient) => retryPhones.has(broadcastService.normalizePhoneNumber(recipient?.phone || recipient)));
+        await Broadcast.updateOne(
+          { _id: broadcastId, activeRetryRunId: retryRunId },
+          { $set: { 'retryRuns.$[run].status': 'running', status: 'sending', startedAt: new Date(), updatedAt: new Date() } },
+          { arrayFilters: [{ 'run.runId': retryRunId }] }
+        );
+      }
       const chunks = splitRecipients(recipients, chunkSize);
-      await initializeBroadcastChunkProgress(broadcastId, chunks.length);
+      await initializeBroadcastChunkProgress(progressId, chunks.length);
 
       if (chunks.length === 0) {
         await Broadcast.findByIdAndUpdate(
-          broadcastId,
+          { _id: broadcastId, ...(retryRunId ? { activeRetryRunId: retryRunId } : {}) },
           {
             $set: {
               status: 'completed',
@@ -355,6 +381,7 @@ if (enableBroadcastDispatchWorker && canStartBullWorkers) {
           },
           { new: false }
         );
+        if (retryRunId) await finishRetryRun({ Broadcast, broadcastId, runId: retryRunId, status: 'completed' });
         await publishBroadcastEvent({
           userId: String(job.data?.userId || broadcast.createdById || ''),
           payload: {
@@ -386,14 +413,16 @@ if (enableBroadcastDispatchWorker && canStartBullWorkers) {
             broadcastId,
             userId: String(job.data?.userId || broadcast.createdById || ''),
             companyId: String(job.data?.companyId || broadcast.companyId || ''),
-            chunkId: `${broadcastId}:${index}`,
+            chunkId: `${progressId}:${index}`,
             chunkIndex: index,
             totalChunks: chunks.length,
             recipientSubset,
+            retryRunId,
+            progressId,
             reason: job.data?.reason || 'planned'
           },
           opts: {
-            jobId: `broadcast:${broadcastId}:chunk:${index}`,
+            jobId: `broadcast:${progressId}:chunk:${index}`,
             attempts: 3,
             backoff: {
               type: 'exponential',
@@ -445,7 +474,7 @@ if (enableBroadcastDispatchWorker && canStartBullWorkers) {
         }
 
         const summary = await markBroadcastChunkState(
-          broadcastId,
+          String(job.data?.progressId || broadcastId),
           String(job.data?.chunkId || job.id),
           'done'
         );
@@ -466,7 +495,9 @@ if (enableBroadcastDispatchWorker && canStartBullWorkers) {
         if (summary.complete) {
           await finalizeBroadcastIfReady(
             broadcastId,
-            userId || String(broadcast.createdById || '')
+            userId || String(broadcast.createdById || ''),
+            String(job.data?.retryRunId || ''),
+            String(job.data?.progressId || broadcastId)
           );
         }
 
@@ -480,7 +511,7 @@ if (enableBroadcastDispatchWorker && canStartBullWorkers) {
           throw error;
         }
         const summary = await markBroadcastChunkState(
-          broadcastId,
+          String(job.data?.progressId || broadcastId),
           String(job.data?.chunkId || job.id),
           'failed'
         );
@@ -501,7 +532,7 @@ if (enableBroadcastDispatchWorker && canStartBullWorkers) {
         if (summary.complete) {
           const finalStatus = Number(summary.failed || 0) > 0 ? 'completed_with_errors' : 'completed';
           await Broadcast.findByIdAndUpdate(
-            broadcastId,
+            { _id: broadcastId, ...(job.data?.retryRunId ? { activeRetryRunId: String(job.data.retryRunId) } : {}) },
             {
               $set: {
                 status: finalStatus,
@@ -511,7 +542,8 @@ if (enableBroadcastDispatchWorker && canStartBullWorkers) {
             },
             { new: false }
           );
-          await clearBroadcastChunkProgress(broadcastId);
+          await clearBroadcastChunkProgress(String(job.data?.progressId || broadcastId));
+          if (job.data?.retryRunId) await finishRetryRun({ Broadcast, broadcastId, runId: String(job.data.retryRunId), status: 'failed', error: error.message });
         }
 
         throw error;
