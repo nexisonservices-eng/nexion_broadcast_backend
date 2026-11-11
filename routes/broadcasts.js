@@ -73,6 +73,9 @@ router.post("/from-segment", (req, res) =>
 router.get("/:id/audience/recipients", (req, res) =>
   broadcastController.getBroadcastAudienceRecipients(req, res),
 );
+router.get("/:id/template-definition", (req, res) =>
+  broadcastController.getBroadcastTemplateDefinition(req, res),
+);
 router.get("/:id", (req, res) =>
   broadcastController.getBroadcastById(req, res),
 );

@@ -14,7 +14,7 @@ const {
   syncConversationSummaryFromConversation,
 } = require("./conversationSummaryService");
 const { enqueueBroadcastSend } = require("../queues/broadcastQueue");
-const { acquireRetryRun, getRetryRun } = require("./broadcastRetryRun");
+const { acquireRetryRun, getRetryRun, isRetryableBroadcastFailure } = require("./broadcastRetryRun");
 const { claimBroadcastDispatch: claimDispatchRecord } = require("./broadcastDispatchClaim");
 const { enqueueBroadcastInboxWrite } = require("../queues/broadcastInboxQueue");
 const {
@@ -921,9 +921,9 @@ class BroadcastService {
 
         const meta = this.classifySendError(result?.error || result);
         const retryableByCode =
-          meta.retryable ||
+          meta.errorCode !== "131048" && (meta.retryable ||
           (meta.errorCode &&
-            normalizedPolicy.retryableCodes.includes(String(meta.errorCode)));
+            normalizedPolicy.retryableCodes.includes(String(meta.errorCode))));
         lastMeta = { ...meta, retryable: retryableByCode };
         const canRetry =
           normalizedPolicy.enabled && retryableByCode && attempts < maxAttempts;
@@ -938,9 +938,9 @@ class BroadcastService {
       } catch (error) {
         const meta = this.classifySendError(error);
         const retryableByCode =
-          meta.retryable ||
+          meta.errorCode !== "131048" && (meta.retryable ||
           (meta.errorCode &&
-            normalizedPolicy.retryableCodes.includes(String(meta.errorCode)));
+            normalizedPolicy.retryableCodes.includes(String(meta.errorCode))));
         lastMeta = { ...meta, retryable: retryableByCode };
         const canRetry =
           normalizedPolicy.enabled && retryableByCode && attempts < maxAttempts;
@@ -1339,11 +1339,10 @@ class BroadcastService {
       // Only explicit pending rows, or known temporary failures, are safe.
       const failureCode = String(detail?.lastFailureCode || "").trim();
       const failureReason = String(detail?.lastFailureReason || "").trim();
-      const retryableCodes = new Set(["131049", "131056", "131016", "131048", "63018"]);
-      const retryableFailure = status === "failed" && (
-        retryableCodes.has(failureCode) ||
-        /timeout|temporar|rate limit|try again/i.test(failureReason)
-      );
+      const retryableFailure = status === "failed" && isRetryableBroadcastFailure({
+        errorCode: failureCode,
+        reason: failureReason,
+      });
       const shouldRetry = !detail?.sent && !detail?.delivered && !detail?.read && (
         (status === "pending" && detail?.dispatchKnown === true) || retryableFailure
       );
@@ -1529,12 +1528,12 @@ class BroadcastService {
       "131049",
       "131056",
       "131016",
-      "131048",
       "63018",
     ]);
     const retryable =
-      retryableCodes.has(errorCode) ||
-      /timeout|temporar|temporarily|rate limit|try again/i.test(raw);
+      (errorCode !== "131048" && retryableCodes.has(errorCode)) ||
+      (errorCode !== "131048" &&
+        /timeout|temporar|temporarily|rate limit|try again/i.test(raw));
 
     return {
       errorCode,
@@ -4257,6 +4256,38 @@ class BroadcastService {
     }
   }
 
+  async getBroadcastTemplateDefinition(broadcastId) {
+    try {
+      const broadcast = await Broadcast.findById(broadcastId).lean();
+      if (!broadcast) return { success: false, error: "Broadcast not found" };
+      const templateName = String(broadcast.templateName || "").trim();
+      const language = String(broadcast.language || "en_US").trim();
+      if (!templateName) return { success: false, error: "Broadcast does not use a WhatsApp template" };
+
+      // Use the campaign's credential snapshot so a subsequently selected WABA
+      // cannot make this lookup inspect a different account's template.
+      const snapshot = broadcast.credentialsSnapshot || {};
+      const accessToken = String(snapshot.accessToken || snapshot.whatsappToken || "").trim();
+      const businessAccountId = String(snapshot.businessAccountId || snapshot.whatsappBusiness || "").trim();
+      const phoneNumberId = String(snapshot.phoneNumberId || snapshot.whatsappId || "").trim();
+      if (!accessToken || !businessAccountId) {
+        return { success: false, error: "The campaign's original WhatsApp account credentials are unavailable. Reconnect that account to inspect its approved template." };
+      }
+
+      const templateList = await whatsappService.getTemplateList({ accessToken, businessAccountId, phoneNumberId });
+      if (!templateList?.success) return { success: false, error: templateList?.error || "Could not load approved templates from the campaign's original WhatsApp account." };
+      const template = (templateList.data?.data || []).find((item) =>
+        String(item?.name || "").trim().toLowerCase() === templateName.toLowerCase() &&
+        String(item?.language || "").trim().toLowerCase() === language.toLowerCase() &&
+        String(item?.status || "").trim().toUpperCase() === "APPROVED"
+      );
+      if (!template) return { success: false, error: `Approved template "${templateName}" (${language}) was not found in the campaign's original WhatsApp account.` };
+      return { success: true, data: { name: template.name, language: template.language, status: template.status, components: template.components || [] } };
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
   async getBroadcastAudienceSummary(broadcastId) {
     try {
       const broadcast = await Broadcast.findById(broadcastId).lean();
@@ -4899,11 +4930,21 @@ class BroadcastService {
     { mediaUrl = "", mediaType = "image" } = {},
     broadcaster = null,
     credentials = null,
+    idempotencyKey = "",
   ) {
     try {
       const sourceBroadcast = await Broadcast.findById(broadcastId);
       if (!sourceBroadcast) {
         return { success: false, error: "Broadcast not found" };
+      }
+
+      const templateResult = await this.getBroadcastTemplateDefinition(broadcastId);
+      if (!templateResult.success) return templateResult;
+      const header = (templateResult.data.components || []).find((component) =>
+        String(component?.type || "").trim().toUpperCase() === "HEADER",
+      );
+      if (String(header?.format || "").trim().toUpperCase() !== "IMAGE") {
+        return { success: false, error: "Header image repair is available only for approved templates with an IMAGE header." };
       }
 
       const normalizedMediaUrl = String(mediaUrl || "").trim();
@@ -4928,6 +4969,7 @@ class BroadcastService {
         broadcastId,
         broadcaster,
         credentials,
+        idempotencyKey,
       );
       if (!retryResult.success) {
         return retryResult;

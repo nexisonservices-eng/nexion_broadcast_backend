@@ -4,6 +4,17 @@ const TERMINAL_BROADCAST_STATUSES = [
   'failed',
 ];
 
+const isSenderSpamRateRestriction = (errorCode) =>
+  String(errorCode || '').trim() === '131048';
+
+const isRetryableBroadcastFailure = ({ errorCode = '', reason = '' } = {}) => {
+  if (isSenderSpamRateRestriction(errorCode)) return false;
+  const code = String(errorCode || '').trim();
+  const message = String(reason || '');
+  return ['131049', '131056', '131016', '63018'].includes(code) ||
+    /timeout|temporar|rate limit|try again/i.test(message);
+};
+
 const getRetryRun = (broadcast, runId) =>
   (Array.isArray(broadcast?.retryRuns) ? broadcast.retryRuns : []).find(
     (run) => String(run?.runId || '') === String(runId || ''),
@@ -139,4 +150,6 @@ module.exports = {
   acquireRetryRun,
   finishRetryRun,
   getRetryRun,
+  isSenderSpamRateRestriction,
+  isRetryableBroadcastFailure,
 };

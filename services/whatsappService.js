@@ -305,13 +305,28 @@ const buildTemplateMessageComponents = (
   templateComponents = [],
   variables = [],
 ) => {
-  const components = normalizeTemplateComponents(templateComponents);
+  const approvedComponents = Array.isArray(approvedTemplate?.components)
+    ? approvedTemplate.components
+    : [];
+  const approvedHeader = approvedComponents.find(
+    (component) => String(component?.type || '').toUpperCase() === 'HEADER'
+  );
+  const approvedHeaderFormat = String(approvedHeader?.format || '').toUpperCase();
+  const hasApprovedImageHeader = approvedHeaderFormat === 'IMAGE';
+  const hasApprovedTextHeader = approvedHeaderFormat === 'TEXT';
+  const components = normalizeTemplateComponents(templateComponents).filter((component) => {
+    if (String(component?.type || '').toUpperCase() !== 'HEADER') return true;
+    const parameters = Array.isArray(component?.parameters) ? component.parameters : [];
+    const hasMediaParameter = parameters.some((parameter) =>
+      ['image', 'video', 'document'].includes(String(parameter?.type || '').toLowerCase())
+    );
+    if (hasMediaParameter) return hasApprovedImageHeader;
+    return hasApprovedTextHeader;
+  });
   const bodyExists = components.some(
     (component) => String(component?.type || '').toUpperCase() === 'BODY'
   );
-  const bodyDefinition = (Array.isArray(approvedTemplate?.components)
-    ? approvedTemplate.components
-    : []).find((component) => String(component?.type || '').toUpperCase() === 'BODY');
+  const bodyDefinition = approvedComponents.find((component) => String(component?.type || '').toUpperCase() === 'BODY');
   const expectedBodyVariableCount = getNumberedVariableCount(bodyDefinition?.text || '');
   const bodyVariables = (Array.isArray(variables) ? variables : [])
     .slice(0, expectedBodyVariableCount);

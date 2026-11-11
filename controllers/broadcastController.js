@@ -842,7 +842,6 @@ class BroadcastController {
         broadcaster,
         req.whatsappCredentials || null,
         String(req.get("Idempotency-Key") || req.body?.idempotencyKey || ""),
-        String(req.get("Idempotency-Key") || req.body?.idempotencyKey || ""),
       );
       if (result.success) {
         return res.json(result);
@@ -884,13 +883,31 @@ class BroadcastController {
           },
           broadcaster,
           req.whatsappCredentials || null,
-        String(req.get("Idempotency-Key") || req.body?.idempotencyKey || ""),
+          String(req.get("Idempotency-Key") || req.body?.idempotencyKey || ""),
         );
       if (result.success) {
         return res.json(result);
       }
 
       return res.status(400).json(result);
+    } catch (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+  }
+
+  async getBroadcastTemplateDefinition(req, res) {
+    try {
+      const { id } = req.params;
+      const ownership = await this.assertOwnership(
+        id,
+        req.user.id,
+        req.companyId,
+        req.user?.normalizedRole || req.user?.companyRole || req.user?.role,
+        req,
+      );
+      if (!ownership.ok) return res.status(ownership.status).json(ownership.body);
+      const result = await broadcastService.getBroadcastTemplateDefinition(id);
+      return result.success ? res.json(result) : res.status(400).json(result);
     } catch (error) {
       return res.status(500).json({ success: false, error: error.message });
     }
