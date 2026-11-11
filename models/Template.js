@@ -86,6 +86,7 @@ const TemplateSchema = new mongoose.Schema({
   businessAccountId: String,
 
   phoneNumberId: String,
+  metaSyncIdentityVersion: { type: Number, default: 0 },
 
   syncedAt: Date,
 
@@ -116,12 +117,14 @@ TemplateSchema.pre('save', function(next) {
 
 
 TemplateSchema.index(
-  { userId: 1, companyId: 1, businessAccountId: 1, whatsappTemplateId: 1, language: 1, name: 1 },
+  { userId: 1, companyId: 1, businessAccountId: 1, whatsappTemplateId: 1 },
   {
     unique: true,
     partialFilterExpression: {
       userId: { $type: 'objectId' },
-      companyId: { $type: 'objectId' }
+      businessAccountId: { $gt: '' },
+      whatsappTemplateId: { $gt: '' },
+      metaSyncIdentityVersion: 1
     }
   }
 );

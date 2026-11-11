@@ -5,6 +5,7 @@ const { getWhatsAppCredentialsForUser } = require('../services/userWhatsAppCrede
 const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
 const { resolveCompanyFolders } = require('../services/cloudinaryCompanyFolders');
 const { normalizeTemplateMediaHandle } = require('../utils/templateMediaHandle');
+const { buildMetaTemplateIdentity, upsertMetaTemplate } = require('../services/metaTemplateSyncIdentity');
 
 const normalizeTemplateLookupValue = (value = '') => String(value || '').trim().toLowerCase();
 
@@ -791,15 +792,15 @@ class TemplateController {
         let operation = 'create';
         let databaseWriteCompleted = false;
         try {
-          // Meta template ids are scoped to a WABA. Keep tenant and WABA in the
-          // lookup together with language for language-specific definitions.
-          const existingTemplate = await Template.findOne({
+          // Meta template IDs are scoped by tenant and original WABA. Mutable
+          // names and language belong in the update payload, not the identity.
+          const templateIdentity = buildMetaTemplateIdentity({
             userId,
             companyId,
             businessAccountId,
-            whatsappTemplateId: wt.id,
-            language
+            metaTemplateId: wt.id
           });
+          const existingTemplate = await Template.findOne(templateIdentity);
           if (existingTemplate) operation = 'update';
           const metaComponents = Array.isArray(wt.components) ? wt.components : [];
           const header = metaComponents.find(component => component.type === 'HEADER');
@@ -836,14 +837,18 @@ class TemplateController {
             metaComponents,
             whatsappTemplateId: wt.id,
             businessAccountId,
+            metaSyncIdentityVersion: 1,
             phoneNumberId: result.phoneNumberId || credentials?.phoneNumberId || '',
             updatedAt: now,
             syncedAt: now,
             createdById: userId
           };
-          const syncedTemplate = existingTemplate
-            ? await Template.findByIdAndUpdate(existingTemplate._id, { $set: templateData }, { new: true })
-            : await Template.create({ ...templateData, createdAt: now });
+          const syncedTemplate = await upsertMetaTemplate(
+            Template,
+            templateIdentity,
+            templateData,
+            now,
+          );
           databaseWriteCompleted = Boolean(syncedTemplate);
           const persistedBodyComponent = (syncedTemplate?.metaComponents || []).find(component => component?.type === 'BODY');
           const expectedBody = String(body?.text || '');
