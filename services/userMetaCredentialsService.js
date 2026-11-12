@@ -93,7 +93,7 @@ const getMetaConfigForUser = async ({ authHeader = '' }) => {
   return null;
 };
 
-const getMetaConfigByUserId = async (userId) => {
+const getMetaConfigByUserId = async (userId, { throwOnError = false } = {}) => {
   if (!userId) return null;
 
   const normalizedUserId = String(userId).trim();
@@ -114,10 +114,17 @@ const getMetaConfigByUserId = async (userId) => {
         }
       );
 
-      return normalizeMetaConfig(response.data?.data);
+      const config = normalizeMetaConfig(response.data?.data);
+      if (config || !throwOnError) return config;
     } catch (error) {
       continue;
     }
+  }
+
+  if (throwOnError) {
+    const error = new Error('Unable to load the current Admin Meta configuration. Please retry before requesting billing.');
+    error.status = 503;
+    throw error;
   }
 
   return null;

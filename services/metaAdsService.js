@@ -7,6 +7,7 @@ const Campaign = require('../models/campaign');
 const { getMetaAdsConfig } = require('../config/metaAdsConfig');
 const metaAuthService = require('./metaAuthService');
 const metaCreativeService = require('./metaCreativeService');
+const { getMetaConfigByUserId } = require('./userMetaCredentialsService');
 
 const { GRAPH_BASE_URL, decryptMetaToken, encryptMetaToken } = metaAuthService;
 
@@ -2176,7 +2177,11 @@ const getAdPreviews = async ({ userId, adId, placements = [] } = {}) => {
 
 const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {}) => {
   const accessContext = await ensureConnectedMetaUser(userId, 'Meta billing');
-  const selectedAdAccountId = toCanonicalAdAccountId(accessContext?.connection?.selectedAdAccountId || '');
+  // Resolve billing configuration independently of the existing OAuth token/selection.
+  const adminMetaConfig = await getMetaConfigByUserId(userId, { throwOnError: true });
+  const configuredAdAccountId = toCanonicalAdAccountId(adminMetaConfig?.adAccountId || '');
+  const selectedAdAccountId = configuredAdAccountId ||
+    toCanonicalAdAccountId(accessContext?.connection?.selectedAdAccountId || '');
 
   if (!selectedAdAccountId) {
     throw buildStageErrorWithDetails(
@@ -2185,6 +2190,29 @@ const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {})
       { userId: userId || '' },
       400
     );
+  }
+
+  if (configuredAdAccountId) {
+    try {
+      // A direct lookup avoids account-list pagination and stale access validation.
+      const account = await graphRequest({
+        path: buildAdAccountPath(configuredAdAccountId),
+        params: { fields: 'id' },
+        accessToken: accessContext.accessToken,
+        apiVersion: accessContext.apiVersion,
+        bypassCache: true
+      });
+      if (toCanonicalAdAccountId(account?.id) !== configuredAdAccountId) {
+        throw new Error('Configured account was not returned by Meta.');
+      }
+    } catch (error) {
+      throw buildStageErrorWithDetails(
+        'Meta billing',
+        'Unable to access the Admin-configured Meta ad account with the current Meta connection. Verify account access before requesting billing.',
+        { adAccountId: configuredAdAccountId },
+        error?.response?.status || error?.status || 403
+      );
+    }
   }
 
   if (forceRefresh) {
@@ -2201,7 +2229,9 @@ const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {})
       fields:
         'id,name,account_status,currency,amount_spent,balance,spend_cap,funding_source_details,is_prepay_account,business,owner'
     },
-    accessToken: accessContext.accessToken
+    accessToken: accessContext.accessToken,
+    apiVersion: accessContext.apiVersion,
+    bypassCache: forceRefresh
   });
 
 console.log(
@@ -2270,7 +2300,9 @@ console.log(
         const fundingResponse = await graphRequest({
           path: `${buildAdAccountPath(selectedAdAccountId)}/funding_source_details`,
           params: { fields: 'id,type,amount,currency,display_amount,coupon,coupons' },
-          accessToken: accessContext.accessToken
+          accessToken: accessContext.accessToken,
+          apiVersion: accessContext.apiVersion,
+          bypassCache: forceRefresh
         });
         fundingSources = Array.isArray(fundingResponse?.data)
           ? fundingResponse.data
