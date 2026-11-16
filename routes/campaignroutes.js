@@ -7,6 +7,7 @@ const protect = require('../middleware/auth');
 const { requireTenantPolicy } = require('../middleware/tenantPolicy');
 const Campaign = require('../models/campaign');
 const campaignController = require('../controllers/campaigncontroller');
+const defaultAudienceTargeting = require('../controllers/defaultAudienceTargeting');
 const { normalizeCampaignContractPayload } = require('../utils/campaignContract');
 const VIDEO_MIME_TYPES = new Set([
     'video/mp4',
@@ -220,6 +221,10 @@ router.use(
 );
 
 // ==================== STATS AND EXPORT ROUTES ====================
+
+// Account-owned defaults must be registered before the /:id routes.
+router.get('/default-audience-targeting', defaultAudienceTargeting.getDefaults);
+router.put('/default-audience-targeting', defaultAudienceTargeting.saveDefaults);
 
 /**
  * @route   GET /api/campaigns/stats/overview
