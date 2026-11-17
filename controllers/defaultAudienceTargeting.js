@@ -1,9 +1,6 @@
 const DefaultAudienceTargeting = require('../models/DefaultAudienceTargeting');
 
-// Confirmed against the Nexion admin account record for SDK AGENCIES.
-const SDK_USER_ID = '6ae31d90e5e34d2d8306891c';
 const fields = ['locations', 'interests', 'behaviors'];
-const isSdk = (req) => req.user?.id === SDK_USER_ID;
 
 const normalizeDefaults = (body) => {
     if (!body || typeof body !== 'object' || Array.isArray(body)
@@ -31,7 +28,6 @@ const normalizeDefaults = (body) => {
 
 exports.getDefaults = async (req, res) => {
     if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
-    if (!isSdk(req)) return res.json({ success: true, eligible: false });
     try {
         const saved = await DefaultAudienceTargeting.findOne({ userId: req.user.id }).lean();
         const data = Object.fromEntries(fields.map((field) => [field, saved?.[field] || []]));
@@ -43,7 +39,6 @@ exports.getDefaults = async (req, res) => {
 
 exports.saveDefaults = async (req, res) => {
     if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
-    if (!isSdk(req)) return res.status(403).json({ success: false, message: 'Default audience targeting is not available for this account.' });
     let data;
     try {
         data = normalizeDefaults(req.body);
