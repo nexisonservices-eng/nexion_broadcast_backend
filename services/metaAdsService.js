@@ -2177,11 +2177,14 @@ const getAdPreviews = async ({ userId, adId, placements = [] } = {}) => {
 
 const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {}) => {
   const accessContext = await ensureConnectedMetaUser(userId, 'Meta billing');
-  // Resolve billing configuration independently of the existing OAuth token/selection.
-  const adminMetaConfig = await getMetaConfigByUserId(userId, { throwOnError: true });
-  const configuredAdAccountId = toCanonicalAdAccountId(adminMetaConfig?.adAccountId || '');
-  const selectedAdAccountId = configuredAdAccountId ||
-    toCanonicalAdAccountId(accessContext?.connection?.selectedAdAccountId || '');
+  // Read this user's saved selection even when credentials come from an owner.
+  const connection = await MetaAdsConnection.findOne({ userId }).select('selectedAdAccountId').lean();
+  let selectedAdAccountId = toCanonicalAdAccountId(connection?.selectedAdAccountId ||
+    accessContext?.connection?.selectedAdAccountId || '');
+  if (!selectedAdAccountId) {
+    const adminMetaConfig = await getMetaConfigByUserId(userId, { throwOnError: true });
+    selectedAdAccountId = toCanonicalAdAccountId(adminMetaConfig?.adAccountId || '');
+  }
 
   if (!selectedAdAccountId) {
     throw buildStageErrorWithDetails(
@@ -2192,27 +2195,25 @@ const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {})
     );
   }
 
-  if (configuredAdAccountId) {
-    try {
-      // A direct lookup avoids account-list pagination and stale access validation.
-      const account = await graphRequest({
-        path: buildAdAccountPath(configuredAdAccountId),
-        params: { fields: 'id' },
-        accessToken: accessContext.accessToken,
-        apiVersion: accessContext.apiVersion,
-        bypassCache: true
-      });
-      if (toCanonicalAdAccountId(account?.id) !== configuredAdAccountId) {
-        throw new Error('Configured account was not returned by Meta.');
-      }
-    } catch (error) {
-      throw buildStageErrorWithDetails(
-        'Meta billing',
-        'Unable to access the Admin-configured Meta ad account with the current Meta connection. Verify account access before requesting billing.',
-        { adAccountId: configuredAdAccountId },
-        error?.response?.status || error?.status || 403
-      );
+  try {
+    // A direct lookup avoids account-list pagination and stale access validation.
+    const account = await graphRequest({
+      path: buildAdAccountPath(selectedAdAccountId),
+      params: { fields: 'id' },
+      accessToken: accessContext.accessToken,
+      apiVersion: accessContext.apiVersion,
+      bypassCache: true
+    });
+    if (toCanonicalAdAccountId(account?.id) !== selectedAdAccountId) {
+      throw new Error('Selected account was not returned by Meta.');
     }
+  } catch (error) {
+    throw buildStageErrorWithDetails(
+      'Meta billing',
+      'Unable to access the selected Meta ad account with the current Meta connection. Verify account access before requesting billing.',
+      { adAccountId: selectedAdAccountId },
+      error?.response?.status || error?.status || 403
+    );
   }
 
   if (forceRefresh) {
@@ -2233,6 +2234,11 @@ const getAdAccountBillingSummary = async ({ userId, forceRefresh = false } = {})
     apiVersion: accessContext.apiVersion,
     bypassCache: forceRefresh
   });
+
+  if (toCanonicalAdAccountId(adAccount?.id) !== selectedAdAccountId) {
+    throw buildStageErrorWithDetails('Meta billing', 'Meta returned billing for an unexpected ad account.',
+      { adAccountId: selectedAdAccountId }, 502);
+  }
 
 console.log(
   '[META BILLING ACCOUNT RESPONSE]',
