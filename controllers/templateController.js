@@ -7,6 +7,7 @@ const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
 const { resolveCompanyFolders } = require('../services/cloudinaryCompanyFolders');
 const { normalizeTemplateMediaHandle } = require('../utils/templateMediaHandle');
 const { buildMetaTemplateIdentity, upsertMetaTemplate } = require('../services/metaTemplateSyncIdentity');
+const { redactCatalogText, logTemplateCatalogFailure } = require('../utils/templateCatalogDiagnostics');
 
 const normalizeTemplateLookupValue = (value = '') => String(value || '').trim().toLowerCase();
 
@@ -957,16 +958,18 @@ class TemplateController {
   // Get templates directly from Meta WhatsApp Business API
   async getMetaTemplates(req, res) {
     try {
-      console.log('🔄 Fetching templates directly from Meta WhatsApp Business API...');
-      
-      const result = await whatsappService.getTemplateList(req.whatsappCredentials);
+      const result = await whatsappService.getTemplateList(req.whatsappCredentials, { logDiagnostics: false });
       
       if (!result.success) {
-        console.error('[WHATSAPP_TEMPLATE_CATALOG]', JSON.stringify({
-          outcome: 'failure', source: 'meta',
-          wabaId: String(result.wabaId || req.whatsappCredentials?.businessAccountId || '').trim(),
-          error: String(result.error?.message || result.error || 'Meta template fetch failed')
-        }));
+        const metaError = result.error?.error ?? result.error;
+        logTemplateCatalogFailure(req, {
+          source: 'meta',
+          stage: (result.upstreamStatus || metaError?.code != null) ? 'meta_rejection' : 'meta_fetch_failure',
+          wabaId: result.wabaId || req.whatsappCredentials?.businessAccountId,
+          upstreamStatus: result.upstreamStatus,
+          error: metaError,
+          message: 'Meta template fetch failed.'
+        });
         return res.status(500).json({ 
           success: false, 
           error: result.error 
@@ -978,23 +981,24 @@ class TemplateController {
       const businessAccountId = String(result.wabaId || req.whatsappCredentials?.businessAccountId || '').trim();
       const phoneNumberId = String(result.phoneNumberId || req.whatsappCredentials?.phoneNumberId || '').trim();
       const companyId = req.companyId || req.user?.companyId || req.whatsappCredentials?.companyId || null;
+      const logText = value => redactCatalogText(String(value || ''), req);
       console.info('[WHATSAPP_TEMPLATE_CATALOG]', JSON.stringify({
-        outcome: 'success', source: 'meta', wabaId: businessAccountId, phoneNumberId,
-        tenantId: String(req.user?.id || ''), clientId: String(req.companyId || ''),
-        credentialOwnerUserId: String(req.whatsappCredentials?.credentialOwnerUserId || req.user?.id || ''),
+        outcome: 'success', source: 'meta', requestId: req.templateCatalogRequestId,
+        wabaId: logText(businessAccountId), phoneNumberId: logText(phoneNumberId),
+        tenantId: logText(req.user?.id), clientId: logText(req.companyId),
+        credentialOwnerUserId: logText(req.whatsappCredentials?.credentialOwnerUserId || req.user?.id),
         credentialSource: req.whatsappCredentials?.credentialSource || 'unknown',
         fetchedCount: metaTemplates.length, fetchedAt,
         templates: metaTemplates.map(template => ({
-          name: String(template?.name || ''),
-          metaTemplateId: String(template?.id || ''),
-          language: String(template?.language || ''),
-          status: String(template?.status || ''),
+          name: logText(template?.name),
+          metaTemplateId: logText(template?.id),
+          language: logText(template?.language),
+          status: logText(template?.status),
           extractedVariableCount: this.extractVariables(
             template?.components?.find(component => component?.type === 'BODY')?.text || ''
           ).length
         }))
       }));
-      console.log(`📋 Retrieved ${metaTemplates.length} templates from Meta`);
 
       res.json({
         success: true,
@@ -1012,7 +1016,10 @@ class TemplateController {
       });
 
     } catch (error) {
-      console.error('❌ Failed to fetch Meta templates:', error);
+      logTemplateCatalogFailure(req, {
+        source: 'controller', stage: 'unexpected_exception', error,
+        message: 'Unexpected error while loading the Meta template catalog.'
+      });
       res.status(500).json({ 
         success: false, 
         error: error.message,

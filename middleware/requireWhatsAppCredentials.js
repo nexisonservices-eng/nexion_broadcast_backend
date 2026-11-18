@@ -1,4 +1,5 @@
 const { getWhatsAppCredentialsForUser } = require('../services/userWhatsAppCredentialsService');
+const { logTemplateCatalogFailure, redactCatalogText } = require('../utils/templateCatalogDiagnostics');
 
 const createWhatsAppCredentialsMiddleware = ({ forceRefresh = false, templateWrite = false } = {}) => async (req, res, next) => {
   const requestCompanyId = String(req.companyId || req.user?.companyId || '').trim();
@@ -11,6 +12,11 @@ const createWhatsAppCredentialsMiddleware = ({ forceRefresh = false, templateWri
     });
 
     if (!credentials) {
+      if (req.templateCatalogRequestId) {
+        logTemplateCatalogFailure(req, {
+          source: 'admin', stage: 'missing_credentials', message: 'WhatsApp credentials are not configured.'
+        });
+      }
       return res.status(400).json({
         success: false,
         error: 'WhatsApp credentials are not configured for this user. Please set twilioId, whatsappId, whatsappToken, and whatsappBusiness for this user in admin backend.',
@@ -20,14 +26,21 @@ const createWhatsAppCredentialsMiddleware = ({ forceRefresh = false, templateWri
 
     const credentialCompanyId = String(credentials.companyId || '').trim();
     if (forceRefresh && requestCompanyId && credentialCompanyId && requestCompanyId !== credentialCompanyId) {
-      console.error('[WHATSAPP_CREDENTIAL_SELECTION]', JSON.stringify({
-        outcome: 'failure', reason: 'company_mismatch',
-        userId: String(req.user?.id || ''),
-        requestCompanyId,
-        credentialCompanyId,
-        credentialOwnerUserId: String(credentials.credentialOwnerUserId || ''),
-        credentialSource: credentials.credentialSource || 'unknown'
-      }));
+      if (req.templateCatalogRequestId) {
+        logTemplateCatalogFailure(req, {
+          source: 'admin', stage: 'company_mismatch', credentials,
+          message: 'The credential company differs from the authenticated company.'
+        });
+      } else {
+        console.error('[WHATSAPP_CREDENTIAL_SELECTION]', JSON.stringify({
+          outcome: 'failure', reason: 'company_mismatch',
+          userId: String(req.user?.id || ''),
+          requestCompanyId,
+          credentialCompanyId,
+          credentialOwnerUserId: String(credentials.credentialOwnerUserId || ''),
+          credentialSource: credentials.credentialSource || 'unknown'
+        }));
+      }
       return res.status(409).json({
         success: false,
         error: 'WhatsApp credentials belong to a different company. Verify the connected client account before syncing templates.'
@@ -35,14 +48,16 @@ const createWhatsAppCredentialsMiddleware = ({ forceRefresh = false, templateWri
     }
 
     req.whatsappCredentials = credentials;
+    const logValue = value => req.templateCatalogRequestId ? redactCatalogText(value, req) : value;
     console.info('[WHATSAPP_CREDENTIAL_SELECTION]', JSON.stringify({
-      userId: String(req.user?.id || ''),
-      companyId: String(req.companyId || req.user?.companyId || ''),
-      credentialOwnerUserId: String(credentials.credentialOwnerUserId || req.user?.id || ''),
-      credentialSource: credentials.credentialSource || 'unknown',
+      userId: logValue(String(req.user?.id || '')),
+      companyId: logValue(requestCompanyId),
+      credentialOwnerUserId: logValue(String(credentials.credentialOwnerUserId || req.user?.id || '')),
+      credentialSource: logValue(credentials.credentialSource || 'unknown'),
       forceRefresh,
-      wabaId: credentials.businessAccountId,
-      phoneNumberId: credentials.phoneNumberId
+      requestId: req.templateCatalogRequestId,
+      wabaId: logValue(credentials.businessAccountId),
+      phoneNumberId: logValue(credentials.phoneNumberId)
     }));
     return next();
   } catch (error) {
@@ -50,14 +65,21 @@ const createWhatsAppCredentialsMiddleware = ({ forceRefresh = false, templateWri
     const message = templateWrite && statusCode !== 400 && statusCode !== 409
       ? 'Failed to fetch WhatsApp credentials from admin backend'
       : String(error?.message || 'Credential lookup failed');
-    console.error('[WHATSAPP_CREDENTIAL_SELECTION]', JSON.stringify({
-      outcome: 'failure',
-      userId: String(req.user?.id || ''),
-      companyId: String(req.companyId || req.user?.companyId || ''),
-      forceRefresh,
-      statusCode,
-      error: message
-    }));
+    if (req.templateCatalogRequestId) {
+      logTemplateCatalogFailure(req, {
+        source: 'admin', stage: 'credential_lookup', upstreamStatus: error?.statusCode,
+        message: 'Admin credential lookup failed.'
+      });
+    } else {
+      console.error('[WHATSAPP_CREDENTIAL_SELECTION]', JSON.stringify({
+        outcome: 'failure',
+        userId: String(req.user?.id || ''),
+        companyId: String(req.companyId || req.user?.companyId || ''),
+        forceRefresh,
+        statusCode,
+        error: message
+      }));
+    }
     return res.status(statusCode).json({
       success: false,
       error: templateWrite ? message : 'Failed to fetch WhatsApp credentials from admin backend',

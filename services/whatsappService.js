@@ -1210,7 +1210,7 @@ class WhatsAppService {
     }
   }
 
-  async getTemplateList(credentials = null) {
+  async getTemplateList(credentials = null, { logDiagnostics = true } = {}) {
     if (credentials) {
       this.initialize(credentials);
     }
@@ -1231,7 +1231,7 @@ class WhatsAppService {
           wabaId: wabaId || null
         };
       }
-      debugLog(`Fetching templates from: ${apiUrl}/${wabaId}/message_templates`);
+      if (logDiagnostics) debugLog(`Fetching templates from: ${apiUrl}/${wabaId}/message_templates`);
       const endpoint = `${apiUrl}/${wabaId}/message_templates`;
       const params = {
         fields: 'id,name,language,status,category,components',
@@ -1274,10 +1274,11 @@ class WhatsAppService {
       debugLog('Templates found across Meta pages:', templates.length);
       return { success: true, data, wabaId, phoneNumberId };
     } catch (error) {
-      console.error('Error fetching templates:', error.response?.data || error.message);
+      if (logDiagnostics) console.error('Error fetching templates:', error.response?.data || error.message);
       return { 
         success: false, 
         error: error.response?.data || error.message,
+        ...(logDiagnostics ? {} : { upstreamStatus: error.response?.status }),
         wabaId,
         phoneNumberId
       };

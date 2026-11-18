@@ -3,6 +3,7 @@ const router = express.Router();
 const templateController = require('../controllers/templateController');
 const auth = require('../middleware/auth');
 const requireWhatsAppCredentials = require('../middleware/requireWhatsAppCredentials');
+const { startTemplateCatalogDiagnostics } = require('../utils/templateCatalogDiagnostics');
 const multer = require('multer');
 const templateImageUpload = multer({
   storage: multer.memoryStorage(),
@@ -31,7 +32,8 @@ router.get('/', (req, res) => templateController.getAllTemplates(req, res));
 router.get('/sync', requireWhatsAppCredentials.forceRefresh, (req, res) => templateController.syncWhatsAppTemplates(req, res));
 
 // Meta-specific routes (must come before /:id)
-router.get('/meta', requireWhatsAppCredentials.forceRefresh, (req, res) => templateController.getMetaTemplates(req, res));
+router.get('/meta', startTemplateCatalogDiagnostics, requireWhatsAppCredentials.forceRefresh,
+  (req, res) => templateController.getMetaTemplates(req, res));
 router.post('/meta/sync', requireWhatsAppCredentials.forceRefresh, (req, res) => templateController.syncMetaTemplates(req, res));
 router.delete('/meta/:name', (req, res) => templateController.deleteMetaTemplate(req, res));
 
