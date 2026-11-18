@@ -1,5 +1,10 @@
 ﻿const axios = require('axios');
 const FormData = require('form-data');
+const {
+  WHATSAPP_API_URL,
+  WHATSAPP_GRAPH_BASE_URL,
+  WHATSAPP_TEMPLATE_CREATE_GRAPH_VERSION
+} = require('../config/whatsapp');
 const { normalizeTemplateMediaHandle } = require('../utils/templateMediaHandle');
 const { isDebugLoggingEnabled } = require('../utils/securityConfig');
 const META_REQUEST_TIMEOUT_MS = Number(process.env.WHATSAPP_META_REQUEST_TIMEOUT_MS || 12000);
@@ -420,7 +425,7 @@ const normalizeMetaSendError = (error, fallback = 'Failed to send WhatsApp messa
 
 class WhatsAppService {
   constructor() {
-    this.apiUrl = 'https://graph.facebook.com/v20.0';
+    this.apiUrl = WHATSAPP_API_URL;
   }
 
   // Initialize service with user-specific credentials
@@ -1112,15 +1117,31 @@ class WhatsAppService {
     }
   }
 
-  async createTemplate(templateData, credentials = null) {
-    if (credentials) {
-      this.initialize(credentials);
+  async createTemplate(templateData, credentials, { companyId, userId, localTemplateId } = {}) {
+    const accessToken = String(credentials?.accessToken || '').trim();
+    const wabaId = String(credentials?.businessAccountId || '').trim();
+    const phoneNumberId = String(credentials?.phoneNumberId || '').trim();
+    const graphVersion = WHATSAPP_TEMPLATE_CREATE_GRAPH_VERSION;
+    if (!accessToken) return { success: false, error: 'Configure the WhatsApp Token in Super Admin.' };
+    if (!/^[1-9]\d*$/.test(wabaId)) {
+      return { success: false, error: 'Verify the numeric WhatsApp Business Account ID in Super Admin.' };
+    }
+    if (!phoneNumberId) {
+      return { success: false, error: 'Configure the WhatsApp Phone Number ID in Super Admin.' };
+    }
+    if (!/^v\d+\.\d+$/.test(graphVersion)) {
+      return { success: false, error: 'The server WhatsApp template Graph API version is invalid.' };
     }
 
+    const logContext = {
+      companyId,
+      userId,
+      credentialOwnerUserId: credentials.credentialOwnerUserId,
+      localTemplateId,
+      graphVersion,
+      wabaId
+    };
     try {
-      debugLog(`ðŸ“ Creating template: ${templateData.name}`);
-      
-      // Meta API format for template creation
       const metaTemplateData = {
         name: templateData.name,
         category: templateData.category,
@@ -1129,22 +1150,62 @@ class WhatsAppService {
       };
 
       const response = await axios.post(
-        `${this.apiUrl}/${this.wabaId}/message_templates`,
+        `${WHATSAPP_GRAPH_BASE_URL}/${graphVersion}/${wabaId}/message_templates`,
         metaTemplateData,
-        { headers: this.getHeaders() }
+        { headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' } }
       );
-      
-      debugLog('âœ… Template created successfully:', response.data);
-      return { 
-        success: true, 
-        data: response.data 
-      };
+
+      const returnedId = response.data?.id;
+      const id = typeof returnedId === 'string' || Number.isSafeInteger(returnedId)
+        ? String(returnedId).trim()
+        : '';
+      if (!/^[1-9]\d*$/.test(id)) {
+        const message = 'Meta did not return a valid WhatsApp template ID.';
+        console.error('[WHATSAPP_TEMPLATE_CREATE]', { ...logContext, message });
+        return { success: false, error: message };
+      }
+      return { success: true, data: { ...response.data, id } };
     } catch (error) {
-      console.error('âŒ Failed to create template:', error.response?.data || error.message);
-      return { 
-        success: false, 
-        error: (error.response?.data?.error?.message || error.response?.data?.message || error.message || 'Failed to create template'),
-        details: error.response?.data || null
+      const metaError = error.response?.data?.error;
+      const redact = (value) => typeof value === 'string'
+        ? value.split(accessToken).join('[redacted]').slice(0, 1000)
+        : undefined;
+      const code = Number(metaError?.code) || undefined;
+      const subcode = Number(metaError?.error_subcode) || undefined;
+      const message = redact(metaError?.message || error.response?.data?.message);
+      const traceId = redact(metaError?.fbtrace_id || error.response?.headers?.['x-fb-trace-id']);
+      const safeError = metaError ? {
+        code,
+        error_subcode: subcode,
+        type: redact(metaError.type),
+        message,
+        error_user_title: redact(metaError.error_user_title),
+        error_user_msg: redact(metaError.error_user_msg),
+        fbtrace_id: traceId
+      } : null;
+      console.error('[WHATSAPP_TEMPLATE_CREATE]', {
+        ...logContext,
+        httpStatus: error.response?.status,
+        metaCode: code,
+        metaSubcode: subcode,
+        metaType: safeError?.type,
+        message: message || 'Template request failed without a Meta error message.',
+        metaTraceId: traceId
+      });
+
+      let diagnostic;
+      if (code === 190 || code === 102) {
+        diagnostic = 'Meta rejected the WhatsApp Token as invalid or expired. Verify the token in Super Admin.';
+      } else if (code === 10 || (code >= 200 && code <= 299)) {
+        diagnostic = 'Meta denied template creation. Verify whatsapp_business_management and access to this WhatsApp Business Account.';
+      } else if (code === 100 && subcode === 33) {
+        diagnostic = 'Meta could not access this WhatsApp Business Account. Verify the WABA ID, the WhatsApp Token’s permissions and asset access, and the configured Graph API version.';
+      }
+      if (diagnostic && safeError) safeError.error_user_msg = diagnostic;
+      return {
+        success: false,
+        error: diagnostic || safeError?.error_user_msg || message || 'Failed to submit the template to Meta.',
+        details: safeError ? { error: safeError } : null
       };
     }
   }

@@ -2,6 +2,7 @@ const Template = require('../models/Template');
 const { buildTenantResourceFilter } = require('../utils/accessControl');
 const whatsappService = require('../services/whatsappService');
 const { getWhatsAppCredentialsForUser } = require('../services/userWhatsAppCredentialsService');
+const requireWhatsAppCredentials = require('../middleware/requireWhatsAppCredentials');
 const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
 const { resolveCompanyFolders } = require('../services/cloudinaryCompanyFolders');
 const { normalizeTemplateMediaHandle } = require('../utils/templateMediaHandle');
@@ -358,9 +359,13 @@ class TemplateController {
         category: templateData.category.toUpperCase(),
         language: templateData.language,
         components: componentsForMeta
-      }, req.whatsappCredentials);
+      }, req.whatsappCredentials, {
+        companyId: req.companyId,
+        userId: req.user.id,
+        localTemplateId: String(template._id)
+      });
 
-      let metaTemplateId = metaResult.data?.id || null;
+      let metaTemplateId = metaResult.success ? metaResult.data?.id || null : null;
       let existingMetaTemplate = null;
 
       if (!metaResult.success && isMetaDuplicateTemplateError(metaResult)) {
@@ -371,8 +376,10 @@ class TemplateController {
             templateData.name,
             templateData.language
           );
-          if (existingMetaTemplate) {
-            metaTemplateId = existingMetaTemplate.id || null;
+          if (typeof existingMetaTemplate?.id === 'string' && /^[1-9]\d*$/.test(existingMetaTemplate.id.trim())) {
+            metaTemplateId = existingMetaTemplate.id.trim();
+          } else {
+            existingMetaTemplate = null;
           }
         }
       }
@@ -386,7 +393,7 @@ class TemplateController {
         templateData.variables = this.extractVariables(templateData.content?.body || '');
       }
 
-      const metaSubmissionFailed = !metaResult.success && !existingMetaTemplate;
+      const metaSubmissionFailed = !metaTemplateId;
       if (metaSubmissionFailed) {
         // A missing Meta ID means this record must not look like a template that
         // is still awaiting Meta review. It is a failed submission that can be
@@ -415,7 +422,7 @@ class TemplateController {
           message: 'Template saved locally, but Meta submission failed',
           metaSubmission: {
             success: false,
-            error: metaResult.error || 'Failed to submit template to Meta',
+            error: metaResult.error || 'Meta did not return a valid WhatsApp template ID.',
             details: metaResult.details || null
           }
         });
@@ -471,24 +478,18 @@ class TemplateController {
       }
       // Failed/draft local templates have never reached Meta; submit their correction.
       if (!existingTemplate.whatsappTemplateId && ['failed', 'draft'].includes(existingTemplate.status)) {
-        if (!req.whatsappCredentials) {
-          req.whatsappCredentials = await getWhatsAppCredentialsForUser({
-            authHeader: req.headers?.authorization || '', userId: req.user.id
-          });
-        }
-        if (!req.whatsappCredentials) {
-          return res.status(400).json({ success: false, error: 'Connect WhatsApp before resubmitting this template.' });
-        }
-        req.templateToRetry = existingTemplate;
-        req.body = {
-          name: existingTemplate.name,
-          category: existingTemplate.category,
-          language: existingTemplate.language,
-          type: existingTemplate.type,
-          content: existingTemplate.content,
-          ...updateData
-        };
-        return await this.createTemplate(req, res);
+        return await requireWhatsAppCredentials.forTemplateWrite(req, res, () => {
+          req.templateToRetry = existingTemplate;
+          req.body = {
+            name: existingTemplate.name,
+            category: existingTemplate.category,
+            language: existingTemplate.language,
+            type: existingTemplate.type,
+            content: existingTemplate.content,
+            ...updateData
+          };
+          return this.createTemplate(req, res);
+        });
       }
       if (updateData.content && typeof updateData.content === 'object') {
         updateData.content = {

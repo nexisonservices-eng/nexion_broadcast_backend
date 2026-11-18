@@ -1,11 +1,13 @@
 const { getWhatsAppCredentialsForUser } = require('../services/userWhatsAppCredentialsService');
 
-const createWhatsAppCredentialsMiddleware = ({ forceRefresh = false } = {}) => async (req, res, next) => {
+const createWhatsAppCredentialsMiddleware = ({ forceRefresh = false, templateWrite = false } = {}) => async (req, res, next) => {
+  const requestCompanyId = String(req.companyId || req.user?.companyId || '').trim();
   try {
     const credentials = await getWhatsAppCredentialsForUser({
       authHeader: req.headers.authorization || '',
       userId: req.user?.id || null,
-      forceRefresh
+      forceRefresh,
+      ...(templateWrite ? { templateCompanyId: requestCompanyId } : {})
     });
 
     if (!credentials) {
@@ -16,7 +18,6 @@ const createWhatsAppCredentialsMiddleware = ({ forceRefresh = false } = {}) => a
       });
     }
 
-    const requestCompanyId = String(req.companyId || req.user?.companyId || '').trim();
     const credentialCompanyId = String(credentials.companyId || '').trim();
     if (forceRefresh && requestCompanyId && credentialCompanyId && requestCompanyId !== credentialCompanyId) {
       console.error('[WHATSAPP_CREDENTIAL_SELECTION]', JSON.stringify({
@@ -46,23 +47,27 @@ const createWhatsAppCredentialsMiddleware = ({ forceRefresh = false } = {}) => a
     return next();
   } catch (error) {
     const statusCode = Number(error?.statusCode) || 502;
+    const message = templateWrite && statusCode !== 400 && statusCode !== 409
+      ? 'Failed to fetch WhatsApp credentials from admin backend'
+      : String(error?.message || 'Credential lookup failed');
     console.error('[WHATSAPP_CREDENTIAL_SELECTION]', JSON.stringify({
       outcome: 'failure',
       userId: String(req.user?.id || ''),
       companyId: String(req.companyId || req.user?.companyId || ''),
       forceRefresh,
       statusCode,
-      error: String(error?.message || 'Credential lookup failed')
+      error: message
     }));
     return res.status(statusCode).json({
       success: false,
-      error: 'Failed to fetch WhatsApp credentials from admin backend',
-      details: error.message
+      error: templateWrite ? message : 'Failed to fetch WhatsApp credentials from admin backend',
+      ...(templateWrite ? {} : { details: error.message })
     });
   }
 };
 
 const requireWhatsAppCredentials = createWhatsAppCredentialsMiddleware();
 requireWhatsAppCredentials.forceRefresh = createWhatsAppCredentialsMiddleware({ forceRefresh: true });
+requireWhatsAppCredentials.forTemplateWrite = createWhatsAppCredentialsMiddleware({ forceRefresh: true, templateWrite: true });
 
 module.exports = requireWhatsAppCredentials;

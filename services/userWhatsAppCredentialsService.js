@@ -174,7 +174,47 @@ const getCachedCredentials = (cacheKey) => {
   return cached.value;
 };
 
-const fetchCredentialsFromAdminApi = async ({ authHeader, userId, token, forceRefresh = false }) => {
+const refreshTemplateCredentials = ({ data, credentials, userId, companyId, cacheKey }) => {
+  const responseUserId = String(data?.userId || '').trim();
+  const ownerId = String(data?.credentialOwnerUserId || '').trim();
+  const credentialCompanyId = String(data?.companyId || '').trim();
+  if (!userId || responseUserId !== String(userId) || credentialCompanyId !== companyId ||
+      (credentials && (!ownerId || (!companyId && ownerId !== responseUserId)))) {
+    throw Object.assign(
+      new Error('WhatsApp credential ownership could not be verified for this workspace.'),
+      { statusCode: 409 }
+    );
+  }
+
+  // Refresh on demand after Admin saves, including sessions inheriting the
+  // changed credential set. Other companies and owners keep their cache.
+  for (const [key, cached] of userCredentialCache) {
+    const sameRequester = String(cached.userId) === responseUserId;
+    const sameCompany = (cached.value.companyId || '') === companyId;
+    const sameOwner = sameCompany && ownerId && cached.value.credentialOwnerUserId === ownerId;
+    if (!sameRequester && !sameOwner) continue;
+    if (!credentials || !sameCompany || cached.value.credentialOwnerUserId !== ownerId ||
+        cached.value.accessToken !== credentials.accessToken ||
+        cached.value.businessAccountId !== credentials.businessAccountId ||
+        cached.value.phoneNumberId !== credentials.phoneNumberId) {
+      userCredentialCache.delete(key);
+    }
+  }
+  if (!credentials) {
+    const missing = [
+      String(data?.whatsappToken || data?.accessToken || '').trim() ? null : 'WhatsApp Token',
+      String(data?.whatsappBusiness || data?.businessAccountId || '').trim() ? null : 'WhatsApp Business Account ID',
+      String(data?.whatsappId || data?.phoneNumberId || '').trim() ? null : 'WhatsApp Phone Number ID'
+    ].filter(Boolean);
+    throw Object.assign(
+      new Error(`No complete WhatsApp credential set is available. Verify ${missing.join(', ')} in Super Admin.`),
+      { statusCode: 400 }
+    );
+  }
+  userCredentialCache.set(cacheKey, { userId, value: credentials, fetchedAt: Date.now() });
+};
+
+const fetchCredentialsFromAdminApi = async ({ authHeader, userId, token, forceRefresh, templateCompanyId }) => {
   let lastError = null;
 
   for (const baseUrl of ADMIN_API_BASE_URLS) {
@@ -188,12 +228,17 @@ const fetchCredentialsFromAdminApi = async ({ authHeader, userId, token, forceRe
         timeout: 10000
       });
 
-      const normalized = normalizeCredentials(response.data?.data);
+      const data = response.data?.data;
+      const normalized = normalizeCredentials(data);
+      const cacheKey = toCacheKey(userId, token);
+      if (templateCompanyId !== undefined) {
+        refreshTemplateCredentials({ data, credentials: normalized, userId, companyId: templateCompanyId, cacheKey });
+        return normalized;
+      }
       if (!normalized) return null;
 
-      const cacheKey = toCacheKey(userId, token);
       if (forceRefresh || !userCredentialCache.has(cacheKey)) {
-        userCredentialCache.set(cacheKey, { value: normalized, fetchedAt: Date.now() });
+        userCredentialCache.set(cacheKey, { userId, value: normalized, fetchedAt: Date.now() });
       }
 
       if (userId) {
@@ -202,6 +247,7 @@ const fetchCredentialsFromAdminApi = async ({ authHeader, userId, token, forceRe
 
       return normalized;
     } catch (error) {
+      if (templateCompanyId !== undefined && [400, 409].includes(error?.statusCode)) throw error;
       const statusCode = error?.response?.status || 502;
       const upstreamMessage =
         error?.response?.data?.error ||
@@ -222,19 +268,19 @@ const fetchCredentialsFromAdminApi = async ({ authHeader, userId, token, forceRe
   throw lastError || new Error('Unable to reach admin backend for user credentials');
 };
 
-const getWhatsAppCredentialsForUser = async ({ authHeader = '', userId = null, forceRefresh = false } = {}) => {
+const getWhatsAppCredentialsForUser = async ({ authHeader = '', userId = null, forceRefresh = false, templateCompanyId } = {}) => {
   if (!authHeader.startsWith('Bearer ')) return null;
 
   const token = authHeader.slice(7).trim();
   if (!token) return null;
 
   const cacheKey = toCacheKey(userId, token);
-  if (!forceRefresh) {
+  if (!forceRefresh && templateCompanyId === undefined) {
     const cached = getCachedCredentials(cacheKey);
     if (cached) return { ...cached, credentialSource: 'admin_user_credentials_cache' };
   }
 
-  const credentials = await fetchCredentialsFromAdminApi({ authHeader, userId, token, forceRefresh });
+  const credentials = await fetchCredentialsFromAdminApi({ authHeader, userId, token, forceRefresh, templateCompanyId });
   return credentials ? { ...credentials, credentialSource: 'admin_user_credentials_api' } : null;
 };
 

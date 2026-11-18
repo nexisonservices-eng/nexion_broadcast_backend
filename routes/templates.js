@@ -17,7 +17,7 @@ const templateImageUpload = multer({
 
 router.use(auth);
 
-router.post('/media', requireWhatsAppCredentials, (req, res) => {
+router.post('/media', requireWhatsAppCredentials.forTemplateWrite, (req, res) => {
   templateImageUpload(req, res, (error) => {
     if (error) {
       return res.status(400).json({ success: false, error: error.code === 'LIMIT_FILE_SIZE'
@@ -37,7 +37,7 @@ router.delete('/meta/:name', (req, res) => templateController.deleteMetaTemplate
 
 // Other routes
 router.get('/:id', (req, res) => templateController.getTemplateById(req, res));
-router.post('/', requireWhatsAppCredentials, (req, res) => templateController.createTemplate(req, res));
+router.post('/', requireWhatsAppCredentials.forTemplateWrite, (req, res) => templateController.createTemplate(req, res));
 router.put('/:id', (req, res) => templateController.updateTemplate(req, res));
 router.delete('/:id', (req, res) => templateController.deleteTemplate(req, res));
 router.post('/:id/usage', (req, res) => templateController.incrementUsage(req, res));
