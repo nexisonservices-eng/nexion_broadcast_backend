@@ -5,12 +5,13 @@ const auth = require('../middleware/auth');
 const requireWhatsAppCredentials = require('../middleware/requireWhatsAppCredentials');
 const { startTemplateCatalogDiagnostics } = require('../utils/templateCatalogDiagnostics');
 const multer = require('multer');
-const templateImageUpload = multer({
+const { bytesPerMB, maxTemplateMediaMB, getTemplateHeaderMediaType } = require('../utils/templateHeaderMedia');
+const templateMediaUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  limits: { fileSize: maxTemplateMediaMB * bytesPerMB + 1, files: 1, fields: 1, fieldSize: 32 },
   fileFilter: (req, file, callback) => {
-    if (!['image/jpeg', 'image/png'].includes(file.mimetype)) {
-      return callback(new Error('Select a JPEG or PNG template image.'));
+    if (!getTemplateHeaderMediaType(file.mimetype)) {
+      return callback(new Error('Unsupported template media. Select a JPEG, PNG, MP4, or PDF file.'));
     }
     callback(null, true);
   }
@@ -19,12 +20,12 @@ const templateImageUpload = multer({
 router.use(auth);
 
 router.post('/media', requireWhatsAppCredentials.forTemplateWrite, (req, res) => {
-  templateImageUpload(req, res, (error) => {
+  templateMediaUpload(req, res, (error) => {
     if (error) {
       return res.status(400).json({ success: false, error: error.code === 'LIMIT_FILE_SIZE'
-        ? 'Template images must be 5 MB or smaller.' : error.message });
+        ? `Template media must be ${maxTemplateMediaMB} MB or smaller.` : error.message });
     }
-    return templateController.uploadTemplateImage(req, res);
+    return templateController.uploadTemplateMedia(req, res);
   });
 });
 

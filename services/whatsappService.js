@@ -6,6 +6,7 @@ const {
   WHATSAPP_TEMPLATE_CREATE_GRAPH_VERSION
 } = require('../config/whatsapp');
 const { normalizeTemplateMediaHandle } = require('../utils/templateMediaHandle');
+const { bytesPerMB, getTemplateHeaderMedia, getTemplateHeaderMediaType } = require('../utils/templateHeaderMedia');
 const { isDebugLoggingEnabled } = require('../utils/securityConfig');
 const META_REQUEST_TIMEOUT_MS = Number(process.env.WHATSAPP_META_REQUEST_TIMEOUT_MS || 12000);
 const TEMPLATE_LIST_TIMEOUT_MS = Number(process.env.WHATSAPP_TEMPLATE_LIST_TIMEOUT_MS || 45000);
@@ -1075,12 +1076,21 @@ class WhatsAppService {
   }
 
   async uploadTemplateImage(file, credentials) {
+    return this.uploadTemplateMedia(file, credentials, 'image');
+  }
+
+  async uploadTemplateMedia(file, credentials, headerType = getTemplateHeaderMediaType(file?.mimetype)) {
     try {
-      if (!file?.buffer?.length || !['image/jpeg', 'image/png'].includes(file.mimetype)) {
-        return { success: false, error: 'Select a JPEG or PNG template image.' };
+      const media = getTemplateHeaderMedia(headerType);
+      if (!media) {
+        return { success: false, error: 'Select a supported template header type: Image, Video, or Document.' };
       }
-      if (file.buffer.length > 5 * 1024 * 1024) {
-        return { success: false, error: 'Template images must be 5 MB or smaller.' };
+      if (!file?.buffer?.length || !media.mimeTypes.includes(file.mimetype)) {
+        return { success: false, error: `Select a non-empty ${media.formats} file for the ${headerType} header.` };
+      }
+      const maxBytes = media.maxMB * bytesPerMB;
+      if (file.buffer.length > maxBytes) {
+        return { success: false, error: `Template ${headerType} files must be ${media.maxMB} MB or smaller.` };
       }
       // Capture request credentials before awaiting; this service is shared across tenants.
       const accessToken = credentials?.accessToken;
@@ -1088,14 +1098,14 @@ class WhatsAppService {
       const apiUrl = this.apiUrl;
       const session = await axios.post(`${apiUrl}/app/uploads`, null, {
         params: {
-          file_name: file.originalname || 'template-image',
+          file_name: file.originalname || `template-${headerType}`,
           file_length: file.buffer.length,
           file_type: file.mimetype
         },
         headers: { Authorization: `Bearer ${accessToken}` },
         timeout: META_REQUEST_TIMEOUT_MS
       });
-      if (!session.data?.id) throw new Error('Meta did not return an image upload session.');
+      if (!session.data?.id) throw new Error('Meta did not return a template media upload session.');
       const uploaded = await axios.post(`${apiUrl}/${session.data.id}`, file.buffer, {
         headers: {
           Authorization: `OAuth ${accessToken}`,
@@ -1103,10 +1113,10 @@ class WhatsAppService {
           file_offset: '0'
         },
         timeout: META_REQUEST_TIMEOUT_MS,
-        maxBodyLength: 5 * 1024 * 1024
+        maxBodyLength: maxBytes
       });
       const headerHandle = normalizeTemplateMediaHandle(uploaded.data?.h);
-      if (!headerHandle) throw new Error('Meta did not return a valid uploaded image handle.');
+      if (!headerHandle) throw new Error('Meta did not return a valid template media handle.');
       return { success: true, data: { headerHandle } };
     } catch (error) {
       return {
