@@ -1953,6 +1953,7 @@ class BroadcastService {
         templateId: source.templateId || undefined,
         mediaUrl: source.mediaUrl || "",
         mediaType: source.mediaType || "",
+        mediaFileName: source.mediaFileName || "",
         recipients,
         recipientCount: recipients.length,
         audienceSource: {
@@ -2854,7 +2855,12 @@ class BroadcastService {
                 parameters: [
                   {
                     type: templateHeaderMediaType,
-                    [templateHeaderMediaType]: { link: templateHeaderMediaUrl },
+                    [templateHeaderMediaType]: {
+                      link: templateHeaderMediaUrl,
+                      ...(templateHeaderMediaType === "document" && String(broadcast?.mediaFileName || "").trim()
+                        ? { filename: String(broadcast.mediaFileName).trim() }
+                        : {}),
+                    },
                   },
                 ],
               },

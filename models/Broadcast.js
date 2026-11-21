@@ -37,6 +37,7 @@ const BroadcastSchema = new mongoose.Schema({
   audienceSnapshot: mongoose.Schema.Types.Mixed,
   mediaUrl: String,
   mediaType: String,
+  mediaFileName: String,
   recipients: [{ 
     phone: { type: String, required: true },
     name: String,

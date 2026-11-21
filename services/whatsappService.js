@@ -279,7 +279,10 @@ const normalizeTemplateComponents = (components = []) => {
                   type: parameterType,
                   [parameterType]: {
                     ...(mediaId ? { id: mediaId } : {}),
-                    ...(mediaLink ? { link: mediaLink } : {})
+                    ...(mediaLink ? { link: mediaLink } : {}),
+                    ...(parameterType === 'document' && String(mediaValue?.filename || '').trim()
+                      ? { filename: String(mediaValue.filename).trim() }
+                      : {})
                   }
                 };
               }

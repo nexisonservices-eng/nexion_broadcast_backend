@@ -104,6 +104,7 @@ const {
 } = require('../services/whatsappOutreach/policy');
 const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
 const { resolveCompanyFolders } = require('../services/cloudinaryCompanyFolders');
+const { validateTemplateHeaderFile } = require('../utils/templateHeaderFileValidation');
 const { filterMessagesForConversation } = require('../utils/conversationMessageScope');
 
 router.use(auth);
@@ -1082,27 +1083,41 @@ router.post(
       if (!req.file) {
         return res.status(400).json({
           success: false,
-          error: 'Image file is required'
+          error: 'Template header media file is required'
+        });
+      }
+
+      const requestedHeaderType = String(req.body?.headerType || '').trim().toLowerCase();
+      const expectedMedia = getTemplateHeaderMedia(requestedHeaderType);
+      const validation = validateTemplateHeaderFile(req.file, requestedHeaderType, expectedMedia);
+      if (!validation.ok) {
+        return res.status(validation.statusCode).json({
+          success: false,
+          error: validation.error
         });
       }
 
       const folder = resolveBroadcastTemplateHeaderFolder(req);
       const mediaUrl = await uploadCampaignCreative(req.file, {
         folder,
-        resourceType: 'auto'
+        resourceType: expectedMedia.resourceType
       });
 
       return res.json({
         success: true,
         data: {
           mediaUrl,
-          folder
+          folder,
+          fileName: req.file.originalname || ''
         }
       });
     } catch (error) {
-      return res.status(error?.status || 500).json({
+      const statusCode = error?.code === 'LIMIT_FILE_SIZE' ? 413 : Number(error?.status || 500);
+      return res.status(statusCode).json({
         success: false,
-        error: error?.message || 'Failed to upload template header image'
+        error: error?.code === 'LIMIT_FILE_SIZE'
+          ? 'Template header media must be 30 MB or smaller'
+          : error?.message || 'Failed to upload template header media'
       });
     }
   }
@@ -1289,55 +1304,6 @@ router.post(
       return res.status(500).json({
         success: false,
         error: error?.message || 'Failed to send reaction'
-      });
-    }
-  }
-);
-
-router.post(
-  '/template-header-media',
-  attachmentRateLimit,
-  requirePlanFeature('templates'),
-  requireWhatsAppCredentials,
-  async (req, res) => {
-    try {
-      await runAttachmentUpload(req, res);
-      if (!req.file) {
-        return res.status(400).json({ success: false, error: 'Template header media file is required' });
-      }
-
-      const requestedHeaderType = String(req.body?.headerType || '').trim().toLowerCase();
-      if (!getTemplateHeaderMedia(requestedHeaderType)) {
-        return res.status(400).json({ success: false, error: 'A valid template header type (image, video, or document) is required' });
-      }
-      const expectedMedia = getTemplateHeaderMedia(requestedHeaderType);
-      if (!expectedMedia.mimeTypes.includes(String(req.file.mimetype || '').toLowerCase())) {
-        return res.status(400).json({
-          success: false,
-          error: `${requestedHeaderType[0].toUpperCase()}${requestedHeaderType.slice(1)} headers must be ${expectedMedia.formats} files`
-        });
-      }
-
-      const companyContext = resolveCompanyStorageContext(req);
-      const folder = resolveCompanyFolders(companyContext).metaTemplateImagesFolder;
-      const mediaUrl = await uploadCampaignCreative(req.file, {
-        folder,
-        resourceType: 'auto'
-      });
-
-      return res.json({
-        success: true,
-        data: {
-          mediaUrl,
-          url: mediaUrl,
-          folder
-        }
-      });
-    } catch (error) {
-      const statusCode = Number(error?.status || 500);
-      return res.status(statusCode).json({
-        success: false,
-        error: error?.message || 'Failed to upload template header media'
       });
     }
   }
