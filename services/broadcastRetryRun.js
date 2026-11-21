@@ -11,7 +11,8 @@ const isRetryableBroadcastFailure = ({ errorCode = '', reason = '' } = {}) => {
   if (isSenderSpamRateRestriction(errorCode)) return false;
   const code = String(errorCode || '').trim();
   const message = String(reason || '');
-  return ['131049', '131056', '131016', '63018'].includes(code) ||
+  if (code === '131049') return false;
+  return ['131056', '131016', '63018'].includes(code) ||
     /timeout|temporar|rate limit|try again/i.test(message);
 };
 

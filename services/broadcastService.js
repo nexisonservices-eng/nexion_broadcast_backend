@@ -1524,8 +1524,14 @@ class BroadcastService {
     );
     const codeMatch = raw.match(/\b(13[0-9]{4}|63[0-9]{3})\b/);
     const errorCode = codeMatch ? codeMatch[1] : "";
+    if (errorCode === "131049") {
+      return {
+        errorCode,
+        retryable: false,
+        errorMessage: raw,
+      };
+    }
     const retryableCodes = new Set([
-      "131049",
       "131056",
       "131016",
       "63018",
