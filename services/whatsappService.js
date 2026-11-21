@@ -318,7 +318,9 @@ const buildTemplateMessageComponents = (
     (component) => String(component?.type || '').toUpperCase() === 'HEADER'
   );
   const approvedHeaderFormat = String(approvedHeader?.format || '').toUpperCase();
-  const hasApprovedImageHeader = approvedHeaderFormat === 'IMAGE';
+  const approvedMediaHeaderType = ['IMAGE', 'VIDEO', 'DOCUMENT'].includes(approvedHeaderFormat)
+    ? approvedHeaderFormat.toLowerCase()
+    : null;
   const hasApprovedTextHeader = approvedHeaderFormat === 'TEXT';
   const components = normalizeTemplateComponents(templateComponents).filter((component) => {
     if (String(component?.type || '').toUpperCase() !== 'HEADER') return true;
@@ -326,7 +328,11 @@ const buildTemplateMessageComponents = (
     const hasMediaParameter = parameters.some((parameter) =>
       ['image', 'video', 'document'].includes(String(parameter?.type || '').toLowerCase())
     );
-    if (hasMediaParameter) return hasApprovedImageHeader;
+    if (hasMediaParameter) {
+      return parameters.some((parameter) =>
+        String(parameter?.type || '').toLowerCase() === approvedMediaHeaderType
+      );
+    }
     return hasApprovedTextHeader;
   });
   const bodyExists = components.some(

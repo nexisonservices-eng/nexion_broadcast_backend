@@ -2830,28 +2830,31 @@ class BroadcastService {
       const templateHeaderMediaType = String(broadcast?.mediaType || "")
         .trim()
         .toLowerCase();
+      const supportedTemplateMediaTypes = ["image", "video", "document"];
+      if (broadcast.templateName && templateHeaderMediaType && !supportedTemplateMediaTypes.includes(templateHeaderMediaType)) {
+        return { success: false, error: "Unsupported template header media type." };
+      }
       if (
         broadcast.templateName &&
-        templateHeaderMediaType === "image" &&
+        supportedTemplateMediaTypes.includes(templateHeaderMediaType) &&
         !templateHeaderMediaUrl
       ) {
         return {
           success: false,
-          error:
-            "This broadcast template requires an image header. Add an image URL before sending.",
+          error: `This broadcast template requires a ${templateHeaderMediaType} header. Add the required media before sending.`,
         };
       }
       const templateComponents =
         broadcast.templateName &&
-        templateHeaderMediaType === "image" &&
+        supportedTemplateMediaTypes.includes(templateHeaderMediaType) &&
         templateHeaderMediaUrl
           ? [
               {
                 type: "HEADER",
                 parameters: [
                   {
-                    type: "image",
-                    image: { link: templateHeaderMediaUrl },
+                    type: templateHeaderMediaType,
+                    [templateHeaderMediaType]: { link: templateHeaderMediaUrl },
                   },
                 ],
               },
