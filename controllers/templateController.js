@@ -58,7 +58,7 @@ const buildLocalTemplateContentFromMeta = (components = []) => {
 
   return {
     header: {
-      type: headerComponent ? String(headerComponent.format || 'text').toLowerCase() : 'text',
+      type: headerComponent ? String(headerComponent.format || 'none').toLowerCase() : 'none',
       text: headerComponent?.text || '',
       mediaUrl: ''
     },
@@ -191,7 +191,7 @@ class TemplateController {
 
         templateContent = {
           header: {
-            type: headerComponent ? (headerComponent.format || 'text').toLowerCase() : 'text',
+            type: headerComponent ? (headerComponent.format || 'none').toLowerCase() : 'none',
             text: headerComponent?.text || '',
             mediaUrl: content?.header?.mediaUrl || ''
           },
@@ -829,7 +829,7 @@ class TemplateController {
               header: header ? {
                 type: String(header.format || 'text').toLowerCase(),
                 text: header.text || ''
-              } : { type: 'text', text: '' },
+              } : { type: 'none', text: '' },
               body: body?.text || '',
               footer: footer?.text || '',
               buttons: normalizeTemplateButtons(buttons?.buttons || [])
@@ -1054,6 +1054,7 @@ class TemplateController {
 }
 
 module.exports = new TemplateController();
+module.exports.buildLocalTemplateContentFromMeta = buildLocalTemplateContentFromMeta;
 
 
 
