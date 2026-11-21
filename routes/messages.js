@@ -33,6 +33,7 @@ const {
   isTenantWideRole
 } = require('../utils/accessControl');
 const { createRedisRateLimiter } = require('../middleware/redisRateLimit');
+const { getTemplateHeaderMedia } = require('../utils/templateHeaderMedia');
 
 const setInboxNoCacheHeaders = (res) => {
   res.set({
@@ -1303,6 +1304,18 @@ router.post(
       await runAttachmentUpload(req, res);
       if (!req.file) {
         return res.status(400).json({ success: false, error: 'Template header media file is required' });
+      }
+
+      const requestedHeaderType = String(req.body?.headerType || '').trim().toLowerCase();
+      if (!getTemplateHeaderMedia(requestedHeaderType)) {
+        return res.status(400).json({ success: false, error: 'A valid template header type (image, video, or document) is required' });
+      }
+      const expectedMedia = getTemplateHeaderMedia(requestedHeaderType);
+      if (!expectedMedia.mimeTypes.includes(String(req.file.mimetype || '').toLowerCase())) {
+        return res.status(400).json({
+          success: false,
+          error: `${requestedHeaderType[0].toUpperCase()}${requestedHeaderType.slice(1)} headers must be ${expectedMedia.formats} files`
+        });
       }
 
       const companyContext = resolveCompanyStorageContext(req);
