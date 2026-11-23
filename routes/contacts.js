@@ -826,7 +826,8 @@ router.get('/', async (req, res) => {
     const pageSize = Number.isFinite(parsedPageSize) && parsedPage > 0
       ? Math.min(Math.floor(parsedPageSize), 200)
       : 10;
-    const isPageMode = !cursor && (
+    const isExportMode = String(req.query.exportAll || '').trim().toLowerCase() === 'true';
+    const isPageMode = !isExportMode && !cursor && (
       req.query.page !== undefined ||
       req.query.pageSize !== undefined ||
       req.query.sort !== undefined ||
