@@ -52,6 +52,7 @@ const {
   applyMarketingTemplateSent,
 } = require("./whatsappOutreach/policy");
 const { resolveOutboundSenderMeta } = require("../utils/messageSenderMeta");
+const { getTemplateHeaderType } = require("../utils/templateHeaderType");
 const axios = require("axios");
 const { createRedisConnection, isRedisDisabled } = require("../config/redis");
 const mongoose = require("mongoose");
@@ -563,6 +564,31 @@ class BroadcastService {
     } catch (_error) {
       return "";
     }
+  }
+
+  async resolveTemplateHeaderTypeForBroadcast({ broadcast }) {
+    if (!broadcast?.templateName) return null;
+
+    const baseFilter = {
+      userId: broadcast.createdById,
+      companyId: broadcast.companyId,
+    };
+    let template = broadcast.templateId
+      ? await Template.findOne({ ...baseFilter, _id: broadcast.templateId })
+          .select('content.header metaComponents components')
+          .lean()
+      : null;
+    if (!template) {
+      template = await Template.findOne({
+          ...baseFilter,
+          name: broadcast.templateName,
+          language: broadcast.language,
+        })
+          .select('content.header metaComponents components')
+          .lean();
+    }
+
+    return template ? getTemplateHeaderType(template) : null;
   }
 
   async reportUsage(companyId, count = 1) {
@@ -2834,13 +2860,37 @@ class BroadcastService {
       const templateCategory =
         toCleanString(templateCategoryRaw).toLowerCase() || "utility";
       const templateHeaderMediaUrl = String(broadcast?.mediaUrl || "").trim();
-      const templateHeaderMediaType = String(broadcast?.mediaType || "")
+      const configuredTemplateHeaderType =
+        broadcast.templateName
+          ? await this.resolveTemplateHeaderTypeForBroadcast({ broadcast })
+          : null;
+      const legacyTemplateMediaType = String(broadcast?.mediaType || "")
         .trim()
         .toLowerCase();
+      const templateHeaderMediaType = configuredTemplateHeaderType ||
+        (["image", "video", "document"].includes(legacyTemplateMediaType)
+          ? legacyTemplateMediaType
+          : "none");
       const supportedTemplateMediaTypes = ["image", "video", "document"];
-      if (broadcast.templateName && templateHeaderMediaType && !supportedTemplateMediaTypes.includes(templateHeaderMediaType)) {
-        return { success: false, error: "Unsupported template header media type." };
-      }
+      const templateInboxMediaUrl = supportedTemplateMediaTypes.includes(
+        templateHeaderMediaType,
+      )
+        ? templateHeaderMediaUrl
+        : "";
+      const templateInboxMediaMetadata = {
+        mediaType: templateHeaderMediaType,
+        mediaId: String(broadcast?.mediaId || "").trim(),
+        mimeType: String(broadcast?.mimeType || "").trim(),
+        mediaCaption: String(broadcast?.mediaCaption || "").trim(),
+        mediaFileName:
+          templateHeaderMediaType === "document"
+            ? String(broadcast?.mediaFileName || "").trim()
+            : "",
+        attachment:
+          broadcast?.attachment && typeof broadcast.attachment === "object"
+            ? broadcast.attachment
+            : null,
+      };
       if (
         broadcast.templateName &&
         supportedTemplateMediaTypes.includes(templateHeaderMediaType) &&
@@ -3236,7 +3286,8 @@ class BroadcastService {
                   companyId: broadcast.companyId,
                   phoneNumber,
                   message: messageTextForInbox,
-                  mediaUrl: templateHeaderMediaType === "image" ? templateHeaderMediaUrl : "",
+                  mediaUrl: templateInboxMediaUrl,
+                  mediaMetadata: templateInboxMediaMetadata,
                   whatsappResponse: result.data,
                   broadcastDispatchKey,
                   templateCategory,
@@ -3251,7 +3302,8 @@ class BroadcastService {
                       broadcast.companyId,
                       broadcastDispatchKey,
                       broadcastSenderMeta,
-                      templateHeaderMediaType === "image" ? templateHeaderMediaUrl : "",
+                      templateInboxMediaUrl,
+                      templateInboxMediaMetadata,
                     );
 
                     if (
@@ -3307,7 +3359,8 @@ class BroadcastService {
                   broadcast.companyId,
                   broadcastDispatchKey,
                   broadcastSenderMeta,
-                  templateHeaderMediaType === "image" ? templateHeaderMediaUrl : "",
+                  templateInboxMediaUrl,
+                  templateInboxMediaMetadata,
                 );
 
                 if (
@@ -3506,10 +3559,37 @@ class BroadcastService {
     broadcastDispatchKey = "",
     senderMeta = null,
     mediaUrl = "",
+    mediaMetadata = {},
   ) {
     try {
       const whatsappMessageId = whatsappResponse?.messages?.[0]?.id;
       const normalizedMediaUrl = String(mediaUrl || "").trim();
+      const metadata = mediaMetadata && typeof mediaMetadata === "object" ? mediaMetadata : {};
+      const requestedMediaType = String(metadata.mediaType || "").trim().toLowerCase();
+      const normalizedMediaType = ["image", "video", "document"].includes(requestedMediaType)
+        ? requestedMediaType
+        : normalizedMediaUrl
+          ? "image"
+          : "";
+      const normalizedMediaId = String(metadata.mediaId || "").trim();
+      const normalizedMimeType = String(metadata.mimeType || "").trim();
+      const normalizedMediaCaption = String(metadata.mediaCaption || "").trim();
+      const normalizedMediaFileName = String(metadata.mediaFileName || "").trim();
+      const suppliedAttachment =
+        metadata.attachment && typeof metadata.attachment === "object"
+          ? { ...metadata.attachment }
+          : null;
+      const attachment = suppliedAttachment ||
+        (normalizedMediaType === "document" && (normalizedMediaFileName || normalizedMimeType)
+          ? {
+              direction: "sent",
+              resourceType: "raw",
+              fileCategory: "document",
+              originalFileName: normalizedMediaFileName || undefined,
+              mimeType: normalizedMimeType || undefined,
+              secureUrl: normalizedMediaUrl || undefined,
+            }
+          : null);
       const resolvedSenderMeta =
         senderMeta && typeof senderMeta === "object"
           ? senderMeta
@@ -3573,8 +3653,8 @@ class BroadcastService {
           assignedToId: assignmentPatch.assignedToId || resolvedAssignee || null,
           lastMessage: message,
           lastMessageTime: new Date(),
-          lastMessageMediaType: normalizedMediaUrl ? "image" : "",
-          lastMessageAttachmentName: "",
+          lastMessageMediaType: normalizedMediaType,
+          lastMessageAttachmentName: normalizedMediaFileName,
           lastMessageAttachmentPages: null,
           lastMessageFrom: "agent",
           lastMessageWhatsappMessageId: whatsappMessageId || "",
@@ -3593,8 +3673,8 @@ class BroadcastService {
         // active again so the agent can continue the conversation in Inbox.
         conversation.status = "active";
         conversation.resolvedAt = null;
-        conversation.lastMessageMediaType = normalizedMediaUrl ? "image" : "";
-        conversation.lastMessageAttachmentName = "";
+        conversation.lastMessageMediaType = normalizedMediaType;
+        conversation.lastMessageAttachmentName = normalizedMediaFileName;
         conversation.lastMessageAttachmentPages = null;
         conversation.lastMessageFrom = "agent";
         conversation.lastMessageWhatsappMessageId = whatsappMessageId || "";
@@ -3639,7 +3719,16 @@ class BroadcastService {
         senderRole: normalizedSenderRole,
         senderName: normalizedSenderName,
         text: message,
-        ...(normalizedMediaUrl ? { mediaType: "image", mediaUrl: normalizedMediaUrl } : {}),
+        ...(normalizedMediaUrl
+          ? {
+              mediaType: normalizedMediaType || "image",
+              mediaUrl: normalizedMediaUrl,
+              ...(normalizedMediaId ? { mediaId: normalizedMediaId } : {}),
+              ...(normalizedMimeType ? { mimeType: normalizedMimeType } : {}),
+              ...(normalizedMediaCaption ? { mediaCaption: normalizedMediaCaption } : {}),
+              ...(attachment ? { attachment } : {}),
+            }
+          : {}),
         whatsappMessageId,
         status: "sent",
         sentAt: new Date(),
@@ -3686,6 +3775,7 @@ class BroadcastService {
     phoneNumber,
     message,
     mediaUrl = "",
+    mediaMetadata = {},
     whatsappResponse,
     broadcastDispatchKey = "",
     templateCategory = "",
@@ -3699,6 +3789,7 @@ class BroadcastService {
       phoneNumber,
       message,
       mediaUrl,
+      mediaMetadata,
       whatsappResponse,
       broadcastDispatchKey,
       templateCategory,
@@ -3882,6 +3973,10 @@ class BroadcastService {
         { id: String(whatsappMessageId || dispatch.whatsappMessageId || "") },
       ],
     };
+    const repairMediaType = String(broadcast?.mediaType || '').trim().toLowerCase();
+    const repairMediaUrl = ['image', 'video', 'document'].includes(repairMediaType)
+      ? String(broadcast?.mediaUrl || '').trim()
+      : '';
     const updateResult = await this.updateConversation(
       phone,
       inboxText,
@@ -3894,6 +3989,11 @@ class BroadcastService {
         broadcast,
         userId: dispatch.userId,
       }),
+      repairMediaUrl,
+      {
+        mediaType: repairMediaType,
+        mediaFileName: String(broadcast?.mediaFileName || "").trim(),
+      },
     );
 
     if (!updateResult?.message?._id) {

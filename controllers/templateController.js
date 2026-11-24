@@ -9,6 +9,7 @@ const { normalizeTemplateMediaHandle } = require('../utils/templateMediaHandle')
 const { getTemplateHeaderMedia, getTemplateHeaderMediaType } = require('../utils/templateHeaderMedia');
 const { buildMetaTemplateIdentity, upsertMetaTemplate } = require('../services/metaTemplateSyncIdentity');
 const { redactCatalogText, logTemplateCatalogFailure } = require('../utils/templateCatalogDiagnostics');
+const { getTemplateHeaderType } = require('../utils/templateHeaderType');
 
 const normalizeTemplateLookupValue = (value = '') => String(value || '').trim().toLowerCase();
 
@@ -58,7 +59,7 @@ const buildLocalTemplateContentFromMeta = (components = []) => {
 
   return {
     header: {
-      type: headerComponent ? String(headerComponent.format || 'none').toLowerCase() : 'none',
+      type: getTemplateHeaderType({ metaComponents: safeComponents }),
       text: headerComponent?.text || '',
       mediaUrl: ''
     },
@@ -191,7 +192,10 @@ class TemplateController {
 
         templateContent = {
           header: {
-            type: headerComponent ? (headerComponent.format || 'none').toLowerCase() : 'none',
+            type: getTemplateHeaderType({
+              components,
+              content: templateContent,
+            }),
             text: headerComponent?.text || '',
             mediaUrl: content?.header?.mediaUrl || ''
           },
@@ -827,7 +831,7 @@ class TemplateController {
             isActive: String(wt.status || '').toLowerCase() === 'approved',
             content: {
               header: header ? {
-                type: String(header.format || 'text').toLowerCase(),
+                type: getTemplateHeaderType({ metaComponents }),
                 text: header.text || ''
               } : { type: 'none', text: '' },
               body: body?.text || '',
