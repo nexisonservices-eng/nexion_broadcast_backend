@@ -575,6 +575,7 @@ if (enableBroadcastInboxWorker && canStartBullWorkers) {
       phoneNumber,
       message,
       mediaUrl = '',
+      mediaMetadata = {},
       whatsappResponse,
       broadcastDispatchKey = '',
       templateCategory = '',
@@ -606,7 +607,8 @@ if (enableBroadcastInboxWorker && canStartBullWorkers) {
       companyId,
       broadcastDispatchKey,
       null,
-      mediaUrl
+      mediaUrl,
+      mediaMetadata
     );
 
     if (!conversation || !savedMessage) {
