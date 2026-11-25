@@ -837,13 +837,17 @@ class WhatsAppService {
         };
       }
 
+      const mediaPayload = normalizedMediaId
+        ? { id: normalizedMediaId }
+        : { link: normalizedMediaUrl };
+      if (normalizedMediaType === 'audio' && options?.isVoiceNote === true) {
+        mediaPayload.voice = true;
+      }
       const payload = {
         messaging_product: 'whatsapp',
         to: normalizedPhone,
         type: normalizedMediaType,
-        [normalizedMediaType]: normalizedMediaId
-          ? { id: normalizedMediaId }
-          : { link: normalizedMediaUrl }
+        [normalizedMediaType]: mediaPayload
       };
 
       if (normalizedCaption && normalizedMediaType !== 'audio' && normalizedMediaType !== 'sticker') {

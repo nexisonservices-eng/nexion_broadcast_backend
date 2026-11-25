@@ -106,6 +106,7 @@ const { uploadCampaignCreative } = require('../utils/cloudinaryUpload');
 const { resolveCompanyFolders } = require('../services/cloudinaryCompanyFolders');
 const { validateTemplateHeaderFile } = require('../utils/templateHeaderFileValidation');
 const { filterMessagesForConversation } = require('../utils/conversationMessageScope');
+const { prepareOutboundAttachmentFile } = require('../services/voiceNoteTranscoder');
 
 router.use(auth);
 router.use(
@@ -1590,8 +1591,10 @@ router.post(
         caption = '',
         replyToMessageId = '',
         whatsappContextMessageId = '',
-        conversationLastInboundMessageAt = ''
+        conversationLastInboundMessageAt = '',
+        isVoiceNote = ''
       } = req.body || {};
+      const isExplicitVoiceNote = String(isVoiceNote).trim().toLowerCase() === 'true';
       if (!to || !conversationId) {
         return res.status(400).json({
           success: false,
@@ -1692,8 +1695,9 @@ router.post(
       const resolvedReplyContextMessageId =
         String(whatsappContextMessageId || replyReference?.whatsappMessageId || '').trim();
 
+      const outboundFile = await prepareOutboundAttachmentFile(req.file, isExplicitVoiceNote);
       const attachment = await uploadInboxAttachment({
-        file: req.file,
+        file: outboundFile,
         username: storageUsername,
         direction: 'sent',
         companyContext: resolveCompanyStorageContext(req),
@@ -1732,7 +1736,7 @@ router.post(
             ? 'audio'
             : 'document';
       const mediaUploadResult = await whatsappService.uploadMediaAsset(
-        req.file,
+        outboundFile,
         req.whatsappCredentials,
         {
           debugContext: {
@@ -1788,6 +1792,7 @@ router.post(
           whatsappContextMessageId: resolvedReplyContextMessageId,
           fileName: mediaType === 'document' ? attachment?.originalFileName : '',
           mediaId: uploadedMetaMediaId,
+          isVoiceNote: isExplicitVoiceNote,
           debugContext: {
             requestId: mediaPipelineRequestId,
             conversationId: conversation._id,
@@ -1832,6 +1837,7 @@ router.post(
         mediaCaption: normalizedCaption || undefined,
         mediaPipelineRequestId,
         attachment,
+        contentPayload: isExplicitVoiceNote ? { audio: { voice: true } } : undefined,
         replyTo: replyReference?._id || undefined,
         whatsappContextMessageId: resolvedReplyContextMessageId || undefined,
         whatsappMessageId,
