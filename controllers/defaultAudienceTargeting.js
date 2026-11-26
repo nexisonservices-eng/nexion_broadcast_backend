@@ -1,13 +1,6 @@
 const DefaultAudienceTargeting = require('../models/DefaultAudienceTargeting');
 
 const fields = ['locations', 'interests', 'behaviors'];
-const QTECH_USER_IDS = new Set([
-    '6a4f94f185de0a2ff96711db',
-    '6a5b7dbddd1a3c4eada8ff84',
-    '6ab277a0915828a41ce0afa3'
-]);
-
-const isEligible = (req) => QTECH_USER_IDS.has(String(req.user?.id || '').trim());
 
 const normalizeDefaults = (body) => {
     const normalizeFields = (source) => Object.fromEntries(fields.map((field) => {
@@ -59,7 +52,6 @@ const profileData = (saved) => {
 
 exports.getDefaults = async (req, res) => {
     if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
-    if (!isEligible(req)) return res.json({ success: true, eligible: false, data: null });
     try {
         const saved = await DefaultAudienceTargeting.findOne({ userId: req.user.id }).lean();
         const data = Object.fromEntries(fields.map((field) => [field, saved?.[field] || []]));
@@ -71,7 +63,6 @@ exports.getDefaults = async (req, res) => {
 
 exports.saveDefaults = async (req, res) => {
     if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
-    if (!isEligible(req)) return res.status(403).json({ success: false, message: 'Default audience targeting is not available for this account.' });
     let data;
     try {
         data = normalizeDefaults(req.body);
