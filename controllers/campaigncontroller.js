@@ -144,6 +144,9 @@ const buildCampaignTargetingSnapshot = (payload = {}) => ({
     ageMin: optionalTargetingNumber(payload.ageMin),
     ageMax: optionalTargetingNumber(payload.ageMax),
     gender: String(payload.gender || 'all').trim().toLowerCase(),
+    profileId: String(payload.audience?.profileId || '').trim(),
+    profileName: String(payload.audience?.profileName || '').trim(),
+    mode: String(payload.audience?.mode || (payload.audience?.profileId ? 'profile' : 'custom')).trim(),
     capturedAt: new Date()
 });
 
@@ -455,6 +458,9 @@ const continueCampaignMetaCreation = async ({
                     $set: {
                         targetingSnapshot: {
                             ...targetingSnapshot,
+                            profileId: String(normalizedPayload.audience?.profileId || ''),
+                            profileName: String(normalizedPayload.audience?.profileName || ''),
+                            mode: String(normalizedPayload.audience?.mode || 'custom'),
                             selectedLocations: selectedTargeting.locations,
                             selectedInterests: selectedTargeting.interests,
                             selectedBehaviors: selectedTargeting.behaviors

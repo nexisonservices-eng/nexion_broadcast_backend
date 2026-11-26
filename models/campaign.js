@@ -156,6 +156,9 @@ const campaignSchema = new mongoose.Schema({
             type: Date,
             default: null
         },
+        profileId: { type: String, trim: true, default: '' },
+        profileName: { type: String, trim: true, default: '' },
+        mode: { type: String, enum: ['profile', 'custom', ''], default: '' },
         customFilters: {
             type: mongoose.Schema.Types.Mixed,
             default: {}
