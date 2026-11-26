@@ -4397,7 +4397,7 @@ const fetchMetaDeliverySnapshot = async ({ userId, campaignId } = {}) => {
   try {
     const response = unwrap(await request(
       `${resolvedCampaignId}/adsets`,
-      'id,name,status,effective_status,start_time,end_time',
+      'id,name,status,effective_status,learning_stage_info,start_time,end_time',
       100
     ));
     adSets = Array.isArray(response?.data) ? response.data : [];
