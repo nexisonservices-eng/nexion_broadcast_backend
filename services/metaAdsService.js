@@ -1208,7 +1208,7 @@ const createMetaCampaignInAdsManager = async ({ name, objective, adAccountId, ac
       apiMode: 'live',
       adAccountId: toCanonicalAdAccountId(resolvedAdAccountId),
       availableAdAccounts: accountSelection.availableAdAccounts,
-      metaStatus: String(response?.status || 'PAUSED').trim().toUpperCase() || 'PAUSED',
+      metaStatus: String(response?.effective_status || response?.status || '').trim().toUpperCase(),
       ...response
     };
   } catch (error) {
@@ -3936,9 +3936,9 @@ const createMetaAdStackFromCrud = async ({
 
   const createdCampaign = createdCampaignResponse?.data || {};
   partialData.metaCampaignId = String(createdCampaign.id || '').trim();
-  partialData.campaignStatus = String(createdCampaign.status || createdCampaign.effective_status || normalizedStatus || 'PAUSED')
+  partialData.campaignStatus = String(createdCampaign.effective_status || createdCampaign.status || '')
     .trim()
-    .toUpperCase() || 'PAUSED';
+    .toUpperCase();
   if (!partialData.metaCampaignId) {
     const wrappedError = buildStageErrorWithDetails(
       'Campaign creation',
@@ -4073,9 +4073,9 @@ const createMetaAdStackFromCrud = async ({
 
   const createdAdSet = createdAdSetResponse?.data || {};
   partialData.metaAdSetId = String(createdAdSet.id || '').trim();
-  partialData.adSetStatus = String(createdAdSet.status || createdAdSet.effective_status || normalizedStatus || 'PAUSED')
+  partialData.adSetStatus = String(createdAdSet.effective_status || createdAdSet.status || '')
     .trim()
-    .toUpperCase() || 'PAUSED';
+    .toUpperCase();
   if (!partialData.metaAdSetId) {
     const wrappedError = buildStageErrorWithDetails(
       'Ad set creation',
@@ -4154,7 +4154,7 @@ const createMetaAdStackFromCrud = async ({
     partialData, effectiveAdAccountId: resolvedAdAccountId, resolvedAccessToken,
     payload: adPayload, onPending: onAdCreationPending
   });
-  partialData.adStatus = normalizedStatus;
+  partialData.adStatus = String(partialData.adStatus || '').trim().toUpperCase();
 
   await invalidateMetaCampaignCache({
     accessToken: resolvedAccessToken,
@@ -4786,6 +4786,40 @@ const syncAllCrudCampaignAnalytics = async ({ userId, mode = 'manual', range = '
           },
           analyticsLastSyncedAt: new Date().toISOString()
         };
+
+        // Delivery state is independent from analytics. Refresh it from Meta
+        // during background sync and preserve the last valid snapshot on failure.
+        try {
+          const deliverySnapshot = await fetchMetaDeliverySnapshot({
+            userId: group.userId,
+            campaignId: persistedCampaign.metaCampaignId
+          });
+          const campaignStatus = String(
+            deliverySnapshot?.campaign?.effective_status || deliverySnapshot?.campaign?.status || ''
+          ).trim().toUpperCase();
+          const adSetStatus = String(
+            deliverySnapshot?.adSets?.[0]?.effective_status || deliverySnapshot?.adSets?.[0]?.status || ''
+          ).trim().toUpperCase();
+          const adStatus = String(
+            deliverySnapshot?.ads?.[0]?.effective_status || deliverySnapshot?.ads?.[0]?.status || ''
+          ).trim().toUpperCase();
+
+          persistedCampaign.metaDeliverySnapshot = deliverySnapshot;
+          persistedCampaign.metaDeliveryStatusSyncedAt = new Date();
+          persistedCampaign.metaDeliveryStatusAttemptedAt = new Date();
+          persistedCampaign.metaDeliveryStatusStale = Array.isArray(deliverySnapshot?.partialErrors)
+            && deliverySnapshot.partialErrors.length > 0;
+          persistedCampaign.metaDeliveryStatusError = persistedCampaign.metaDeliveryStatusStale ? 'partial_sync' : '';
+          if (campaignStatus) persistedCampaign.metaStatus = campaignStatus;
+          if (adSetStatus) persistedCampaign.metaAdSetStatus = adSetStatus;
+          if (adStatus) persistedCampaign.metaAdStatus = adStatus;
+          persistedCampaign.markModified('metaDeliverySnapshot');
+        } catch (statusError) {
+          console.warn('[Meta] Delivery status background sync failed; preserving last known status', {
+            campaignId: String(persistedCampaign._id || ''),
+            error: statusError?.message || statusError
+          });
+        }
         persistedCampaign.markModified('metaResponse');
         await persistedCampaign.save();
         results.synced += 1;

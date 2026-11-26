@@ -499,11 +499,29 @@ const continueCampaignMetaCreation = async ({
             }
         });
 
-        const requestedStatus = String(normalizedPayload?.status || '').trim().toLowerCase();
-        const nextLocalStatus =
-            requestedStatus === 'active' || requestedStatus === 'paused'
-                ? requestedStatus
-                : String(metaResult?.campaignStatus || 'paused').trim().toLowerCase();
+        let deliverySnapshot = null;
+        try {
+            deliverySnapshot = await metaAdsService.fetchMetaDeliverySnapshot({
+                userId,
+                campaignId: String(metaResult?.campaignId || '').trim()
+            });
+        } catch (statusError) {
+            console.warn('[campaign-meta-status] post-creation refresh failed', statusError?.message || statusError);
+        }
+
+        const campaignMetaStatus = String(
+            deliverySnapshot?.campaign?.effective_status ||
+            deliverySnapshot?.campaign?.status ||
+            metaResult?.campaignStatus ||
+            ''
+        ).trim().toUpperCase();
+        const mapMetaStatusToLocalStatus = (status) => {
+            if (status === 'ACTIVE') return 'active';
+            if (['PAUSED', 'CAMPAIGN_PAUSED', 'ADSET_PAUSED', 'AD_PAUSED'].includes(status)) return 'paused';
+            if (['ARCHIVED', 'DELETED', 'COMPLETED', 'DISAPPROVED'].includes(status)) return 'ended';
+            return 'draft';
+        };
+        const nextLocalStatus = mapMetaStatusToLocalStatus(campaignMetaStatus);
         const nextLifecycleStatus =
             nextLocalStatus === 'active'
                 ? 'running'
@@ -519,14 +537,29 @@ const continueCampaignMetaCreation = async ({
                     metaAdSetId: String(metaResult?.adSetId || '').trim(),
                     metaCreativeId: String(metaResult?.creativeId || '').trim(),
                     metaAdId: String(metaResult?.adId || '').trim(),
-                    metaStatus: String(metaResult?.campaignStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
-                    metaAdSetStatus: String(metaResult?.adSetStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
-                    metaAdStatus: String(metaResult?.adStatus || 'PAUSED').trim().toUpperCase() || 'PAUSED',
+                    ...(campaignMetaStatus ? { metaStatus: campaignMetaStatus } : {}),
+                    ...(String(deliverySnapshot?.adSets?.[0]?.effective_status || deliverySnapshot?.adSets?.[0]?.status || metaResult?.adSetStatus || '').trim().toUpperCase()
+                        ? { metaAdSetStatus: String(deliverySnapshot?.adSets?.[0]?.effective_status || deliverySnapshot?.adSets?.[0]?.status || metaResult?.adSetStatus).trim().toUpperCase() }
+                        : {}),
+                    ...(String(deliverySnapshot?.ads?.[0]?.effective_status || deliverySnapshot?.ads?.[0]?.status || metaResult?.adStatus || '').trim().toUpperCase()
+                        ? { metaAdStatus: String(deliverySnapshot?.ads?.[0]?.effective_status || deliverySnapshot?.ads?.[0]?.status || metaResult?.adStatus).trim().toUpperCase() }
+                        : {}),
                     adAccountId: String(metaResult?.adAccountId || adAccountId || '').trim(),
                     status: nextLocalStatus,
                     lifecycleStatus: nextLifecycleStatus,
                     reviewStatus: 'pending_review',
-                    deliveryStatus: nextLocalStatus === 'active' ? 'active' : 'paused',
+                    deliveryStatus: nextLocalStatus === 'active'
+                        ? 'active'
+                        : nextLocalStatus === 'paused'
+                            ? 'paused'
+                            : 'not_published',
+                    ...(deliverySnapshot ? { metaDeliverySnapshot: deliverySnapshot } : {}),
+                    ...(deliverySnapshot ? {
+                        metaDeliveryStatusSyncedAt: new Date(),
+                        metaDeliveryStatusAttemptedAt: new Date(),
+                        metaDeliveryStatusStale: Array.isArray(deliverySnapshot.partialErrors) && deliverySnapshot.partialErrors.length > 0,
+                        metaDeliveryStatusError: Array.isArray(deliverySnapshot.partialErrors) && deliverySnapshot.partialErrors.length > 0 ? 'partial_sync' : ''
+                    } : {}),
                     metaResponse: metaResult,
                     updatedBy: userId
                 }
